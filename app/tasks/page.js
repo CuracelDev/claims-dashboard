@@ -206,7 +206,7 @@ function TaskCard({ task, onStatusChange, onDelete }) {
 /* ── Create Task Modal ───────────────────────────────────── */
 function CreateTaskModal({ members, onClose, onCreated }) {
   const [form, setForm] = useState({
-    title: "", description: "", assigned_to: "", assigned_by: "",
+    title: "", description: "", assigned_to: [], assigned_by: "",
     due_date: "", priority: "medium", category: "ad_hoc",
   });
   const [saving, setSaving] = useState(false);
@@ -215,7 +215,7 @@ function CreateTaskModal({ members, onClose, onCreated }) {
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
   async function submit() {
-    if (!form.title.trim() || !form.assigned_to) {
+    if (!form.title.trim() || form.assigned_to.length === 0) {
       setError("Title and assignee are required.");
       return;
     }
@@ -226,28 +226,17 @@ function CreateTaskModal({ members, onClose, onCreated }) {
     setSaving(true);
     setError("");
     try {
-      if (form.assigned_to === "everyone") {
-        // Create one task per team member
-        const results = await Promise.all(
-          members.map(m =>
-            fetch("/api/tasks", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ ...form, assigned_to: m.id }),
-            }).then(r => r.json())
-          )
-        );
-        results.forEach(data => { if (data.task) onCreated(data.task); });
-      } else {
-        const res = await fetch("/api/tasks", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...form }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Failed to create task");
-        onCreated(data.task);
-      }
+      // Create one task per selected member
+      const results = await Promise.all(
+        form.assigned_to.map(memberId =>
+          fetch("/api/tasks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...form, assigned_to: memberId }),
+          }).then(r => r.json())
+        )
+      );
+      results.forEach(data => { if (data.task) onCreated(data.task); });
       onClose();
     } catch (e) {
       setError(e.message);
@@ -288,21 +277,47 @@ function CreateTaskModal({ members, onClose, onCreated }) {
             <textarea style={{ ...inp, height: 80, resize: "vertical" }} value={form.description}
               onChange={e => set("description", e.target.value)} placeholder="Optional details..." />
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <div>
-              <label style={label}>Assigned By *</label>
-              <select style={inp} value={form.assigned_by} onChange={e => set("assigned_by", e.target.value)}>
-                <option value="">Who is assigning?</option>
-                {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
-              </select>
+          <div>
+            <label style={label}>Assigned By *</label>
+            <select style={inp} value={form.assigned_by} onChange={e => set("assigned_by", e.target.value)}>
+              <option value="">Who is assigning?</option>
+              {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <label style={{ ...label, margin: 0 }}>Assign To * <span style={{ color: C.muted, fontWeight: 400 }}>({form.assigned_to.length} selected)</span></label>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button type="button" onClick={() => set("assigned_to", members.map(m => m.id))}
+                  style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: "transparent", color: C.accent, cursor: "pointer" }}>
+                  All
+                </button>
+                <button type="button" onClick={() => set("assigned_to", [])}
+                  style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: "transparent", color: C.muted, cursor: "pointer" }}>
+                  None
+                </button>
+              </div>
             </div>
-            <div>
-              <label style={label}>Assign To *</label>
-              <select style={inp} value={form.assigned_to} onChange={e => set("assigned_to", e.target.value)}>
-                <option value="">Select assignee...</option>
-                <option value="everyone">👥 Everyone</option>
-                {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-              </select>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px" }}>
+              {members.map(m => {
+                const checked = form.assigned_to.includes(m.id);
+                return (
+                  <div key={m.id} onClick={() => {
+                    const current = form.assigned_to;
+                    set("assigned_to", checked ? current.filter(id => id !== m.id) : [...current, m.id]);
+                  }} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 6,
+                    background: checked ? `${C.accent}15` : "transparent",
+                    border: `1px solid ${checked ? C.accent + "50" : "transparent"}`,
+                    cursor: "pointer", transition: "all .15s" }}>
+                    <div style={{ width: 16, height: 16, borderRadius: 4, border: `2px solid ${checked ? C.accent : C.border}`,
+                      background: checked ? C.accent : "transparent", display: "flex", alignItems: "center", justifyContent: "center",
+                      flexShrink: 0, transition: "all .15s" }}>
+                      {checked && <span style={{ color: C.bg, fontSize: 10, fontWeight: 700, lineHeight: 1 }}>✓</span>}
+                    </div>
+                    <span style={{ fontSize: 12, color: checked ? C.text : C.sub, fontWeight: checked ? 600 : 400 }}>{m.name}</span>
+                  </div>
+                );
+              })}
             </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
