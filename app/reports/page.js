@@ -83,6 +83,58 @@ function MetricGroup({ group, metrics, onChange, randKey }) {
           </div>
         ))}
       </div>
+
+      {showPreview && editingReport && (
+        <div style={{ position: 'fixed', inset: 0, background: '#000A', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 32, width: '100%', maxWidth: 560, maxHeight: '80vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
+              <div style={{ fontWeight: 700, fontSize: 18 }}>Report Preview</div>
+              <button onClick={() => setShowPreview(false)} style={{ background: 'none', border: 'none', color: C.sub, fontSize: 20, cursor: 'pointer' }}>✕</button>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 20 }}>
+              <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: C.accent }}>{Object.values(editingReport.metrics || {}).reduce((a,b) => a+(parseInt(b)||0), 0)}</div>
+                <div style={{ fontSize: 12, color: C.sub }}>Total Output</div>
+              </div>
+              <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: C.blue }}>{Object.keys(editingReport.metrics || {}).length}</div>
+                <div style={{ fontSize: 12, color: C.sub }}>Metrics Filled</div>
+              </div>
+            </div>
+            {METRIC_GROUPS.map(g => (
+              <div key={g.category} style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: g.color, marginBottom: 8 }}>{g.label}</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {g.metrics.filter(m => editingReport.metrics?.[m.key]).map(m => (
+                    <div key={m.key} style={{ display: 'flex', justifyContent: 'space-between', background: C.elevated, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}>
+                      <span style={{ color: C.sub }}>{m.label}</span>
+                      <span style={{ color: C.text, fontWeight: 600 }}>{editingReport.metrics[m.key]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: 12, marginTop: 20 }}>
+              <button onClick={() => {
+                const text = METRIC_GROUPS.flatMap(g => g.metrics.filter(m => editingReport.metrics?.[m.key]).map(m => `${m.label}: ${editingReport.metrics[m.key]}`)).join('\n');
+                navigator.clipboard.writeText(text);
+                alert('Copied!');
+              }} style={{ flex: 1, padding: '10px', background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, cursor: 'pointer' }}>
+                📋 Copy Text
+              </button>
+              <button onClick={async () => {
+                const member = teamMembers.find(m => String(m.id) === String(editingReport.team_member_id));
+                const res = await fetch('/api/reports/send-slack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ report: editingReport, teamMember: member, channel: 'health-ops' }) });
+                const result = await res.json();
+                if (result.error) alert('Failed: ' + result.error);
+                else alert('Sent to Slack!');
+              }} style={{ flex: 1, padding: '10px', background: C.accentDim, border: 'none', borderRadius: 8, color: '#0B0F1A', fontWeight: 700, cursor: 'pointer' }}>
+                📤 Send to Slack
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -324,6 +376,7 @@ export default function ReportsPage() {
   const [saveMsg, setSaveMsg] = useState(null);
   const [isLeaveActive, setIsLeaveActive] = useState(false);
   const [editingReport, setEditingReport] = useState(null);
+  const [showPreview, setShowPreview] = useState(false);
   const [reports, setReports] = useState([]);
   const [histFilter, setHistFilter] = useState({ person: '', date: '' });
   const [loadingHist, setLoadingHist] = useState(false);
@@ -503,6 +556,13 @@ export default function ReportsPage() {
                       cursor: saving || !selectedMember ? 'not-allowed' : 'pointer',
                     }}>
                       {saving ? 'Saving…' : '💾 Save'}
+                    </button>
+                    <button onClick={async () => { await handleSave(); setShowPreview(true); }} disabled={saving || !selectedMember} style={{
+                      padding: '10px 28px', background: C.accent, color: '#0B0F1A',
+                      border: 'none', borderRadius: 8, fontWeight: 700, fontSize: 14,
+                      cursor: saving || !selectedMember ? 'not-allowed' : 'pointer',
+                    }}>
+                      ✨ Save & Preview
                     </button>
                   </div>
                 </div>
