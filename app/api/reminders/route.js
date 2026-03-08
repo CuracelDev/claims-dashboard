@@ -1,7 +1,7 @@
 import { getSupabase } from '@/lib/supabase';
 export const dynamic = 'force-dynamic';
 
-const supabase = getSupabase();
+
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
@@ -10,6 +10,7 @@ export async function GET(req) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const supabase = getSupabase();
   const today = new Date().toISOString().split('T')[0];
   const botToken = process.env.SLACK_BOT_TOKEN;
 
