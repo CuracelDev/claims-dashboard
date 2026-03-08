@@ -76,9 +76,9 @@ function MetricGroup({ group, metrics, onChange }) {
           <div key={m.key}>
             <label style={labelStyle}>{m.label}</label>
             <input
-              type="number"
-              min="0"
-              name={`metric_${m.key}`}
+              type="text"
+              inputMode="numeric"
+              name={`metric_${m.key}_${Date.now()}`}
               autoComplete="off"
               value={metrics[m.key] ?? ''}
               onChange={e => onChange(m.key, e.target.value)}

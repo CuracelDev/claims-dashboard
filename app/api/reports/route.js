@@ -89,21 +89,28 @@ export async function POST(request) {
       ? metrics
       : {};
 
-    // Upsert — same person+date always updates
-    const { data, error } = await supabase
+    // Check if report exists for this person+date
+    const memberId = parseInt(team_member_id);
+    const { data: existing } = await supabase
       .from('daily_reports')
-      .upsert({
-        team_member_id: parseInt(team_member_id),
-        report_date,
-        metrics: safeMetrics,
-        tasks_completed: tasks_completed || null,
-        notes: notes || null,
-        status: status || 'submitted',
-      }, {
-        onConflict: 'team_member_id,report_date',
-      })
-      .select()
-      .single();
+      .select('id')
+      .eq('team_member_id', memberId)
+      .eq('report_date', report_date)
+      .maybeSingle();
+
+    let data, error;
+    if (existing?.id) {
+      ({ data, error } = await supabase
+        .from('daily_reports')
+        .update({ metrics: safeMetrics, tasks_completed: tasks_completed || null, notes: notes || null, status: status || 'submitted' })
+        .eq('id', existing.id)
+        .select().single());
+    } else {
+      ({ data, error } = await supabase
+        .from('daily_reports')
+        .insert({ team_member_id: memberId, report_date, metrics: safeMetrics, tasks_completed: tasks_completed || null, notes: notes || null, status: status || 'submitted' })
+        .select().single());
+    }
 
     if (error) return Response.json({ error: error.message }, { status: 500 });
     return Response.json({ data });
