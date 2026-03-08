@@ -47,19 +47,18 @@ const todayStr = () => new Date().toISOString().split('T')[0];
 
 const S = {
   input: {
-    background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8,
-    color: C.text, padding: '9px 12px', fontSize: 14, width: '100%',
+    background: '#1A2332', border: '1px solid #1E2D3D', borderRadius: 8,
+    color: '#F0F4F8', padding: '9px 12px', fontSize: 14, width: '100%',
     outline: 'none', boxSizing: 'border-box',
   },
-  label: { fontSize: 12, color: C.sub, marginBottom: 4, display: 'block' },
+  label: { fontSize: 12, color: '#8899AA', marginBottom: 4, display: 'block' },
   card: {
-    background: C.card, border: `1px solid ${C.border}`,
+    background: '#111827', border: '1px solid #1E2D3D',
     borderRadius: 12, padding: 20, marginBottom: 16,
   },
 };
 
-// ── MetricGroup ───────────────────────────────────────────────────────────────
-function MetricGroup({ group, metrics, onChange, randKey }) {
+function MetricGroup({ group, metrics, onChangeMetric }) {
   return (
     <div style={{ ...S.card, borderTop: `3px solid ${group.color}` }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: group.color, marginBottom: 16 }}>{group.label}</div>
@@ -72,74 +71,20 @@ function MetricGroup({ group, metrics, onChange, randKey }) {
               inputMode="numeric"
               pattern="[0-9]*"
               autoComplete="off"
-              value={metrics[m.key] ?? ''}
+              value={metrics[m.key] !== undefined ? metrics[m.key] : ''}
               onChange={e => {
                 const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange(m.key, v);
+                if (v === '' || /^\d+$/.test(v)) onChangeMetric(m.key, v);
               }}
-              placeholder=""
               style={S.input}
             />
           </div>
         ))}
       </div>
-
-      {showPreview && editingReport && (
-        <div style={{ position: 'fixed', inset: 0, background: '#000A', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 32, width: '100%', maxWidth: 560, maxHeight: '80vh', overflowY: 'auto' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
-              <div style={{ fontWeight: 700, fontSize: 18 }}>Report Preview</div>
-              <button onClick={() => setShowPreview(false)} style={{ background: 'none', border: 'none', color: C.sub, fontSize: 20, cursor: 'pointer' }}>✕</button>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 20 }}>
-              <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
-                <div style={{ fontSize: 28, fontWeight: 700, color: C.accent }}>{Object.values(editingReport.metrics || {}).reduce((a,b) => a+(parseInt(b)||0), 0)}</div>
-                <div style={{ fontSize: 12, color: C.sub }}>Total Output</div>
-              </div>
-              <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
-                <div style={{ fontSize: 28, fontWeight: 700, color: C.blue }}>{Object.keys(editingReport.metrics || {}).length}</div>
-                <div style={{ fontSize: 12, color: C.sub }}>Metrics Filled</div>
-              </div>
-            </div>
-            {METRIC_GROUPS.map(g => (
-              <div key={g.category} style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: g.color, marginBottom: 8 }}>{g.label}</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                  {g.metrics.filter(m => editingReport.metrics?.[m.key]).map(m => (
-                    <div key={m.key} style={{ display: 'flex', justifyContent: 'space-between', background: C.elevated, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}>
-                      <span style={{ color: C.sub }}>{m.label}</span>
-                      <span style={{ color: C.text, fontWeight: 600 }}>{editingReport.metrics[m.key]}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
-            <div style={{ display: 'flex', gap: 12, marginTop: 20 }}>
-              <button onClick={() => {
-                const text = METRIC_GROUPS.flatMap(g => g.metrics.filter(m => editingReport.metrics?.[m.key]).map(m => `${m.label}: ${editingReport.metrics[m.key]}`)).join('\n');
-                navigator.clipboard.writeText(text);
-                alert('Copied!');
-              }} style={{ flex: 1, padding: '10px', background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, cursor: 'pointer' }}>
-                📋 Copy Text
-              </button>
-              <button onClick={async () => {
-                const member = teamMembers.find(m => String(m.id) === String(editingReport.team_member_id));
-                const res = await fetch('/api/reports/send-slack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ report: editingReport, teamMember: member, channel: 'health-ops' }) });
-                const result = await res.json();
-                if (result.error) alert('Failed: ' + result.error);
-                else alert('Sent to Slack!');
-              }} style={{ flex: 1, padding: '10px', background: C.accentDim, border: 'none', borderRadius: 8, color: '#0B0F1A', fontWeight: 700, cursor: 'pointer' }}>
-                📤 Send to Slack
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
-// ── LeavePanel ────────────────────────────────────────────────────────────────
 function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   const [activeLeave, setActiveLeave] = useState(null);
   const [open, setOpen] = useState(false);
@@ -167,7 +112,6 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   }, [memberId, reportDate]);
 
   const handleMark = async () => {
-    if (!memberId) return;
     setSaving(true);
     try {
       const isSingle = leaveType === 'off_today' || leaveType === 'public_holiday';
@@ -204,21 +148,18 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   return (
     <div style={{ marginBottom: 16 }}>
       {activeLeave ? (
-        <div style={{ background: '#FFB84D10', border: `1px solid ${C.warn}44`, borderRadius: 10, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ background: '#FFB84D10', border: '1px solid #FFB84D44', borderRadius: 10, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span style={{ fontSize: 13, color: C.warn }}>
             🌙 {memberName} is on leave — {activeLeave.leave_type.replace(/_/g, ' ')}
             {activeLeave.reason ? ` · "${activeLeave.reason}"` : ''}
           </span>
-          <button onClick={handleCancel} style={{ background: 'none', border: `1px solid ${C.warn}44`, borderRadius: 6, color: C.warn, fontSize: 12, padding: '4px 10px', cursor: 'pointer' }}>
+          <button onClick={handleCancel} style={{ background: 'none', border: '1px solid #FFB84D44', borderRadius: 6, color: C.warn, fontSize: 12, padding: '4px 10px', cursor: 'pointer' }}>
             ✕ Cancel leave
           </button>
         </div>
       ) : (
         <div>
-          <button
-            onClick={() => setOpen(o => !o)}
-            style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.sub, fontSize: 13, padding: '8px 16px', cursor: 'pointer', width: '100%', textAlign: 'left' }}
-          >
+          <button onClick={() => setOpen(o => !o)} style={{ background: 'none', border: '1px solid #1E2D3D', borderRadius: 8, color: C.sub, fontSize: 13, padding: '8px 16px', cursor: 'pointer', width: '100%', textAlign: 'left' }}>
             🌙 Mark {memberName} as off / on leave
           </button>
           {open && (
@@ -233,7 +174,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
                     <option value="public_holiday">🎉 Public Holiday</option>
                   </select>
                 </div>
-                {(leaveType === 'leave_range' || leaveType === 'weekend_off') ? (
+                {(leaveType === 'leave_range' || leaveType === 'weekend_off') && (
                   <>
                     <div>
                       <label style={S.label}>Start Date</label>
@@ -244,7 +185,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
                       <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={S.input} />
                     </div>
                   </>
-                ) : null}
+                )}
                 <div>
                   <label style={S.label}>Reason (optional)</label>
                   <input type="text" value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Annual leave" style={S.input} autoComplete="off" />
@@ -254,7 +195,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
                 <button onClick={handleMark} disabled={saving} style={{ padding: '8px 20px', background: C.warn, color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
                   {saving ? 'Saving…' : 'Confirm'}
                 </button>
-                <button onClick={() => setOpen(false)} style={{ padding: '8px 20px', background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.sub, fontSize: 13, cursor: 'pointer' }}>
+                <button onClick={() => setOpen(false)} style={{ padding: '8px 20px', background: 'none', border: '1px solid #1E2D3D', borderRadius: 8, color: C.sub, fontSize: 13, cursor: 'pointer' }}>
                   Cancel
                 </button>
               </div>
@@ -266,13 +207,92 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   );
 }
 
-// ── ReportCard ────────────────────────────────────────────────────────────────
+function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
+  const member = teamMembers.find(m => String(m.id) === String(report.team_member_id));
+  const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
+  const filled = Object.keys(report.metrics || {}).filter(k => parseInt(report.metrics[k]) > 0).length;
+  const dateStr = report.report_date ? new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+
+  const copyText = () => {
+    const lines = [`📊 Daily Report — ${member?.name || ''} | ${dateStr}`, ''];
+    METRIC_GROUPS.forEach(g => {
+      const items = g.metrics.filter(m => parseInt(report.metrics?.[m.key]) > 0);
+      if (items.length > 0) {
+        lines.push(`*${g.label}*`);
+        items.forEach(m => lines.push(`  ${m.label}: ${report.metrics[m.key]}`));
+        lines.push('');
+      }
+    });
+    lines.push(`Total Output: ${total}`);
+    if (report.tasks_completed) { lines.push(''); lines.push(`Tasks: ${report.tasks_completed}`); }
+    if (report.notes) { lines.push(''); lines.push(`Notes: ${report.notes}`); }
+    navigator.clipboard.writeText(lines.join('\n'));
+    alert('Copied!');
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+      <div style={{ background: C.card, border: '1px solid #1E2D3D', borderRadius: 16, padding: 32, width: '100%', maxWidth: 560, maxHeight: '85vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 18 }}>Report Preview</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.sub, fontSize: 22, cursor: 'pointer', lineHeight: 1 }}>✕</button>
+        </div>
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 20 }}>{dateStr}</div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 24 }}>
+          <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
+            <div style={{ fontSize: 32, fontWeight: 700, color: C.accent }}>{total}</div>
+            <div style={{ fontSize: 12, color: C.sub }}>Total Output</div>
+          </div>
+          <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
+            <div style={{ fontSize: 32, fontWeight: 700, color: C.blue }}>{filled}</div>
+            <div style={{ fontSize: 12, color: C.sub }}>Metrics Filled</div>
+          </div>
+        </div>
+
+        {METRIC_GROUPS.map(g => {
+          const items = g.metrics.filter(m => parseInt(report.metrics?.[m.key]) > 0);
+          if (items.length === 0) return null;
+          return (
+            <div key={g.category} style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: g.color, marginBottom: 8 }}>{g.label}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {items.map(m => (
+                  <div key={m.key} style={{ display: 'flex', justifyContent: 'space-between', background: C.elevated, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}>
+                    <span style={{ color: C.sub }}>{m.label}</span>
+                    <span style={{ color: C.text, fontWeight: 600 }}>{report.metrics[m.key]}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+
+        {report.tasks_completed && (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 4 }}>Tasks Completed</div>
+            <div style={{ fontSize: 13, color: C.text, background: C.elevated, borderRadius: 8, padding: '8px 12px' }}>{report.tasks_completed}</div>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 12, marginTop: 24 }}>
+          <button onClick={copyText} style={{ flex: 1, padding: 12, background: C.elevated, border: '1px solid #1E2D3D', borderRadius: 8, color: C.text, fontSize: 14, cursor: 'pointer' }}>
+            📋 Copy Text
+          </button>
+          <button onClick={onSendSlack} style={{ flex: 1, padding: 12, background: C.accentDim, border: 'none', borderRadius: 8, color: '#0B0F1A', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}>
+            📤 Send to Slack
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ReportCard({ report, teamMembers, onEdit }) {
   const member = teamMembers.find(m => m.id === report.team_member_id) || report.team_members;
   const name = member?.display_name || member?.name || 'Unknown';
   const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
   const dateStr = report.report_date ? new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
-
   return (
     <div style={{ ...S.card, marginBottom: 0 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
@@ -286,34 +306,34 @@ function ReportCard({ report, teamMembers, onEdit }) {
         </div>
       </div>
       {report.tasks_completed && (
-        <div style={{ fontSize: 12, color: C.sub, marginBottom: 8, borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
+        <div style={{ fontSize: 12, color: C.sub, marginBottom: 8, borderTop: '1px solid #1E2D3D', paddingTop: 8 }}>
           {report.tasks_completed.slice(0, 100)}{report.tasks_completed.length > 100 ? '…' : ''}
         </div>
       )}
-      <button onClick={() => onEdit(report)} style={{ fontSize: 12, padding: '5px 12px', background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 6, color: C.sub, cursor: 'pointer' }}>
+      <button onClick={() => onEdit(report)} style={{ fontSize: 12, padding: '5px 12px', background: C.elevated, border: '1px solid #1E2D3D', borderRadius: 6, color: C.sub, cursor: 'pointer' }}>
         ✏️ Edit
       </button>
     </div>
   );
 }
 
-// ── DailySummary ──────────────────────────────────────────────────────────────
 function DailySummary({ teamMembers, date }) {
   const [data, setData] = useState({ reports: [], leave: [] });
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!date) return;
     setLoading(true);
     Promise.all([
       fetch(`/api/reports?date=${date}`).then(r => r.json()),
-      fetch(`/api/leave?date=${date}&all=true`).then(r => r.json()),
+      fetch(`/api/leave?date=${date}&all=true`).then(r => r.json()).catch(() => ({ data: [] })),
     ]).then(([r, l]) => {
       setData({ reports: r.data || [], leave: l.data || [] });
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [date]);
 
-  if (loading) return null;
+  if (loading || !date) return null;
 
   const submitted = data.reports.map(r => r.team_member_id);
   const onLeave = data.leave.map(l => l.team_member_id);
@@ -326,22 +346,17 @@ function DailySummary({ teamMembers, date }) {
         Today's Summary — {new Date(date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
       </div>
       <div style={{ display: 'flex', gap: 24, marginBottom: 16, flexWrap: 'wrap' }}>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 28, fontWeight: 700, color: C.accent }}>{data.reports.length}</div>
-          <div style={{ fontSize: 11, color: C.sub }}>Submitted</div>
-        </div>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 28, fontWeight: 700, color: C.warn }}>{onLeave.length}</div>
-          <div style={{ fontSize: 11, color: C.sub }}>On Leave</div>
-        </div>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 28, fontWeight: 700, color: C.muted }}>{pending.length}</div>
-          <div style={{ fontSize: 11, color: C.sub }}>Pending</div>
-        </div>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 28, fontWeight: 700, color: C.blue }}>{totalOutput}</div>
-          <div style={{ fontSize: 11, color: C.sub }}>Total Output</div>
-        </div>
+        {[
+          { val: data.reports.length, label: 'Submitted', color: C.accent },
+          { val: onLeave.length, label: 'On Leave', color: C.warn },
+          { val: pending.length, label: 'Pending', color: C.muted },
+          { val: totalOutput, label: 'Total Output', color: C.blue },
+        ].map(s => (
+          <div key={s.label} style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: 28, fontWeight: 700, color: s.color }}>{s.val}</div>
+            <div style={{ fontSize: 11, color: C.sub }}>{s.label}</div>
+          </div>
+        ))}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         {teamMembers.map(m => {
@@ -352,7 +367,7 @@ function DailySummary({ teamMembers, date }) {
               padding: '5px 12px', borderRadius: 20, fontSize: 12,
               background: off ? '#FFB84D12' : done ? '#00E5A012' : C.elevated,
               color: off ? C.warn : done ? C.accent : C.muted,
-              border: `1px solid ${off ? C.warn + '33' : done ? C.accent + '33' : C.border}`,
+              border: `1px solid ${off ? '#FFB84D33' : done ? '#00E5A033' : '#1E2D3D'}`,
             }}>
               {off ? '🌙' : done ? '✓' : '○'} {m.name}
             </span>
@@ -363,7 +378,6 @@ function DailySummary({ teamMembers, date }) {
   );
 }
 
-// ── Main Page ─────────────────────────────────────────────────────────────────
 export default function ReportsPage() {
   const [tab, setTab] = useState('form');
   const [teamMembers, setTeamMembers] = useState([]);
@@ -380,13 +394,11 @@ export default function ReportsPage() {
   const [reports, setReports] = useState([]);
   const [histFilter, setHistFilter] = useState({ person: '', date: '' });
   const [loadingHist, setLoadingHist] = useState(false);
-  const randKey = useRef(Math.random().toString(36).slice(2));
 
   useEffect(() => {
     fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
   }, []);
 
-  // Load report when member+date changes
   useEffect(() => {
     if (!selectedMember || !reportDate) {
       setMetrics({}); setTasksCompleted(''); setNotes(''); setEditingReport(null);
@@ -396,11 +408,7 @@ export default function ReportsPage() {
       .then(r => r.json())
       .then(({ data }) => {
         if (data) {
-          const m = data.metrics || {};
-          // Only load if values are not all identical (corrupted data guard)
-          const vals = Object.values(m).map(v => parseInt(v)).filter(n => !isNaN(n));
-          const allSame = vals.length > 1 && vals.every(v => v === vals[0]);
-          setMetrics(allSame ? {} : m);
+          setMetrics(data.metrics || {});
           setTasksCompleted(data.tasks_completed || '');
           setNotes(data.notes || '');
           setEditingReport(data);
@@ -413,10 +421,12 @@ export default function ReportsPage() {
       });
   }, [selectedMember, reportDate]);
 
-  const handleMetricChange = (key, val) => setMetrics(prev => ({ ...prev, [key]: val }));
+  const handleMetricChange = (key, val) => {
+    setMetrics(prev => ({ ...prev, [key]: val }));
+  };
 
   const handleSave = async () => {
-    if (!selectedMember) { setSaveMsg({ type: 'error', text: 'Select a team member first.' }); return; }
+    if (!selectedMember) { setSaveMsg({ type: 'error', text: 'Select a team member first.' }); return null; }
     setSaving(true); setSaveMsg(null);
     try {
       const res = await fetch('/api/reports', {
@@ -428,9 +438,36 @@ export default function ReportsPage() {
       if (json.error) throw new Error(json.error);
       setSaveMsg({ type: 'success', text: 'Saved!' });
       setEditingReport(json.data);
+      setSaving(false);
+      return json.data;
     } catch (err) {
       setSaveMsg({ type: 'error', text: err.message });
-    } finally { setSaving(false); }
+      setSaving(false);
+      return null;
+    }
+  };
+
+  const handleSaveAndPreview = async () => {
+    const saved = await handleSave();
+    if (saved) setShowPreview(true);
+  };
+
+  const handleSendSlack = async () => {
+    if (!editingReport) return;
+    const member = teamMembers.find(m => String(m.id) === String(editingReport.team_member_id));
+    try {
+      const res = await fetch('/api/reports/send-slack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ report: editingReport, teamMember: member, channel: 'health-ops' }),
+      });
+      const result = await res.json();
+      if (result.error) throw new Error(result.error);
+      alert('Sent to Slack!');
+      setShowPreview(false);
+    } catch (err) {
+      alert('Failed: ' + err.message);
+    }
   };
 
   const handleEditReport = (report) => {
@@ -469,11 +506,11 @@ export default function ReportsPage() {
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60 }}>
-      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 32px' }}>
+      <div style={{ background: C.card, borderBottom: '1px solid #1E2D3D', padding: '20px 32px' }}>
         <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700 }}>Daily Reports</h1>
         <p style={{ margin: '4px 0 0', fontSize: 14, color: C.sub }}>Health Ops team reporting</p>
       </div>
-      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '0 32px', display: 'flex' }}>
+      <div style={{ background: C.card, borderBottom: '1px solid #1E2D3D', padding: '0 32px', display: 'flex' }}>
         {tabBtn('form', '📝 Submit Report')}
         {tabBtn('history', '🕐 History')}
         {tabBtn('team', '👥 Team View')}
@@ -481,20 +518,16 @@ export default function ReportsPage() {
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px 32px' }}>
 
-        {/* ── FORM TAB ── */}
         {tab === 'form' && (
-          <div style={{ maxWidth: 720 }} autoComplete="off">
-
-            {/* Today's summary */}
+          <div style={{ maxWidth: 720 }}>
             <DailySummary teamMembers={teamMembers} date={reportDate} />
 
             {editingReport && (
-              <div style={{ background: '#5B8DEF15', border: `1px solid ${C.blue}44`, borderRadius: 10, padding: '10px 16px', marginBottom: 14, fontSize: 13, color: C.blue }}>
+              <div style={{ background: '#5B8DEF15', border: '1px solid #5B8DEF44', borderRadius: 10, padding: '10px 16px', marginBottom: 14, fontSize: 13, color: C.blue }}>
                 ✏️ Editing existing report — changes will overwrite
               </div>
             )}
 
-            {/* Person + Date */}
             <div style={S.card}>
               <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16 }}>Report Details</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
@@ -512,7 +545,6 @@ export default function ReportsPage() {
               </div>
             </div>
 
-            {/* Leave panel */}
             {selectedMember && (
               <LeavePanel
                 memberId={selectedMember}
@@ -522,11 +554,15 @@ export default function ReportsPage() {
               />
             )}
 
-            {/* Metrics — hidden if on leave */}
             {!isLeaveActive && (
               <>
                 {METRIC_GROUPS.map(group => (
-                  <MetricGroup key={group.category} group={group} metrics={metrics} onChange={handleMetricChange} randKey={randKey.current} />
+                  <MetricGroup
+                    key={group.category}
+                    group={group}
+                    metrics={metrics}
+                    onChangeMetric={handleMetricChange}
+                  />
                 ))}
 
                 <div style={S.card}>
@@ -551,15 +587,15 @@ export default function ReportsPage() {
                       </span>
                     )}
                     <button onClick={handleSave} disabled={saving || !selectedMember} style={{
-                      padding: '10px 28px', background: saving || !selectedMember ? C.muted : C.accent,
-                      color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, fontSize: 14,
+                      padding: '10px 24px', background: saving || !selectedMember ? C.muted : C.elevated,
+                      color: C.text, border: '1px solid #1E2D3D', borderRadius: 8, fontWeight: 600, fontSize: 14,
                       cursor: saving || !selectedMember ? 'not-allowed' : 'pointer',
                     }}>
                       {saving ? 'Saving…' : '💾 Save'}
                     </button>
-                    <button onClick={async () => { await handleSave(); setShowPreview(true); }} disabled={saving || !selectedMember} style={{
-                      padding: '10px 28px', background: C.accent, color: '#0B0F1A',
-                      border: 'none', borderRadius: 8, fontWeight: 700, fontSize: 14,
+                    <button onClick={handleSaveAndPreview} disabled={saving || !selectedMember} style={{
+                      padding: '10px 24px', background: saving || !selectedMember ? C.muted : C.accent,
+                      color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, fontSize: 14,
                       cursor: saving || !selectedMember ? 'not-allowed' : 'pointer',
                     }}>
                       ✨ Save & Preview
@@ -570,7 +606,7 @@ export default function ReportsPage() {
             )}
 
             {isLeaveActive && (
-              <div style={{ background: '#FFB84D08', border: `1px dashed ${C.warn}44`, borderRadius: 12, padding: 32, textAlign: 'center' }}>
+              <div style={{ background: '#FFB84D08', border: '1px dashed #FFB84D44', borderRadius: 12, padding: 32, textAlign: 'center' }}>
                 <div style={{ fontSize: 36, marginBottom: 10 }}>🌙</div>
                 <div style={{ fontSize: 15, fontWeight: 600, color: C.warn, marginBottom: 4 }}>{selectedMemberName} is off today</div>
                 <div style={{ fontSize: 13, color: C.sub }}>No report needed. Slack reminder will be skipped.</div>
@@ -579,7 +615,6 @@ export default function ReportsPage() {
           </div>
         )}
 
-        {/* ── HISTORY TAB ── */}
         {tab === 'history' && (
           <div>
             <div style={{ ...S.card, display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
@@ -595,7 +630,7 @@ export default function ReportsPage() {
                 <input type="date" value={histFilter.date} onChange={e => setHistFilter(f => ({ ...f, date: e.target.value }))} style={{ ...S.input, width: 'auto' }} autoComplete="off" />
               </div>
               <button onClick={loadHistory} style={{ padding: '9px 20px', background: C.accent, color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>Apply</button>
-              <button onClick={() => { setHistFilter({ person: '', date: '' }); }} style={{ padding: '9px 20px', background: C.elevated, color: C.sub, border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 13, cursor: 'pointer' }}>Clear</button>
+              <button onClick={() => setHistFilter({ person: '', date: '' })} style={{ padding: '9px 20px', background: C.elevated, color: C.sub, border: '1px solid #1E2D3D', borderRadius: 8, fontSize: 13, cursor: 'pointer' }}>Clear</button>
             </div>
             {loadingHist ? (
               <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>Loading…</div>
@@ -609,10 +644,17 @@ export default function ReportsPage() {
           </div>
         )}
 
-        {/* ── TEAM VIEW TAB ── */}
         {tab === 'team' && <DailySummary teamMembers={teamMembers} date={todayStr()} />}
-
       </div>
+
+      {showPreview && editingReport && (
+        <PreviewModal
+          report={editingReport}
+          teamMembers={teamMembers}
+          onClose={() => setShowPreview(false)}
+          onSendSlack={handleSendSlack}
+        />
+      )}
     </div>
   );
 }
