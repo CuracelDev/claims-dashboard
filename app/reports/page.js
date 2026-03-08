@@ -81,6 +81,8 @@ function MetricGroup({ group, metrics, onChange }) {
               name={`metric_${m.key}`}
               autoComplete="off"
               value={metrics[m.key] ?? ''}
+              name={`metric_${m.key}`}
+              autoComplete="off"
               onChange={e => onChange(m.key, e.target.value)}
               placeholder="0"
               style={inputStyle}
