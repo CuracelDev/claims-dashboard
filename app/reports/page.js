@@ -76,7 +76,7 @@ function MetricGroup({ group, metrics, onChange }) {
           <div key={m.key}>
             <label style={labelStyle}>{m.label}</label>
             <input
-              type="number"
+              type="number" autoComplete="new-password"
               min="0"
               name={`metric_${m.key}`}
               autoComplete="off"
@@ -428,7 +428,10 @@ export default function ReportsPage() {
       .then(({ data }) => {
         if (data && data.length > 0) {
           const r = data[0];
-          setMetrics(r.metrics || {});
+          const m = r.metrics || {};
+          const vals = Object.values(m).filter(v => v !== '' && v !== null);
+          const allSame = vals.length > 1 && vals.every(v => v === vals[0]);
+          setMetrics(allSame ? {} : m);
           setTasksCompleted(r.tasks_completed || '');
           setNotes(r.notes || '');
           setEditingReport(r);
