@@ -19,15 +19,15 @@ const NAV = [
   {
     section: 'OPERATIONS',
     items: [
-      { href: '/reports',        icon: '📝', label: 'Daily Reports',   sub: 'Team reporting' },
-      { href: '/reports/weekly', icon: '📅', label: 'Weekly Summary',  sub: 'Aggregated view' },
-      { href: '/team',           icon: '👥', label: 'Team Management', sub: 'Members & metrics' },
+      { href: '/reports',        icon: '📝', label: 'Daily Reports',    sub: 'Team reporting' },
+      { href: '/reports/weekly', icon: '📅', label: 'Weekly Summary',   sub: 'Aggregated view' },
+      { href: '/team',           icon: '👥', label: 'Team Management',  sub: 'Members & metrics' },
+      { href: '/tasks',          icon: '✅', label: 'Task Management',  sub: 'Assign & track work' },
     ],
   },
   {
     section: 'COMING SOON',
     items: [
-      { href: '/tasks',  icon: '✅', label: 'Task Management',    disabled: true },
       { href: '/errors', icon: '🔴', label: 'Error Tracking',     disabled: true },
       { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',        disabled: true },
       { href: '/slack',  icon: '💬', label: 'Slack Intelligence',  disabled: true },
@@ -99,7 +99,7 @@ export default function Sidebar() {
 
       {/* Footer */}
       <div style={{ padding: '12px 18px', borderTop: `1px solid ${C.border}` }}>
-        <div style={{ fontSize: 10, color: C.muted }}>v4.2 — Phase 2</div>
+        <div style={{ fontSize: 10, color: C.muted }}>v4.4 — Phase 3</div>
       </div>
     </aside>
   );
