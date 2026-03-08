@@ -431,7 +431,8 @@ export default function ReportsPage() {
           const m = r.metrics || {};
           const vals = Object.values(m).filter(v => v !== '' && v !== null);
           const allSame = vals.length > 1 && vals.every(v => v === vals[0]);
-          setMetrics(allSame ? {} : m);
+          const cleaned = Object.fromEntries(Object.entries(m).filter(([,v]) => v !== 0 && v !== '0' && v !== '' && v !== null));
+          setMetrics(cleaned);
           setTasksCompleted(r.tasks_completed || '');
           setNotes(r.notes || '');
           setEditingReport(r);
