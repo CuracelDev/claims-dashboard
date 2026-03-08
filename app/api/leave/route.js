@@ -1,7 +1,6 @@
 import { getSupabase } from '@/lib/supabase';
 export const dynamic = 'force-dynamic';
 
-const supabase = getSupabase();
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
