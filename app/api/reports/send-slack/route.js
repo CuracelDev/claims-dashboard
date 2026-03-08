@@ -104,7 +104,7 @@ export async function POST(request) {
     });
 
     // Send to Slack
-    const slackWebhook = webhookUrl || process.env.SLACK_HEALTH_OPS_WEBHOOK;
+    const slackWebhook = webhookUrl || process.env.SLACK_WEBHOOK_HEALTHOPS;
     if (!slackWebhook) {
       return Response.json({ error: 'No Slack webhook configured' }, { status: 400 });
     }
