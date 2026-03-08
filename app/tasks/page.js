@@ -160,12 +160,15 @@ function TaskCard({ task, onStatusChange, onDelete }) {
         )}
       </div>
 
-      {/* Assignee (shown in All Tasks view) */}
-      {task.team_members?.name && (
-        <div style={{ marginTop: 8, fontSize: 11, color: C.sub }}>
-          👤 {task.team_members.name}
-        </div>
-      )}
+      {/* Assigned to / from */}
+      <div style={{ display: "flex", gap: 12, marginTop: 8, fontSize: 11 }}>
+        {task.team_members?.name && (
+          <span style={{ color: C.sub }}>→ <strong style={{ color: C.text }}>{task.team_members.name}</strong></span>
+        )}
+        {task.assigned_by && (
+          <span style={{ color: C.muted }}>by {task.assigned_by}</span>
+        )}
+      </div>
 
       {/* Actions */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12, gap: 6 }}>
@@ -201,9 +204,9 @@ function TaskCard({ task, onStatusChange, onDelete }) {
 }
 
 /* ── Create Task Modal ───────────────────────────────────── */
-function CreateTaskModal({ members, currentUser, onClose, onCreated }) {
+function CreateTaskModal({ members, onClose, onCreated }) {
   const [form, setForm] = useState({
-    title: "", description: "", assigned_to: "",
+    title: "", description: "", assigned_to: "", assigned_by: "",
     due_date: "", priority: "medium", category: "ad_hoc",
   });
   const [saving, setSaving] = useState(false);
@@ -216,13 +219,17 @@ function CreateTaskModal({ members, currentUser, onClose, onCreated }) {
       setError("Title and assignee are required.");
       return;
     }
+    if (!form.assigned_by) {
+      setError("Please select who is assigning this task.");
+      return;
+    }
     setSaving(true);
     setError("");
     try {
       const res = await fetch("/api/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, assigned_by: currentUser }),
+        body: JSON.stringify({ ...form }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to create task");
@@ -267,12 +274,21 @@ function CreateTaskModal({ members, currentUser, onClose, onCreated }) {
             <textarea style={{ ...inp, height: 80, resize: "vertical" }} value={form.description}
               onChange={e => set("description", e.target.value)} placeholder="Optional details..." />
           </div>
-          <div>
-            <label style={label}>Assign To *</label>
-            <select style={inp} value={form.assigned_to} onChange={e => set("assigned_to", e.target.value)}>
-              <option value="">Select team member...</option>
-              {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-            </select>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <label style={label}>Assigned By *</label>
+              <select style={inp} value={form.assigned_by} onChange={e => set("assigned_by", e.target.value)}>
+                <option value="">Who is assigning?</option>
+                {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={label}>Assign To *</label>
+              <select style={inp} value={form.assigned_to} onChange={e => set("assigned_to", e.target.value)}>
+                <option value="">Select assignee...</option>
+                {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <div>
@@ -331,9 +347,9 @@ export default function TasksPage() {
   useEffect(() => { fetchMembers(); fetchTasks(); }, []);
 
   async function fetchMembers() {
-    const res = await fetch("/api/team");
+    const res = await fetch("/api/team-members");
     const data = await res.json();
-    setMembers(data.data || []);
+    setMembers(data.members || []);
   }
 
   async function fetchTasks() {
@@ -567,7 +583,6 @@ export default function TasksPage() {
       {showCreate && (
         <CreateTaskModal
           members={members}
-          currentUser={currentMemberName}
           onClose={() => setShowCreate(false)}
           onCreated={handleCreated}
         />
