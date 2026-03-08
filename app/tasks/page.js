@@ -226,14 +226,28 @@ function CreateTaskModal({ members, onClose, onCreated }) {
     setSaving(true);
     setError("");
     try {
-      const res = await fetch("/api/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to create task");
-      onCreated(data.task);
+      if (form.assigned_to === "everyone") {
+        // Create one task per team member
+        const results = await Promise.all(
+          members.map(m =>
+            fetch("/api/tasks", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...form, assigned_to: m.id }),
+            }).then(r => r.json())
+          )
+        );
+        results.forEach(data => { if (data.task) onCreated(data.task); });
+      } else {
+        const res = await fetch("/api/tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...form }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to create task");
+        onCreated(data.task);
+      }
       onClose();
     } catch (e) {
       setError(e.message);
@@ -286,6 +300,7 @@ function CreateTaskModal({ members, onClose, onCreated }) {
               <label style={label}>Assign To *</label>
               <select style={inp} value={form.assigned_to} onChange={e => set("assigned_to", e.target.value)}>
                 <option value="">Select assignee...</option>
+                <option value="everyone">👥 Everyone</option>
                 {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
               </select>
             </div>
