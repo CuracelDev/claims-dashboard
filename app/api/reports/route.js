@@ -89,13 +89,15 @@ export async function POST(request) {
       status: status || 'submitted',
     };
 
-    // Check if exists
-    const { data: existing } = await supabase
+    // Check if exists — use limit(1) not maybeSingle() to avoid crash on duplicate rows
+    const { data: existingRows } = await supabase
       .from('daily_reports')
       .select('id')
       .eq('team_member_id', memberId)
       .eq('report_date', report_date)
-      .maybeSingle();
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const existing = existingRows?.[0];
 
     let data, error;
     if (existing?.id) {
