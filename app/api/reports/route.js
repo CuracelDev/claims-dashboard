@@ -101,10 +101,14 @@ export async function POST(request) {
 
     let data, error;
     if (existing?.id) {
-      const { metrics: _m, team_member_id: _t, report_date: _d, ...updatePayload } = payload;
       ({ data, error } = await supabase
         .from('daily_reports')
-        .update({ metrics: safeMetrics, ...updatePayload })
+        .update({
+          metrics: safeMetrics,
+          tasks_completed: tasks_completed || null,
+          notes: notes || null,
+          status: status || 'submitted',
+        })
         .eq('id', existing.id)
         .select().single());
     } else {
