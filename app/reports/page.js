@@ -71,8 +71,7 @@ function MetricGroup({ group, metrics, onChange, randKey }) {
               type="text"
               inputMode="numeric"
               pattern="[0-9]*"
-              name={`${randKey}_${m.key}`}
-              autoComplete="new-password"
+              autoComplete="off"
               value={metrics[m.key] ?? ''}
               onChange={e => {
                 const v = e.target.value;
@@ -431,7 +430,7 @@ export default function ReportsPage() {
 
         {/* ── FORM TAB ── */}
         {tab === 'form' && (
-          <div style={{ maxWidth: 720 }}>
+          <div style={{ maxWidth: 720 }} autoComplete="off">
 
             {/* Today's summary */}
             <DailySummary teamMembers={teamMembers} date={reportDate} />
