@@ -1,101 +1,86 @@
-"use client";
+'use client';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 
-import { usePathname } from "next/navigation";
-import Link from "next/link";
-
-const C = {
-  bg: "#0B0F1A", sidebar: "#090D16", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", accent: "#00E5A0", accentDim: "#00B87D",
-  text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  purple: "#A78BFA", blue: "#60A5FA",
-};
-
-const NAV_ITEMS = [
-  { href: "/", label: "Claims Dashboard", icon: "📊", desc: "Real-time monitoring" },
-  { href: "/query-builder", label: "Query Builder", icon: "⚡", desc: "SQL generator & templates" },
+const NAV = [
+  {
+    section: 'ANALYTICS',
+    items: [
+      { href: '/',               icon: '📊', label: 'Claims Dashboard' },
+      { href: '/query-builder',  icon: '🤖', label: 'AI Query Builder' },
+    ],
+  },
+  {
+    section: 'OPERATIONS',
+    items: [
+      { href: '/reports',         icon: '📝', label: 'Daily Reports' },
+      { href: '/reports/weekly',  icon: '📅', label: 'Weekly Summary' },
+    ],
+  },
+  {
+    section: 'COMING SOON',
+    items: [
+      { href: '/tasks',  icon: '✅', label: 'Task Management',   disabled: true },
+      { href: '/errors', icon: '🔴', label: 'Error Tracking',    disabled: true },
+      { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',       disabled: true },
+      { href: '/slack',  icon: '💬', label: 'Slack Intelligence', disabled: true },
+    ],
+  },
 ];
 
 export default function Sidebar() {
   const pathname = usePathname();
 
   return (
-    <aside style={{
-      width: 240, minHeight: "100vh", background: C.sidebar,
-      borderRight: `1px solid ${C.border}`, display: "flex",
-      flexDirection: "column", position: "fixed", top: 0, left: 0, zIndex: 50,
-    }}>
-      {/* Brand — Curacel Logo */}
-      <div style={{ padding: "20px 18px 16px", borderBottom: `1px solid ${C.border}` }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {/* ✅ Improvement #5: Curacel logo replaces the green "C" box */}
-          <img
-            src="/curacel-logo.png"
-            alt="Curacel"
-            style={{
-              width: 34,
-              height: 34,
-              borderRadius: 8,
-              objectFit: "contain",
-              background: "transparent",
-            }}
-          />
-          <div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.2 }}>Claims Intel</div>
-            <div style={{ fontSize: 10, color: C.muted, fontWeight: 500 }}>Curacel Health Ops</div>
-          </div>
-        </div>
+    <aside className="w-56 min-h-screen bg-gray-900 text-white flex flex-col">
+      {/* Logo */}
+      <div className="px-4 py-5 border-b border-gray-700">
+        <div className="text-sm font-bold text-white">Curacel</div>
+        <div className="text-xs text-gray-400">Health Ops Platform</div>
       </div>
 
       {/* Nav */}
-      <nav style={{ padding: "12px 10px", flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-        <div style={{ fontSize: 10, fontWeight: 600, color: C.muted, textTransform: "uppercase", letterSpacing: ".08em", padding: "8px 8px 4px", marginBottom: 2 }}>
-          Navigation
-        </div>
-        {NAV_ITEMS.map(item => {
-          const active = pathname === item.href;
-          return (
-            <Link key={item.href} href={item.href} style={{
-              display: "flex", alignItems: "center", gap: 10,
-              padding: "10px 12px", borderRadius: 8, textDecoration: "none",
-              background: active ? `${C.accent}15` : "transparent",
-              border: active ? `1.5px solid ${C.accent}40` : "1.5px solid transparent",
-              transition: "all .15s",
-            }}>
-              <span style={{ fontSize: 16, width: 24, textAlign: "center" }}>{item.icon}</span>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: active ? 600 : 500, color: active ? C.accent : C.sub, lineHeight: 1.2 }}>
-                  {item.label}
-                </div>
-                <div style={{ fontSize: 10, color: C.muted, marginTop: 1 }}>{item.desc}</div>
-              </div>
-            </Link>
-          );
-        })}
-
-        {/* Future tools placeholder */}
-        <div style={{ fontSize: 10, fontWeight: 600, color: C.muted, textTransform: "uppercase", letterSpacing: ".08em", padding: "16px 8px 4px", marginTop: 8 }}>
-          Coming Soon
-        </div>
-        {[
-          { icon: "🔔", label: "Alerts & SLA", desc: "Breach monitoring" },
-          { icon: "📈", label: "Analytics", desc: "Trends & insights" },
-        ].map((item, i) => (
-          <div key={i} style={{
-            display: "flex", alignItems: "center", gap: 10,
-            padding: "10px 12px", borderRadius: 8, opacity: 0.4, cursor: "default",
-          }}>
-            <span style={{ fontSize: 16, width: 24, textAlign: "center" }}>{item.icon}</span>
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 500, color: C.muted, lineHeight: 1.2 }}>{item.label}</div>
-              <div style={{ fontSize: 10, color: C.muted, marginTop: 1 }}>{item.desc}</div>
+      <nav className="flex-1 px-3 py-4 space-y-5 overflow-y-auto">
+        {NAV.map(group => (
+          <div key={group.section}>
+            <div className="text-xs font-semibold text-gray-500 px-2 mb-1 tracking-wider">
+              {group.section}
             </div>
+            <ul className="space-y-0.5">
+              {group.items.map(item => {
+                const active = pathname === item.href || (item.href !== '/' && pathname.startsWith(item.href));
+                return (
+                  <li key={item.href}>
+                    {item.disabled ? (
+                      <span className="flex items-center gap-2 px-2 py-2 rounded-md text-sm text-gray-600 cursor-not-allowed">
+                        <span>{item.icon}</span>
+                        <span>{item.label}</span>
+                        <span className="ml-auto text-xs bg-gray-800 px-1.5 py-0.5 rounded text-gray-500">Soon</span>
+                      </span>
+                    ) : (
+                      <Link
+                        href={item.href}
+                        className={`flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors ${
+                          active
+                            ? 'bg-blue-600 text-white'
+                            : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+                        }`}
+                      >
+                        <span>{item.icon}</span>
+                        <span>{item.label}</span>
+                      </Link>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         ))}
       </nav>
 
       {/* Footer */}
-      <div style={{ padding: "12px 18px", borderTop: `1px solid ${C.border}`, fontSize: 10, color: C.muted }}>
-        v3.1 · Health Ops Tools
+      <div className="px-4 py-3 border-t border-gray-700">
+        <div className="text-xs text-gray-500">v4.1 — Phase 2</div>
       </div>
     </aside>
   );
