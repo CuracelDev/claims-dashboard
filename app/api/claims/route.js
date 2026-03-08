@@ -1,15 +1,16 @@
-import { supabase } from "@/lib/supabase";
+import { getSupabase } from "@/lib/supabase";
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const from = searchParams.get("from");
-    const to = searchParams.get("to");
-    const insurer = searchParams.get("insurer");
+  const { searchParams } = new URL(request.url);
+  const from = searchParams.get("from");
+  const to = searchParams.get("to");
+  const insurer = searchParams.get("insurer");
 
+  try {
+    const supabase = getSupabase();
     let query = supabase
       .from("claims_daily")
       .select("unique_key, date, insurer, claims_count, submitted_count, approved_count, rejected_count, total_billed, total_approved, currency")
@@ -20,7 +21,6 @@ export async function GET(request) {
     if (insurer) query = query.eq("insurer", insurer);
 
     const { data, error } = await query;
-
     if (error) throw error;
 
     return NextResponse.json(
