@@ -82,7 +82,7 @@ function MetricGroup({ group, metrics, onChange }) {
               autoComplete="off"
               value={metrics[m.key] ?? ''}
               onChange={e => onChange(m.key, e.target.value)}
-              placeholder="0"
+              placeholder=""
               style={inputStyle}
             />
           </div>
@@ -424,8 +424,8 @@ export default function ReportsPage() {
     fetch(`/api/reports?person_id=${selectedMember}&date=${reportDate}`)
       .then(r => r.json())
       .then(({ data }) => {
-        if (data && data.length > 0) {
-          const r = data[0];
+        if (data) {
+          const r = data;
           setMetrics(r.metrics || {});
           setTasksCompleted(r.tasks_completed || '');
           setNotes(r.notes || '');
