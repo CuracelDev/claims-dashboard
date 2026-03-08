@@ -347,9 +347,9 @@ export default function TasksPage() {
   useEffect(() => { fetchMembers(); fetchTasks(); }, []);
 
   async function fetchMembers() {
-    const res = await fetch("/api/team-members");
+    const res = await fetch("/api/team");
     const data = await res.json();
-    setMembers(data.members || []);
+    setMembers(data.data || []);
   }
 
   async function fetchTasks() {
