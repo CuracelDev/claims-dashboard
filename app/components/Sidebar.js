@@ -26,6 +26,13 @@ const NAV = [
     ],
   },
   {
+    section: 'INTELLIGENCE',
+    items: [
+      { href: '/qa',  icon: '🔍', label: 'QA Flag Tracker',   sub: 'Claims quality audit' },
+      { href: '/ops', icon: '⚡', label: 'Ops Overview',       sub: 'Team performance' },
+    ],
+  },
+  {
     section: 'COMING SOON',
     items: [
       { href: '/errors', icon: '🔴', label: 'Error Tracking',     disabled: true },
@@ -99,7 +106,7 @@ export default function Sidebar() {
 
       {/* Footer */}
       <div style={{ padding: '12px 18px', borderTop: `1px solid ${C.border}` }}>
-        <div style={{ fontSize: 10, color: C.muted }}>v4.4 — Phase 3</div>
+        <div style={{ fontSize: 10, color: C.muted }}>v4.5 — Phase 4</div>
       </div>
     </aside>
   );
