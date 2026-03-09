@@ -357,6 +357,7 @@ function FilterPanel({ filters: fl, values: v, onChange }) {
 
 function AIAssistant({ onResult }) {
   const { C } = useTheme();
+  const inputS = { padding:"9px 12px", border:`1.5px solid ${C.border}`, borderRadius:6, fontSize:13, fontFamily:"DM Sans,sans-serif", color:C.text, background:C.elevated, outline:"none", width:"100%" };
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -415,6 +416,8 @@ function AIAssistant({ onResult }) {
 function CustomBuilder({ onSQL }) {
   const { C } = useTheme();
   const btnSmall = { padding:"5px 10px", border:`1px solid ${C.border}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", background:C.elevated, color:C.sub, fontFamily:"DM Sans,sans-serif" };
+  const inputS = { padding:"9px 12px", border:`1.5px solid ${C.border}`, borderRadius:6, fontSize:13, fontFamily:"DM Sans,sans-serif", color:C.text, background:C.elevated, outline:"none", width:"100%" };
+  const selectS = { ...inputS, cursor:"pointer" };
   const [baseTable, setBaseTable] = useState("claims");
   const [selectedCols, setSelectedCols] = useState(["id","hmo_id","total_amount","approved_amount","hmo_status","created_at"]);
   const [joins, setJoins] = useState([]);
@@ -671,6 +674,8 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
 
 /* ─── Saved Queries Panel (Improvement #3) ────────────────── */
 function SavedQueries({ onLoad, onDelete }) {
+  const { C } = useTheme();
+  const btnSmall = { padding:"5px 10px", border:`1px solid ${C.border}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", background:C.elevated, color:C.sub, fontFamily:"DM Sans,sans-serif" };
   const [saved, setSaved] = useState([]);
 
   useEffect(() => {
