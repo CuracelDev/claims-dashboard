@@ -1,5 +1,6 @@
 'use client';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import ReportPinGate, { getSession } from '@/components/ReportPinGate';
 
 const C = {
   accent: '#00E5A0', accentDim: '#00B87D',
@@ -378,10 +379,9 @@ function DailySummary({ teamMembers, date }) {
   );
 }
 
-export default function ReportsPage() {
-  const [tab, setTab] = useState('form');
-  const [teamMembers, setTeamMembers] = useState([]);
-  const [selectedMember, setSelectedMember] = useState('');
+// ─── Report Form (shown after PIN auth) ───────────────────────────────────────
+function ReportForm({ teamMembers, authSession }) {
+  const [selectedMember, setSelectedMember] = useState(String(authSession.memberId));
   const [reportDate, setReportDate] = useState(todayStr());
   const [metrics, setMetrics] = useState({});
   const [tasksCompleted, setTasksCompleted] = useState('');
@@ -391,13 +391,8 @@ export default function ReportsPage() {
   const [isLeaveActive, setIsLeaveActive] = useState(false);
   const [editingReport, setEditingReport] = useState(null);
   const [showPreview, setShowPreview] = useState(false);
-  const [reports, setReports] = useState([]);
-  const [histFilter, setHistFilter] = useState({ person: '', date: '' });
-  const [loadingHist, setLoadingHist] = useState(false);
 
-  useEffect(() => {
-    fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
-  }, []);
+  const selectedMemberName = teamMembers.find(m => String(m.id) === String(selectedMember))?.name || '';
 
   useEffect(() => {
     if (!selectedMember || !reportDate) {
@@ -426,7 +421,7 @@ export default function ReportsPage() {
   };
 
   const handleSave = async () => {
-    if (!selectedMember) { setSaveMsg({ type: 'error', text: 'Select a team member first.' }); return null; }
+    if (!selectedMember) { setSaveMsg({ type: 'error', text: 'No member selected.' }); return null; }
     setSaving(true); setSaveMsg(null);
     try {
       const res = await fetch('/api/reports', {
@@ -470,14 +465,136 @@ export default function ReportsPage() {
     }
   };
 
-  const handleEditReport = (report) => {
-    setSelectedMember(String(report.team_member_id));
-    setReportDate(report.report_date);
-    setMetrics(report.metrics || {});
-    setTasksCompleted(report.tasks_completed || '');
-    setNotes(report.notes || '');
-    setEditingReport(report);
-    setTab('form');
+  const totalOutput = Object.values(metrics).reduce((a, b) => a + (parseInt(b) || 0), 0);
+
+  return (
+    <>
+      <DailySummary teamMembers={teamMembers} date={reportDate} />
+
+      {editingReport && (
+        <div style={{ background: '#5B8DEF15', border: '1px solid #5B8DEF44', borderRadius: 10, padding: '10px 16px', marginBottom: 14, fontSize: 13, color: C.blue }}>
+          ✏️ Editing existing report — changes will overwrite
+        </div>
+      )}
+
+      <div style={S.card}>
+        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16 }}>Report Details</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          {/* Member is locked to session — show as read-only pill */}
+          <div>
+            <label style={S.label}>Team Member</label>
+            <div style={{ ...S.input, background: '#0B0F1A', color: C.accent, fontWeight: 600, cursor: 'default', display: 'flex', alignItems: 'center', gap: 8 }}>
+              🔒 {authSession.memberName}
+            </div>
+          </div>
+          <div>
+            <label style={S.label}>Report Date</label>
+            <input type="date" value={reportDate} onChange={e => setReportDate(e.target.value)} style={S.input} autoComplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <LeavePanel
+        memberId={selectedMember}
+        memberName={selectedMemberName}
+        reportDate={reportDate}
+        onLeaveActive={(leave) => setIsLeaveActive(!!leave)}
+      />
+
+      {!isLeaveActive && (
+        <>
+          {METRIC_GROUPS.map(group => (
+            <MetricGroup
+              key={group.category}
+              group={group}
+              metrics={metrics}
+              onChangeMetric={handleMetricChange}
+            />
+          ))}
+
+          <div style={S.card}>
+            <div style={{ marginBottom: 16 }}>
+              <label style={S.label}>Tasks Completed</label>
+              <textarea value={tasksCompleted} onChange={e => setTasksCompleted(e.target.value)} rows={3} placeholder="List tasks you completed today…" style={{ ...S.input, resize: 'vertical' }} />
+            </div>
+            <div>
+              <label style={S.label}>Notes / Blockers</label>
+              <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} placeholder="Any blockers, observations, or notes…" style={{ ...S.input, resize: 'vertical' }} />
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0' }}>
+            <div style={{ fontSize: 14, color: C.sub }}>
+              Total output: <span style={{ color: C.accent, fontWeight: 700, fontSize: 22 }}>{totalOutput}</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              {saveMsg && (
+                <span style={{ fontSize: 13, color: saveMsg.type === 'success' ? C.success : C.danger }}>
+                  {saveMsg.type === 'success' ? '✓' : '✗'} {saveMsg.text}
+                </span>
+              )}
+              <button onClick={handleSave} disabled={saving} style={{
+                padding: '10px 24px', background: saving ? C.muted : C.elevated,
+                color: C.text, border: '1px solid #1E2D3D', borderRadius: 8, fontWeight: 600, fontSize: 14,
+                cursor: saving ? 'not-allowed' : 'pointer',
+              }}>
+                {saving ? 'Saving…' : '💾 Save'}
+              </button>
+              <button onClick={handleSaveAndPreview} disabled={saving} style={{
+                padding: '10px 24px', background: saving ? C.muted : C.accent,
+                color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, fontSize: 14,
+                cursor: saving ? 'not-allowed' : 'pointer',
+              }}>
+                ✨ Save & Preview
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {isLeaveActive && (
+        <div style={{ background: '#FFB84D08', border: '1px dashed #FFB84D44', borderRadius: 12, padding: 32, textAlign: 'center' }}>
+          <div style={{ fontSize: 36, marginBottom: 10 }}>🌙</div>
+          <div style={{ fontSize: 15, fontWeight: 600, color: C.warn, marginBottom: 4 }}>{selectedMemberName} is off today</div>
+          <div style={{ fontSize: 13, color: C.sub }}>No report needed. Slack reminder will be skipped.</div>
+        </div>
+      )}
+
+      {showPreview && editingReport && (
+        <PreviewModal
+          report={editingReport}
+          teamMembers={teamMembers}
+          onClose={() => setShowPreview(false)}
+          onSendSlack={handleSendSlack}
+        />
+      )}
+    </>
+  );
+}
+
+// ─── Main Page ────────────────────────────────────────────────────────────────
+export default function ReportsPage() {
+  const [tab, setTab] = useState('form');
+  const [teamMembers, setTeamMembers] = useState([]);
+  const [authSession, setAuthSession] = useState(null);
+
+  // History tab state
+  const [reports, setReports] = useState([]);
+  const [histFilter, setHistFilter] = useState({ person: '', date: '' });
+  const [loadingHist, setLoadingHist] = useState(false);
+
+  // History edit state (edit from history switches to form tab)
+  const [editingFromHistory, setEditingFromHistory] = useState(null);
+
+  useEffect(() => {
+    fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
+    // Restore session if already authenticated this browser session
+    const existing = getSession();
+    if (existing) setAuthSession(existing);
+  }, []);
+
+  const handleAuth = (session) => {
+    setAuthSession(session);
   };
 
   const loadHistory = useCallback(() => {
@@ -492,8 +609,10 @@ export default function ReportsPage() {
 
   useEffect(() => { if (tab === 'history') loadHistory(); }, [tab, loadHistory]);
 
-  const totalOutput = Object.values(metrics).reduce((a, b) => a + (parseInt(b) || 0), 0);
-  const selectedMemberName = teamMembers.find(m => String(m.id) === String(selectedMember))?.name || '';
+  const handleEditReport = (report) => {
+    setEditingFromHistory(report);
+    setTab('form');
+  };
 
   const tabBtn = (key, label) => (
     <button key={key} onClick={() => setTab(key)} style={{
@@ -518,103 +637,22 @@ export default function ReportsPage() {
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px 32px' }}>
 
+        {/* ── SUBMIT REPORT TAB — PIN gated ── */}
         {tab === 'form' && (
           <div style={{ maxWidth: 720 }}>
-            <DailySummary teamMembers={teamMembers} date={reportDate} />
-
-            {editingReport && (
-              <div style={{ background: '#5B8DEF15', border: '1px solid #5B8DEF44', borderRadius: 10, padding: '10px 16px', marginBottom: 14, fontSize: 13, color: C.blue }}>
-                ✏️ Editing existing report — changes will overwrite
-              </div>
-            )}
-
-            <div style={S.card}>
-              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16 }}>Report Details</div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-                <div>
-                  <label style={S.label}>Team Member</label>
-                  <select value={selectedMember} onChange={e => { setSelectedMember(e.target.value); setIsLeaveActive(false); }} style={S.input}>
-                    <option value="">Select member…</option>
-                    {teamMembers.map(m => <option key={m.id} value={String(m.id)}>{m.name}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label style={S.label}>Report Date</label>
-                  <input type="date" value={reportDate} onChange={e => setReportDate(e.target.value)} style={S.input} autoComplete="off" />
-                </div>
-              </div>
-            </div>
-
-            {selectedMember && (
-              <LeavePanel
-                memberId={selectedMember}
-                memberName={selectedMemberName}
-                reportDate={reportDate}
-                onLeaveActive={(leave) => setIsLeaveActive(!!leave)}
-              />
-            )}
-
-            {!isLeaveActive && (
-              <>
-                {METRIC_GROUPS.map(group => (
-                  <MetricGroup
-                    key={group.category}
-                    group={group}
-                    metrics={metrics}
-                    onChangeMetric={handleMetricChange}
-                  />
-                ))}
-
-                <div style={S.card}>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={S.label}>Tasks Completed</label>
-                    <textarea value={tasksCompleted} onChange={e => setTasksCompleted(e.target.value)} rows={3} placeholder="List tasks you completed today…" style={{ ...S.input, resize: 'vertical' }} />
-                  </div>
-                  <div>
-                    <label style={S.label}>Notes / Blockers</label>
-                    <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} placeholder="Any blockers, observations, or notes…" style={{ ...S.input, resize: 'vertical' }} />
-                  </div>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0' }}>
-                  <div style={{ fontSize: 14, color: C.sub }}>
-                    Total output: <span style={{ color: C.accent, fontWeight: 700, fontSize: 22 }}>{totalOutput}</span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    {saveMsg && (
-                      <span style={{ fontSize: 13, color: saveMsg.type === 'success' ? C.success : C.danger }}>
-                        {saveMsg.type === 'success' ? '✓' : '✗'} {saveMsg.text}
-                      </span>
-                    )}
-                    <button onClick={handleSave} disabled={saving || !selectedMember} style={{
-                      padding: '10px 24px', background: saving || !selectedMember ? C.muted : C.elevated,
-                      color: C.text, border: '1px solid #1E2D3D', borderRadius: 8, fontWeight: 600, fontSize: 14,
-                      cursor: saving || !selectedMember ? 'not-allowed' : 'pointer',
-                    }}>
-                      {saving ? 'Saving…' : '💾 Save'}
-                    </button>
-                    <button onClick={handleSaveAndPreview} disabled={saving || !selectedMember} style={{
-                      padding: '10px 24px', background: saving || !selectedMember ? C.muted : C.accent,
-                      color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, fontSize: 14,
-                      cursor: saving || !selectedMember ? 'not-allowed' : 'pointer',
-                    }}>
-                      ✨ Save & Preview
-                    </button>
-                  </div>
-                </div>
-              </>
-            )}
-
-            {isLeaveActive && (
-              <div style={{ background: '#FFB84D08', border: '1px dashed #FFB84D44', borderRadius: 12, padding: 32, textAlign: 'center' }}>
-                <div style={{ fontSize: 36, marginBottom: 10 }}>🌙</div>
-                <div style={{ fontSize: 15, fontWeight: 600, color: C.warn, marginBottom: 4 }}>{selectedMemberName} is off today</div>
-                <div style={{ fontSize: 13, color: C.sub }}>No report needed. Slack reminder will be skipped.</div>
-              </div>
-            )}
+            <ReportPinGate members={teamMembers} onAuth={handleAuth} existingSession={authSession}>
+              {authSession && (
+                <ReportForm
+                  teamMembers={teamMembers}
+                  authSession={authSession}
+                  initialReport={editingFromHistory}
+                />
+              )}
+            </ReportPinGate>
           </div>
         )}
 
+        {/* ── HISTORY TAB ── */}
         {tab === 'history' && (
           <div>
             <div style={{ ...S.card, display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
@@ -644,17 +682,9 @@ export default function ReportsPage() {
           </div>
         )}
 
+        {/* ── TEAM VIEW TAB ── */}
         {tab === 'team' && <DailySummary teamMembers={teamMembers} date={todayStr()} />}
       </div>
-
-      {showPreview && editingReport && (
-        <PreviewModal
-          report={editingReport}
-          teamMembers={teamMembers}
-          onClose={() => setShowPreview(false)}
-          onSendSlack={handleSendSlack}
-        />
-      )}
     </div>
   );
 }
