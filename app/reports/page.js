@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
-import ReportPinGate, { getSession } from '@/components/ReportPinGate';
+import ReportPinGate, { getSession } from '@/app/components/ReportPinGate';
 
 const C = {
   accent: '#00E5A0', accentDim: '#00B87D',
