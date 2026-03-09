@@ -1,5 +1,5 @@
 import { DM_Sans } from 'next/font/google';
-import Providers from '@/app/providers';
+import Providers from './providers';
 import Sidebar from '@/app/components/Sidebar';
 
 const dmSans = DM_Sans({ subsets: ['latin'], variable: '--font-dm-sans' });

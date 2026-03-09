@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { useTheme } from '@/app/context/ThemeContext';
+import { useTheme } from '../../context/ThemeContext';
 
 const METRIC_LABELS = {
   providers_mapped: 'Providers Mapped', care_items_mapped: 'Care Items Mapped',

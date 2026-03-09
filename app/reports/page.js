@@ -1,7 +1,7 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
-import { useTheme } from '@/app/context/ThemeContext';
-import ReportPinGate, { getSession } from '@/app/components/ReportPinGate';
+import { useTheme } from '../context/ThemeContext';
+import ReportPinGate, { getSession } from '../components/ReportPinGate';
 
 const METRIC_GROUPS = [
   {

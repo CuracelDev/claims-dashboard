@@ -1,5 +1,5 @@
 'use client';
-import { ThemeProvider } from '@/app/context/ThemeContext';
+import { ThemeProvider } from './context/ThemeContext';
 
 export default function Providers({ children }) {
   return <ThemeProvider>{children}</ThemeProvider>;
