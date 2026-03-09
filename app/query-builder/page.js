@@ -1,20 +1,11 @@
 "use client";
 
 import { useState, useMemo, useEffect, useCallback } from "react";
+import { useTheme } from "../context/ThemeContext";
 // Sidebar is rendered by layout.js — no import needed here
 
-/* ─── colour tokens (matched from main dashboard) ─────────── */
-const C = {
-  accent: "#00E5A0", accentDim: "#00B87D",
-  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C", warn: "#FFB84D", success: "#34D399",
-  purple: "#A78BFA", purpleDim: "#7C3AED",
-  blue: "#60A5FA", blueDim: "#3B82F6",
-  code: { bg: "#0D1117", text: "#E6EDF3", kw: "#CBA6F7", str: "#A6E3A1", num: "#FAB387", col: "#89B4FA", comment: "#6C7086" },
-};
-
-/* ─── Utilities ────────────────────────────────────────────── */
+/* ─── Code syntax colors (stable, not theme-dependent) ─── */
+const CODE_COLORS = { bg: "#0D1117", text: "#E6EDF3", kw: "#CBA6F7", str: "#A6E3A1", num: "#FAB387", col: "#89B4FA", comment: "#6C7086" };
 function esc(str) { return str ? String(str).replace(/'/g, "''") : ""; }
 function isNum(v) { return v !== "" && v !== undefined && v !== null && !isNaN(Number(v)); }
 
@@ -32,11 +23,11 @@ function getToday() {
 function highlightSQL(sql) {
   const kws = ["SELECT","FROM","LEFT JOIN","RIGHT JOIN","INNER JOIN","CROSS JOIN","JOIN","ON","WHERE","AND","OR","AS","IS","NOT","NULL","IN","LIKE","BETWEEN","ORDER BY","GROUP BY","HAVING","LIMIT","CONCAT","TIMESTAMPDIFF","YEAR","CURDATE","NOW","DATE_ADD","DATE_SUB","INTERVAL","COUNT","SUM","AVG","MAX","MIN","DISTINCT","CASE","WHEN","THEN","ELSE","END","COALESCE","IFNULL","IF","NULLIF","EXISTS","WITH","DESC","ASC","CAST","UNSIGNED","SUBSTRING","JSON_EXTRACT","JSON_UNQUOTE","GROUP_CONCAT","SEPARATOR","CONCAT_WS","DAY"];
   let r = sql.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  r = r.replace(/'([^']*)'/g, `<span style="color:${C.code.str}">'$1'</span>`);
-  r = r.replace(/\b(\d+\.?\d*)\b/g, `<span style="color:${C.code.num}">$1</span>`);
-  kws.forEach(kw => { r = r.replace(new RegExp(`\\b${kw}\\b`,"gi"), m => `<span style="color:${C.code.kw};font-weight:600">${m.toUpperCase()}</span>`); });
-  r = r.replace(/`([^`]*)`/g, `<span style="color:${C.code.col}">\`$1\`</span>`);
-  r = r.replace(/(--.*$)/gm, `<span style="color:${C.code.comment};font-style:italic">$1</span>`);
+  r = r.replace(/'([^']*)'/g, `<span style="color:${CODE_COLORS.str}">'$1'</span>`);
+  r = r.replace(/\b(\d+\.?\d*)\b/g, `<span style="color:${CODE_COLORS.num}">$1</span>`);
+  kws.forEach(kw => { r = r.replace(new RegExp(`\\b${kw}\\b`,"gi"), m => `<span style="color:${CODE_COLORS.kw};font-weight:600">${m.toUpperCase()}</span>`); });
+  r = r.replace(/`([^`]*)`/g, `<span style="color:${CODE_COLORS.col}">\`$1\`</span>`);
+  r = r.replace(/(--.*$)/gm, `<span style="color:${CODE_COLORS.comment};font-style:italic">$1</span>`);
   return r;
 }
 
@@ -283,17 +274,20 @@ const CATS = {
 };
 
 /* ─── Shared styles ────────────────────────────────────────── */
-const inputS = { padding:"9px 12px", border:`1.5px solid ${C.border}`, borderRadius:6, fontSize:13, fontFamily:"DM Sans,sans-serif", color:C.text, background:C.elevated, outline:"none", width:"100%" };
-const selectS = { ...inputS, cursor:"pointer" };
-const btnSmall = { padding:"5px 10px", border:`1px solid ${C.border}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", background:C.elevated, color:C.sub, fontFamily:"DM Sans,sans-serif" };
+// All style objects that reference C are now defined inside their components using useTheme()
 
 /* ─── Components ───────────────────────────────────────────── */
-function Badge({ children, color = C.accent, bg }) {
-  return <span style={{ display:"inline-flex", alignItems:"center", gap:4, padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, background:bg||color+"22", color }}>{children}</span>;
+function Badge({ children, color, bg }) {
+  const { C } = useTheme();
+  const effectiveColor = color ?? C.accent;
+  return <span style={{ display:"inline-flex", alignItems:"center", gap:4, padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, background:bg||effectiveColor+"22", color:effectiveColor }}>{children}</span>;
 }
 
 function FilterPanel({ filters: fl, values: v, onChange }) {
+  const { C } = useTheme();
   const [customHmo, setCustomHmo] = useState("");
+  const inputS = { padding:"9px 12px", border:`1.5px solid ${C.border}`, borderRadius:6, fontSize:13, fontFamily:"DM Sans,sans-serif", color:C.text, background:C.elevated, outline:"none", width:"100%" };
+  const selectS = { ...inputS, cursor:"pointer" };
   if (!fl || !fl.length) return <div style={{ padding:18, color:C.muted, fontSize:13, fontStyle:"italic", textAlign:"center" }}>No filters needed — runs as-is ✅</div>;
   const L = (label) => <label style={{ fontSize:11, fontWeight:600, color:C.sub, textTransform:"uppercase", letterSpacing:".05em" }}>{label}</label>;
   return (
@@ -362,6 +356,7 @@ function FilterPanel({ filters: fl, values: v, onChange }) {
 }
 
 function AIAssistant({ onResult }) {
+  const { C } = useTheme();
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -418,6 +413,8 @@ function AIAssistant({ onResult }) {
 
 /* ─── Custom Query Builder ─────────────────────────────────── */
 function CustomBuilder({ onSQL }) {
+  const { C } = useTheme();
+  const btnSmall = { padding:"5px 10px", border:`1px solid ${C.border}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", background:C.elevated, color:C.sub, fontFamily:"DM Sans,sans-serif" };
   const [baseTable, setBaseTable] = useState("claims");
   const [selectedCols, setSelectedCols] = useState(["id","hmo_id","total_amount","approved_amount","hmo_status","created_at"]);
   const [joins, setJoins] = useState([]);
@@ -624,7 +621,7 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
     setCb(true); setTimeout(()=>setCb(false),2000);
   };
   return (
-    <div style={{ background:C.code.bg, borderRadius:12, border:`1.5px solid ${C.border}`, overflow:"hidden" }}>
+    <div style={{ background:CODE_COLORS.bg, borderRadius:12, border:`1.5px solid ${C.border}`, overflow:"hidden" }}>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 16px", background:"#0A0E18", borderBottom:`1px solid ${C.border}`, flexWrap:"wrap", gap:8 }}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <div style={{display:"flex",gap:6}}><div style={{width:12,height:12,borderRadius:"50%",background:C.danger}}/><div style={{width:12,height:12,borderRadius:"50%",background:C.warn}}/><div style={{width:12,height:12,borderRadius:"50%",background:C.success}}/></div>
@@ -653,7 +650,7 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
         </div>
       </div>
       {/* ✅ Improvement #2: Table scroll fix — added minWidth:0 to prevent overflow */}
-      <pre style={{ padding:"18px 20px", margin:0, fontFamily:"JetBrains Mono,monospace", fontSize:13, lineHeight:1.7, color:C.code.text, overflowX:"auto", overflowY:"auto", maxHeight:520, whiteSpace:"pre", tabSize:2, minWidth:0 }} dangerouslySetInnerHTML={{__html:highlightSQL(sql)}} />
+      <pre style={{ padding:"18px 20px", margin:0, fontFamily:"JetBrains Mono,monospace", fontSize:13, lineHeight:1.7, color:CODE_COLORS.text, overflowX:"auto", overflowY:"auto", maxHeight:520, whiteSpace:"pre", tabSize:2, minWidth:0 }} dangerouslySetInnerHTML={{__html:highlightSQL(sql)}} />
 
       {/* ✅ Improvement #4: Count SQL display (appears when user clicks Count) */}
       {countSQL && (
@@ -665,7 +662,7 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
               fontSize:11, fontWeight:600, fontFamily:"DM Sans,sans-serif", cursor:"pointer",
             }}>{countCopied?"✓ Copied!":"📋 Copy Count"}</button>
           </div>
-          <pre style={{ margin:0, fontFamily:"JetBrains Mono,monospace", fontSize:12, lineHeight:1.6, color:C.code.text, overflowX:"auto", whiteSpace:"pre", minWidth:0 }} dangerouslySetInnerHTML={{__html:highlightSQL(countSQL)}} />
+          <pre style={{ margin:0, fontFamily:"JetBrains Mono,monospace", fontSize:12, lineHeight:1.6, color:CODE_COLORS.text, overflowX:"auto", whiteSpace:"pre", minWidth:0 }} dangerouslySetInnerHTML={{__html:highlightSQL(countSQL)}} />
         </div>
       )}
     </div>
@@ -715,6 +712,8 @@ function SavedQueries({ onLoad, onDelete }) {
 
 /* ─── Main Page ────────────────────────────────────────────── */
 export default function QueryBuilderPage() {
+  const { C } = useTheme();
+  const btnSmall = { padding:"5px 10px", border:`1px solid ${C.border}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", background:C.elevated, color:C.sub, fontFamily:"DM Sans,sans-serif" };
   const [activeCat, setActiveCat] = useState("ai_assistant");
   const [activeTpl, setActiveTpl] = useState(null);
   const [filters, setFilters] = useState({});

@@ -6,20 +6,15 @@ import {
   ResponsiveContainer, LineChart, Line, Legend, PieChart, Pie, Cell,
   AreaChart, Area,
 } from "recharts";
+import { useTheme } from "./context/ThemeContext";
 
-/* ── colour tokens ──────────────────────────────────────── */
-const C = {
-  accent: "#00E5A0", accentDim: "#00B87D",
-  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C", warn: "#FFB84D", success: "#34D399",
-  chart: [
-    "#00E5A0","#FF6B8A","#5B8DEF","#FFB84D","#A78BFA",
-    "#F472B6","#34D399","#F59E0B","#EF4444","#8B5CF6",
-    "#EC4899","#14B8A6","#6366F1","#F97316","#06B6D4","#84CC16",
-  ],
-  periods: ["#00E5A0","#5B8DEF","#FF6B8A","#FFB84D","#A78BFA"],
-};
+/* ── chart palette (not in ThemeContext, stable across themes) ── */
+const CHART_COLORS = [
+  "#00E5A0","#FF6B8A","#5B8DEF","#FFB84D","#A78BFA",
+  "#F472B6","#34D399","#F59E0B","#EF4444","#8B5CF6",
+  "#EC4899","#14B8A6","#6366F1","#F97316","#06B6D4","#84CC16",
+];
+const PERIOD_COLORS = ["#00E5A0","#5B8DEF","#FF6B8A","#FFB84D","#A78BFA"];
 
 const fmt = (n) => n?.toLocaleString() ?? "0";
 const pct = (n, t) => t ? ((n / t) * 100).toFixed(1) : "0.0";
@@ -44,10 +39,12 @@ const getMonday = (d) => {
 };
 
 /* ── shared components ──────────────────────────────────── */
-function StatCard({ label, value, sub, icon, color = C.accent, delay = 0 }) {
+function StatCard({ label, value, sub, icon, color, delay = 0 }) {
+  const { C } = useTheme();
+  const effectiveColor = color ?? C.accent;
   return (
     <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "20px 24px", flex: 1, minWidth: 170, position: "relative", overflow: "hidden", animation: `slideUp .5s ease ${delay}s both` }}>
-      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg,${color},transparent)` }}/>
+      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg,${effectiveColor},transparent)` }}/>
       <div style={{ fontSize: 12, color: C.sub, marginBottom: 6, letterSpacing: .5, textTransform: "uppercase", fontWeight: 500 }}>{icon} {label}</div>
       <div style={{ fontSize: 30, fontWeight: 700, color: C.text, fontFamily: "'JetBrains Mono',monospace", letterSpacing: -1 }}>{value}</div>
       {sub && <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{sub}</div>}
@@ -56,6 +53,7 @@ function StatCard({ label, value, sub, icon, color = C.accent, delay = 0 }) {
 }
 
 function Tip({ active, payload, label }) {
+  const { C } = useTheme();
   if (!active || !payload?.length) return null;
   return (
     <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px", boxShadow: "0 8px 32px rgba(0,0,0,.5)" }}>
@@ -72,6 +70,7 @@ function Tip({ active, payload, label }) {
 }
 
 function Delta({ value, small }) {
+  const { C } = useTheme();
   if (value === null || value === undefined || isNaN(value)) return <span style={{ color: C.muted, fontSize: small ? 10 : 12 }}>—</span>;
   const pos = value > 0, neutral = Math.abs(value) < 0.5;
   const color = neutral ? C.muted : pos ? C.success : C.danger;
@@ -79,12 +78,14 @@ function Delta({ value, small }) {
   return <span style={{ color, fontSize: small ? 10 : 12, fontWeight: 600, fontFamily: "monospace" }}>{arrow} {Math.abs(value).toFixed(1)}%</span>;
 }
 
-function Checkbox({ checked, onChange, label, color = C.accent }) {
+function Checkbox({ checked, onChange, label, color }) {
+  const { C } = useTheme();
+  const effectiveColor = color ?? C.accent;
   return (
     <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, color: checked ? C.text : C.muted, padding: "4px 0", userSelect: "none" }} onClick={onChange}>
       <div style={{
-        width: 18, height: 18, borderRadius: 4, border: `2px solid ${checked ? color : C.border}`,
-        background: checked ? color : "transparent", display: "flex", alignItems: "center", justifyContent: "center",
+        width: 18, height: 18, borderRadius: 4, border: `2px solid ${checked ? effectiveColor : C.border}`,
+        background: checked ? effectiveColor : "transparent", display: "flex", alignItems: "center", justifyContent: "center",
         transition: "all .15s", flexShrink: 0,
       }}>
         {checked && <span style={{ color: C.bg, fontSize: 12, fontWeight: 700, lineHeight: 1 }}>✓</span>}
@@ -96,6 +97,9 @@ function Checkbox({ checked, onChange, label, color = C.accent }) {
 
 /* ═══════════ MAIN DASHBOARD ═══════════════════════════════ */
 export default function Dashboard() {
+  const { C } = useTheme();
+  const CHART = CHART_COLORS;
+  const PERIODS = PERIOD_COLORS;
   /* ── data state ─────────────────────────────────────── */
   const [rawData, setRawData] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -260,7 +264,7 @@ export default function Dashboard() {
       records.forEach(r => { byInsurer[r.insurer] = (byInsurer[r.insurer] || 0) + r.claims_count; });
       const daily = {};
       records.forEach(r => { const d = parseInt(r.date.split("-")[2]); daily[d] = (daily[d] || 0) + r.claims_count; });
-      return { month, total: totalVal, avg: avgVal, days, byInsurer, daily, color: C.periods[idx % C.periods.length] };
+      return { month, total: totalVal, avg: avgVal, days, byInsurer, daily, color: PERIODS[idx % PERIODS.length] };
     });
   }, [compFilteredData, compMonths]);
 
@@ -279,7 +283,7 @@ export default function Dashboard() {
         daily[`Day ${dayNum}`] = (daily[`Day ${dayNum}`] || 0) + r.claims_count;
       });
       const label = p.label || `${new Date(p.from).toLocaleDateString("en",{month:"short",day:"numeric"})} → ${new Date(p.to).toLocaleDateString("en",{month:"short",day:"numeric"})}`;
-      return { ...p, label, total: totalVal, avg: avgVal, days, byInsurer, daily, color: C.periods[idx % C.periods.length] };
+      return { ...p, label, total: totalVal, avg: avgVal, days, byInsurer, daily, color: PERIODS[idx % PERIODS.length] };
     });
   }, [compFilteredData, customPeriods]);
 
@@ -639,9 +643,9 @@ export default function Dashboard() {
               const on = selected.has(ins);
               return (
                 <button key={ins} onClick={() => toggle(ins)} style={{
-                  background: on ? `${C.chart[i % C.chart.length]}22` : "transparent",
-                  border: `1px solid ${on ? C.chart[i % C.chart.length] : C.border}`,
-                  color: on ? C.chart[i % C.chart.length] : C.muted,
+                  background: on ? `${CHART[i % CHART.length]}22` : "transparent",
+                  border: `1px solid ${on ? CHART[i % CHART.length] : C.border}`,
+                  color: on ? CHART[i % CHART.length] : C.muted,
                   borderRadius: 20, padding: "5px 14px", fontSize: 11, cursor: "pointer",
                   fontWeight: on ? 600 : 400, transition: "all .2s",
                 }}>{on ? "✓ " : ""}{ins}</button>
@@ -681,7 +685,7 @@ export default function Dashboard() {
                 <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>Distribution</div>
                 <ResponsiveContainer width="100%" height={270}>
                   <PieChart><Pie data={insurerTotals} dataKey="total" nameKey="insurer" cx="50%" cy="50%" outerRadius={85} innerRadius={48} paddingAngle={2}>
-                    {insurerTotals.map((_,i) => <Cell key={i} fill={C.chart[i%C.chart.length]}/>)}
+                    {insurerTotals.map((_,i) => <Cell key={i} fill={CHART[i%CHART.length]}/>)}
                   </Pie><Tooltip content={<Tip/>}/></PieChart>
                 </ResponsiveContainer>
               </div>
@@ -697,7 +701,7 @@ export default function Dashboard() {
                     <span style={{ fontSize: 11, color: C.muted, width: 20, textAlign: "right", fontFamily: "monospace" }}>{i+1}</span>
                     <span style={{ fontSize: 12, color: C.text, width: 200, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{it.insurer}</span>
                     <div style={{ flex: 1, height: 22, background: C.elevated, borderRadius: 6, overflow: "hidden" }}>
-                      <div style={{ height: "100%", width: `${pct(it.total,total)}%`, background: `linear-gradient(90deg,${C.chart[i%C.chart.length]},${C.chart[i%C.chart.length]}88)`, borderRadius: 6, transition: "width .5s ease", display: "flex", alignItems: "center", paddingLeft: 8 }}>
+                      <div style={{ height: "100%", width: `${pct(it.total,total)}%`, background: `linear-gradient(90deg,${CHART[i%CHART.length]},${CHART[i%CHART.length]}88)`, borderRadius: 6, transition: "width .5s ease", display: "flex", alignItems: "center", paddingLeft: 8 }}>
                         {parseFloat(pct(it.total,total)) > 8 && <span style={{ fontSize: 9, fontWeight: 600, color: C.bg }}>{pct(it.total,total)}%</span>}
                       </div>
                     </div>
@@ -734,7 +738,7 @@ export default function Dashboard() {
                     return (
                       <tr key={ins} style={{ background: idx%2 ? `${C.elevated}44` : "transparent" }}>
                         <td style={{ position: "sticky", left: 0, background: idx%2 ? C.elevated : C.card, padding: "8px 14px", fontWeight: 500, color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" }}>
-                          <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: C.chart[allInsurers.indexOf(ins)%C.chart.length], marginRight: 8 }}/>{ins}
+                          <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: CHART[allInsurers.indexOf(ins)%CHART.length], marginRight: 8 }}/>{ins}
                         </td>
                         {pivot.dates.map(d => { const v = pivot.map[`${d}_${ins}`]||0; rt+=v; return <td key={d} style={{ padding: "8px 10px", textAlign: "right", fontFamily: "monospace", color: v===0 ? C.muted : C.text, fontSize: 10, borderBottom: `1px solid ${C.border}` }}>{fmt(v)}</td>; })}
                         <td style={{ position: "sticky", right: 0, background: idx%2 ? C.elevated : C.card, padding: "8px 14px", textAlign: "right", fontFamily: "monospace", fontWeight: 600, color: C.text, borderBottom: `1px solid ${C.border}` }}>{fmt(rt)}</td>
@@ -758,7 +762,7 @@ export default function Dashboard() {
                   <XAxis dataKey="date" tick={{ fontSize: 10, fill: C.muted }} tickFormatter={d => d.slice(5)}/>
                   <YAxis tick={{ fontSize: 10, fill: C.muted }}/>
                   <Tooltip content={<Tip/>}/><Legend wrapperStyle={{ fontSize: 10 }}/>
-                  {[...selected].sort().map(ins => <Line key={ins} type="monotone" dataKey={ins} stroke={C.chart[allInsurers.indexOf(ins)%C.chart.length]} strokeWidth={2} dot={false} name={ins}/>)}
+                  {[...selected].sort().map(ins => <Line key={ins} type="monotone" dataKey={ins} stroke={CHART[allInsurers.indexOf(ins)%CHART.length]} strokeWidth={2} dot={false} name={ins}/>)}
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -844,7 +848,7 @@ export default function Dashboard() {
                     availableMonths.map(m => {
                       const on = compMonths.has(m);
                       const idx = [...compMonths].sort().indexOf(m);
-                      const color = on ? C.periods[idx%C.periods.length] : C.muted;
+                      const color = on ? PERIODS[idx%PERIODS.length] : C.muted;
                       return (
                         <button key={m} onClick={() => toggleCompMonth(m)} style={{
                           background: on ? `${color}22` : "transparent", border: `1px solid ${on ? color : C.border}`,
@@ -858,11 +862,11 @@ export default function Dashboard() {
                       <div style={{ fontSize: 12, color: C.muted, padding: "8px 0" }}>No periods added yet. Use the date pickers above to add comparison periods.</div>
                     ) : [...customPeriods].sort((a,b) => a.from.localeCompare(b.from)).map((p, idx) => (
                       <div key={p.id} style={{
-                        background: `${C.periods[idx%C.periods.length]}15`, border: `1px solid ${C.periods[idx%C.periods.length]}`,
+                        background: `${PERIODS[idx%PERIODS.length]}15`, border: `1px solid ${PERIODS[idx%PERIODS.length]}`,
                         borderRadius: 10, padding: "8px 14px", fontSize: 11, display: "flex", alignItems: "center", gap: 10,
                       }}>
-                        <span style={{ width: 10, height: 10, borderRadius: "50%", background: C.periods[idx%C.periods.length], flexShrink: 0 }}/>
-                        <span style={{ fontWeight: 600, color: C.periods[idx%C.periods.length] }}>{p.label}</span>
+                        <span style={{ width: 10, height: 10, borderRadius: "50%", background: PERIODS[idx%PERIODS.length], flexShrink: 0 }}/>
+                        <span style={{ fontWeight: 600, color: PERIODS[idx%PERIODS.length] }}>{p.label}</span>
                         <span style={{ color: C.sub, fontSize: 10 }}>{p.from} → {p.to}</span>
                         <span style={{ color: C.sub, fontSize: 10 }}>({Math.round((new Date(p.to) - new Date(p.from)) / 86400000) + 1} days)</span>
                         <button onClick={() => removeCustomPeriod(p.id)} style={{ background: "transparent", border: "none", color: C.danger, cursor: "pointer", fontSize: 14, padding: "0 4px", fontWeight: 700 }}>×</button>
@@ -883,7 +887,7 @@ export default function Dashboard() {
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 4 }}>
                   {allInsurers.map((ins, i) => (
                     <Checkbox key={ins} checked={compInsurers.has(ins)} onChange={() => toggleCompInsurer(ins)}
-                      label={ins} color={C.chart[i%C.chart.length]}/>
+                      label={ins} color={CHART[i%CHART.length]}/>
                   ))}
                 </div>
               </div>
@@ -1013,7 +1017,7 @@ export default function Dashboard() {
                       {compInsurerTable.map((row, idx) => (
                         <tr key={row.insurer} style={{ background: idx%2 ? `${C.elevated}44` : "transparent" }}>
                           <td style={{ position: "sticky", left: 0, background: idx%2 ? C.elevated : C.card, padding: "8px 14px", fontWeight: 500, color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" }}>
-                            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: C.chart[allInsurers.indexOf(row.insurer)%C.chart.length], marginRight: 8 }}/>{row.insurer}
+                            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: CHART[allInsurers.indexOf(row.insurer)%CHART.length], marginRight: 8 }}/>{row.insurer}
                           </td>
                           {compPeriods.map((p,i) => {
                             const key = compMode === "month" ? p.month : p.label;
@@ -1073,7 +1077,7 @@ export default function Dashboard() {
                   <div style={{ maxHeight: 160, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
                     {allInsurers.map((ins,i) => (
                       <Checkbox key={ins} checked={slackInsurers.has(ins)} onChange={() => { const n = new Set(slackInsurers); n.has(ins) ? n.delete(ins) : n.add(ins); setSlackInsurers(n); }}
-                        label={ins} color={C.chart[i%C.chart.length]}/>
+                        label={ins} color={CHART[i%CHART.length]}/>
                     ))}
                   </div>
                 </div>
@@ -1171,7 +1175,7 @@ export default function Dashboard() {
                         <div key={p.id} style={{
                           background: C.elevated, border: `1px solid ${C.border}`,
                           borderRadius: 8, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10,
-                          borderLeft: `3px solid ${C.periods[idx % C.periods.length]}`,
+                          borderLeft: `3px solid ${PERIODS[idx % PERIODS.length]}`,
                         }}>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{p.label}</div>
@@ -1214,7 +1218,7 @@ export default function Dashboard() {
                   <div style={{ maxHeight: 120, overflowY: "auto", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
                     {allInsurers.map((ins,i) => (
                       <Checkbox key={ins} checked={reportInsurers.has(ins)} onChange={() => { const n = new Set(reportInsurers); n.has(ins) ? n.delete(ins) : n.add(ins); setReportInsurers(n); }}
-                        label={ins} color={C.chart[i%C.chart.length]}/>
+                        label={ins} color={CHART[i%CHART.length]}/>
                     ))}
                   </div>
                 </div>
@@ -1226,7 +1230,7 @@ export default function Dashboard() {
                   {[...reportPeriods].sort((a,b) => a.from.localeCompare(b.from)).map((p, idx) => {
                     const comp = reportComputed[idx];
                     return (
-                      <div key={p.id} style={{ marginTop: 6, paddingLeft: 8, borderLeft: `2px solid ${C.periods[idx % C.periods.length]}` }}>
+                      <div key={p.id} style={{ marginTop: 6, paddingLeft: 8, borderLeft: `2px solid ${PERIODS[idx % PERIODS.length]}` }}>
                         <strong style={{ color: C.text }}>{p.label}</strong> ({p.from} → {p.to})<br/>
                         🏥 Total: <strong style={{ color: C.text }}>{comp ? fmt(comp.total) : "—"}</strong> | Avg: <strong style={{ color: C.text }}>{comp ? fmt(comp.avg) : "—"}</strong>/day | {comp?.days || 0} days
                         {idx > 0 && comp && reportComputed[idx-1] && (() => {

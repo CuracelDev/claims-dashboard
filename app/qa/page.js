@@ -4,14 +4,9 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, LineChart, Line, Cell,
 } from "recharts";
+import { useTheme } from "../context/ThemeContext";
 
-const C = {
-  accent: "#00E5A0", accentDim: "#00B87D",
-  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C", warn: "#FFB84D", success: "#34D399",
-  chart: ["#00E5A0","#FF6B8A","#5B8DEF","#FFB84D","#A78BFA","#F472B6","#34D399","#F59E0B"],
-};
+const CHART_COLORS = ["#00E5A0","#FF6B8A","#5B8DEF","#FFB84D","#A78BFA","#F472B6","#34D399","#F59E0B"];
 
 const fmt = n => n?.toLocaleString() ?? "0";
 
@@ -25,12 +20,14 @@ const ISSUE_COLORS = {
   "Other":                    "#8899AA",
 };
 
-function StatCard({ label, value, sub, icon, color = C.accent, delay = 0, onClick }) {
+function StatCard({ label, value, sub, icon, color, delay = 0, onClick }) {
+  const { C } = useTheme();
+  const effectiveColor = color ?? C.accent;
   return (
     <div onClick={onClick} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "20px 24px", flex: 1, minWidth: 160, position: "relative", overflow: "hidden", animation: `slideUp .5s ease ${delay}s both`, cursor: onClick ? "pointer" : "default", transition: "border-color .2s" }}
-      onMouseEnter={e => onClick && (e.currentTarget.style.borderColor = color)}
+      onMouseEnter={e => onClick && (e.currentTarget.style.borderColor = effectiveColor)}
       onMouseLeave={e => onClick && (e.currentTarget.style.borderColor = C.border)}>
-      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg,${color},transparent)` }}/>
+      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg,${effectiveColor},transparent)` }}/>
       <div style={{ fontSize: 11, color: C.sub, marginBottom: 6, letterSpacing: .5, textTransform: "uppercase", fontWeight: 500 }}>{icon} {label}</div>
       <div style={{ fontSize: 28, fontWeight: 700, color: C.text, fontFamily: "'JetBrains Mono',monospace", letterSpacing: -1 }}>{value}</div>
       {sub && <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{sub}</div>}
@@ -39,6 +36,7 @@ function StatCard({ label, value, sub, icon, color = C.accent, delay = 0, onClic
 }
 
 function Tip({ active, payload, label }) {
+  const { C } = useTheme();
   if (!active || !payload?.length) return null;
   return (
     <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px" }}>
@@ -56,6 +54,7 @@ function Tip({ active, payload, label }) {
 
 // ── AI Insight Card ─────────────────────────────────────────────────────────
 function InsightCard({ data, dateRange }) {
+  const { C } = useTheme();
   const [insight, setInsight]       = useState(null);
   const [loading, setLoading]       = useState(false);
   const [sending, setSending]       = useState(false);
@@ -156,6 +155,8 @@ function InsightCard({ data, dateRange }) {
 }
 
 export default function QADashboard() {
+  const { C } = useTheme();
+  const CHART = CHART_COLORS;
   const [data, setData]     = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]   = useState(null);
@@ -388,7 +389,7 @@ export default function QADashboard() {
                       <Tooltip content={<Tip/>}/>
                       <Bar dataKey="count" radius={[0,4,4,0]} name="Count" cursor="pointer">
                         {byIssue.map((entry, i) => (
-                          <Cell key={i} fill={activeIssue === entry.issue ? ISSUE_COLORS[entry.issue] : `${ISSUE_COLORS[entry.issue] || C.chart[i]}88`} stroke={activeIssue === entry.issue ? ISSUE_COLORS[entry.issue] : "none"} strokeWidth={2}/>
+                          <Cell key={i} fill={activeIssue === entry.issue ? ISSUE_COLORS[entry.issue] : `${ISSUE_COLORS[entry.issue] || CHART[i]}88`} stroke={activeIssue === entry.issue ? ISSUE_COLORS[entry.issue] : "none"} strokeWidth={2}/>
                         ))}
                       </Bar>
                     </BarChart>
@@ -409,7 +410,7 @@ export default function QADashboard() {
                       <div key={item.insurer} style={{ display: "flex", alignItems: "center", gap: 12 }}>
                         <span style={{ fontSize: 12, color: C.text, width: 200, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{item.insurer}</span>
                         <div style={{ flex: 1, height: 22, background: C.elevated, borderRadius: 6, overflow: "hidden" }}>
-                          <div style={{ height: "100%", width: `${total > 0 ? (item.count / total * 100) : 0}%`, background: `linear-gradient(90deg,${C.chart[i % C.chart.length]},${C.chart[i % C.chart.length]}88)`, borderRadius: 6, display: "flex", alignItems: "center", paddingLeft: 8, transition: "width .5s ease" }}>
+                          <div style={{ height: "100%", width: `${total > 0 ? (item.count / total * 100) : 0}%`, background: `linear-gradient(90deg,${CHART[i % CHART.length]},${CHART[i % CHART.length]}88)`, borderRadius: 6, display: "flex", alignItems: "center", paddingLeft: 8, transition: "width .5s ease" }}>
                             {(item.count / total * 100) > 10 && <span style={{ fontSize: 9, fontWeight: 600, color: C.bg }}>{(item.count / total * 100).toFixed(0)}%</span>}
                           </div>
                         </div>

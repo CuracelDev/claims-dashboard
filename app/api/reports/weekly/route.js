@@ -13,14 +13,20 @@ export async function GET(request) {
   }
 
   try {
-    const { data: reports, error } = await supabase
+    // Fetch recent reports and filter in JS — avoids Supabase date-type comparison issues
+    const { data: allReports, error } = await supabase
       .from('daily_reports')
       .select('*, team_members (id, name, role)')
-      .gte('report_date', from)
-      .lte('report_date', to)
-      .order('report_date', { ascending: false });
+      .order('report_date', { ascending: false })
+      .limit(500);
 
     if (error) throw error;
+
+    // Client-side date filter (robust against column type variations)
+    const reports = (allReports || []).filter(r => {
+      const d = (r.report_date || '').slice(0, 10);
+      return d >= from && d <= to;
+    });
 
     const byPerson = {};
     for (const report of reports) {

@@ -181,7 +181,7 @@ export default function OpsPage() {
         <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:24 }}>
           {[
             { val:`${todayReports.length}/${teamMembers.length}`, label:'Submitted today',  color:C.accent },
-            { val:reports.reduce((s,r)=>s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length,0), label:'Total fields (range)', color:C.blue },
+            { val:reports.reduce((s,r)=>s+Object.values(r.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0),0).toLocaleString(), label:'Total output (range)', color:C.blue },
             { val:new Set(reports.map(r=>r.report_date)).size, label:'Days tracked', color:C.purple },
             { val:pendingTasks.length, label:'Pending tasks', color:pendingTasks.length>0?C.warn:C.success },
           ].map((s,i) => (
