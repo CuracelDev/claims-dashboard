@@ -616,6 +616,7 @@ function CustomBuilder({ onSQL }) {
 
 /* ─── SQL Display (updated with Save + Count) ─────────────── */
 function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQL }) {
+  const { C } = useTheme();
   const [copied, setCopied] = useState(false);
   const [countCopied, setCountCopied] = useState(false);
   const lines = sql.split("\n").length;
