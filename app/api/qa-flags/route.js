@@ -47,7 +47,10 @@ export async function POST(request) {
 
     const { data, error } = await supabase
       .from("qa_flags")
-      .insert(rows)
+      .upsert(rows, {
+        onConflict: "claim_id,item_description,issues,encounter_date",
+        ignoreDuplicates: false,
+      })
       .select("id");
 
     if (error) throw error;
