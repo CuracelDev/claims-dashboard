@@ -1,440 +1,354 @@
-"use client";
-import { useState, useEffect, useMemo, useCallback } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+'use client';
+import { useState, useEffect } from 'react';
+import { useTheme } from '@/app/context/ThemeContext';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
-const C = {
-  accent: "#00E5A0", accentDim: "#00B87D",
-  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C", warn: "#FFB84D", success: "#34D399",
-  blue: "#5B8DEF", purple: "#A78BFA",
+const METRIC_LABELS = {
+  providers_mapped:'Providers Mapped', care_items_mapped:'Care Items Mapped',
+  care_items_grouped:'Care Items Grouped', resolved_cares:'Resolved Cares',
+  claims_kenya:'Kenya', claims_tanzania:'Tanzania', claims_uganda:'Uganda',
+  claims_uap:'UAP Old Mutual', claims_defmis:'Defmis', claims_hadiel:'Hadiel Tech', claims_axa:'AXA',
+  auto_pa_reviewed:'Auto PA Reviewed', flagged_care_items:'Flagged Care Items',
+  icd10_adjusted:'ICD10 Adjusted', benefits_set_up:'Benefits Set Up',
+  providers_assigned:'Providers Assigned',
 };
 
-const METRIC_GROUPS = [
-  { key: "claims_piles", label: "Claims Piles", color: "#A78BFA", metrics: [
-    { key: "claims_kenya", label: "Kenya" }, { key: "claims_tanzania", label: "Tanzania" },
-    { key: "claims_uganda", label: "Uganda" }, { key: "claims_uap", label: "UAP Old Mutual" },
-    { key: "claims_defmis", label: "Defmis" }, { key: "claims_hadiel", label: "Hadiel Tech" },
-    { key: "claims_axa", label: "AXA" },
-  ]},
-  { key: "mapping_data", label: "Mapping & Data", color: "#5B8DEF", metrics: [
-    { key: "providers_mapped", label: "Providers Mapped" }, { key: "care_items_mapped", label: "Care Items Mapped" },
-    { key: "care_items_grouped", label: "Care Items Grouped" }, { key: "resolved_cares", label: "Resolved Cares" },
-  ]},
-  { key: "quality_review", label: "Quality & Review", color: "#00E5A0", metrics: [
-    { key: "auto_pa_reviewed", label: "Auto PA Reviewed" }, { key: "flagged_care_items", label: "Flagged Care Items" },
-    { key: "icd10_adjusted", label: "ICD10 Adjusted" }, { key: "benefits_set_up", label: "Benefits Set Up" },
-    { key: "providers_assigned", label: "Providers Assigned" },
-  ]},
+const TODAY = new Date().toISOString().split('T')[0];
+
+const fmtDay = (d) => {
+  const dt = new Date(d + 'T12:00:00');
+  return dt.toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short' });
+};
+
+const QUICK_RANGES = [
+  { label:'Today',      days: 0  },
+  { label:'This week',  days: 7  },
+  { label:'2 weeks',    days: 14 },
+  { label:'30 days',    days: 30 },
+  { label:'This month', month: true },
 ];
 
-const ALL_KEYS = METRIC_GROUPS.flatMap(g => g.metrics.map(m => m.key));
-const TOTAL_FIELDS = ALL_KEYS.length;
-
-function scoreReport(report) {
-  const m = report?.metrics || {};
-  return ALL_KEYS.filter(k => m[k] && parseInt(m[k]) > 0).length;
-}
-function scoreColor(f) { return !f ? "#556677" : f >= 5 ? "#34D399" : "#FF5C5C"; }
-function scoreBg(f)    { return !f ? "transparent" : f >= 5 ? "#34D39922" : "#FF5C5C22"; }
-
-const fmt = n => (n ?? 0).toLocaleString();
-const todayStr   = () => new Date().toISOString().slice(0, 10);
-const daysAgo    = n => { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); };
-const monthStart = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`; };
-
-function Tip({ active, payload, label }) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div style={{ background: "#1A2332", border: "1px solid #1E2D3D", borderRadius: 8, padding: "10px 14px" }}>
-      <div style={{ fontSize: 11, color: "#00E5A0", fontWeight: 600, marginBottom: 4 }}>{label}</div>
-      {payload.map((p, i) => (
-        <div key={i} style={{ fontSize: 11, color: "#8899AA", display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ width: 8, height: 8, borderRadius: "50%", background: p.color }}/>
-          <span style={{ flex: 1 }}>{p.name}</span>
-          <span style={{ fontWeight: 600, color: "#F0F4F8" }}>{p.value}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function MetricPopup({ report, onClose }) {
-  if (!report) return null;
-  const m = report.metrics || {};
-  const filled = scoreReport(report);
-  return (
-    <div style={{ position: "fixed", inset: 0, zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,.65)", backdropFilter: "blur(4px)" }} onClick={onClose}>
-      <div style={{ background: "#111827", border: "1px solid #1E2D3D", borderRadius: 14, padding: 24, width: 440, maxWidth: "92vw", maxHeight: "80vh", overflowY: "auto", boxShadow: "0 20px 60px rgba(0,0,0,.6)" }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 15, color: "#F0F4F8" }}>{report._memberName}</div>
-            <div style={{ fontSize: 11, color: "#556677" }}>{new Date(report.report_date + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" })}</div>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={{ fontFamily: "monospace", fontWeight: 700, fontSize: 20, color: scoreColor(filled) }}>{filled}/{TOTAL_FIELDS}</span>
-            <button onClick={onClose} style={{ background: "#1A2332", border: "1px solid #1E2D3D", borderRadius: 8, color: "#8899AA", width: 28, height: 28, cursor: "pointer", fontSize: 14 }}>✕</button>
-          </div>
-        </div>
-        {METRIC_GROUPS.map(g => {
-          const gFilled = g.metrics.filter(mk => m[mk.key] && parseInt(m[mk.key]) > 0);
-          return (
-            <div key={g.key} style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: g.color, marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
-                <span>{g.label}</span><span style={{ color: "#556677" }}>{gFilled.length}/{g.metrics.length}</span>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px 12px" }}>
-                {g.metrics.map(mk => {
-                  const val = m[mk.key]; const has = val && parseInt(val) > 0;
-                  return (
-                    <div key={mk.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "3px 0", borderBottom: "1px solid #1E2D3D" }}>
-                      <span style={{ color: has ? "#8899AA" : "#556677" }}>{mk.label}</span>
-                      <span style={{ fontFamily: "monospace", fontWeight: has ? 700 : 400, color: has ? g.color : "#556677" }}>{has ? fmt(val) : "—"}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-        {(report.tasks_completed || report.notes) && (
-          <div style={{ borderTop: "1px solid #1E2D3D", paddingTop: 12, marginTop: 4 }}>
-            {report.tasks_completed && <div style={{ fontSize: 12, color: "#8899AA", marginBottom: 4 }}><span style={{ color: "#556677" }}>Tasks: </span>{report.tasks_completed}</div>}
-            {report.notes && <div style={{ fontSize: 12, color: "#8899AA" }}><span style={{ color: "#556677" }}>Notes: </span>{report.notes}</div>}
-          </div>
-        )}
-      </div>
-    </div>
-  );
+function getRangeDates(range) {
+  const today = new Date(TODAY + 'T12:00:00');
+  if (range.month) {
+    const from = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().split('T')[0];
+    return { from, to: TODAY };
+  }
+  if (range.days === 0) return { from: TODAY, to: TODAY };
+  const from = new Date(today);
+  from.setDate(today.getDate() - range.days + 1);
+  return { from: from.toISOString().split('T')[0], to: TODAY };
 }
 
 export default function OpsPage() {
-  const [members, setMembers] = useState([]);
-  const [reports, setReports] = useState([]);
-  const [tasks,   setTasks]   = useState([]);
-  const [leave,   setLeave]   = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [popup,   setPopup]   = useState(null);
+  const { C } = useTheme();
 
-  const today = todayStr();
-  const [appliedFrom,  setAppliedFrom]  = useState(daysAgo(6));
-  const [appliedTo,    setAppliedTo]    = useState(today);
-  const [inputFrom,    setInputFrom]    = useState(daysAgo(6));
-  const [inputTo,      setInputTo]      = useState(today);
-  const [activePreset, setActivePreset] = useState("This week");
+  const [activeRange, setActiveRange] = useState(1);
+  const [customFrom, setCustomFrom]   = useState('');
+  const [customTo, setCustomTo]       = useState(TODAY);
+  const [useCustom, setUseCustom]     = useState(false);
 
-  const applyRange = useCallback(() => {
-    if (inputFrom && inputTo) { setAppliedFrom(inputFrom); setAppliedTo(inputTo); setActivePreset(null); }
-  }, [inputFrom, inputTo]);
+  const [teamMembers, setTeamMembers]   = useState([]);
+  const [reports, setReports]           = useState([]);
+  const [todayReports, setTodayReports] = useState([]);
+  const [tasks, setTasks]               = useState([]);
+  const [loading, setLoading]           = useState(true);
+  const [expandedRow, setExpandedRow]   = useState(null);
 
-  const applyPreset = (label, from, to) => {
-    setInputFrom(from); setInputTo(to); setAppliedFrom(from); setAppliedTo(to); setActivePreset(label);
-  };
-
-  const presets = [
-    { label: "Today",      from: today,        to: today },
-    { label: "This week",  from: daysAgo(6),   to: today },
-    { label: "2 weeks",    from: daysAgo(13),  to: today },
-    { label: "30 days",    from: daysAgo(29),  to: today },
-    { label: "This month", from: monthStart(), to: today },
-  ];
+  const { from, to } = useCustom && customFrom
+    ? { from: customFrom, to: customTo }
+    : getRangeDates(QUICK_RANGES[activeRange]);
 
   useEffect(() => {
-    async function load() {
-      setLoading(true);
-      try {
-        const [mRes, rRes, tRes, lRes] = await Promise.all([
-          fetch("/api/team"),
-          fetch(`/api/reports?from=${appliedFrom}&to=${appliedTo}&limit=300`),
-          fetch("/api/tasks"),
-          fetch(`/api/leave?from=${today}&to=${today}`),
-        ]);
-        const [mData, rData, tData, lData] = await Promise.all([mRes.json(), rRes.json(), tRes.json(), lRes.json()]);
-        setMembers(mData.data || []);
-        setReports(rData.reports || rData.data || []);
-        setTasks(tData.tasks || []);
-        setLeave(lData.leave || lData.data || []);
-      } catch (e) { console.error(e); }
-      finally { setLoading(false); }
-    }
-    load();
-  }, [appliedFrom, appliedTo]);
+    fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
+    fetch('/api/tasks').then(r => r.json()).then(({ data }) => setTasks(data || []));
+  }, []);
 
-  const todayReports  = reports.filter(r => (r.report_date || r.date) === today);
-  const submittedIds  = new Set(todayReports.map(r => r.team_member_id));
-  const onLeaveIds    = new Set(leave.map(l => l.team_member_id));
-  const teamStatus    = members.map(m => ({
-    ...m,
-    status: onLeaveIds.has(m.id) ? "leave" : submittedIds.has(m.id) ? "submitted" : "pending",
-    report: todayReports.find(r => r.team_member_id === m.id),
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      fetch(`/api/reports?from=${from}&to=${to}&limit=200`).then(r => r.json()),
+      fetch(`/api/reports?date=${TODAY}&limit=50`).then(r => r.json()),
+    ]).then(([range, today]) => {
+      setReports(range.data || []);
+      setTodayReports(today.data || []);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, [from, to]);
+
+  const getMemberScore  = (id, date) => {
+    const r = reports.find(x => String(x.team_member_id) === String(id) && x.report_date === date);
+    if (!r) return null;
+    return Object.values(r.metrics||{}).filter(v => parseInt(v)>0).length;
+  };
+  const getMemberTotal  = (id) => reports.filter(r => String(r.team_member_id) === String(id))
+    .reduce((s,r) => s + Object.values(r.metrics||{}).reduce((a,b) => a+(parseInt(b)||0), 0), 0);
+  const getMemberDays   = (id) => new Set(reports.filter(r => String(r.team_member_id)===String(id)).map(r=>r.report_date)).size;
+  const getTodayReport  = (id) => todayReports.find(r => String(r.team_member_id)===String(id));
+
+  const allDates = [...new Set(reports.map(r => r.report_date))].sort();
+  const chartData = allDates.map(d => ({
+    date: d,
+    fields: reports.filter(r => r.report_date===d)
+      .reduce((s,r) => s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length, 0),
   }));
 
-  const rangeReports = useMemo(() =>
-    reports.filter(r => { const d = r.report_date || r.date || ""; return d >= appliedFrom && d <= appliedTo; }),
-    [reports, appliedFrom, appliedTo]
-  );
-
-  const dates = useMemo(() => {
-    const set = new Set(rangeReports.map(r => r.report_date || r.date).filter(Boolean));
-    return [...set].sort((a, b) => b.localeCompare(a));
-  }, [rangeReports]);
-
-  const memberStats = useMemo(() => {
-    const map = {};
-    for (const m of members) {
-      const myR = rangeReports.filter(r => r.team_member_id === m.id);
-      map[m.id] = {
-        reportsByDate: Object.fromEntries(myR.map(r => [r.report_date || r.date, { ...r, _memberName: m.name }])),
-        totalFilled: myR.reduce((s, r) => s + scoreReport(r), 0),
-        reportCount: myR.length,
-      };
+  const getDaysInRange = () => {
+    const start = new Date(from + 'T12:00:00');
+    const end   = new Date(to   + 'T12:00:00');
+    const diff  = Math.round((end - start) / 86400000);
+    const days  = [];
+    for (let i = 0; i <= Math.min(diff, 13); i++) {
+      const d = new Date(start); d.setDate(start.getDate() + i);
+      if (d.getDay() !== 0 && d.getDay() !== 6) days.push(d.toISOString().split('T')[0]);
     }
-    return map;
-  }, [rangeReports, members]);
+    return days.reverse();
+  };
+  const days = getDaysInRange();
+  const pendingTasks = tasks.filter(t => t.status !== 'done');
 
-  const dailyChart = useMemo(() =>
-    dates.slice().reverse().map(d => ({
-      date: d.slice(5),
-      fields: rangeReports.filter(r => (r.report_date || r.date) === d).reduce((s, r) => s + scoreReport(r), 0),
-    })),
-    [dates, rangeReports]
-  );
-
-  const pendingTasks  = tasks.filter(t => t.status !== "done");
-  const tasksByMember = members.map(m => ({ ...m, tasks: pendingTasks.filter(t => t.assigned_to === m.id) })).filter(m => m.tasks.length > 0);
-  const totalFilled   = Object.values(memberStats).reduce((s, m) => s + m.totalFilled, 0);
-  const submittedToday = teamStatus.filter(m => m.status === "submitted").length;
-
-  const inp   = { background: "#1A2332", border: "1px solid #1E2D3D", borderRadius: 8, padding: "6px 10px", color: "#F0F4F8", fontSize: 11, outline: "none", colorScheme: "dark" };
-  const btnSt = on => ({ background: on ? "#00E5A0" : "transparent", color: on ? "#0B0F1A" : "#8899AA", border: `1px solid ${on ? "#00E5A0" : "#1E2D3D"}`, borderRadius: 8, padding: "5px 11px", fontSize: 11, fontWeight: 600, cursor: "pointer" });
-
-  if (loading) return (
-    <div style={{ marginLeft: 240, background: "#0B0F1A", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Sans',sans-serif" }}>
-      <div style={{ textAlign: "center" }}>
-        <div style={{ width: 48, height: 48, borderRadius: 12, background: "linear-gradient(135deg,#00E5A0,#00B4D8)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 700, color: "#0B0F1A", margin: "0 auto 16px", animation: "pulse 1.5s infinite" }}>C</div>
-        <div style={{ color: "#8899AA", fontSize: 14 }}>Loading ops data...</div>
-      </div>
-    </div>
-  );
+  const cardStyle = {
+    background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20,
+  };
+  const inputStyle = {
+    background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 8,
+    color: C.text, padding: '7px 10px', fontSize: 13, outline: 'none',
+  };
 
   return (
-    <div style={{ marginLeft: 240, background: "#0B0F1A", minHeight: "100vh", color: "#F0F4F8", fontFamily: "'DM Sans',sans-serif" }}>
-      <style>{`
-        @keyframes slideUp { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:none} }
-        @keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:.5} }
-        input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(.7);cursor:pointer}
-        ::-webkit-scrollbar{width:6px;height:6px}
-        ::-webkit-scrollbar-track{background:#0B0F1A}
-        ::-webkit-scrollbar-thumb{background:#1E2D3D;border-radius:3px}
-        .clickable:hover{opacity:.8;cursor:pointer}
-      `}</style>
-
-      {popup && <MetricPopup report={popup} onClose={() => setPopup(null)} />}
+    <div style={{ minHeight:'100vh', background:C.bg, color:C.text, paddingBottom:60, transition:'background 0.2s' }}>
 
       {/* Header */}
-      <div style={{ background: "#111827", borderBottom: "1px solid #1E2D3D", padding: "14px 28px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 50 }}>
+      <div style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:'20px 32px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
         <div>
-          <div style={{ fontSize: 16, fontWeight: 700 }}>Operations Overview</div>
-          <div style={{ fontSize: 10, color: "#556677" }}>Curacel Health Ops · Team performance</div>
+          <h1 style={{ margin:0, fontSize:22, fontWeight:700, color:C.text }}>Operations Overview</h1>
+          <p style={{ margin:'4px 0 0', fontSize:13, color:C.sub }}>Curacel Health Ops · Team performance</p>
         </div>
-        <div style={{ fontSize: 12, color: "#556677" }}>
-          📅 {new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
+        <div style={{ fontSize:13, color:C.sub, background:C.elevated, padding:'8px 14px', borderRadius:8, border:`1px solid ${C.border}` }}>
+          📅 {new Date().toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}
         </div>
       </div>
 
-      <div style={{ padding: "20px 28px" }}>
+      <div style={{ padding:'24px 32px', maxWidth:1160, margin:'0 auto', boxSizing:'border-box' }}>
 
-        {/* ── MEMBER COLUMNS ─────────────────────────────────── */}
-        <div style={{ marginBottom: 24, animation: "slideUp .4s ease both" }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#556677", textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>
-            Today · {new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" })}
+        {/* Today score cards */}
+        <div style={{ marginBottom:8, fontSize:11, fontWeight:600, color:C.muted, letterSpacing:'0.07em' }}>
+          TODAY · {new Date(TODAY+'T12:00:00').toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'short'}).toUpperCase()}
+        </div>
+        <div style={{ display:'grid', gridTemplateColumns:`repeat(${Math.max(teamMembers.length,1)},1fr)`, gap:10, marginBottom:24 }}>
+          {teamMembers.map(m => {
+            const r = getTodayReport(m.id);
+            const score = r ? Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length : null;
+            return (
+              <div key={m.id} style={{ ...cardStyle, padding:'14px 10px', textAlign:'center', borderTop:`3px solid ${r ? (score>=5?C.accent:C.warn) : C.border}` }}>
+                <div style={{ fontSize:13, fontWeight:700, color:C.text, marginBottom:6, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{m.name}</div>
+                {r ? (
+                  <>
+                    <div style={{ fontSize:24, fontWeight:700, color:score>=5?C.accent:C.warn }}>{score}</div>
+                    <div style={{ fontSize:10, color:C.sub }}>fields</div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ color:C.border, fontSize:18, margin:'4px 0' }}>—</div>
+                    <div style={{ fontSize:10, color:C.muted }}>Not submitted</div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Range controls */}
+        <div style={{ ...cardStyle, marginBottom:24, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+          {QUICK_RANGES.map((r,i) => (
+            <button key={r.label} onClick={() => { setActiveRange(i); setUseCustom(false); }} style={{
+              padding:'7px 14px', borderRadius:8, fontSize:13, fontWeight:500, cursor:'pointer',
+              border:`1px solid ${!useCustom&&activeRange===i ? C.accent : C.border}`,
+              background:!useCustom&&activeRange===i ? `${C.accent}18` : 'transparent',
+              color:!useCustom&&activeRange===i ? C.accent : C.sub,
+            }}>{r.label}</button>
+          ))}
+          <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)} style={{ ...inputStyle, marginLeft:8 }} />
+          <span style={{ color:C.muted }}>→</span>
+          <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)} style={inputStyle} />
+          <button onClick={() => setUseCustom(true)} style={{
+            padding:'7px 14px', background:C.accent, color:'#0B0F1A',
+            border:'none', borderRadius:8, fontWeight:700, fontSize:13, cursor:'pointer',
+          }}>Apply</button>
+        </div>
+
+        {/* Stats */}
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:24 }}>
+          {[
+            { val:`${todayReports.length}/${teamMembers.length}`, label:'Submitted today',  color:C.accent },
+            { val:reports.reduce((s,r)=>s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length,0), label:'Total fields (range)', color:C.blue },
+            { val:new Set(reports.map(r=>r.report_date)).size, label:'Days tracked', color:C.purple },
+            { val:pendingTasks.length, label:'Pending tasks', color:pendingTasks.length>0?C.warn:C.success },
+          ].map((s,i) => (
+            <div key={i} style={{ ...cardStyle, textAlign:'center' }}>
+              <div style={{ fontSize:30, fontWeight:700, color:s.color, fontFamily:'monospace' }}>{s.val}</div>
+              <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Chart + Pending */}
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 260px', gap:18, marginBottom:24 }}>
+          <div style={cardStyle}>
+            <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:14 }}>Daily Fields Filled</div>
+            {chartData.length===0 ? (
+              <div style={{ textAlign:'center', padding:40, color:C.muted }}>No data for this range</div>
+            ) : (
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={chartData} margin={{ top:0, right:0, left:-20, bottom:0 }}>
+                  <XAxis dataKey="date" tickFormatter={d => {
+                    const dt = new Date(d+'T12:00:00');
+                    return `${dt.getMonth()+1}-${String(dt.getDate()).padStart(2,'0')}`;
+                  }} tick={{ fontSize:10, fill:C.sub }} />
+                  <YAxis tick={{ fontSize:10, fill:C.sub }} />
+                  <Tooltip contentStyle={{ background:C.elevated, border:`1px solid ${C.border}`, borderRadius:8, fontSize:12 }} labelFormatter={d => fmtDay(d)} />
+                  <Bar dataKey="fields" radius={[4,4,0,0]}>
+                    {chartData.map((_,i) => <Cell key={i} fill={C.accent} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(members.length, 6)}, 1fr)`, gap: 10 }}>
-            {teamStatus.map(m => {
-              const filled = m.report ? scoreReport(m.report) : null;
-              const col = filled !== null ? scoreColor(filled) : (m.status === "leave" ? "#FFB84D" : "#556677");
+          <div style={{ ...cardStyle, overflowY:'auto', maxHeight:270 }}>
+            <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:12 }}>Pending Tasks</div>
+            {pendingTasks.length===0 ? (
+              <div style={{ textAlign:'center', padding:20 }}>
+                <div style={{ fontSize:20, marginBottom:6 }}>🎉</div>
+                <div style={{ fontSize:12, color:C.sub }}>All clear</div>
+              </div>
+            ) : pendingTasks.slice(0,8).map(t => (
+              <div key={t.id} style={{ borderBottom:`1px solid ${C.border}`, paddingBottom:8, marginBottom:8 }}>
+                <div style={{ fontSize:12, fontWeight:600, color:C.text }}>{t.title}</div>
+                <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>
+                  {t.priority && <span style={{ color:t.priority==='high'?C.danger:t.priority==='medium'?C.warn:C.sub }}>● {t.priority}</span>}
+                  {t.due_date && <span style={{ marginLeft:6 }}>Due {t.due_date}</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Range summary + Daily breakdown */}
+        <div style={{ display:'grid', gridTemplateColumns:'200px 1fr', gap:18 }}>
+          <div style={cardStyle}>
+            <div style={{ fontSize:11, fontWeight:600, color:C.muted, letterSpacing:'0.07em', marginBottom:12 }}>RANGE SUMMARY</div>
+            {teamMembers.map(m => {
+              const total = getMemberTotal(m.id);
+              const dCount = getMemberDays(m.id);
               return (
-                <div key={m.id} className={m.report ? "clickable" : ""} onClick={() => m.report && setPopup({ ...m.report, _memberName: m.name })}
-                  style={{ background: "#111827", border: "1px solid #1E2D3D", borderTop: `3px solid ${col}`, borderRadius: 12, padding: "16px 14px", textAlign: "center" }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: "#F0F4F8" }}>{m.name}</div>
-                  {filled !== null ? (
-                    <>
-                      <div style={{ fontSize: 28, fontWeight: 700, fontFamily: "monospace", color: col, lineHeight: 1 }}>{filled}</div>
-                      <div style={{ fontSize: 10, color: "#556677", marginTop: 3 }}>of {TOTAL_FIELDS} fields</div>
-                      <div style={{ marginTop: 10, background: scoreBg(filled), borderRadius: 6, padding: "3px 8px", display: "inline-block" }}>
-                        <span style={{ fontSize: 10, fontWeight: 600, color: col }}>{filled >= 5 ? "✓ On track" : "⚠ Needs attention"}</span>
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <div style={{ fontSize: 24, color: "#556677", lineHeight: 1, marginBottom: 4 }}>{m.status === "leave" ? "⏸" : "—"}</div>
-                      <div style={{ fontSize: 10, color: "#556677" }}>{m.status === "leave" ? "On leave" : "Not submitted"}</div>
-                    </>
-                  )}
+                <div key={m.id} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'7px 0', borderBottom:`1px solid ${C.border}` }}>
+                  <span style={{ fontSize:12, color:C.text }}>{m.name}</span>
+                  <span style={{ fontSize:12, color:total>0?C.accent:C.muted, fontWeight:600 }}>
+                    {total>0 ? total : '—'}
+                    {dCount>0 && <span style={{ fontSize:10, color:C.muted, marginLeft:4 }}>({dCount}d)</span>}
+                  </span>
                 </div>
               );
             })}
           </div>
-        </div>
 
-        {/* ── MAIN: Table + Tasks sidebar ────────────────────── */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 272px", gap: 16, animation: "slideUp .4s ease .1s both" }}>
-
-          {/* LEFT */}
-          <div>
-            {/* Controls */}
-            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 14 }}>
-              {presets.map(p => (
-                <button key={p.label} onClick={() => applyPreset(p.label, p.from, p.to)} style={btnSt(activePreset === p.label)}>{p.label}</button>
-              ))}
-              <div style={{ width: 1, height: 20, background: "#1E2D3D" }}/>
-              <input type="date" value={inputFrom} onChange={e => setInputFrom(e.target.value)} onBlur={applyRange} style={inp}/>
-              <span style={{ fontSize: 11, color: "#556677" }}>→</span>
-              <input type="date" value={inputTo} onChange={e => setInputTo(e.target.value)} onBlur={applyRange} style={inp}/>
-              <button onClick={applyRange} style={{ ...btnSt(false), background: "#00B87D", color: "#0B0F1A", border: "none" }}>Apply</button>
-            </div>
-
-            {/* Summary pills */}
-            <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-              {[
-                { label: "Submitted today", value: `${submittedToday}/${members.length}`, color: "#34D399" },
-                { label: "Total fields (range)", value: fmt(totalFilled), color: "#00E5A0" },
-                { label: "Days tracked", value: dates.length, color: "#5B8DEF" },
-                { label: "Pending tasks", value: pendingTasks.length, color: pendingTasks.length > 0 ? "#FFB84D" : "#556677" },
-              ].map(s => (
-                <div key={s.label} style={{ background: "#111827", border: "1px solid #1E2D3D", borderRadius: 10, padding: "10px 16px", display: "flex", gap: 10, alignItems: "center" }}>
-                  <span style={{ fontSize: 20, fontWeight: 700, fontFamily: "monospace", color: s.color }}>{s.value}</span>
-                  <span style={{ fontSize: 11, color: "#556677" }}>{s.label}</span>
-                </div>
-              ))}
-            </div>
-
-            {/* Chart */}
-            {dailyChart.length > 1 && (
-              <div style={{ background: "#111827", border: "1px solid #1E2D3D", borderRadius: 12, padding: 20, marginBottom: 14 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: "#F0F4F8" }}>Daily Fields Filled</div>
-                <ResponsiveContainer width="100%" height={150}>
-                  <BarChart data={dailyChart}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1E2D3D" vertical={false}/>
-                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: "#556677" }}/>
-                    <YAxis tick={{ fontSize: 10, fill: "#556677" }}/>
-                    <Tooltip content={<Tip/>}/>
-                    <Bar dataKey="fields" fill="#00E5A0" radius={[4,4,0,0]} name="Fields"/>
-                  </BarChart>
-                </ResponsiveContainer>
+          <div style={{ ...cardStyle, overflowX:'auto' }}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14, flexWrap:'wrap', gap:8 }}>
+              <div style={{ fontSize:13, fontWeight:600, color:C.text }}>
+                Daily Breakdown
+                <span style={{ fontSize:11, fontWeight:400, color:C.sub, marginLeft:8 }}>· Click any score to expand</span>
               </div>
-            )}
-
-            {/* Breakdown table */}
-            <div style={{ background: "#111827", border: "1px solid #1E2D3D", borderRadius: 12, overflow: "hidden" }}>
-              <div style={{ padding: "12px 18px", borderBottom: "1px solid #1E2D3D", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>Daily Breakdown · Click any score to expand</div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <span style={{ background: "#34D39922", color: "#34D399", padding: "2px 8px", borderRadius: 4, fontSize: 10 }}>≥5 on track</span>
-                  <span style={{ background: "#FF5C5C22", color: "#FF5C5C", padding: "2px 8px", borderRadius: 4, fontSize: 10 }}>{"<5 attention"}</span>
-                </div>
+              <div style={{ display:'flex', gap:8 }}>
+                <span style={{ fontSize:11, background:`${C.accent}20`, color:C.accent, padding:'3px 10px', borderRadius:20 }}>≥5 on track</span>
+                <span style={{ fontSize:11, background:`${C.danger}20`, color:C.danger, padding:'3px 10px', borderRadius:20 }}>&lt;5 attention</span>
               </div>
-              {dates.length === 0 ? (
-                <div style={{ padding: "40px 20px", textAlign: "center", color: "#556677", fontSize: 13 }}>No submissions in this range</div>
-              ) : (
-                <div style={{ overflowX: "auto" }}>
-                  <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
-                    <thead>
-                      <tr>
-                        <th style={{ position: "sticky", left: 0, background: "#1A2332", padding: "10px 16px", textAlign: "left", borderBottom: "1px solid #1E2D3D", color: "#8899AA", fontWeight: 600, minWidth: 120 }}>Date</th>
-                        {members.map(m => (
-                          <th key={m.id} style={{ background: "#1A2332", padding: "10px 14px", textAlign: "center", borderBottom: "1px solid #1E2D3D", color: "#8899AA", fontWeight: 500, minWidth: 100, fontSize: 11, whiteSpace: "nowrap" }}>{m.name}</th>
-                        ))}
-                        <th style={{ position: "sticky", right: 0, background: "#1A2332", padding: "10px 14px", textAlign: "center", borderBottom: "1px solid #1E2D3D", color: "#00E5A0", fontWeight: 700 }}>Team</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {dates.map((d, idx) => {
-                        const dayReports = rangeReports.filter(r => (r.report_date || r.date) === d);
-                        const dayTotal = dayReports.reduce((s, r) => s + scoreReport(r), 0);
+            </div>
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign:'left', padding:'8px 12px', color:C.sub, fontWeight:600, borderBottom:`1px solid ${C.border}` }}>Date</th>
+                  {teamMembers.map(m => (
+                    <th key={m.id} style={{ textAlign:'center', padding:'8px 8px', color:C.sub, fontWeight:600, borderBottom:`1px solid ${C.border}` }}>{m.name}</th>
+                  ))}
+                  <th style={{ textAlign:'center', padding:'8px 8px', color:C.accent, fontWeight:700, borderBottom:`1px solid ${C.border}` }}>Team</th>
+                </tr>
+              </thead>
+              <tbody>
+                {days.map(d => {
+                  const isToday = d === TODAY;
+                  const dayReports = reports.filter(r => r.report_date===d);
+                  const teamTotal  = dayReports.reduce((s,r)=>s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length,0);
+                  return [
+                    <tr key={d} style={{ background:isToday?`${C.accent}08`:'transparent' }}>
+                      <td style={{ padding:'9px 12px', borderBottom:`1px solid ${C.border}`, color:isToday?C.accent:C.text, fontWeight:isToday?700:400, whiteSpace:'nowrap' }}>
+                        {fmtDay(d)}
+                      </td>
+                      {teamMembers.map(m => {
+                        const score = getMemberScore(m.id, d);
+                        const key = `${m.id}-${d}`;
                         return (
-                          <tr key={d} style={{ background: idx % 2 ? "#1A233288" : "transparent" }}>
-                            <td style={{ position: "sticky", left: 0, background: idx % 2 ? "#1A2332" : "#111827", padding: "10px 16px", color: "#F0F4F8", fontWeight: 500, borderBottom: "1px solid #1E2D3D", whiteSpace: "nowrap" }}>
-                              {new Date(d + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}
-                            </td>
-                            {members.map(m => {
-                              const report = memberStats[m.id]?.reportsByDate?.[d] || null;
-                              const f = report ? scoreReport(report) : null;
-                              return (
-                                <td key={m.id} className={report ? "clickable" : ""} onClick={() => report && setPopup(report)}
-                                  style={{ padding: "10px 14px", textAlign: "center", borderBottom: "1px solid #1E2D3D" }}>
-                                  {f !== null ? (
-                                    <span style={{ background: scoreBg(f), color: scoreColor(f), fontFamily: "monospace", fontWeight: 700, fontSize: 14, padding: "3px 10px", borderRadius: 6, display: "inline-block" }}>{f}</span>
-                                  ) : <span style={{ color: "#556677" }}>—</span>}
-                                </td>
-                              );
-                            })}
-                            <td style={{ position: "sticky", right: 0, background: idx % 2 ? "#1A2332" : "#111827", padding: "10px 14px", textAlign: "center", fontFamily: "monospace", fontWeight: 700, color: "#00E5A0", borderBottom: "1px solid #1E2D3D" }}>{dayTotal}</td>
-                          </tr>
+                          <td key={m.id} style={{ textAlign:'center', padding:'9px 6px', borderBottom:`1px solid ${C.border}`, cursor:score!==null?'pointer':'default' }}
+                            onClick={() => score!==null && setExpandedRow(expandedRow===key?null:key)}>
+                            {score===null ? <span style={{ color:C.muted }}>—</span> : (
+                              <span style={{
+                                display:'inline-block', minWidth:26, padding:'2px 6px', borderRadius:6,
+                                fontWeight:700, background:score>=5?`${C.accent}20`:`${C.danger}20`,
+                                color:score>=5?C.accent:C.danger,
+                              }}>{score}</span>
+                            )}
+                          </td>
                         );
                       })}
-                      <tr style={{ background: "#00E5A011" }}>
-                        <td style={{ position: "sticky", left: 0, background: "#00E5A01A", padding: "11px 16px", fontWeight: 700, color: "#00E5A0", borderTop: "2px solid #00E5A044" }}>TOTAL</td>
-                        {members.map(m => {
-                          const ms = memberStats[m.id];
-                          return (
-                            <td key={m.id} style={{ padding: "11px 14px", textAlign: "center", borderTop: "2px solid #00E5A044", fontFamily: "monospace", fontWeight: 700, color: "#00E5A0", fontSize: 13 }}>
-                              {ms?.totalFilled || "—"}{ms?.reportCount > 0 && <span style={{ color: "#556677", fontWeight: 400, fontSize: 10 }}> ({ms.reportCount}d)</span>}
-                            </td>
-                          );
-                        })}
-                        <td style={{ position: "sticky", right: 0, background: "#00E5A01A", padding: "11px 14px", textAlign: "center", fontFamily: "monospace", fontWeight: 700, color: "#00E5A0", fontSize: 14, borderTop: "2px solid #00E5A044" }}>{totalFilled}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* RIGHT: Tasks sidebar */}
-          <div>
-            <div style={{ background: "#111827", border: "1px solid #1E2D3D", borderRadius: 12, overflow: "hidden", position: "sticky", top: 76 }}>
-              <div style={{ padding: "12px 16px", borderBottom: "1px solid #1E2D3D", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>Pending Tasks</div>
-                {pendingTasks.length > 0 && <span style={{ background: "#FFB84D22", color: "#FFB84D", border: "1px solid #FFB84D44", borderRadius: 20, padding: "2px 9px", fontSize: 11, fontWeight: 600 }}>{pendingTasks.length}</span>}
-              </div>
-              {tasksByMember.length === 0 ? (
-                <div style={{ padding: "28px 16px", textAlign: "center", color: "#556677", fontSize: 12 }}>🎉 All clear</div>
-              ) : (
-                <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
-                  {tasksByMember.map(m => (
-                    <div key={m.id} style={{ padding: "10px 14px", borderBottom: "1px solid #1E2D3D" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                        <span style={{ fontSize: 12, fontWeight: 600 }}>{m.name}</span>
-                        <span style={{ fontSize: 10, color: "#556677" }}>{m.tasks.length}</span>
-                      </div>
-                      {m.tasks.map(t => (
-                        <div key={t.id} style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 4 }}>
-                          <span style={{ fontSize: 10, color: t.status === "in_progress" ? "#5B8DEF" : "#556677", marginTop: 2, flexShrink: 0 }}>{t.status === "in_progress" ? "◑" : "○"}</span>
-                          <span style={{ fontSize: 11, color: "#8899AA", flex: 1, lineHeight: 1.4 }}>{t.title}</span>
-                          <span style={{ fontSize: 9, flexShrink: 0 }}>{t.priority === "high" ? "🔴" : t.priority === "medium" ? "🟡" : "🟢"}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {/* Range totals at bottom */}
-              <div style={{ padding: "10px 14px", borderTop: "1px solid #1E2D3D", background: "#1A2332" }}>
-                <div style={{ fontSize: 10, color: "#556677", marginBottom: 6, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Range Summary</div>
-                {members.map(m => {
-                  const ms = memberStats[m.id];
-                  const total = ms?.totalFilled || 0; const days = ms?.reportCount || 0;
-                  return (
-                    <div key={m.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "2px 0" }}>
-                      <span style={{ color: "#8899AA" }}>{m.name}</span>
-                      <span style={{ fontFamily: "monospace", color: total > 0 ? "#00E5A0" : "#556677", fontWeight: 600 }}>{total}<span style={{ color: "#556677", fontWeight: 400 }}> ({days}d)</span></span>
-                    </div>
-                  );
+                      <td style={{ textAlign:'center', padding:'9px 6px', borderBottom:`1px solid ${C.border}` }}>
+                        <span style={{ fontWeight:700, color:teamTotal>0?C.accent:C.muted }}>{teamTotal>0?teamTotal:'—'}</span>
+                      </td>
+                    </tr>,
+                    ...teamMembers.map(m => {
+                      const key = `${m.id}-${d}`;
+                      if (expandedRow !== key) return null;
+                      const r = reports.find(x => String(x.team_member_id)===String(m.id) && x.report_date===d);
+                      if (!r) return null;
+                      return (
+                        <tr key={`${key}-exp`}>
+                          <td colSpan={teamMembers.length+2} style={{ background:`${C.accent}06`, padding:'10px 16px', borderBottom:`1px solid ${C.border}` }}>
+                            <div style={{ fontSize:12, fontWeight:600, color:C.accent, marginBottom:6 }}>{m.name} · {fmtDay(d)}</div>
+                            <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
+                              {Object.entries(r.metrics||{}).filter(([,v])=>parseInt(v)>0).map(([key,val]) => (
+                                <span key={key} style={{ background:C.elevated, border:`1px solid ${C.border}`, borderRadius:6, padding:'3px 8px', fontSize:11 }}>
+                                  <span style={{ color:C.sub }}>{METRIC_LABELS[key]||key}: </span>
+                                  <span style={{ color:C.text, fontWeight:600 }}>{val}</span>
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    }).filter(Boolean),
+                  ];
                 })}
-              </div>
-            </div>
+                <tr style={{ background:`${C.accent}10` }}>
+                  <td style={{ padding:'10px 12px', fontWeight:700, color:C.accent, fontSize:13 }}>TOTAL</td>
+                  {teamMembers.map(m => {
+                    const total = getMemberTotal(m.id);
+                    const dCount = getMemberDays(m.id);
+                    return (
+                      <td key={m.id} style={{ textAlign:'center', padding:'10px 6px' }}>
+                        {total>0 ? (
+                          <span style={{ color:C.accent, fontWeight:700 }}>
+                            {total} <span style={{ fontSize:10, color:C.muted }}>({dCount}d)</span>
+                          </span>
+                        ) : <span style={{ color:C.muted }}>—</span>}
+                      </td>
+                    );
+                  })}
+                  <td style={{ textAlign:'center', padding:'10px 6px' }}>
+                    <span style={{ fontWeight:700, color:C.accent }}>
+                      {reports.reduce((s,r)=>s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length,0)}
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>

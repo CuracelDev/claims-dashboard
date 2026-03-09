@@ -1,41 +1,24 @@
 'use client';
 import { useState, useEffect } from 'react';
+import { useTheme } from '@/app/context/ThemeContext';
 
-const C = {
-  accent: "#00E5A0", accentDim: "#00B87D",
-  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C", warn: "#FFB84D", success: "#34D399",
-  blue: "#5B8DEF", purple: "#A78BFA",
+const METRIC_LABELS = {
+  providers_mapped: 'Providers Mapped', care_items_mapped: 'Care Items Mapped',
+  care_items_grouped: 'Care Items Grouped', resolved_cares: 'Resolved Cares',
+  claims_kenya: 'Kenya', claims_tanzania: 'Tanzania', claims_uganda: 'Uganda',
+  claims_uap: 'UAP Old Mutual', claims_defmis: 'Defmis', claims_hadiel: 'Hadiel Tech', claims_axa: 'AXA',
+  auto_pa_reviewed: 'Auto PA Reviewed', flagged_care_items: 'Flagged Care Items',
+  icd10_adjusted: 'ICD10 Adjusted', benefits_set_up: 'Benefits Set Up',
+  providers_assigned: 'Providers Assigned',
 };
 
-const METRIC_GROUPS = [
-  { key: "claims_piles", label: "Claims Piles", color: C.purple, metrics: [
-    { key: "claims_kenya", label: "Kenya" }, { key: "claims_tanzania", label: "Tanzania" },
-    { key: "claims_uganda", label: "Uganda" }, { key: "claims_uap", label: "UAP Old Mutual" },
-    { key: "claims_defmis", label: "Defmis" }, { key: "claims_hadiel", label: "Hadiel Tech" },
-    { key: "claims_axa", label: "AXA" },
-  ]},
-  { key: "mapping_data", label: "Mapping & Data", color: C.blue, metrics: [
-    { key: "providers_mapped", label: "Providers Mapped" }, { key: "care_items_mapped", label: "Care Items Mapped" },
-    { key: "care_items_grouped", label: "Care Items Grouped" }, { key: "resolved_cares", label: "Resolved Cares" },
-  ]},
-  { key: "quality_review", label: "Quality & Review", color: C.accent, metrics: [
-    { key: "auto_pa_reviewed", label: "Auto PA Reviewed" }, { key: "flagged_care_items", label: "Flagged Care Items" },
-    { key: "icd10_adjusted", label: "ICD10 Adjusted" }, { key: "benefits_set_up", label: "Benefits Set Up" },
-    { key: "providers_assigned", label: "Providers Assigned" },
-  ]},
-];
+const METRIC_GROUPS = {
+  'Claims Piles': ['claims_kenya','claims_tanzania','claims_uganda','claims_uap','claims_defmis','claims_hadiel','claims_axa'],
+  'Mapping & Data': ['providers_mapped','care_items_mapped','care_items_grouped','resolved_cares'],
+  'Quality & Review': ['auto_pa_reviewed','flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned'],
+};
 
-const ALL_KEYS = METRIC_GROUPS.flatMap(g => g.metrics.map(m => m.key));
-const TOTAL_FIELDS = ALL_KEYS.length;
-
-function scoreReport(report) {
-  const m = report?.metrics || {};
-  return ALL_KEYS.filter(k => m[k] && parseInt(m[k]) > 0).length;
-}
-const scoreColor = f => !f ? C.muted : f >= 5 ? C.success : C.danger;
-const fmt = n => (n ?? 0).toLocaleString();
+const MEDALS = ['🥇','🥈','🥉'];
 
 function getWeekRange(dateStr) {
   const d = new Date(dateStr + 'T12:00:00');
@@ -44,278 +27,469 @@ function getWeekRange(dateStr) {
   const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
   return [mon.toISOString().split('T')[0], sun.toISOString().split('T')[0]];
 }
-const fmtDate = d => new Date(d + 'T12:00:00').toLocaleDateString('en-GB', { month: 'short', day: 'numeric' });
+
+const fmt = d => new Date(d + 'T12:00:00').toLocaleDateString('en-GB', { month: 'short', day: 'numeric' });
+const fmtFull = d => new Date(d + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', month: 'short', day: 'numeric' });
+
+function exportCSV(data, from, to) {
+  if (!data?.by_person?.length) return;
+  const allKeys = [...new Set(data.by_person.flatMap(p => Object.keys(p.totals)))];
+  const headers = ['Name', 'Role', 'Days Reported', 'Total Output', ...allKeys.map(k => METRIC_LABELS[k] || k)];
+  const rows = data.by_person.map(p => [
+    p.person?.name || '', p.person?.role || '', p.days_reported, p.total_output,
+    ...allKeys.map(k => p.totals[k] || 0),
+  ]);
+  rows.push(['TEAM TOTAL', '', data.by_person.reduce((a,p) => a + p.days_reported, 0),
+    data.by_person.reduce((a,p) => a + p.total_output, 0),
+    ...allKeys.map(k => data.team_totals[k] || 0)]);
+  const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url;
+  a.download = `weekly-summary-${from}-${to}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
 
 export default function WeeklyPage() {
+  const { C } = useTheme();
   const today = new Date().toISOString().split('T')[0];
+
+  // View mode: 'week' | 'custom'
+  const [mode, setMode] = useState('week');
   const [selectedDate, setSelectedDate] = useState(today);
-  const [members, setMembers] = useState([]);
-  const [reports, setReports] = useState([]);
-  const [tasks, setTasks]     = useState([]);
-  const [leave, setLeave]     = useState([]);
+  const [customFrom, setCustomFrom] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() - 30);
+    return d.toISOString().split('T')[0];
+  });
+  const [customTo, setCustomTo] = useState(today);
+  const [activeFrom, setActiveFrom] = useState('');
+  const [activeTo, setActiveTo]   = useState('');
+
+  const [data, setData]       = useState(null);
   const [loading, setLoading] = useState(false);
-  const [expandedMember, setExpandedMember] = useState(null);
+  const [error, setError]     = useState(null);
+  const [expandedRow, setExpandedRow] = useState(null);
 
-  const [from, to] = getWeekRange(selectedDate);
+  // Compute the active range
+  const weekRange = getWeekRange(selectedDate);
+  const from = mode === 'week' ? weekRange[0] : activeFrom || customFrom;
+  const to   = mode === 'week' ? weekRange[1] : activeTo   || customTo;
 
+  // Fetch when from/to change
   useEffect(() => {
-    setLoading(true);
-    Promise.all([
-      fetch('/api/team').then(r => r.json()),
-      fetch(`/api/reports?from=${from}&to=${to}&limit=200`).then(r => r.json()),
-      fetch('/api/tasks').then(r => r.json()),
-      fetch(`/api/leave?from=${from}&to=${to}`).then(r => r.json()),
-    ]).then(([mData, rData, tData, lData]) => {
-      setMembers(mData.data || []);
-      setReports(rData.reports || rData.data || []);
-      setTasks(tData.tasks || []);
-      setLeave(lData.leave || lData.data || []);
-    }).catch(console.error).finally(() => setLoading(false));
+    if (!from || !to) return;
+    setLoading(true); setError(null);
+    fetch(`/api/reports/weekly?from=${from}&to=${to}`)
+      .then(r => r.json())
+      .then(d => { if (d.error) throw new Error(d.error); setData(d); })
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
   }, [from, to]);
 
-  // Build weekdays Mon–Fri
-  const weekDays = [];
-  const monDate = new Date(from + 'T12:00:00');
-  for (let i = 0; i < 5; i++) {
-    const d = new Date(monDate); d.setDate(monDate.getDate() + i);
-    weekDays.push(d.toISOString().split('T')[0]);
-  }
+  // Sync week mode immediately when date changes
+  useEffect(() => {
+    if (mode === 'week') { /* useEffect above handles it via from/to */ }
+  }, [selectedDate, mode]);
 
-  // Per-member data
-  const memberData = members.map(m => {
-    const myReports = reports.filter(r => r.team_member_id === m.id);
-    const myLeave   = leave.filter(l => l.team_member_id === m.id);
-    const myTasks   = tasks.filter(t => t.assigned_to === m.id);
-    const doneTasks = myTasks.filter(t => t.status === 'done');
-    const pendTasks = myTasks.filter(t => t.status !== 'done');
+  const applyCustom = () => {
+    setActiveFrom(customFrom);
+    setActiveTo(customTo);
+  };
 
-    const reportByDay = Object.fromEntries(myReports.map(r => [r.report_date || r.date, r]));
-    const leaveByDay  = Object.fromEntries(myLeave.map(l => [l.start_date || l.date, l]));
+  // Styles derived from theme
+  const cardStyle = {
+    background: C.card, border: `1px solid ${C.border}`,
+    borderRadius: 12, padding: 20, marginBottom: 16,
+  };
+  const inputStyle = {
+    background: C.inputBg, border: `1px solid ${C.border}`,
+    borderRadius: 8, color: C.text, padding: '8px 12px',
+    fontSize: 13, outline: 'none',
+  };
 
-    const totalFilled = myReports.reduce((s, r) => s + scoreReport(r), 0);
-    const daysReported = myReports.length;
-    const metricTotals = {};
-    for (const k of ALL_KEYS) {
-      const total = myReports.reduce((s, r) => s + (parseInt(r.metrics?.[k]) || 0), 0);
-      if (total > 0) metricTotals[k] = total;
+  // Days in range for grid header (week mode: Mon-Fri, custom mode: show days)
+  const getDaysInRange = () => {
+    if (mode === 'week') {
+      const days = [];
+      const start = new Date(from + 'T12:00:00');
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(start); d.setDate(start.getDate() + i);
+        days.push(d.toISOString().split('T')[0]);
+      }
+      return days.filter(d => {
+        const day = new Date(d + 'T12:00:00').getDay();
+        return day !== 0 && day !== 6;
+      });
     }
+    // Custom: show up to 14 days, or aggregate if longer
+    const start = new Date(from + 'T12:00:00');
+    const end = new Date(to + 'T12:00:00');
+    const diff = Math.round((end - start) / 86400000);
+    if (diff <= 14) {
+      const days = [];
+      for (let i = 0; i <= diff; i++) {
+        const d = new Date(start); d.setDate(start.getDate() + i);
+        const dow = d.getDay();
+        if (dow !== 0 && dow !== 6) days.push(d.toISOString().split('T')[0]);
+      }
+      return days;
+    }
+    return null; // null = show aggregated view, not daily grid
+  };
 
-    return { ...m, reportByDay, leaveByDay, totalFilled, daysReported, metricTotals, doneTasks, pendTasks };
-  });
+  const days = getDaysInRange();
+  const showGrid = !!days;
 
-  // Team totals
-  const teamTotals = {};
-  for (const k of ALL_KEYS) {
-    teamTotals[k] = memberData.reduce((s, m) => s + (m.metricTotals[k] || 0), 0);
-  }
-  const teamTotalFields = memberData.reduce((s, m) => s + m.totalFilled, 0);
+  const getDayReport = (personId, dayStr) => {
+    if (!data?.daily_breakdown) return null;
+    return data.daily_breakdown?.find(r =>
+      String(r.team_member_id) === String(personId) && r.report_date === dayStr
+    ) || null;
+  };
 
-  const inp = { background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, padding: '7px 12px', fontSize: 12, outline: 'none', colorScheme: 'dark' };
-
-  function exportCSV() {
-    const headers = ['Member', 'Days Reported', 'Total Fields', ...ALL_KEYS];
-    const rows = memberData.map(m => [m.name, m.daysReported, m.totalFilled, ...ALL_KEYS.map(k => m.metricTotals[k] || 0)]);
-    rows.push(['TEAM TOTAL', memberData.reduce((s,m) => s+m.daysReported,0), teamTotalFields, ...ALL_KEYS.map(k => teamTotals[k] || 0)]);
-    const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
-    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
-    a.download = `weekly-${from}-${to}.csv`; a.click();
-  }
+  const getScore = (report) => {
+    if (!report) return null;
+    return Object.values(report.metrics || {}).filter(v => parseInt(v) > 0).length;
+  };
 
   return (
-    <div style={{ marginLeft: 240, background: C.bg, minHeight: '100vh', color: C.text, fontFamily: "'DM Sans',sans-serif" }}>
-      <style>{`
-        @keyframes slideUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-        input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(.7);cursor:pointer}
-        ::-webkit-scrollbar{width:6px;height:6px}
-        ::-webkit-scrollbar-track{background:${C.bg}}
-        ::-webkit-scrollbar-thumb{background:${C.border};border-radius:3px}
-        .member-row:hover{background:#1A233299!important;cursor:pointer}
-      `}</style>
-
+    <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60, transition: 'background 0.2s' }}>
       {/* Header */}
-      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '14px 28px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', position: 'sticky', top: 0, zIndex: 50 }}>
-        <div>
-          <div style={{ fontSize: 16, fontWeight: 700 }}>Weekly Summary</div>
-          <div style={{ fontSize: 10, color: C.muted }}>Team performance aggregated by week</div>
-        </div>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-          <input type="date" value={selectedDate} onChange={e => setSelectedDate(e.target.value)} style={inp}/>
-          <span style={{ fontSize: 12, color: C.accent, fontWeight: 600 }}>{fmtDate(from)} – {fmtDate(to)}</span>
-          <button onClick={exportCSV} style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, color: C.accent, padding: '7px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>⬇ CSV</button>
-        </div>
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 32px' }}>
+        <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: C.text }}>Weekly Summary</h1>
+        <p style={{ margin: '4px 0 0', fontSize: 13, color: C.sub }}>Team performance aggregated by period</p>
       </div>
 
-      {loading ? (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 80 }}>
-          <div style={{ color: C.sub, fontSize: 14 }}>Loading...</div>
-        </div>
-      ) : (
-        <div style={{ padding: '20px 28px' }}>
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 32px' }}>
 
-          {/* ── WEEK AT A GLANCE GRID ─────────────────────────── */}
-          <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 12 }}>
-            Week at a Glance · {fmtDate(from)} – {fmtDate(to)}
+        {/* ── Controls ── */}
+        <div style={{ ...cardStyle, marginBottom: 20 }}>
+          {/* Mode toggle */}
+          <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+            {[['week','📅 Weekly'], ['custom','📊 Custom Range']].map(([m, label]) => (
+              <button key={m} onClick={() => setMode(m)} style={{
+                padding: '7px 16px', borderRadius: 8, fontSize: 13, fontWeight: 500,
+                border: `1px solid ${mode === m ? C.accent : C.border}`,
+                background: mode === m ? `${C.accent}18` : 'transparent',
+                color: mode === m ? C.accent : C.sub, cursor: 'pointer',
+              }}>{label}</button>
+            ))}
           </div>
 
-          {/* Day headers row */}
-          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden', marginBottom: 16, animation: 'slideUp .4s ease both' }}>
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 12 }}>
-                <thead>
-                  <tr>
-                    <th style={{ background: C.elevated, padding: '10px 16px', textAlign: 'left', borderBottom: `1px solid ${C.border}`, color: C.sub, fontWeight: 600, minWidth: 130, position: 'sticky', left: 0 }}>Member</th>
-                    {weekDays.map(d => {
-                      const isToday = d === new Date().toISOString().split('T')[0];
-                      return (
-                        <th key={d} style={{ background: isToday ? `${C.accent}15` : C.elevated, padding: '10px 14px', textAlign: 'center', borderBottom: `1px solid ${C.border}`, color: isToday ? C.accent : C.sub, fontWeight: isToday ? 700 : 500, minWidth: 110, fontSize: 11 }}>
-                          {new Date(d + 'T12:00:00Z').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })}
-                          {isToday && <div style={{ fontSize: 9, color: C.accent }}>TODAY</div>}
-                        </th>
-                      );
-                    })}
-                    <th style={{ background: C.elevated, padding: '10px 14px', textAlign: 'center', borderBottom: `1px solid ${C.border}`, color: C.accent, fontWeight: 700, minWidth: 80 }}>Total</th>
-                    <th style={{ background: C.elevated, padding: '10px 14px', textAlign: 'center', borderBottom: `1px solid ${C.border}`, color: C.warn, fontWeight: 600, minWidth: 90, fontSize: 11 }}>Tasks</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {memberData.map((m, idx) => (
-                    <>
-                      <tr key={m.id} className="member-row" onClick={() => setExpandedMember(expandedMember === m.id ? null : m.id)}
-                        style={{ background: idx % 2 ? `${C.elevated}55` : 'transparent', transition: 'background .15s' }}>
-                        <td style={{ position: 'sticky', left: 0, background: idx % 2 ? C.elevated : C.card, padding: '12px 16px', fontWeight: 600, color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <span>{m.name}</span>
-                            <span style={{ fontSize: 10, color: C.muted }}>{expandedMember === m.id ? '▲' : '▼'}</span>
-                          </div>
-                        </td>
-                        {weekDays.map(d => {
-                          const report = m.reportByDay[d];
-                          const isLeave = m.leaveByDay[d];
-                          const filled = report ? scoreReport(report) : null;
-                          return (
-                            <td key={d} style={{ padding: '12px 14px', textAlign: 'center', borderBottom: `1px solid ${C.border}` }}>
-                              {isLeave ? (
-                                <span style={{ fontSize: 10, color: C.warn, background: `${C.warn}22`, padding: '3px 8px', borderRadius: 4 }}>Off</span>
-                              ) : filled !== null ? (
-                                <span style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 14, color: scoreColor(filled), background: filled >= 5 ? `${C.success}22` : `${C.danger}22`, padding: '3px 10px', borderRadius: 6, display: 'inline-block' }}>{filled}</span>
-                              ) : (
-                                <span style={{ color: C.muted, fontSize: 13 }}>—</span>
-                              )}
-                            </td>
-                          );
-                        })}
-                        <td style={{ padding: '12px 14px', textAlign: 'center', borderBottom: `1px solid ${C.border}`, fontFamily: 'monospace', fontWeight: 700, color: m.totalFilled > 0 ? C.accent : C.muted, fontSize: 14 }}>
-                          {m.totalFilled}
-                        </td>
-                        <td style={{ padding: '12px 14px', textAlign: 'center', borderBottom: `1px solid ${C.border}` }}>
-                          <div style={{ display: 'flex', gap: 4, justifyContent: 'center', alignItems: 'center' }}>
-                            {m.doneTasks.length > 0 && <span style={{ fontSize: 10, background: `${C.success}22`, color: C.success, padding: '2px 7px', borderRadius: 4 }}>✓{m.doneTasks.length}</span>}
-                            {m.pendTasks.length > 0 && <span style={{ fontSize: 10, background: `${C.warn}22`, color: C.warn, padding: '2px 7px', borderRadius: 4 }}>○{m.pendTasks.length}</span>}
-                            {m.doneTasks.length === 0 && m.pendTasks.length === 0 && <span style={{ color: C.muted, fontSize: 11 }}>—</span>}
-                          </div>
-                        </td>
-                      </tr>
-
-                      {/* Expanded metric breakdown */}
-                      {expandedMember === m.id && (
-                        <tr key={`${m.id}-expand`}>
-                          <td colSpan={weekDays.length + 3} style={{ padding: 0, borderBottom: `1px solid ${C.border}` }}>
-                            <div style={{ background: `${C.accent}08`, padding: '16px 20px' }}>
-                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
-                                {METRIC_GROUPS.map(g => (
-                                  <div key={g.key}>
-                                    <div style={{ fontSize: 11, fontWeight: 600, color: g.color, marginBottom: 8 }}>{g.label}</div>
-                                    {g.metrics.map(mk => {
-                                      const val = m.metricTotals[mk.key];
-                                      if (!val) return null;
-                                      return (
-                                        <div key={mk.key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '3px 0', borderBottom: `1px solid ${C.border}` }}>
-                                          <span style={{ color: C.sub }}>{mk.label}</span>
-                                          <span style={{ fontFamily: 'monospace', fontWeight: 600, color: g.color }}>{fmt(val)}</span>
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                ))}
-                              </div>
-                              {/* Tasks list */}
-                              {(m.doneTasks.length > 0 || m.pendTasks.length > 0) && (
-                                <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}`, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-                                  {m.doneTasks.length > 0 && (
-                                    <div>
-                                      <div style={{ fontSize: 11, fontWeight: 600, color: C.success, marginBottom: 6 }}>✓ Done this week</div>
-                                      {m.doneTasks.map(t => <div key={t.id} style={{ fontSize: 11, color: C.sub, padding: '2px 0' }}>✓ {t.title}</div>)}
-                                    </div>
-                                  )}
-                                  {m.pendTasks.length > 0 && (
-                                    <div>
-                                      <div style={{ fontSize: 11, fontWeight: 600, color: C.warn, marginBottom: 6 }}>○ Pending</div>
-                                      {m.pendTasks.map(t => <div key={t.id} style={{ fontSize: 11, color: C.sub, padding: '2px 0' }}>{t.priority === 'high' ? '🔴' : '🟡'} {t.title}</div>)}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </>
-                  ))}
-
-                  {/* Team total row */}
-                  <tr style={{ background: `${C.accent}11` }}>
-                    <td style={{ position: 'sticky', left: 0, background: `${C.accent}1A`, padding: '11px 16px', fontWeight: 700, color: C.accent, borderTop: `2px solid ${C.accent}44` }}>TEAM TOTAL</td>
-                    {weekDays.map(d => {
-                      const dayReports = reports.filter(r => (r.report_date || r.date) === d);
-                      const dayTotal   = dayReports.reduce((s, r) => s + scoreReport(r), 0);
-                      return (
-                        <td key={d} style={{ padding: '11px 14px', textAlign: 'center', borderTop: `2px solid ${C.accent}44`, fontFamily: 'monospace', fontWeight: 700, color: dayTotal > 0 ? C.accent : C.muted }}>
-                          {dayTotal || '—'}
-                        </td>
-                      );
-                    })}
-                    <td style={{ padding: '11px 14px', textAlign: 'center', borderTop: `2px solid ${C.accent}44`, fontFamily: 'monospace', fontWeight: 700, color: C.accent, fontSize: 14 }}>{teamTotalFields}</td>
-                    <td style={{ padding: '11px 14px', textAlign: 'center', borderTop: `2px solid ${C.accent}44`, color: C.muted, fontSize: 11 }}>
-                      {tasks.filter(t => t.status === 'done').length} done
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+          {mode === 'week' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, color: C.sub }}>Pick any day in the week:</span>
+              <input type="date" value={selectedDate}
+                onChange={e => setSelectedDate(e.target.value)} style={inputStyle} />
+              <span style={{ fontSize: 13, color: C.accent, fontWeight: 600 }}>
+                {fmt(from)} – {fmt(to)}
+              </span>
+              <button onClick={() => exportCSV(data, from, to)} disabled={!data?.by_person?.length}
+                style={{
+                  padding: '7px 16px', background: !data?.by_person?.length ? C.elevated : `${C.accent}18`,
+                  color: !data?.by_person?.length ? C.muted : C.accent,
+                  border: `1px solid ${!data?.by_person?.length ? C.border : C.accent}40`,
+                  borderRadius: 8, fontWeight: 600, fontSize: 12, cursor: !data?.by_person?.length ? 'not-allowed' : 'pointer',
+                  marginLeft: 'auto',
+                }}>
+                ⬇ CSV
+              </button>
             </div>
-          </div>
+          )}
 
-          {/* ── TEAM METRIC TOTALS ──────────────────────────────── */}
-          {Object.values(teamTotals).some(v => v > 0) && (
-            <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20, animation: 'slideUp .4s ease .1s both' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 16 }}>Team Metric Totals · {fmtDate(from)} – {fmtDate(to)}</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 20 }}>
-                {METRIC_GROUPS.map(g => (
-                  <div key={g.key}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: g.color, marginBottom: 10, paddingBottom: 6, borderBottom: `1px solid ${C.border}` }}>{g.label}</div>
-                    {g.metrics.map(mk => {
-                      const val = teamTotals[mk.key];
-                      if (!val) return null;
-                      return (
-                        <div key={mk.key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 0', borderBottom: `1px solid ${C.border}` }}>
-                          <span style={{ color: C.sub }}>{mk.label}</span>
-                          <span style={{ fontFamily: 'monospace', fontWeight: 700, color: g.color }}>{fmt(val)}</span>
-                        </div>
-                      );
-                    })}
+          {mode === 'custom' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 13, color: C.sub }}>From</span>
+                <input type="date" value={customFrom}
+                  onChange={e => setCustomFrom(e.target.value)} style={inputStyle} />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 13, color: C.sub }}>To</span>
+                <input type="date" value={customTo}
+                  onChange={e => setCustomTo(e.target.value)} style={inputStyle} />
+              </div>
+              <button onClick={applyCustom} style={{
+                padding: '8px 20px', background: C.accent, color: '#0B0F1A',
+                border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer',
+              }}>Apply</button>
+              {activeFrom && (
+                <span style={{ fontSize: 13, color: C.accent, fontWeight: 600 }}>
+                  {fmt(activeFrom)} – {fmt(activeTo)}
+                </span>
+              )}
+              <button onClick={() => exportCSV(data, from, to)} disabled={!data?.by_person?.length}
+                style={{
+                  padding: '7px 16px', background: !data?.by_person?.length ? C.elevated : `${C.accent}18`,
+                  color: !data?.by_person?.length ? C.muted : C.accent,
+                  border: `1px solid ${!data?.by_person?.length ? C.border : C.accent}40`,
+                  borderRadius: 8, fontWeight: 600, fontSize: 12, cursor: !data?.by_person?.length ? 'not-allowed' : 'pointer',
+                  marginLeft: 'auto',
+                }}>
+                ⬇ CSV
+              </button>
+            </div>
+          )}
+        </div>
+
+        {loading && <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>Loading…</div>}
+        {error && <div style={{ textAlign: 'center', padding: 40, color: C.danger }}>{error}</div>}
+
+        {data && !loading && data.total_reports > 0 && (
+          <>
+            {/* ── Team Hero Banner ── */}
+            <div style={{
+              background: `linear-gradient(135deg, ${C.accentDim}, ${C.accent})`,
+              borderRadius: 12, padding: 24, marginBottom: 16,
+            }}>
+              <div style={{ fontWeight: 700, fontSize: 18, color: '#0B0F1A', marginBottom: 3 }}>
+                Team Total — {fmt(from)} – {fmt(to)}
+              </div>
+              <div style={{ fontSize: 12, color: '#0B0F1A99', marginBottom: 14 }}>
+                {data.total_reports} reports · {data.by_person?.length} members
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                {Object.entries(data.team_totals || {}).filter(([,v]) => v > 0).map(([key, val]) => (
+                  <div key={key} style={{ background: '#00000022', borderRadius: 8, padding: '8px 14px' }}>
+                    <div style={{ fontSize: 20, fontWeight: 700, color: '#0B0F1A' }}>{val.toLocaleString()}</div>
+                    <div style={{ fontSize: 11, color: '#0B0F1A99' }}>{METRIC_LABELS[key] || key}</div>
                   </div>
                 ))}
               </div>
             </div>
-          )}
 
-          {reports.length === 0 && !loading && (
-            <div style={{ textAlign: 'center', padding: '60px 20px', color: C.muted, fontSize: 14 }}>
-              No reports for {fmtDate(from)} – {fmtDate(to)}
+            {/* ── Week At A Glance Grid (only in week or short custom range) ── */}
+            {showGrid && data.daily_breakdown && (
+              <div style={{ ...cardStyle, overflowX: 'auto' }}>
+                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3, color: C.text }}>
+                  📅 {mode === 'week' ? 'Week at a Glance' : 'Daily Breakdown'}
+                  <span style={{ fontSize: 11, color: C.sub, marginLeft: 8, fontWeight: 400 }}>
+                    {fmt(from)} – {fmt(to)} · Click a row to expand
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, color: C.sub, marginBottom: 14 }}>
+                  🟢 ≥5 fields · 🔴 &lt;5 · — not submitted
+                </div>
+                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 600 }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: 'left', padding: '8px 12px', fontSize: 12, color: C.sub, fontWeight: 600, borderBottom: `1px solid ${C.border}` }}>
+                        Member
+                      </th>
+                      {days.map(d => {
+                        const isToday = d === today;
+                        return (
+                          <th key={d} style={{
+                            textAlign: 'center', padding: '8px 10px', fontSize: 11,
+                            color: isToday ? C.accent : C.sub, fontWeight: isToday ? 700 : 500,
+                            borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap',
+                          }}>
+                            {fmtFull(d)}
+                            {isToday && <div style={{ fontSize: 9, color: C.accent }}>TODAY</div>}
+                          </th>
+                        );
+                      })}
+                      <th style={{ textAlign: 'center', padding: '8px 12px', fontSize: 12, color: C.accent, fontWeight: 700, borderBottom: `1px solid ${C.border}` }}>Total</th>
+                      <th style={{ textAlign: 'center', padding: '8px 12px', fontSize: 12, color: C.sub, fontWeight: 600, borderBottom: `1px solid ${C.border}` }}>Tasks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(data.by_person || []).map((person, pi) => {
+                      const isExpanded = expandedRow === person.person?.id;
+                      return (
+                        <>
+                          <tr key={person.person?.id}
+                            onClick={() => setExpandedRow(isExpanded ? null : person.person?.id)}
+                            style={{ cursor: 'pointer', background: isExpanded ? `${C.accent}08` : 'transparent', transition: 'background 0.15s' }}>
+                            <td style={{ padding: '10px 12px', borderBottom: `1px solid ${C.border}`, color: C.text }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <span style={{ fontSize: 14 }}>{MEDALS[pi] || '👤'}</span>
+                                <div>
+                                  <div style={{ fontSize: 13, fontWeight: 600 }}>{person.person?.name}</div>
+                                  <div style={{ fontSize: 10, color: C.muted }}>{person.days_reported}d submitted</div>
+                                </div>
+                              </div>
+                            </td>
+                            {days.map(d => {
+                              const report = getDayReport(person.person?.id, d);
+                              const leave = data.leave_days?.find(l =>
+                                String(l.team_member_id) === String(person.person?.id) &&
+                                d >= l.start_date && d <= l.end_date
+                              );
+                              const score = report ? getScore(report) : null;
+                              return (
+                                <td key={d} style={{ textAlign: 'center', padding: '10px 8px', borderBottom: `1px solid ${C.border}` }}>
+                                  {leave ? (
+                                    <span style={{ fontSize: 11, color: C.warn }}>Off</span>
+                                  ) : score === null ? (
+                                    <span style={{ color: C.muted, fontSize: 16 }}>—</span>
+                                  ) : (
+                                    <span style={{
+                                      display: 'inline-block', minWidth: 28, padding: '3px 7px',
+                                      borderRadius: 6, fontSize: 12, fontWeight: 700,
+                                      background: score >= 5 ? '#34D39920' : '#FF5C5C20',
+                                      color: score >= 5 ? C.success : C.danger,
+                                    }}>{score}</span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                            <td style={{ textAlign: 'center', padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
+                              <span style={{ fontSize: 16, fontWeight: 700, color: C.accent }}>
+                                {person.total_output.toLocaleString()}
+                              </span>
+                            </td>
+                            <td style={{ textAlign: 'center', padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
+                              {person.tasks_done > 0 ? (
+                                <span style={{ fontSize: 11, background: `${C.blue}20`, color: C.blue, padding: '2px 8px', borderRadius: 10 }}>
+                                  ✓{person.tasks_done}
+                                </span>
+                              ) : <span style={{ color: C.muted }}>—</span>}
+                            </td>
+                          </tr>
+                          {isExpanded && (
+                            <tr key={`${person.person?.id}-exp`}>
+                              <td colSpan={days.length + 3} style={{ padding: '0 12px 16px', background: `${C.accent}06` }}>
+                                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '12px 0' }}>
+                                  {Object.entries(METRIC_GROUPS).map(([groupName, keys]) => {
+                                    const groupTotal = keys.reduce((s, k) => s + (person.totals[k] || 0), 0);
+                                    if (!groupTotal) return null;
+                                    return (
+                                      <div key={groupName} style={{
+                                        background: C.card, border: `1px solid ${C.border}`,
+                                        borderRadius: 8, padding: '10px 14px', minWidth: 160,
+                                      }}>
+                                        <div style={{ fontSize: 11, color: C.sub, marginBottom: 6, fontWeight: 600 }}>{groupName}</div>
+                                        {keys.filter(k => person.totals[k] > 0).map(k => (
+                                          <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '2px 0' }}>
+                                            <span style={{ color: C.sub }}>{METRIC_LABELS[k]}</span>
+                                            <span style={{ color: C.text, fontWeight: 600, marginLeft: 12 }}>{person.totals[k]}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </>
+                      );
+                    })}
+                    {/* Team total row */}
+                    <tr style={{ background: `${C.accent}10` }}>
+                      <td style={{ padding: '10px 12px', fontSize: 13, fontWeight: 700, color: C.accent }}>TEAM TOTAL</td>
+                      {days.map(d => {
+                        const dayReports = (data.daily_breakdown || []).filter(r => r.report_date === d);
+                        const dayTotal = dayReports.reduce((s, r) =>
+                          s + Object.values(r.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0), 0);
+                        return (
+                          <td key={d} style={{ textAlign: 'center', padding: '10px 8px' }}>
+                            {dayTotal > 0 ? (
+                              <span style={{ fontSize: 12, fontWeight: 700, color: C.accent }}>{dayTotal}</span>
+                            ) : <span style={{ color: C.muted }}>—</span>}
+                          </td>
+                        );
+                      })}
+                      <td style={{ textAlign: 'center', padding: '10px 12px' }}>
+                        <span style={{ fontSize: 16, fontWeight: 700, color: C.accent }}>
+                          {data.by_person?.reduce((s, p) => s + p.total_output, 0).toLocaleString()}
+                        </span>
+                      </td>
+                      <td style={{ textAlign: 'center', padding: '10px 12px', fontSize: 11, color: C.sub }}>
+                        {data.by_person?.reduce((s,p) => s + (p.tasks_done||0), 0) > 0
+                          ? `${data.by_person.reduce((s,p) => s + (p.tasks_done||0), 0)} done` : '—'}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Aggregated leaderboard for longer ranges */}
+            {!showGrid && (
+              <div style={cardStyle}>
+                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3, color: C.text }}>🏆 Team Leaderboard</div>
+                <div style={{ fontSize: 11, color: C.sub, marginBottom: 14 }}>
+                  {fmt(from)} – {fmt(to)} · Ranked by total output
+                </div>
+                {(data.by_person || []).map((person, i) => (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'center', gap: 16,
+                    padding: '14px 0', borderBottom: `1px solid ${C.border}`,
+                  }}>
+                    <span style={{ fontSize: 22, width: 32, textAlign: 'center' }}>{MEDALS[i] || `${i+1}`}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                        <span style={{ fontWeight: 600, color: C.text }}>{person.person?.name}</span>
+                        <span style={{ fontSize: 11, color: C.muted }}>{person.person?.role}</span>
+                        <span style={{ fontSize: 10, background: `${C.blue}22`, color: C.blue, padding: '2px 8px', borderRadius: 20 }}>
+                          {person.days_reported}d
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                        {Object.entries(person.totals).filter(([,v]) => v > 0).sort((a,b) => b[1]-a[1]).slice(0,5).map(([key,val]) => (
+                          <span key={key} style={{ fontSize: 10, background: C.elevated, color: C.sub, padding: '2px 7px', borderRadius: 5 }}>
+                            {METRIC_LABELS[key] || key}: <strong style={{ color: C.text }}>{val}</strong>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 26, fontWeight: 700, color: C.accent }}>{person.total_output.toLocaleString()}</div>
+                      <div style={{ fontSize: 10, color: C.muted }}>total</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Team Metric Totals ── */}
+            <div style={cardStyle}>
+              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3, color: C.text }}>
+                📊 Team Metric Totals · {fmt(from)} – {fmt(to)}
+              </div>
+              <div style={{ fontSize: 11, color: C.sub, marginBottom: 16 }}>
+                Aggregated across all team members
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+                {Object.entries(METRIC_GROUPS).map(([groupName, keys]) => {
+                  const groupData = keys.filter(k => (data.team_totals?.[k] || 0) > 0);
+                  if (!groupData.length) return null;
+                  const colors = { 'Claims Piles': C.purple, 'Mapping & Data': C.blue, 'Quality & Review': C.accent };
+                  return (
+                    <div key={groupName} style={{
+                      border: `1px solid ${C.border}`, borderTop: `3px solid ${colors[groupName]}`,
+                      borderRadius: 10, padding: 16, background: C.elevated,
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: colors[groupName], marginBottom: 10 }}>
+                        {groupName}
+                      </div>
+                      {groupData.map(k => (
+                        <div key={k} style={{
+                          display: 'flex', justifyContent: 'space-between',
+                          fontSize: 12, padding: '4px 0', borderBottom: `1px solid ${C.border}`,
+                        }}>
+                          <span style={{ color: C.sub }}>{METRIC_LABELS[k]}</span>
+                          <span style={{ fontWeight: 700, color: C.text }}>
+                            {(data.team_totals[k] || 0).toLocaleString()}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-          )}
+          </>
+        )}
 
-        </div>
-      )}
+        {data && data.total_reports === 0 && !loading && (
+          <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>
+            No reports for {fmt(from)} – {fmt(to)}.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

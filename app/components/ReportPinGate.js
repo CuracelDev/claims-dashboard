@@ -1,33 +1,25 @@
 'use client';
 import { useState, useEffect } from 'react';
-
-const C = {
-  accent: "#00E5A0", accentDim: "#00B87D",
-  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C",
-};
+import { useTheme } from '@/app/context/ThemeContext';
 
 const SESSION_KEY = 'report_auth';
 
-// Returns { memberId, memberName } if authenticated, else null
-function getSession() {
+export function getSession() {
   try {
     const raw = sessionStorage.getItem(SESSION_KEY);
     return raw ? JSON.parse(raw) : null;
   } catch { return null; }
 }
-function setSession(data) {
+function saveSession(data) {
   try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(data)); } catch {}
 }
-function clearSession() {
+export function clearSession() {
   try { sessionStorage.removeItem(SESSION_KEY); } catch {}
 }
 
-export { getSession, clearSession };
-
-export default function ReportPinGate({ members = [], onAuth, children }) {
-  const [step, setStep] = useState('select'); // select | pin
+export default function ReportPinGate({ members = [], onAuth, existingSession, children }) {
+  const { C } = useTheme();
+  const [step, setStep] = useState('select');
   const [selectedId, setSelectedId] = useState('');
   const [pin, setPin] = useState('');
   const [sending, setSending] = useState(false);
@@ -39,26 +31,60 @@ export default function ReportPinGate({ members = [], onAuth, children }) {
 
   useEffect(() => {
     setMounted(true);
-    const s = getSession();
+    const s = existingSession || getSession();
     if (s) { setSessionState(s); onAuth?.(s); }
   }, []);
 
+  // Sync if parent passes existingSession after mount
+  useEffect(() => {
+    if (existingSession && !session) {
+      setSessionState(existingSession);
+    }
+  }, [existingSession]);
+
+  const handleSignOut = () => {
+    clearSession();
+    setSessionState(null);
+    setPin('');
+    setStep('select');
+    setSelectedId('');
+    setError('');
+    setSentMsg('');
+    onAuth?.(null);
+  };
+
   if (!mounted) return null;
+
   if (session) {
     return (
       <div>
-        {/* Slim auth bar shown at top of form */}
+        {/* Auth bar */}
         <div style={{
-          background: `${C.accent}15`, border: `1px solid ${C.accent}33`,
-          borderRadius: 10, padding: '8px 16px', marginBottom: 16,
+          background: `${C.accent}18`, border: `1px solid ${C.accent}35`,
+          borderRadius: 10, padding: '10px 16px', marginBottom: 16,
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
         }}>
-          <span style={{ fontSize: 12, color: C.accent }}>
-            🔐 Submitting as <strong>{session.memberName}</strong>
-          </span>
-          <button onClick={() => { clearSession(); setSessionState(null); setPin(''); setStep('select'); }}
-            style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 6, color: C.muted, padding: '3px 10px', fontSize: 11, cursor: 'pointer' }}>
-            Switch
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 16 }}>🔒</span>
+            <div>
+              <div style={{ fontSize: 13, color: C.accent, fontWeight: 600 }}>
+                {session.memberName}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted }}>Authenticated for this session</div>
+            </div>
+          </div>
+          <button
+            onClick={handleSignOut}
+            style={{
+              background: 'transparent', border: `1px solid ${C.border}`,
+              borderRadius: 8, color: C.sub, padding: '5px 12px',
+              fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5,
+              transition: 'all 0.15s',
+            }}
+            onMouseEnter={e => { e.target.style.borderColor = C.danger; e.target.style.color = C.danger; }}
+            onMouseLeave={e => { e.target.style.borderColor = C.border; e.target.style.color = C.sub; }}
+          >
+            🚪 Sign Out
           </button>
         </div>
         {children}
@@ -67,6 +93,12 @@ export default function ReportPinGate({ members = [], onAuth, children }) {
   }
 
   const selectedMember = members.find(m => String(m.id) === String(selectedId));
+
+  const inp = {
+    background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 10,
+    color: C.text, padding: '12px 16px', fontSize: 14, outline: 'none',
+    width: '100%', boxSizing: 'border-box', transition: 'border-color 0.15s',
+  };
 
   async function handleSendPin() {
     if (!selectedId) return;
@@ -97,26 +129,31 @@ export default function ReportPinGate({ members = [], onAuth, children }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       const s = { memberId: data.member_id, memberName: data.name };
-      setSession(s);
+      saveSession(s);
       setSessionState(s);
       onAuth?.(s);
     } catch (e) { setError(e.message); }
     finally { setVerifying(false); }
   }
 
-  const inp = {
-    background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 10,
-    color: C.text, padding: '12px 16px', fontSize: 14, outline: 'none',
-    width: '100%', boxSizing: 'border-box',
-  };
-
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh', padding: 20 }}>
-      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 32, width: '100%', maxWidth: 400, boxShadow: '0 20px 60px rgba(0,0,0,.4)' }}>
-
+    <div style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      minHeight: '60vh', padding: 20,
+    }}>
+      <div style={{
+        background: C.card, border: `1px solid ${C.border}`,
+        borderRadius: 16, padding: 32, width: '100%', maxWidth: 400,
+        boxShadow: '0 20px 60px rgba(0,0,0,.2)',
+      }}>
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${C.accent},#00B4D8)`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, margin: '0 auto 14px' }}>🔐</div>
-          <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 6 }}>
+          <div style={{
+            width: 52, height: 52, borderRadius: 14,
+            background: `linear-gradient(135deg, ${C.accent}, #00B4D8)`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 22, margin: '0 auto 14px',
+          }}>🔐</div>
+          <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 6, color: C.text }}>
             {step === 'select' ? 'Who are you?' : `Hi, ${selectedMember?.name || ''}!`}
           </div>
           <div style={{ fontSize: 12, color: C.muted }}>
@@ -129,20 +166,37 @@ export default function ReportPinGate({ members = [], onAuth, children }) {
         {step === 'select' && (
           <>
             <div style={{ marginBottom: 16 }}>
-              <label style={{ fontSize: 11, color: C.muted, display: 'block', marginBottom: 6 }}>Select your name</label>
-              <select value={selectedId} onChange={e => { setSelectedId(e.target.value); setError(''); }}
-                style={{ ...inp, cursor: 'pointer' }}>
+              <label style={{ fontSize: 11, color: C.muted, display: 'block', marginBottom: 6 }}>
+                Select your name
+              </label>
+              <select
+                value={selectedId}
+                onChange={e => { setSelectedId(e.target.value); setError(''); }}
+                style={{ ...inp, cursor: 'pointer' }}
+              >
                 <option value="">— Choose member —</option>
                 {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
               </select>
             </div>
-            {error && <div style={{ fontSize: 12, color: C.danger, marginBottom: 12, textAlign: 'center' }}>{error}</div>}
+            {error && (
+              <div style={{ fontSize: 12, color: C.danger, marginBottom: 12, textAlign: 'center' }}>
+                {error}
+              </div>
+            )}
             <button
               onClick={handleSendPin}
               disabled={!selectedId || sending}
-              style={{ width: '100%', background: selectedId ? C.accent : C.elevated, color: selectedId ? C.bg : C.muted, border: 'none', borderRadius: 10, padding: '12px 0', fontSize: 14, fontWeight: 700, cursor: selectedId ? 'pointer' : 'not-allowed', transition: 'all .15s' }}
+              style={{
+                width: '100%',
+                background: selectedId ? C.accent : C.elevated,
+                color: selectedId ? '#0B0F1A' : C.muted,
+                border: 'none', borderRadius: 10, padding: '12px 0',
+                fontSize: 14, fontWeight: 700,
+                cursor: selectedId ? 'pointer' : 'not-allowed',
+                transition: 'all .15s',
+              }}
             >
-              {sending ? 'Sending...' : '📲 Send me my PIN'}
+              {sending ? 'Sending…' : '📲 Send me my PIN'}
             </button>
           </>
         )}
@@ -150,7 +204,9 @@ export default function ReportPinGate({ members = [], onAuth, children }) {
         {step === 'pin' && (
           <>
             <div style={{ marginBottom: 16 }}>
-              <label style={{ fontSize: 11, color: C.muted, display: 'block', marginBottom: 6 }}>Enter your 6-digit PIN</label>
+              <label style={{ fontSize: 11, color: C.muted, display: 'block', marginBottom: 6 }}>
+                Enter your 6-digit PIN
+              </label>
               <input
                 type="text"
                 inputMode="numeric"
@@ -159,21 +215,42 @@ export default function ReportPinGate({ members = [], onAuth, children }) {
                 value={pin}
                 onChange={e => { setPin(e.target.value.replace(/\D/g, '')); setError(''); }}
                 onKeyDown={e => e.key === 'Enter' && handleVerify()}
-                style={{ ...inp, textAlign: 'center', fontSize: 22, letterSpacing: 8, fontFamily: 'monospace' }}
+                style={{
+                  ...inp, textAlign: 'center', fontSize: 24,
+                  letterSpacing: 10, fontFamily: 'monospace',
+                }}
                 autoFocus
               />
             </div>
-            {error && <div style={{ fontSize: 12, color: C.danger, marginBottom: 12, textAlign: 'center' }}>{error}</div>}
+            {error && (
+              <div style={{ fontSize: 12, color: C.danger, marginBottom: 12, textAlign: 'center' }}>
+                {error}
+              </div>
+            )}
             <button
               onClick={handleVerify}
               disabled={pin.length < 4 || verifying}
-              style={{ width: '100%', background: pin.length >= 4 ? C.accent : C.elevated, color: pin.length >= 4 ? C.bg : C.muted, border: 'none', borderRadius: 10, padding: '12px 0', fontSize: 14, fontWeight: 700, cursor: pin.length >= 4 ? 'pointer' : 'not-allowed', marginBottom: 10, transition: 'all .15s' }}
+              style={{
+                width: '100%',
+                background: pin.length >= 4 ? C.accent : C.elevated,
+                color: pin.length >= 4 ? '#0B0F1A' : C.muted,
+                border: 'none', borderRadius: 10, padding: '12px 0',
+                fontSize: 14, fontWeight: 700,
+                cursor: pin.length >= 4 ? 'pointer' : 'not-allowed',
+                marginBottom: 10, transition: 'all .15s',
+              }}
             >
-              {verifying ? 'Verifying...' : '→ Sign In'}
+              {verifying ? 'Verifying…' : '→ Sign In'}
             </button>
             <div style={{ textAlign: 'center' }}>
-              <button onClick={() => { setStep('select'); setPin(''); setError(''); setSentMsg(''); }}
-                style={{ background: 'transparent', border: 'none', color: C.muted, fontSize: 12, cursor: 'pointer', textDecoration: 'underline' }}>
+              <button
+                onClick={() => { setStep('select'); setPin(''); setError(''); setSentMsg(''); }}
+                style={{
+                  background: 'transparent', border: 'none',
+                  color: C.muted, fontSize: 12, cursor: 'pointer',
+                  textDecoration: 'underline',
+                }}
+              >
                 ← Back / Resend PIN
               </button>
             </div>

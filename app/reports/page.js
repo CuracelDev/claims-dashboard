@@ -1,18 +1,11 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
+import { useTheme } from '@/app/context/ThemeContext';
 import ReportPinGate, { getSession } from '@/app/components/ReportPinGate';
-
-const C = {
-  accent: '#00E5A0', accentDim: '#00B87D',
-  bg: '#0B0F1A', card: '#111827', elevated: '#1A2332',
-  border: '#1E2D3D', text: '#F0F4F8', sub: '#8899AA', muted: '#556677',
-  danger: '#FF5C5C', warn: '#FFB84D', success: '#34D399',
-  blue: '#5B8DEF', purple: '#A78BFA', orange: '#FB923C',
-};
 
 const METRIC_GROUPS = [
   {
-    category: 'claims_piles', label: 'Claims Piles Checked', color: C.purple,
+    category: 'claims_piles', label: 'Claims Piles Checked',
     metrics: [
       { key: 'claims_kenya',    label: 'Kenya' },
       { key: 'claims_tanzania', label: 'Tanzania' },
@@ -24,7 +17,7 @@ const METRIC_GROUPS = [
     ],
   },
   {
-    category: 'mapping_data', label: 'Mapping & Data', color: C.blue,
+    category: 'mapping_data', label: 'Mapping & Data',
     metrics: [
       { key: 'providers_mapped',   label: 'Num of Providers Mapped' },
       { key: 'care_items_mapped',  label: 'Num of Care Items Mapped' },
@@ -33,7 +26,7 @@ const METRIC_GROUPS = [
     ],
   },
   {
-    category: 'quality_review', label: 'Quality & Review', color: C.accent,
+    category: 'quality_review', label: 'Quality & Review',
     metrics: [
       { key: 'auto_pa_reviewed',   label: 'Num of Auto P.A Reviewed/Approved' },
       { key: 'flagged_care_items', label: 'Num of Flagged Care Items' },
@@ -44,34 +37,27 @@ const METRIC_GROUPS = [
   },
 ];
 
-const todayStr = () => new Date().toISOString().split('T')[0];
-
-const S = {
-  input: {
-    background: '#1A2332', border: '1px solid #1E2D3D', borderRadius: 8,
-    color: '#F0F4F8', padding: '9px 12px', fontSize: 14, width: '100%',
-    outline: 'none', boxSizing: 'border-box',
-  },
-  label: { fontSize: 12, color: '#8899AA', marginBottom: 4, display: 'block' },
-  card: {
-    background: '#111827', border: '1px solid #1E2D3D',
-    borderRadius: 12, padding: 20, marginBottom: 16,
-  },
+const GROUP_COLORS = {
+  claims_piles: '#A78BFA',
+  mapping_data: '#5B8DEF',
+  quality_review: '#00E5A0',
 };
 
+const todayStr = () => new Date().toISOString().split('T')[0];
+
 function MetricGroup({ group, metrics, onChangeMetric }) {
+  const { C } = useTheme();
+  const color = GROUP_COLORS[group.category];
+  const S = makeS(C);
   return (
-    <div style={{ ...S.card, borderTop: `3px solid ${group.color}` }}>
-      <div style={{ fontSize: 13, fontWeight: 600, color: group.color, marginBottom: 16 }}>{group.label}</div>
+    <div style={{ ...S.card, borderTop: `3px solid ${color}` }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color, marginBottom: 16 }}>{group.label}</div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 }}>
         {group.metrics.map(m => (
           <div key={m.key}>
             <label style={S.label}>{m.label}</label>
             <input
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              autoComplete="off"
+              type="text" inputMode="numeric" pattern="[0-9]*" autoComplete="off"
               value={metrics[m.key] !== undefined ? metrics[m.key] : ''}
               onChange={e => {
                 const v = e.target.value;
@@ -87,6 +73,8 @@ function MetricGroup({ group, metrics, onChangeMetric }) {
 }
 
 function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
+  const { C } = useTheme();
+  const S = makeS(C);
   const [activeLeave, setActiveLeave] = useState(null);
   const [open, setOpen] = useState(false);
   const [leaveType, setLeaveType] = useState('off_today');
@@ -95,10 +83,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   const [reason, setReason] = useState('');
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    setStartDate(reportDate);
-    setEndDate(reportDate);
-  }, [reportDate]);
+  useEffect(() => { setStartDate(reportDate); setEndDate(reportDate); }, [reportDate]);
 
   useEffect(() => {
     if (!memberId || !reportDate) { setActiveLeave(null); onLeaveActive(null); return; }
@@ -106,8 +91,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
       .then(r => r.json())
       .then(({ data, on_leave }) => {
         const leave = on_leave && data ? data : null;
-        setActiveLeave(leave);
-        onLeaveActive(leave);
+        setActiveLeave(leave); onLeaveActive(leave);
       })
       .catch(() => { setActiveLeave(null); onLeaveActive(null); });
   }, [memberId, reportDate]);
@@ -117,22 +101,16 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
     try {
       const isSingle = leaveType === 'off_today' || leaveType === 'public_holiday';
       const res = await fetch('/api/leave', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          team_member_id: memberId,
-          leave_type: leaveType,
+          team_member_id: memberId, leave_type: leaveType,
           start_date: isSingle ? reportDate : startDate,
           end_date: isSingle ? reportDate : endDate,
-          reason,
-          marked_by: 'Admin',
+          reason, marked_by: 'Admin',
         }),
       });
       const { data } = await res.json();
-      setActiveLeave(data);
-      onLeaveActive(data);
-      setOpen(false);
-      setReason('');
+      setActiveLeave(data); onLeaveActive(data); setOpen(false); setReason('');
     } catch (e) { console.error(e); }
     setSaving(false);
   };
@@ -140,27 +118,25 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   const handleCancel = async () => {
     if (!activeLeave) return;
     await fetch(`/api/leave?id=${activeLeave.id}`, { method: 'DELETE' });
-    setActiveLeave(null);
-    onLeaveActive(null);
+    setActiveLeave(null); onLeaveActive(null);
   };
 
   if (!memberId) return null;
-
   return (
     <div style={{ marginBottom: 16 }}>
       {activeLeave ? (
-        <div style={{ background: '#FFB84D10', border: '1px solid #FFB84D44', borderRadius: 10, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ background: `${C.warn}10`, border: `1px solid ${C.warn}44`, borderRadius: 10, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span style={{ fontSize: 13, color: C.warn }}>
             🌙 {memberName} is on leave — {activeLeave.leave_type.replace(/_/g, ' ')}
             {activeLeave.reason ? ` · "${activeLeave.reason}"` : ''}
           </span>
-          <button onClick={handleCancel} style={{ background: 'none', border: '1px solid #FFB84D44', borderRadius: 6, color: C.warn, fontSize: 12, padding: '4px 10px', cursor: 'pointer' }}>
+          <button onClick={handleCancel} style={{ background: 'none', border: `1px solid ${C.warn}44`, borderRadius: 6, color: C.warn, fontSize: 12, padding: '4px 10px', cursor: 'pointer' }}>
             ✕ Cancel leave
           </button>
         </div>
       ) : (
         <div>
-          <button onClick={() => setOpen(o => !o)} style={{ background: 'none', border: '1px solid #1E2D3D', borderRadius: 8, color: C.sub, fontSize: 13, padding: '8px 16px', cursor: 'pointer', width: '100%', textAlign: 'left' }}>
+          <button onClick={() => setOpen(o => !o)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.sub, fontSize: 13, padding: '8px 16px', cursor: 'pointer', width: '100%', textAlign: 'left' }}>
             🌙 Mark {memberName} as off / on leave
           </button>
           {open && (
@@ -177,14 +153,8 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
                 </div>
                 {(leaveType === 'leave_range' || leaveType === 'weekend_off') && (
                   <>
-                    <div>
-                      <label style={S.label}>Start Date</label>
-                      <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={S.input} />
-                    </div>
-                    <div>
-                      <label style={S.label}>End Date</label>
-                      <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={S.input} />
-                    </div>
+                    <div><label style={S.label}>Start Date</label><input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={S.input} /></div>
+                    <div><label style={S.label}>End Date</label><input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={S.input} /></div>
                   </>
                 )}
                 <div>
@@ -196,7 +166,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
                 <button onClick={handleMark} disabled={saving} style={{ padding: '8px 20px', background: C.warn, color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
                   {saving ? 'Saving…' : 'Confirm'}
                 </button>
-                <button onClick={() => setOpen(false)} style={{ padding: '8px 20px', background: 'none', border: '1px solid #1E2D3D', borderRadius: 8, color: C.sub, fontSize: 13, cursor: 'pointer' }}>
+                <button onClick={() => setOpen(false)} style={{ padding: '8px 20px', background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.sub, fontSize: 13, cursor: 'pointer' }}>
                   Cancel
                 </button>
               </div>
@@ -209,6 +179,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
 }
 
 function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
+  const { C } = useTheme();
   const member = teamMembers.find(m => String(m.id) === String(report.team_member_id));
   const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
   const filled = Object.keys(report.metrics || {}).filter(k => parseInt(report.metrics[k]) > 0).length;
@@ -233,13 +204,12 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
-      <div style={{ background: C.card, border: '1px solid #1E2D3D', borderRadius: 16, padding: 32, width: '100%', maxWidth: 560, maxHeight: '85vh', overflowY: 'auto' }}>
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 32, width: '100%', maxWidth: 560, maxHeight: '85vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          <div style={{ fontWeight: 700, fontSize: 18 }}>Report Preview</div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.sub, fontSize: 22, cursor: 'pointer', lineHeight: 1 }}>✕</button>
+          <div style={{ fontWeight: 700, fontSize: 18, color: C.text }}>Report Preview</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.sub, fontSize: 22, cursor: 'pointer' }}>✕</button>
         </div>
         <div style={{ fontSize: 13, color: C.sub, marginBottom: 20 }}>{dateStr}</div>
-
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 24 }}>
           <div style={{ background: C.elevated, borderRadius: 10, padding: 16, textAlign: 'center' }}>
             <div style={{ fontSize: 32, fontWeight: 700, color: C.accent }}>{total}</div>
@@ -250,13 +220,12 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
             <div style={{ fontSize: 12, color: C.sub }}>Metrics Filled</div>
           </div>
         </div>
-
         {METRIC_GROUPS.map(g => {
           const items = g.metrics.filter(m => parseInt(report.metrics?.[m.key]) > 0);
-          if (items.length === 0) return null;
+          if (!items.length) return null;
           return (
             <div key={g.category} style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: g.color, marginBottom: 8 }}>{g.label}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: GROUP_COLORS[g.category], marginBottom: 8 }}>{g.label}</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                 {items.map(m => (
                   <div key={m.key} style={{ display: 'flex', justifyContent: 'space-between', background: C.elevated, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}>
@@ -268,16 +237,14 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
             </div>
           );
         })}
-
         {report.tasks_completed && (
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 12, color: C.sub, marginBottom: 4 }}>Tasks Completed</div>
             <div style={{ fontSize: 13, color: C.text, background: C.elevated, borderRadius: 8, padding: '8px 12px' }}>{report.tasks_completed}</div>
           </div>
         )}
-
         <div style={{ display: 'flex', gap: 12, marginTop: 24 }}>
-          <button onClick={copyText} style={{ flex: 1, padding: 12, background: C.elevated, border: '1px solid #1E2D3D', borderRadius: 8, color: C.text, fontSize: 14, cursor: 'pointer' }}>
+          <button onClick={copyText} style={{ flex: 1, padding: 12, background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 14, cursor: 'pointer' }}>
             📋 Copy Text
           </button>
           <button onClick={onSendSlack} style={{ flex: 1, padding: 12, background: C.accentDim, border: 'none', borderRadius: 8, color: '#0B0F1A', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}>
@@ -290,6 +257,8 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
 }
 
 function ReportCard({ report, teamMembers, onEdit }) {
+  const { C } = useTheme();
+  const S = makeS(C);
   const member = teamMembers.find(m => m.id === report.team_member_id) || report.team_members;
   const name = member?.display_name || member?.name || 'Unknown';
   const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
@@ -307,11 +276,11 @@ function ReportCard({ report, teamMembers, onEdit }) {
         </div>
       </div>
       {report.tasks_completed && (
-        <div style={{ fontSize: 12, color: C.sub, marginBottom: 8, borderTop: '1px solid #1E2D3D', paddingTop: 8 }}>
+        <div style={{ fontSize: 12, color: C.sub, marginBottom: 8, borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
           {report.tasks_completed.slice(0, 100)}{report.tasks_completed.length > 100 ? '…' : ''}
         </div>
       )}
-      <button onClick={() => onEdit(report)} style={{ fontSize: 12, padding: '5px 12px', background: C.elevated, border: '1px solid #1E2D3D', borderRadius: 6, color: C.sub, cursor: 'pointer' }}>
+      <button onClick={() => onEdit(report)} style={{ fontSize: 12, padding: '5px 12px', background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 6, color: C.sub, cursor: 'pointer' }}>
         ✏️ Edit
       </button>
     </div>
@@ -319,6 +288,8 @@ function ReportCard({ report, teamMembers, onEdit }) {
 }
 
 function DailySummary({ teamMembers, date }) {
+  const { C } = useTheme();
+  const S = makeS(C);
   const [data, setData] = useState({ reports: [], leave: [] });
   const [loading, setLoading] = useState(true);
 
@@ -366,9 +337,9 @@ function DailySummary({ teamMembers, date }) {
           return (
             <span key={m.id} style={{
               padding: '5px 12px', borderRadius: 20, fontSize: 12,
-              background: off ? '#FFB84D12' : done ? '#00E5A012' : C.elevated,
+              background: off ? `${C.warn}12` : done ? `${C.accent}12` : C.elevated,
               color: off ? C.warn : done ? C.accent : C.muted,
-              border: `1px solid ${off ? '#FFB84D33' : done ? '#00E5A033' : '#1E2D3D'}`,
+              border: `1px solid ${off ? C.warn + '33' : done ? C.accent + '33' : C.border}`,
             }}>
               {off ? '🌙' : done ? '✓' : '○'} {m.name}
             </span>
@@ -379,9 +350,27 @@ function DailySummary({ teamMembers, date }) {
   );
 }
 
-// ─── Report Form (shown after PIN auth) ───────────────────────────────────────
+// Helper to generate style objects from theme
+function makeS(C) {
+  return {
+    input: {
+      background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 8,
+      color: C.text, padding: '9px 12px', fontSize: 14, width: '100%',
+      outline: 'none', boxSizing: 'border-box',
+    },
+    label: { fontSize: 12, color: C.sub, marginBottom: 4, display: 'block' },
+    card: {
+      background: C.card, border: `1px solid ${C.border}`,
+      borderRadius: 12, padding: 20, marginBottom: 16,
+    },
+  };
+}
+
+// ── Report Form (shown after PIN auth) ────────────────────────────────────────
 function ReportForm({ teamMembers, authSession }) {
-  const [selectedMember, setSelectedMember] = useState(String(authSession.memberId));
+  const { C } = useTheme();
+  const S = makeS(C);
+  const [selectedMember] = useState(String(authSession.memberId));
   const [reportDate, setReportDate] = useState(todayStr());
   const [metrics, setMetrics] = useState({});
   const [tasksCompleted, setTasksCompleted] = useState('');
@@ -411,22 +400,14 @@ function ReportForm({ teamMembers, authSession }) {
           setMetrics({}); setTasksCompleted(''); setNotes(''); setEditingReport(null);
         }
       })
-      .catch(() => {
-        setMetrics({}); setTasksCompleted(''); setNotes(''); setEditingReport(null);
-      });
+      .catch(() => { setMetrics({}); setTasksCompleted(''); setNotes(''); setEditingReport(null); });
   }, [selectedMember, reportDate]);
 
-  const handleMetricChange = (key, val) => {
-    setMetrics(prev => ({ ...prev, [key]: val }));
-  };
-
   const handleSave = async () => {
-    if (!selectedMember) { setSaveMsg({ type: 'error', text: 'No member selected.' }); return null; }
     setSaving(true); setSaveMsg(null);
     try {
       const res = await fetch('/api/reports', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ team_member_id: selectedMember, report_date: reportDate, metrics, tasks_completed: tasksCompleted, notes, status: 'submitted' }),
       });
       const json = await res.json();
@@ -452,17 +433,14 @@ function ReportForm({ teamMembers, authSession }) {
     const member = teamMembers.find(m => String(m.id) === String(editingReport.team_member_id));
     try {
       const res = await fetch('/api/reports/send-slack', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ report: editingReport, teamMember: member, channel: 'health-ops' }),
       });
       const result = await res.json();
       if (result.error) throw new Error(result.error);
       alert('Sent to Slack!');
       setShowPreview(false);
-    } catch (err) {
-      alert('Failed: ' + err.message);
-    }
+    } catch (err) { alert('Failed: ' + err.message); }
   };
 
   const totalOutput = Object.values(metrics).reduce((a, b) => a + (parseInt(b) || 0), 0);
@@ -472,18 +450,17 @@ function ReportForm({ teamMembers, authSession }) {
       <DailySummary teamMembers={teamMembers} date={reportDate} />
 
       {editingReport && (
-        <div style={{ background: '#5B8DEF15', border: '1px solid #5B8DEF44', borderRadius: 10, padding: '10px 16px', marginBottom: 14, fontSize: 13, color: C.blue }}>
+        <div style={{ background: `${C.blue}15`, border: `1px solid ${C.blue}44`, borderRadius: 10, padding: '10px 16px', marginBottom: 14, fontSize: 13, color: C.blue }}>
           ✏️ Editing existing report — changes will overwrite
         </div>
       )}
 
       <div style={S.card}>
-        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16 }}>Report Details</div>
+        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: C.text }}>Report Details</div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-          {/* Member is locked to session — show as read-only pill */}
           <div>
             <label style={S.label}>Team Member</label>
-            <div style={{ ...S.input, background: '#0B0F1A', color: C.accent, fontWeight: 600, cursor: 'default', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ ...S.input, background: C.elevated, color: C.accent, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 }}>
               🔒 {authSession.memberName}
             </div>
           </div>
@@ -494,22 +471,12 @@ function ReportForm({ teamMembers, authSession }) {
         </div>
       </div>
 
-      <LeavePanel
-        memberId={selectedMember}
-        memberName={selectedMemberName}
-        reportDate={reportDate}
-        onLeaveActive={(leave) => setIsLeaveActive(!!leave)}
-      />
+      <LeavePanel memberId={selectedMember} memberName={selectedMemberName} reportDate={reportDate} onLeaveActive={leave => setIsLeaveActive(!!leave)} />
 
       {!isLeaveActive && (
         <>
           {METRIC_GROUPS.map(group => (
-            <MetricGroup
-              key={group.category}
-              group={group}
-              metrics={metrics}
-              onChangeMetric={handleMetricChange}
-            />
+            <MetricGroup key={group.category} group={group} metrics={metrics} onChangeMetric={(key, val) => setMetrics(prev => ({ ...prev, [key]: val }))} />
           ))}
 
           <div style={S.card}>
@@ -535,7 +502,7 @@ function ReportForm({ teamMembers, authSession }) {
               )}
               <button onClick={handleSave} disabled={saving} style={{
                 padding: '10px 24px', background: saving ? C.muted : C.elevated,
-                color: C.text, border: '1px solid #1E2D3D', borderRadius: 8, fontWeight: 600, fontSize: 14,
+                color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, fontWeight: 600, fontSize: 14,
                 cursor: saving ? 'not-allowed' : 'pointer',
               }}>
                 {saving ? 'Saving…' : '💾 Save'}
@@ -553,7 +520,7 @@ function ReportForm({ teamMembers, authSession }) {
       )}
 
       {isLeaveActive && (
-        <div style={{ background: '#FFB84D08', border: '1px dashed #FFB84D44', borderRadius: 12, padding: 32, textAlign: 'center' }}>
+        <div style={{ background: `${C.warn}08`, border: `1px dashed ${C.warn}44`, borderRadius: 12, padding: 32, textAlign: 'center' }}>
           <div style={{ fontSize: 36, marginBottom: 10 }}>🌙</div>
           <div style={{ fontSize: 15, fontWeight: 600, color: C.warn, marginBottom: 4 }}>{selectedMemberName} is off today</div>
           <div style={{ fontSize: 13, color: C.sub }}>No report needed. Slack reminder will be skipped.</div>
@@ -561,41 +528,31 @@ function ReportForm({ teamMembers, authSession }) {
       )}
 
       {showPreview && editingReport && (
-        <PreviewModal
-          report={editingReport}
-          teamMembers={teamMembers}
-          onClose={() => setShowPreview(false)}
-          onSendSlack={handleSendSlack}
-        />
+        <PreviewModal report={editingReport} teamMembers={teamMembers} onClose={() => setShowPreview(false)} onSendSlack={handleSendSlack} />
       )}
     </>
   );
 }
 
-// ─── Main Page ────────────────────────────────────────────────────────────────
+// ── Main Page ─────────────────────────────────────────────────────────────────
 export default function ReportsPage() {
+  const { C } = useTheme();
   const [tab, setTab] = useState('form');
   const [teamMembers, setTeamMembers] = useState([]);
   const [authSession, setAuthSession] = useState(null);
-
-  // History tab state
   const [reports, setReports] = useState([]);
   const [histFilter, setHistFilter] = useState({ person: '', date: '' });
   const [loadingHist, setLoadingHist] = useState(false);
 
-  // History edit state (edit from history switches to form tab)
-  const [editingFromHistory, setEditingFromHistory] = useState(null);
+  const S = makeS(C);
 
   useEffect(() => {
     fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
-    // Restore session if already authenticated this browser session
     const existing = getSession();
     if (existing) setAuthSession(existing);
   }, []);
 
-  const handleAuth = (session) => {
-    setAuthSession(session);
-  };
+  const handleAuth = (session) => setAuthSession(session);
 
   const loadHistory = useCallback(() => {
     setLoadingHist(true);
@@ -609,10 +566,7 @@ export default function ReportsPage() {
 
   useEffect(() => { if (tab === 'history') loadHistory(); }, [tab, loadHistory]);
 
-  const handleEditReport = (report) => {
-    setEditingFromHistory(report);
-    setTab('form');
-  };
+  const handleEditReport = (report) => setTab('form');
 
   const tabBtn = (key, label) => (
     <button key={key} onClick={() => setTab(key)} style={{
@@ -624,35 +578,26 @@ export default function ReportsPage() {
   );
 
   return (
-    <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60 }}>
-      <div style={{ background: C.card, borderBottom: '1px solid #1E2D3D', padding: '20px 32px' }}>
-        <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700 }}>Daily Reports</h1>
+    <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60, transition: 'background 0.2s' }}>
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 32px' }}>
+        <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, color: C.text }}>Daily Reports</h1>
         <p style={{ margin: '4px 0 0', fontSize: 14, color: C.sub }}>Health Ops team reporting</p>
       </div>
-      <div style={{ background: C.card, borderBottom: '1px solid #1E2D3D', padding: '0 32px', display: 'flex' }}>
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '0 32px', display: 'flex' }}>
         {tabBtn('form', '📝 Submit Report')}
         {tabBtn('history', '🕐 History')}
         {tabBtn('team', '👥 Team View')}
       </div>
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px 32px' }}>
-
-        {/* ── SUBMIT REPORT TAB — PIN gated ── */}
         {tab === 'form' && (
           <div style={{ maxWidth: 720 }}>
             <ReportPinGate members={teamMembers} onAuth={handleAuth} existingSession={authSession}>
-              {authSession && (
-                <ReportForm
-                  teamMembers={teamMembers}
-                  authSession={authSession}
-                  initialReport={editingFromHistory}
-                />
-              )}
+              {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} />}
             </ReportPinGate>
           </div>
         )}
 
-        {/* ── HISTORY TAB ── */}
         {tab === 'history' && (
           <div>
             <div style={{ ...S.card, display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' }}>
@@ -668,7 +613,7 @@ export default function ReportsPage() {
                 <input type="date" value={histFilter.date} onChange={e => setHistFilter(f => ({ ...f, date: e.target.value }))} style={{ ...S.input, width: 'auto' }} autoComplete="off" />
               </div>
               <button onClick={loadHistory} style={{ padding: '9px 20px', background: C.accent, color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>Apply</button>
-              <button onClick={() => setHistFilter({ person: '', date: '' })} style={{ padding: '9px 20px', background: C.elevated, color: C.sub, border: '1px solid #1E2D3D', borderRadius: 8, fontSize: 13, cursor: 'pointer' }}>Clear</button>
+              <button onClick={() => setHistFilter({ person: '', date: '' })} style={{ padding: '9px 20px', background: C.elevated, color: C.sub, border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 13, cursor: 'pointer' }}>Clear</button>
             </div>
             {loadingHist ? (
               <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>Loading…</div>
@@ -682,7 +627,6 @@ export default function ReportsPage() {
           </div>
         )}
 
-        {/* ── TEAM VIEW TAB ── */}
         {tab === 'team' && <DailySummary teamMembers={teamMembers} date={todayStr()} />}
       </div>
     </div>
