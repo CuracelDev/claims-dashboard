@@ -12,32 +12,32 @@ const NAV = [
   {
     section: 'ANALYTICS',
     items: [
-      { href: '/',              icon: '📊', label: 'Claims Dashboard',  sub: 'Real-time monitoring' },
-      { href: '/query-builder', icon: '⚡', label: 'Query Builder',     sub: 'SQL generator & templates' },
+      { href: '/',              icon: '📊', label: 'Claims Dashboard', sub: 'Real-time monitoring' },
+      { href: '/query-builder', icon: '⚡', label: 'Query Builder',    sub: 'SQL generator & templates' },
     ],
   },
   {
     section: 'OPERATIONS',
     items: [
-      { href: '/reports',        icon: '📝', label: 'Daily Reports',    sub: 'Team reporting' },
-      { href: '/reports/weekly', icon: '📅', label: 'Weekly Summary',   sub: 'Aggregated view' },
-      { href: '/team',           icon: '👥', label: 'Team Management',  sub: 'Members & metrics' },
-      { href: '/tasks',          icon: '✅', label: 'Task Management',  sub: 'Assign & track work' },
+      { href: '/reports',        icon: '📝', label: 'Daily Reports',   sub: 'Team reporting',    exact: true },
+      { href: '/reports/weekly', icon: '📅', label: 'Weekly Summary',  sub: 'Aggregated view' },
+      { href: '/team',           icon: '👥', label: 'Team Management', sub: 'Members & metrics' },
+      { href: '/tasks',          icon: '✅', label: 'Task Management', sub: 'Assign & track work' },
     ],
   },
   {
     section: 'INTELLIGENCE',
     items: [
-      { href: '/qa',  icon: '🔍', label: 'QA Flag Tracker',   sub: 'Claims quality audit' },
-      { href: '/ops', icon: '⚡', label: 'Ops Overview',       sub: 'Team performance' },
+      { href: '/qa',  icon: '🔍', label: 'QA Flag Tracker', sub: 'Claims quality audit' },
+      { href: '/ops', icon: '⚡', label: 'Ops Overview',     sub: 'Team performance' },
     ],
   },
   {
     section: 'COMING SOON',
     items: [
-      { href: '/errors', icon: '🔴', label: 'Error Tracking',     disabled: true },
-      { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',        disabled: true },
-      { href: '/slack',  icon: '💬', label: 'Slack Intelligence',  disabled: true },
+      { href: '/errors', icon: '🔴', label: 'Error Tracking',    disabled: true },
+      { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',       disabled: true },
+      { href: '/slack',  icon: '💬', label: 'Slack Intelligence', disabled: true },
     ],
   },
 ];
@@ -45,13 +45,18 @@ const NAV = [
 export default function Sidebar() {
   const pathname = usePathname();
 
+  const isActive = (item) => {
+    if (item.exact) return pathname === item.href;
+    if (item.href === '/') return pathname === '/';
+    return pathname === item.href || pathname.startsWith(item.href + '/');
+  };
+
   return (
     <aside style={{
       width: 240, minHeight: '100vh', background: C.card,
       borderRight: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column',
       position: 'fixed', top: 0, left: 0, zIndex: 100,
     }}>
-      {/* Logo */}
       <div style={{ padding: '20px 18px', borderBottom: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 30, height: 30, borderRadius: 8, background: C.accent, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: '#0B0F1A' }}>C</div>
@@ -62,7 +67,6 @@ export default function Sidebar() {
         </div>
       </div>
 
-      {/* Nav */}
       <nav style={{ flex: 1, padding: '12px 10px', overflowY: 'auto' }}>
         {NAV.map(group => (
           <div key={group.section} style={{ marginBottom: 22 }}>
@@ -70,7 +74,7 @@ export default function Sidebar() {
               {group.section}
             </div>
             {group.items.map(item => {
-              const active = pathname === item.href || (item.href !== '/' && pathname.startsWith(item.href));
+              const active = isActive(item);
               if (item.disabled) {
                 return (
                   <div key={item.href} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 8, marginBottom: 2, opacity: 0.35, cursor: 'not-allowed' }}>
@@ -104,9 +108,8 @@ export default function Sidebar() {
         ))}
       </nav>
 
-      {/* Footer */}
       <div style={{ padding: '12px 18px', borderTop: `1px solid ${C.border}` }}>
-        <div style={{ fontSize: 10, color: C.muted }}>v4.5 — Phase 4</div>
+        <div style={{ fontSize: 10, color: C.muted }}>v5.0 — Phase 5</div>
       </div>
     </aside>
   );
