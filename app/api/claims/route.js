@@ -3,6 +3,23 @@ import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
+// Canonical insurer name map — add any bad variants here
+const CANONICAL_INSURERS = {
+  "uap old mutual uganda":       "UAP Old Mutual Uganda",
+  "uap old mutual ug":           "UAP Old Mutual Uganda",
+  "uap old mutual uganda ltd":   "UAP Old Mutual Uganda",
+  "uap old mutual kenya":        "UAP Old Mutual Kenya",
+  "jubilee health uganda":       "Jubilee Health Uganda",
+  "jubilee health kenya":        "Jubilee Health Kenya",
+  "jubilee health tanzania":     "Jubilee Health Tanzania",
+};
+
+function normaliseInsurer(name) {
+  if (!name) return name;
+  const key = name.toLowerCase().trim();
+  return CANONICAL_INSURERS[key] || name;
+}
+
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const from = searchParams.get("from");
@@ -17,14 +34,20 @@ export async function GET(request) {
       .order("date", { ascending: false });
 
     if (from) query = query.gte("date", from);
-    if (to) query = query.lte("date", to);
+    if (to)   query = query.lte("date", to);
     if (insurer) query = query.eq("insurer", insurer);
 
     const { data, error } = await query;
     if (error) throw error;
 
+    // Normalise insurer names before returning
+    const normalised = data.map(row => ({
+      ...row,
+      insurer: normaliseInsurer(row.insurer),
+    }));
+
     return NextResponse.json(
-      { success: true, data, count: data.length, updated_at: new Date().toISOString() },
+      { success: true, data: normalised, count: normalised.length, updated_at: new Date().toISOString() },
       { headers: { "Cache-Control": "s-maxage=300, stale-while-revalidate=600" } }
     );
   } catch (error) {
