@@ -246,6 +246,21 @@ export default function QADashboard() {
   const inp = { background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: "7px 12px", color: C.text, fontSize: 12, outline: "none" };
   const btn = (on) => ({ background: on ? C.accent : "transparent", color: on ? C.bg : C.sub, border: `1px solid ${on ? C.accent : C.border}`, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all .2s" });
 
+  function exportCSV() {
+    const flags = filteredFlags.length > 0 ? filteredFlags : (data?.flags || []);
+    if (!flags.length) return;
+    const cols = ["flagged_at","claim_id","full_name","insurance_number","provider_name","insurer_name","item_description","issues","qty_billed","qty_approved","unit_price_billed","unit_price_calculated","bill_submitted","bill_approved","vetting_comment","item_status","encounter_date","source"];
+    const escape = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const rows = [cols.join(","), ...flags.map(f => cols.map(c => escape(f[c])).join(","))];
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `qa-flags-${from}-to-${to}${activeIssue ? "-" + activeIssue.replace(/\s+/g,"-") : ""}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div style={{ background: C.bg, minHeight: "100vh", color: C.text, fontFamily: "'DM Sans', sans-serif" }}>
       <style>{`
@@ -268,9 +283,14 @@ export default function QADashboard() {
             <div style={{ fontSize: 10, color: C.muted }}>Curacel Health Ops · Claims Quality Assurance</div>
           </div>
         </div>
-        <button onClick={fetchData} style={{ background: "transparent", border: `1px solid ${C.sub}`, color: C.sub, borderRadius: 8, padding: "10px 20px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
-          🔄 Refresh
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={exportCSV} disabled={!data?.flags?.length} style={{ background: "transparent", border: `1px solid ${C.accent}`, color: C.accent, borderRadius: 8, padding: "10px 20px", fontSize: 13, fontWeight: 600, cursor: "pointer", opacity: !data?.flags?.length ? 0.4 : 1 }}>
+            ⬇ Export CSV
+          </button>
+          <button onClick={fetchData} style={{ background: "transparent", border: `1px solid ${C.sub}`, color: C.sub, borderRadius: 8, padding: "10px 20px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+            🔄 Refresh
+          </button>
+        </div>
       </div>
 
       <div style={{ padding: "20px 28px", maxWidth: 1440, margin: "0 auto" }}>
