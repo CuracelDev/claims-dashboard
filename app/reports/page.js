@@ -2,6 +2,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
 import ReportPinGate, { getSession } from '../components/ReportPinGate';
+import InsightBanner from '../components/InsightBanner';
 
 const METRIC_GROUPS = [
   {
@@ -604,6 +605,7 @@ export default function ReportsPage() {
       </div>
 
       <div style={{ padding: '20px 24px' }}>
+        <InsightBanner />
         {tab === 'form' && (
           <div style={{ maxWidth: '100%' }}>
             <ReportPinGate members={teamMembers} onAuth={handleAuth} existingSession={authSession}>

@@ -1,6 +1,7 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
+import InsightBanner from '../components/InsightBanner';
 
 const todayISO = () => new Date().toISOString().split('T')[0];
 const fmtDate  = (iso) => new Date(iso + 'T12:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
@@ -309,6 +310,7 @@ export default function TargetsPage() {
       </div>
 
       <div style={{ padding:'16px 24px' }}>
+        <InsightBanner />
 
         {/* Summary strip */}
         <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginBottom:16 }}>

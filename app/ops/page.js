@@ -1,7 +1,9 @@
+// PATH: app/ops/page.js
 'use client';
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import InsightBanner from '../components/InsightBanner';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LineChart, Line } from 'recharts';
 
 const METRIC_LABELS = {
   providers_mapped:'Providers Mapped', care_items_mapped:'Care Items Mapped',
@@ -13,424 +15,521 @@ const METRIC_LABELS = {
   providers_assigned:'Providers Assigned',
 };
 
-// Dynamic today — computed fresh each render, not stale module-level
-const getToday = () => new Date().toISOString().split('T')[0];
-
-const fmtDay = (d) => {
-  const dt = new Date(d + 'T12:00:00');
-  return dt.toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short' });
-};
-
-const QUICK_RANGES = [
-  { label:'Today',      days: 0  },
-  { label:'This week',  days: 7  },
-  { label:'2 weeks',    days: 14 },
-  { label:'30 days',    days: 30 },
-  { label:'This month', month: true },
+const KEY_METRICS = [
+  { key:'care_items_mapped',  label:'Care Items Mapped',  color:'#00E5A0' },
+  { key:'resolved_cares',     label:'Resolved Cares',     color:'#5B8DEF' },
+  { key:'providers_mapped',   label:'Providers Mapped',   color:'#A78BFA' },
+  { key:'care_items_grouped', label:'Care Items Grouped', color:'#F59E0B' },
 ];
 
-function getRangeDates(range) {
-  const today = getToday();
-  const todayDate = new Date(today + 'T12:00:00');
-  if (range.month) {
-    const from = new Date(todayDate.getFullYear(), todayDate.getMonth(), 1).toISOString().split('T')[0];
-    return { from, to: today };
-  }
-  if (range.days === 0) return { from: today, to: today };
-  const from = new Date(todayDate);
-  from.setDate(todayDate.getDate() - range.days + 1);
-  return { from: from.toISOString().split('T')[0], to: today };
+const CLAIMS_INSURERS = [
+  { key:'claims_kenya',    label:'Kenya' },
+  { key:'claims_tanzania', label:'Tanzania' },
+  { key:'claims_uganda',   label:'Uganda' },
+  { key:'claims_uap',      label:'UAP Old Mutual' },
+  { key:'claims_defmis',   label:'Defmis' },
+  { key:'claims_hadiel',   label:'Hadiel Tech' },
+  { key:'claims_axa',      label:'AXA' },
+];
+
+const localDate = (offsetDays = 0) => {
+  const d = new Date();
+  if (offsetDays) d.setDate(d.getDate() + offsetDays);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+};
+const getToday     = () => localDate(0);
+const getYesterday = () => localDate(-1);
+const weekStart = () => {
+  const d = new Date(); const day = d.getDay();
+  const mon = new Date(d); mon.setDate(d.getDate() + (day===0?-6:1-day));
+  return mon.toISOString().split('T')[0];
+};
+const fmt = d => new Date(d+'T12:00:00').toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+const fmtTime = iso => iso ? new Date(iso).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}) : null;
+const pctChange = (a, b) => b > 0 ? Math.round(((a-b)/b)*100) : null;
+const numFmt = n => n >= 1000 ? (n/1000).toFixed(1)+'k' : n.toString();
+
+const QUICK_RANGES = [
+  { label:'Today',       from: ()=> getToday(),   to: ()=> getToday() },
+  { label:'This week',   from: ()=> weekStart(),   to: ()=> getToday() },
+  { label:'Last 14d',    from: ()=>{ const d=new Date(); d.setDate(d.getDate()-13); return d.toISOString().split('T')[0]; }, to: ()=> getToday() },
+  { label:'This month',  from: ()=> new Date(new Date().getFullYear(),new Date().getMonth(),1).toISOString().split('T')[0], to: ()=> getToday() },
+];
+
+// ── Trend chip ─────────────────────────────────────────────────────────
+function TrendChip({ value, inverted = false }) {
+  if (value === null || value === undefined) return null;
+  const positive = inverted ? value < 0 : value > 0;
+  const neutral = value === 0;
+  return (
+    <span style={{
+      fontSize: 11, fontWeight: 700, padding: '2px 7px', borderRadius: 20,
+      background: neutral ? '#3A4A5E22' : positive ? '#00E5A022' : '#FF4D4D22',
+      color: neutral ? '#6B7A99' : positive ? '#00E5A0' : '#FF4D4D',
+      display: 'inline-block', marginLeft: 6,
+    }}>
+      {neutral ? '—' : value > 0 ? `▲ ${value}%` : `▼ ${Math.abs(value)}%`}
+    </span>
+  );
 }
 
-/* ── ℹ️ InfoTip — hover tooltip for stat cards ─────────────── */
-function InfoTip({ text, C }) {
-  const [show, setShow] = useState(false);
+// ── Stat card with trend ───────────────────────────────────────────────
+function StatCard({ label, value, trend, trendLabel, color, sub, onClick, C }) {
   return (
     <div
-      onMouseEnter={() => setShow(true)}
-      onMouseLeave={() => setShow(false)}
-      style={{ position:'absolute', top:10, right:10, cursor:'default' }}
+      onClick={onClick}
+      style={{
+        background: C.card, border: `1px solid ${C.border}`, borderRadius: 12,
+        padding: 18, flex: 1, minWidth: 160, position: 'relative',
+        cursor: onClick ? 'pointer' : 'default',
+        transition: 'border-color 0.15s',
+      }}
+      onMouseEnter={e => { if (onClick) e.currentTarget.style.borderColor = color || '#00E5A0'; }}
+      onMouseLeave={e => { if (onClick) e.currentTarget.style.borderColor = '#1E2D45'; }}
     >
-      <span style={{ fontSize:13, color:C.muted, userSelect:'none' }}>ℹ</span>
-      {show && (
-        <div style={{
-          position:'absolute', top:20, right:0, width:220, background:C.elevated,
-          border:`1px solid ${C.border}`, borderRadius:8, padding:'9px 12px',
-          fontSize:11, color:C.sub, lineHeight:1.5, zIndex:50,
-          boxShadow:'0 4px 20px rgba(0,0,0,0.4)', textAlign:'left',
-        }}>
-          {text}
+      <div style={{ fontSize: 12, color: '#6B7A99', marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 700, color: color || '#00E5A0', lineHeight: 1 }}>
+        {value}
+      </div>
+      {(trend !== undefined || sub) && (
+        <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 4 }}>
+          {sub && <span style={{ fontSize: 11, color: '#6B7A99' }}>{sub}</span>}
+          {trend !== undefined && <TrendChip value={trend} />}
+          {trendLabel && <span style={{ fontSize: 10, color: '#3A4A5E', marginLeft: 2 }}>{trendLabel}</span>}
         </div>
       )}
     </div>
   );
 }
 
+// ── Member row with drilldown ──────────────────────────────────────────
+function MemberRow({ member, memberMap, metrics, avgMetrics, onDrilldown, C }) {
+  const name = memberMap[String(member.id)]?.display_name || memberMap[String(member.id)]?.name || member.name;
+  const totals = member.totals || {};
+  const totalOutput = Object.values(totals).reduce((a,b)=>a+b,0);
+
+  return (
+    <tr
+      style={{ cursor: 'pointer' }}
+      onClick={() => onDrilldown(member)}
+      onMouseEnter={e => e.currentTarget.style.background = '#1A2A3F'}
+      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+    >
+      <td style={{ padding: '10px 14px', fontSize: 13, fontWeight: 600, color: '#E8EEF7', whiteSpace: 'nowrap' }}>
+        {name}
+      </td>
+      {KEY_METRICS.map(m => {
+        const val = totals[m.key] || 0;
+        const avg = avgMetrics[m.key] || 0;
+        const diff = avg > 0 ? Math.round(((val - avg) / avg) * 100) : null;
+        return (
+          <td key={m.key} style={{ padding: '10px 14px', fontSize: 13, textAlign: 'right' }}>
+            <span style={{ color: '#E8EEF7' }}>{val.toLocaleString()}</span>
+            {diff !== null && (
+              <span style={{
+                fontSize: 10, marginLeft: 5,
+                color: diff >= 0 ? '#00E5A0' : '#FF4D4D',
+              }}>
+                {diff >= 0 ? `+${diff}%` : `${diff}%`}
+              </span>
+            )}
+          </td>
+        );
+      })}
+      <td style={{ padding: '10px 14px', fontSize: 13, textAlign: 'right', fontWeight: 700, color: '#00E5A0' }}>
+        {totalOutput.toLocaleString()}
+      </td>
+      <td style={{ padding: '10px 14px', textAlign: 'center' }}>
+        <span style={{ fontSize: 11, color: '#6B7A99' }}>
+          {member.days_reported}d
+        </span>
+      </td>
+    </tr>
+  );
+}
+
+// ── Drilldown modal ────────────────────────────────────────────────────
+function DrilldownModal({ member, memberMap, from, to, onClose, C }) {
+  const name = memberMap[String(member.person?.id)]?.display_name
+    || memberMap[String(member.person?.id)]?.name
+    || member.person?.name || 'Unknown';
+  const totals = member.totals || {};
+  const daily  = member.daily || [];
+
+  const chartData = daily
+    .map(d => ({ date: d.date?.slice(5), total: Object.values(d.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0) }))
+    .sort((a,b) => a.date > b.date ? 1 : -1)
+    .slice(-7);
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
+    }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{
+        background: C.card, border: `1px solid ${C.border}`, borderRadius: 16,
+        padding: 28, width: '100%', maxWidth: 600, maxHeight: '85vh', overflowY: 'auto',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 18, color: C.text }}>{name}</div>
+            <div style={{ fontSize: 12, color: C.sub }}>
+              {fmt(from)} — {fmt(to)} · {member.days_reported} day{member.days_reported !== 1 ? 's' : ''} reported
+            </div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.sub, fontSize: 22, cursor: 'pointer' }}>✕</button>
+        </div>
+
+        {/* Daily trend chart */}
+        {chartData.length > 1 && (
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 8 }}>Daily output trend</div>
+            <ResponsiveContainer width="100%" height={100}>
+              <LineChart data={chartData}>
+                <XAxis dataKey="date" tick={{ fill: '#6B7A99', fontSize: 10 }} axisLine={false} tickLine={false} />
+                <YAxis hide />
+                <Tooltip contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }} />
+                <Line type="monotone" dataKey="total" stroke="#00E5A0" strokeWidth={2} dot={{ fill: '#00E5A0', r: 3 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+
+        {/* Metric breakdown */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          {Object.entries(totals)
+            .filter(([, v]) => parseInt(v) > 0)
+            .sort(([, a], [, b]) => b - a)
+            .map(([k, v]) => (
+              <div key={k} style={{ background: C.elevated, borderRadius: 8, padding: '10px 12px', display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ fontSize: 12, color: C.sub }}>{METRIC_LABELS[k] || k}</span>
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{parseInt(v).toLocaleString()}</span>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main page ──────────────────────────────────────────────────────────
 export default function OpsPage() {
   const { C } = useTheme();
-  const TODAY = getToday(); // Fresh on each render
+  const TODAY     = getToday();
+  const YESTERDAY = getYesterday();
 
-  const [activeRange, setActiveRange] = useState(1);
-  const [customFrom, setCustomFrom]   = useState('');
-  const [customTo, setCustomTo]       = useState(TODAY);
-  const [useCustom, setUseCustom]     = useState(false);
+  const [rangeIdx, setRangeIdx]   = useState(0);
+  const [opsData, setOpsData]     = useState(null);
+  const [yData, setYData]         = useState(null);
+  const [loading, setLoading]     = useState(true);
+  const [teamMembers, setTeamMembers] = useState([]);
+  const [drilldown, setDrilldown] = useState(null);
+  const [insightData, setInsightData] = useState(null);
+  const [lastRefresh, setLastRefresh] = useState(null);
 
-  const [teamMembers, setTeamMembers]   = useState([]);
-  const [reports, setReports]           = useState([]);
-  const [todayReports, setTodayReports] = useState([]);
-  const [tasks, setTasks]               = useState([]);
-  const [loading, setLoading]           = useState(true);
-  const [expandedRow, setExpandedRow]   = useState(null);
+  const memberMap = useMemo(() => {
+    const m = {};
+    teamMembers.forEach(t => { m[String(t.id)] = t; });
+    return m;
+  }, [teamMembers]);
 
-  const { from, to } = useCustom && customFrom
-    ? { from: customFrom, to: customTo }
-    : getRangeDates(QUICK_RANGES[activeRange]);
+  const range = QUICK_RANGES[rangeIdx];
 
-  // Sync inputs to quick range dates so user can see the active range
-  const handleQuickRange = (i) => {
-    setActiveRange(i);
-    setUseCustom(false);
-    const { from: f, to: t } = getRangeDates(QUICK_RANGES[i]);
-    setCustomFrom(f);
-    setCustomTo(t);
-  };
-
-  useEffect(() => {
-    // Initialise inputs with default range (This week)
-    const { from: f, to: t } = getRangeDates(QUICK_RANGES[1]);
-    setCustomFrom(f); setCustomTo(t);
-  }, []);
-
-  useEffect(() => {
-    fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
-    fetch('/api/tasks').then(r => r.json()).then(({ data }) => setTasks(data || []));
-  }, []);
-
-  useEffect(() => {
+  const loadData = useCallback(() => {
+    const from = range.from();
+    const to   = range.to();
     setLoading(true);
+
     Promise.all([
-      fetch(`/api/reports?from=${from}&to=${to}&limit=200`).then(r => r.json()),
-      fetch(`/api/reports?date=${TODAY}&limit=50`).then(r => r.json()),
-    ]).then(([range, today]) => {
-      setReports(range.data || []);
-      setTodayReports(today.data || []);
-      setLoading(false);
-    }).catch(() => setLoading(false));
-  }, [from, to]);
+      fetch(`/api/reports/weekly?from=${from}&to=${to}`).then(r => r.json()),
+      fetch(`/api/reports/weekly?from=${YESTERDAY}&to=${YESTERDAY}`).then(r => r.json()),
+      fetch('/api/team').then(r => r.json()),
+      fetch('/api/insights').then(r => r.json()),
+    ]).then(([main, yest, team, ins]) => {
+      setOpsData(main);
+      setYData(yest);
+      setTeamMembers(team.data || []);
+      setInsightData(ins);
+      setLastRefresh(new Date());
+    }).catch(console.error)
+      .finally(() => setLoading(false));
+  }, [rangeIdx]);
 
-  const getMemberScore  = (id, date) => {
-    const r = reports.find(x => String(x.team_member_id) === String(id) && x.report_date === date);
-    if (!r) return null;
-    return Object.values(r.metrics||{}).filter(v => parseInt(v)>0).length;
-  };
-  const getMemberTotal  = (id) => reports.filter(r => String(r.team_member_id) === String(id))
-    .reduce((s,r) => s + Object.values(r.metrics||{}).reduce((a,b) => a+(parseInt(b)||0), 0), 0);
-  const getMemberDays   = (id) => new Set(reports.filter(r => String(r.team_member_id)===String(id)).map(r=>r.report_date)).size;
-  const getTodayReport  = (id) => todayReports.find(r => String(r.team_member_id)===String(id));
+  useEffect(() => { loadData(); }, [loadData]);
 
-  const allDates = [...new Set(reports.map(r => r.report_date))].sort();
-  const chartData = allDates.map(d => ({
-    date: d,
-    output: reports.filter(r => r.report_date===d)
-      .reduce((s,r) => s+Object.values(r.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0), 0),
-  }));
+  // Auto-refresh every 90s
+  useEffect(() => {
+    const t = setInterval(loadData, 90_000);
+    return () => clearInterval(t);
+  }, [loadData]);
 
-  const daysTracked = new Set(reports.map(r => r.report_date)).size;
-  // totalOutput retained for the TOTAL row in the breakdown table
-  const totalOutput = reports.reduce((s,r)=>s+Object.values(r.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0),0);
+  const members   = opsData?.by_person    || [];
+  const teamTotals = opsData?.team_totals || {};
+  const yTotals   = yData?.team_totals    || {};
 
-  // Top metric across the range
-  const metricTotals = {};
-  reports.forEach(r => {
-    Object.entries(r.metrics||{}).forEach(([k,v]) => {
-      metricTotals[k] = (metricTotals[k]||0) + (parseInt(v)||0);
-    });
-  });
-  const topMetric = Object.entries(metricTotals).sort((a,b)=>b[1]-a[1])[0];
-
-  const getDaysInRange = () => {
-    const start = new Date(from + 'T12:00:00');
-    const end   = new Date(to   + 'T12:00:00');
-    const diff  = Math.round((end - start) / 86400000);
-    const days  = [];
-    for (let i = 0; i <= Math.min(diff, 13); i++) {
-      const d = new Date(start); d.setDate(start.getDate() + i);
-      if (d.getDay() !== 0 && d.getDay() !== 6) days.push(d.toISOString().split('T')[0]);
+  // Compute team averages per metric
+  const avgMetrics = useMemo(() => {
+    if (!members.length) return {};
+    const avg = {};
+    for (const m of KEY_METRICS) {
+      const sum = members.reduce((a, p) => a + (p.totals?.[m.key] || 0), 0);
+      avg[m.key] = Math.round(sum / members.length);
     }
-    return days.reverse();
-  };
-  const days = getDaysInRange();
-  const pendingTasks = tasks.filter(t => t.status !== 'done');
+    return avg;
+  }, [members]);
 
-  const cardStyle = {
-    background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20,
-  };
-  const inputStyle = {
-    background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 8,
-    color: C.text, padding: '7px 10px', fontSize: 13, outline: 'none',
+  // Bar chart data — insurer breakdown for selected range
+  const claimsChartData = CLAIMS_INSURERS
+    .map(c => ({ name: c.label, value: teamTotals[c.key] || 0 }))
+    .filter(c => c.value > 0)
+    .sort((a,b) => b.value - a.value);
+
+  const S = {
+    section: { marginBottom: 24 },
+    label:  { fontSize: 12, color: C.sub, marginBottom: 4 },
+    card:   { background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' },
+    th:     { padding: '10px 14px', fontSize: 11, fontWeight: 700, color: '#00E5A0', textTransform: 'uppercase', letterSpacing: '0.05em', borderBottom: `1px solid ${C.border}`, background: C.elevated, textAlign: 'right' },
   };
 
   return (
-    <div style={{ minHeight:'100vh', background:C.bg, color:C.text, paddingBottom:60, transition:'background 0.2s' }}>
-
+    <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60 }}>
       {/* Header */}
-      <div style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:'18px 24px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <h1 style={{ margin:0, fontSize:22, fontWeight:700, color:C.text }}>Operations Overview</h1>
-          <p style={{ margin:'4px 0 0', fontSize:13, color:C.sub }}>Curacel Health Ops · Team performance</p>
+          <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, color: C.text }}>Ops Overview</h1>
+          <p style={{ margin: '4px 0 0', fontSize: 14, color: C.sub }}>Team performance intelligence</p>
         </div>
-        <div style={{ fontSize:13, color:C.sub, background:C.elevated, padding:'8px 14px', borderRadius:8, border:`1px solid ${C.border}` }}>
-          📅 {new Date().toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {lastRefresh && (
+            <span style={{ fontSize: 11, color: C.muted }}>
+              🟢 Live · refreshed {lastRefresh.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}
+            </span>
+          )}
+          <button
+            onClick={loadData}
+            style={{ padding: '6px 14px', background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, color: C.sub, fontSize: 12, cursor: 'pointer' }}
+          >
+            ↺ Refresh
+          </button>
         </div>
       </div>
 
-      <div style={{ padding:'20px 24px', boxSizing:'border-box' }}>
+      <div style={{ padding: '20px 24px' }}>
 
-        {/* Today score cards */}
-        <div style={{ marginBottom:8, fontSize:11, fontWeight:600, color:C.muted, letterSpacing:'0.07em' }}>
-          TODAY · {new Date(TODAY+'T12:00:00').toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'short'}).toUpperCase()}
-        </div>
-        <div style={{ display:'grid', gridTemplateColumns:`repeat(${Math.max(teamMembers.length,1)},1fr)`, gap:10, marginBottom:24 }}>
-          {teamMembers.map(m => {
-            const r = getTodayReport(m.id);
-            const score = r ? Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length : null;
-            return (
-              <div key={m.id} style={{ ...cardStyle, padding:'14px 10px', textAlign:'center', borderTop:`3px solid ${r ? (score>=5?C.accent:C.warn) : C.border}` }}>
-                <div style={{ fontSize:13, fontWeight:700, color:C.text, marginBottom:6, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{m.name}</div>
-                {r ? (
-                  <>
-                    <div style={{ fontSize:24, fontWeight:700, color:score>=5?C.accent:C.warn }}>{score}</div>
-                    <div style={{ fontSize:10, color:C.sub }}>fields</div>
-                  </>
-                ) : (
-                  <>
-                    <div style={{ color:C.border, fontSize:18, margin:'4px 0' }}>—</div>
-                    <div style={{ fontSize:10, color:C.muted }}>Not submitted</div>
-                  </>
-                )}
-              </div>
-            );
-          })}
-        </div>
+        {/* Insight Banner */}
+        <InsightBanner autoRefresh={false} />
 
-        {/* Range controls */}
-        <div style={{ ...cardStyle, marginBottom:24, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
-          {QUICK_RANGES.map((r,i) => (
-            <button key={r.label} onClick={() => handleQuickRange(i)} style={{
-              padding:'7px 14px', borderRadius:8, fontSize:13, fontWeight:500, cursor:'pointer',
-              border:`1px solid ${!useCustom&&activeRange===i ? C.accent : C.border}`,
-              background:!useCustom&&activeRange===i ? `${C.accent}18` : 'transparent',
-              color:!useCustom&&activeRange===i ? C.accent : C.sub,
+        {/* Range selector */}
+        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+          {QUICK_RANGES.map((r, i) => (
+            <button key={i} onClick={() => setRangeIdx(i)} style={{
+              padding: '6px 14px', fontSize: 12, fontWeight: i === rangeIdx ? 700 : 400,
+              background: i === rangeIdx ? '#00E5A022' : C.elevated,
+              color: i === rangeIdx ? '#00E5A0' : C.sub,
+              border: `1px solid ${i === rangeIdx ? '#00E5A044' : C.border}`,
+              borderRadius: 8, cursor: 'pointer',
             }}>{r.label}</button>
           ))}
-          <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)} style={{ ...inputStyle, marginLeft:8 }} />
-          <span style={{ color:C.muted }}>→</span>
-          <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)} style={inputStyle} />
-          <button onClick={() => { setUseCustom(true); setActiveRange(-1); }} style={{
-            padding:'7px 14px', background:C.accent, color:'#0B0F1A',
-            border:'none', borderRadius:8, fontWeight:700, fontSize:13, cursor:'pointer',
-          }}>Apply</button>
         </div>
 
-        {/* Stats — 4 cards with ℹ️ tooltips */}
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:24 }}>
-          {[
-            {
-              val: `${todayReports.length}/${teamMembers.length}`,
-              label: 'Submitted today',
-              color: C.accent,
-              tip: 'Number of team members who have submitted a daily report today vs total active members.',
-            },
-            {
-              val: reports.length,
-              label: 'Reports this period',
-              color: C.blue,
-              sub: from === to ? 'today' : `${from} – ${to}`,
-              tip: 'Total individual report submissions within the selected date range.',
-            },
-            {
-              val: daysTracked,
-              label: 'Days with activity',
-              color: C.purple,
-              tip: 'Number of distinct calendar days within the range that have at least one report submitted — not counting days where everyone was off or no one logged anything.',
-            },
-            {
-              val: pendingTasks.length,
-              label: 'Pending tasks',
-              color: pendingTasks.length > 0 ? C.warn : C.success,
-              tip: 'Open tasks assigned to the team via Task Management that have not yet been marked complete.',
-            },
-          ].map((s, i) => (
-            <div key={i} style={{ ...cardStyle, textAlign:'center', position:'relative' }}>
-              {/* ℹ️ tooltip trigger */}
-              <InfoTip text={s.tip} C={C} />
-              <div style={{ fontSize:30, fontWeight:700, color:s.color, fontFamily:'monospace' }}>{s.val}</div>
-              <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>{s.label}</div>
-              {s.sub && <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>{s.sub}</div>}
+        {loading ? (
+          <div style={{ textAlign: 'center', padding: 80, color: C.sub, fontSize: 14 }}>Loading intelligence data…</div>
+        ) : (
+          <>
+            {/* ── KPI stat cards ─────────────────────────────────── */}
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
+              {KEY_METRICS.map(m => {
+                const val  = teamTotals[m.key] || 0;
+                const yVal = yTotals[m.key] || 0;
+                const trend = rangeIdx === 0 ? pctChange(val, yVal) : null;
+                return (
+                  <StatCard
+                    key={m.key}
+                    label={m.label}
+                    value={numFmt(val)}
+                    trend={trend}
+                    trendLabel={trend !== null ? 'vs yesterday' : undefined}
+                    color={m.color}
+                    sub={rangeIdx === 0 ? `Yesterday: ${numFmt(yVal)}` : undefined}
+                    C={C}
+                  />
+                );
+              })}
+
+              {/* Submission rate card */}
+              {insightData?.kpis && (
+                <StatCard
+                  label="Submission Rate"
+                  value={`${insightData.kpis.submission_rate}%`}
+                  sub={`${insightData.submission?.submitted} / ${insightData.kpis.active_members} active`}
+                  color={insightData.kpis.submission_rate === 100 ? '#00E5A0' : '#F59E0B'}
+                  C={C}
+                />
+              )}
+              {insightData?.kpis?.target_attainment !== null && insightData?.kpis?.target_attainment !== undefined && (
+                <StatCard
+                  label="Target Attainment"
+                  value={`${insightData.kpis.target_attainment}%`}
+                  sub={`${insightData.kpis.targets_hit} of ${insightData.kpis.targets_total} targets`}
+                  color={insightData.kpis.target_attainment >= 80 ? '#00E5A0' : insightData.kpis.target_attainment >= 50 ? '#5B8DEF' : '#FF4D4D'}
+                  C={C}
+                />
+              )}
             </div>
-          ))}
-        </div>
 
-        {/* Chart + Pending */}
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 260px', gap:18, marginBottom:24 }}>
-          <div style={cardStyle}>
-            <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:14 }}>Daily Output</div>
-            {chartData.length===0 ? (
-              <div style={{ textAlign:'center', padding:40, color:C.muted }}>No data for this range</div>
-            ) : (
-              <ResponsiveContainer width="100%" height={200}>
-                <BarChart data={chartData} margin={{ top:0, right:0, left:-20, bottom:0 }}>
-                  <XAxis dataKey="date" tickFormatter={d => {
-                    const dt = new Date(d+'T12:00:00');
-                    return `${dt.getMonth()+1}-${String(dt.getDate()).padStart(2,'0')}`;
-                  }} tick={{ fontSize:10, fill:C.sub }} />
-                  <YAxis tick={{ fontSize:10, fill:C.sub }} tickFormatter={v => v>=1000?`${(v/1000).toFixed(0)}k`:v} />
-                  <Tooltip contentStyle={{ background:C.elevated, border:`1px solid ${C.border}`, borderRadius:8, fontSize:12 }} labelFormatter={d => fmtDay(d)} />
-                  <Bar dataKey="output" radius={[4,4,0,0]} name="Output">
-                    {chartData.map((_,i) => <Cell key={i} fill={C.accent} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-          <div style={{ ...cardStyle, overflowY:'auto', maxHeight:270 }}>
-            <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:12 }}>Pending Tasks</div>
-            {pendingTasks.length===0 ? (
-              <div style={{ textAlign:'center', padding:20 }}>
-                <div style={{ fontSize:20, marginBottom:6 }}>🎉</div>
-                <div style={{ fontSize:12, color:C.sub }}>All clear</div>
-              </div>
-            ) : pendingTasks.slice(0,8).map(t => (
-              <div key={t.id} style={{ borderBottom:`1px solid ${C.border}`, paddingBottom:8, marginBottom:8 }}>
-                <div style={{ fontSize:12, fontWeight:600, color:C.text }}>{t.title}</div>
-                <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>
-                  {t.priority && <span style={{ color:t.priority==='high'?C.danger:t.priority==='medium'?C.warn:C.sub }}>● {t.priority}</span>}
-                  {t.due_date && <span style={{ marginLeft:6 }}>Due {t.due_date}</span>}
+            {/* ── Today vs Yesterday detail ───────────────────────── */}
+            {rangeIdx === 0 && insightData?.today_vs_yesterday?.length > 0 && (
+              <div style={{ ...S.section }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Today vs Yesterday
                 </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Range summary + Daily breakdown */}
-        <div style={{ display:'grid', gridTemplateColumns:'200px 1fr', gap:18 }}>
-          <div style={cardStyle}>
-            <div style={{ fontSize:11, fontWeight:600, color:C.muted, letterSpacing:'0.07em', marginBottom:12 }}>RANGE SUMMARY</div>
-            {teamMembers.map(m => {
-              const total = getMemberTotal(m.id);
-              const dCount = getMemberDays(m.id);
-              return (
-                <div key={m.id} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'7px 0', borderBottom:`1px solid ${C.border}` }}>
-                  <span style={{ fontSize:12, color:C.text }}>{m.name}</span>
-                  <span style={{ fontSize:12, color:total>0?C.accent:C.muted, fontWeight:600 }}>
-                    {total>0 ? total.toLocaleString() : '—'}
-                    {dCount>0 && <span style={{ fontSize:10, color:C.muted, marginLeft:4 }}>({dCount}d)</span>}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-
-          <div style={{ ...cardStyle, overflowX:'auto' }}>
-            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14, flexWrap:'wrap', gap:8 }}>
-              <div style={{ fontSize:13, fontWeight:600, color:C.text }}>
-                Daily Breakdown
-                <span style={{ fontSize:11, fontWeight:400, color:C.sub, marginLeft:8 }}>· Click any score to expand</span>
-              </div>
-              <div style={{ display:'flex', gap:8 }}>
-                <span style={{ fontSize:11, background:`${C.accent}20`, color:C.accent, padding:'3px 10px', borderRadius:20 }}>≥5 on track</span>
-                <span style={{ fontSize:11, background:`${C.danger}20`, color:C.danger, padding:'3px 10px', borderRadius:20 }}>&lt;5 attention</span>
-              </div>
-            </div>
-            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign:'left', padding:'8px 12px', color:C.sub, fontWeight:600, borderBottom:`1px solid ${C.border}` }}>Date</th>
-                  {teamMembers.map(m => (
-                    <th key={m.id} style={{ textAlign:'center', padding:'8px 8px', color:C.sub, fontWeight:600, borderBottom:`1px solid ${C.border}` }}>{m.name}</th>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  {insightData.today_vs_yesterday.filter(m => m.today > 0 || m.yesterday > 0).map(m => (
+                    <div key={m.key} style={{ ...S.card, padding: '12px 16px', minWidth: 160 }}>
+                      <div style={{ fontSize: 11, color: C.sub, marginBottom: 4 }}>{m.label}</div>
+                      <div style={{ fontSize: 22, fontWeight: 700, color: C.text }}>{m.today.toLocaleString()}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 }}>
+                        <span style={{ fontSize: 11, color: C.muted }}>{m.yesterday.toLocaleString()} yest.</span>
+                        <TrendChip value={m.pct_change} inverted={m.key === 'flagged_care_items'} />
+                      </div>
+                    </div>
                   ))}
-                  <th style={{ textAlign:'center', padding:'8px 8px', color:C.accent, fontWeight:700, borderBottom:`1px solid ${C.border}` }}>Team</th>
-                </tr>
-              </thead>
-              <tbody>
-                {days.map(d => {
-                  const isToday = d === TODAY;
-                  const dayReports = reports.filter(r => r.report_date===d);
-                  const teamTotal  = dayReports.reduce((s,r)=>s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length,0);
-                  return [
-                    <tr key={d} style={{ background:isToday?`${C.accent}08`:'transparent' }}>
-                      <td style={{ padding:'9px 12px', borderBottom:`1px solid ${C.border}`, color:isToday?C.accent:C.text, fontWeight:isToday?700:400, whiteSpace:'nowrap' }}>
-                        {fmtDay(d)}
-                      </td>
-                      {teamMembers.map(m => {
-                        const score = getMemberScore(m.id, d);
-                        const key = `${m.id}-${d}`;
-                        return (
-                          <td key={m.id} style={{ textAlign:'center', padding:'9px 6px', borderBottom:`1px solid ${C.border}`, cursor:score!==null?'pointer':'default' }}
-                            onClick={() => score!==null && setExpandedRow(expandedRow===key?null:key)}>
-                            {score===null ? <span style={{ color:C.muted }}>—</span> : (
-                              <span style={{
-                                display:'inline-block', minWidth:26, padding:'2px 6px', borderRadius:6,
-                                fontWeight:700, background:score>=5?`${C.accent}20`:`${C.danger}20`,
-                                color:score>=5?C.accent:C.danger,
-                              }}>{score}</span>
-                            )}
-                          </td>
-                        );
-                      })}
-                      <td style={{ textAlign:'center', padding:'9px 6px', borderBottom:`1px solid ${C.border}` }}>
-                        <span style={{ fontWeight:700, color:teamTotal>0?C.accent:C.muted }}>{teamTotal>0?teamTotal:'—'}</span>
-                      </td>
-                    </tr>,
-                    ...teamMembers.map(m => {
-                      const key = `${m.id}-${d}`;
-                      if (expandedRow !== key) return null;
-                      const r = reports.find(x => String(x.team_member_id)===String(m.id) && x.report_date===d);
-                      if (!r) return null;
-                      return (
-                        <tr key={`${key}-exp`}>
-                          <td colSpan={teamMembers.length+2} style={{ background:`${C.accent}06`, padding:'10px 16px', borderBottom:`1px solid ${C.border}` }}>
-                            <div style={{ fontSize:12, fontWeight:600, color:C.accent, marginBottom:6 }}>{m.name} · {fmtDay(d)}</div>
-                            <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
-                              {Object.entries(r.metrics||{}).filter(([,v])=>parseInt(v)>0).map(([key,val]) => (
-                                <span key={key} style={{ background:C.elevated, border:`1px solid ${C.border}`, borderRadius:6, padding:'3px 8px', fontSize:11 }}>
-                                  <span style={{ color:C.sub }}>{METRIC_LABELS[key]||key}: </span>
-                                  <span style={{ color:C.text, fontWeight:600 }}>{Number(val).toLocaleString()}</span>
-                                </span>
-                              ))}
-                            </div>
-                          </td>
+                </div>
+              </div>
+            )}
+
+            {/* ── Member performance table ────────────────────────── */}
+            {members.length > 0 && (
+              <div style={{ ...S.section }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Member Breakdown — click row to drill down
+                </div>
+                <div style={S.card}>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                      <thead>
+                        <tr>
+                          <th style={{ ...S.th, textAlign: 'left' }}>Member</th>
+                          {KEY_METRICS.map(m => (
+                            <th key={m.key} style={S.th}>{m.label.replace(' Items','').replace(' Cares','').replace(' Mapped','')}</th>
+                          ))}
+                          <th style={S.th}>Total</th>
+                          <th style={{ ...S.th, textAlign: 'center' }}>Days</th>
                         </tr>
-                      );
-                    }).filter(Boolean),
-                  ];
-                })}
-                <tr style={{ background:`${C.accent}10` }}>
-                  <td style={{ padding:'10px 12px', fontWeight:700, color:C.accent, fontSize:13 }}>TOTAL</td>
-                  {teamMembers.map(m => {
-                    const total = getMemberTotal(m.id);
-                    const dCount = getMemberDays(m.id);
-                    return (
-                      <td key={m.id} style={{ textAlign:'center', padding:'10px 6px' }}>
-                        {total>0 ? (
-                          <span style={{ color:C.accent, fontWeight:700 }}>
-                            {total.toLocaleString()} <span style={{ fontSize:10, color:C.muted }}>({dCount}d)</span>
-                          </span>
-                        ) : <span style={{ color:C.muted }}>—</span>}
-                      </td>
-                    );
-                  })}
-                  <td style={{ textAlign:'center', padding:'10px 6px' }}>
-                    <span style={{ fontWeight:700, color:C.accent }}>
-                      {totalOutput.toLocaleString()}
-                    </span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+                        {/* Team averages row */}
+                        <tr style={{ background: '#0B1929' }}>
+                          <td style={{ padding: '6px 14px', fontSize: 11, color: C.muted, fontStyle: 'italic' }}>Team avg</td>
+                          {KEY_METRICS.map(m => (
+                            <td key={m.key} style={{ padding: '6px 14px', fontSize: 11, color: C.muted, textAlign: 'right' }}>
+                              {(avgMetrics[m.key] || 0).toLocaleString()}
+                            </td>
+                          ))}
+                          <td colSpan={2} />
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {members.map(p => (
+                          <MemberRow
+                            key={p.person?.id || p.person?.name}
+                            member={{ ...p, id: p.person?.id, name: p.person?.name, totals: p.totals, days_reported: p.days_reported }}
+                            memberMap={memberMap}
+                            metrics={KEY_METRICS}
+                            avgMetrics={avgMetrics}
+                            onDrilldown={() => setDrilldown(p)}
+                            C={C}
+                          />
+                        ))}
+                        {/* Team total row */}
+                        <tr style={{ borderTop: `2px solid ${C.border}`, background: C.elevated }}>
+                          <td style={{ padding: '10px 14px', fontSize: 12, fontWeight: 700, color: '#00E5A0' }}>Team Total</td>
+                          {KEY_METRICS.map(m => (
+                            <td key={m.key} style={{ padding: '10px 14px', fontSize: 13, fontWeight: 700, color: '#00E5A0', textAlign: 'right' }}>
+                              {(teamTotals[m.key] || 0).toLocaleString()}
+                            </td>
+                          ))}
+                          <td style={{ padding: '10px 14px', fontSize: 13, fontWeight: 700, color: '#00E5A0', textAlign: 'right' }}>
+                            {Object.values(teamTotals).reduce((a,b)=>a+b,0).toLocaleString()}
+                          </td>
+                          <td />
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── Claims by insurer bar chart ─────────────────────── */}
+            {claimsChartData.length > 0 && (
+              <div style={S.section}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Claims Piles by Insurer
+                </div>
+                <div style={{ ...S.card, padding: '16px 0 8px' }}>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <BarChart data={claimsChartData} margin={{ top: 0, right: 24, bottom: 0, left: 0 }}>
+                      <XAxis dataKey="name" tick={{ fill: '#6B7A99', fontSize: 11 }} axisLine={false} tickLine={false} />
+                      <YAxis hide />
+                      <Tooltip
+                        contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }}
+                        formatter={v => v.toLocaleString()}
+                      />
+                      <Bar dataKey="value" radius={[4,4,0,0]}>
+                        {claimsChartData.map((_, i) => (
+                          <Cell key={i} fill={['#00E5A0','#5B8DEF','#A78BFA','#F59E0B','#FF4D4D','#22D3EE','#F97316'][i % 7]} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {/* ── Week vs Last week comparison ────────────────────── */}
+            {insightData?.week_vs_lastweek?.length > 0 && rangeIdx === 1 && (
+              <div style={S.section}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  This Week vs Last Week
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  {insightData.week_vs_lastweek.filter(m => m.this_week > 0 || m.last_week > 0).map(m => (
+                    <div key={m.key} style={{ ...S.card, padding: '12px 16px', minWidth: 160 }}>
+                      <div style={{ fontSize: 11, color: C.sub, marginBottom: 4 }}>{m.label}</div>
+                      <div style={{ fontSize: 22, fontWeight: 700, color: C.text }}>{m.this_week.toLocaleString()}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 }}>
+                        <span style={{ fontSize: 11, color: C.muted }}>{m.last_week.toLocaleString()} last wk</span>
+                        <TrendChip value={m.pct_change} inverted={m.key === 'flagged_care_items'} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {members.length === 0 && !loading && (
+              <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>
+                No reports found for this period.
+              </div>
+            )}
+          </>
+        )}
       </div>
+
+      {/* Drilldown modal */}
+      {drilldown && (
+        <DrilldownModal
+          member={drilldown}
+          memberMap={memberMap}
+          from={range.from()}
+          to={range.to()}
+          onClose={() => setDrilldown(null)}
+          C={C}
+        />
+      )}
     </div>
   );
 }

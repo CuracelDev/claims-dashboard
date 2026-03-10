@@ -1,51 +1,88 @@
-import { getSupabase } from '../../../../lib/supabase';
+// CORRECT PATH: app/api/reports/weekly/route.js
+// (NOT app/reports/weekly/route.js — that conflicts with page.js)
+
+import { createClient } from '@supabase/supabase-js';
 
 export const dynamic = 'force-dynamic';
+
+function getSupabase() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+}
 
 export async function GET(request) {
   const supabase = getSupabase();
   const { searchParams } = new URL(request.url);
   const from = searchParams.get('from');
-  const to = searchParams.get('to');
+  const to   = searchParams.get('to');
 
   if (!from || !to) {
     return Response.json({ error: 'from and to date params required' }, { status: 400 });
   }
 
   try {
-    // Fetch recent reports and filter in JS — avoids Supabase date-type comparison issues
-    const { data: allReports, error } = await supabase
+    // 1. Fetch all active team members — no FK join
+    const { data: allMembers, error: membersError } = await supabase
+      .from('team_members')
+      .select('id, name, display_name, is_active')
+      .eq('is_active', true);
+
+    if (membersError) throw membersError;
+
+    const memberMap = {};
+    for (const m of (allMembers || [])) {
+      memberMap[String(m.id)] = m;
+    }
+
+    // 2. Fetch reports — no FK join, no supabase-level date filter
+    const { data: allReports, error: reportsError } = await supabase
       .from('daily_reports')
-      .select('*, team_members (id, name, role)')
+      .select('id, team_member_id, report_date, metrics, tasks_completed, notes, status')
       .order('report_date', { ascending: false })
       .limit(500);
 
-    if (error) throw error;
+    if (reportsError) throw reportsError;
 
-    // Client-side date filter (robust against column type variations)
+    // 3. Client-side date filter
     const reports = (allReports || []).filter(r => {
       const d = (r.report_date || '').slice(0, 10);
       return d >= from && d <= to;
     });
 
+    // 4. Aggregate by person
     const byPerson = {};
     for (const report of reports) {
-      const personId = report.team_member_id;
-      if (!byPerson[personId]) {
-        byPerson[personId] = { person: report.team_members, days_reported: 0, totals: {}, daily: [] };
+      const pid = String(report.team_member_id);
+      const member = memberMap[pid] || { id: report.team_member_id, name: 'Unknown', display_name: null };
+
+      if (!byPerson[pid]) {
+        byPerson[pid] = {
+          person: {
+            id:           member.id,
+            name:         member.display_name || member.name || 'Unknown',
+            display_name: member.display_name,
+          },
+          days_reported: 0,
+          totals: {},
+          daily: [],
+        };
       }
-      byPerson[personId].days_reported += 1;
-      byPerson[personId].daily.push({ date: report.report_date, metrics: report.metrics });
+
+      byPerson[pid].days_reported += 1;
+      byPerson[pid].daily.push({ date: report.report_date, metrics: report.metrics });
+
       const m = report.metrics || {};
       for (const [key, val] of Object.entries(m)) {
         const num = parseInt(val);
-        if (!isNaN(num)) byPerson[personId].totals[key] = (byPerson[personId].totals[key] || 0) + num;
+        if (!isNaN(num)) byPerson[pid].totals[key] = (byPerson[pid].totals[key] || 0) + num;
       }
     }
 
     const leaderboard = Object.values(byPerson).map(p => ({
       ...p,
-      total_output: Object.values(p.totals).reduce((a, b) => a + b, 0)
+      total_output: Object.values(p.totals).reduce((a, b) => a + b, 0),
     })).sort((a, b) => b.total_output - a.total_output);
 
     const teamTotals = {};
@@ -55,8 +92,16 @@ export async function GET(request) {
       }
     }
 
-    return Response.json({ from, to, total_reports: reports.length, by_person: leaderboard, team_totals: teamTotals });
+    return Response.json({
+      from,
+      to,
+      total_reports: reports.length,
+      by_person: leaderboard,
+      team_totals: teamTotals,
+    });
+
   } catch (err) {
+    console.error('[weekly route error]', err.message);
     return Response.json({ error: err.message }, { status: 500 });
   }
 }
