@@ -195,13 +195,24 @@ async function getTodayReports() {
 // ── Fetch pending tasks ───────────────────────────────────────
 async function getPendingTasks() {
   const supabase = getSupabase();
-  const { data } = await supabase
+  const { data: tasks } = await supabase
     .from("tasks")
-    .select("title, priority, due_date, assigned_to, team_members(name)")
+    .select("title, priority, due_date, assigned_to, status")
     .in("status", ["todo", "in_progress"])
     .order("due_date", { ascending: true })
     .limit(5);
-  return data || [];
+
+  if (!tasks || tasks.length === 0) return [];
+
+  const memberIds = [...new Set(tasks.map(t => t.assigned_to).filter(Boolean))];
+  const { data: members } = await supabase
+    .from("team_members")
+    .select("id, name")
+    .in("id", memberIds);
+
+  const memberMap = {};
+  (members || []).forEach(m => { memberMap[m.id] = m.name; });
+  return tasks.map(t => ({ ...t, member_name: memberMap[t.assigned_to] || "Unassigned" }));
 }
 
 // ── Fetch active targets ──────────────────────────────────────
@@ -291,7 +302,7 @@ export async function POST(request) {
               { type: "section", text: { type: "mrkdwn", text: `⏳ *Pending Tasks (${tasks.length})* — showing up to 5` } },
               ...tasks.map(t => ({
                 type: "section",
-                text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.team_members?.name || "Unassigned"}${t.due_date ? ` · Due ${t.due_date}` : ""}` },
+                text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.member_name || "Unassigned"}${t.due_date ? ` · Due ${t.due_date}` : ""}` },
               })),
               ...(tasks.length === 0 ? [{ type: "section", text: { type: "mrkdwn", text: "_No pending tasks_ 🎉" } }] : []),
               { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "View Task Board →" }, url: "https://claims-dashboard.vercel.app/tasks", action_id: "view_tasks" }]},
@@ -377,7 +388,7 @@ export async function POST(request) {
           text: "Pending tasks",
           blocks: [
             { type: "section", text: { type: "mrkdwn", text: `⏳ *Pending Tasks (${tasks.length})*` } },
-            ...tasks.map(t => ({ type: "section", text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.team_members?.name||"Unassigned"}${t.due_date?` · Due ${t.due_date}`:""}` } })),
+            ...tasks.map(t => ({ type: "section", text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.member_name||"Unassigned"}${t.due_date?` · Due ${t.due_date}`:""}` } })),
             ...(tasks.length===0?[{ type:"section", text:{type:"mrkdwn", text:"_No pending tasks_ 🎉"} }]:[]),
           ],
         });
