@@ -42,6 +42,30 @@ function getRangeDates(range) {
   return { from: from.toISOString().split('T')[0], to: today };
 }
 
+/* ── ℹ️ InfoTip — hover tooltip for stat cards ─────────────── */
+function InfoTip({ text, C }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+      style={{ position:'absolute', top:10, right:10, cursor:'default' }}
+    >
+      <span style={{ fontSize:13, color:C.muted, userSelect:'none' }}>ℹ</span>
+      {show && (
+        <div style={{
+          position:'absolute', top:20, right:0, width:220, background:C.elevated,
+          border:`1px solid ${C.border}`, borderRadius:8, padding:'9px 12px',
+          fontSize:11, color:C.sub, lineHeight:1.5, zIndex:50,
+          boxShadow:'0 4px 20px rgba(0,0,0,0.4)', textAlign:'left',
+        }}>
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function OpsPage() {
   const { C } = useTheme();
   const TODAY = getToday(); // Fresh on each render
@@ -208,39 +232,43 @@ export default function OpsPage() {
           }}>Apply</button>
         </div>
 
-        {/* Stats — 4 actionable cards */}
+        {/* Stats — 4 cards with ℹ️ tooltips */}
         <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:24 }}>
-          {/* Card 1: Submitted today */}
-          <div style={{ ...cardStyle, textAlign:'center' }}>
-            <div style={{ fontSize:30, fontWeight:700, color:C.accent, fontFamily:'monospace' }}>
-              {todayReports.length}/{teamMembers.length}
+          {[
+            {
+              val: `${todayReports.length}/${teamMembers.length}`,
+              label: 'Submitted today',
+              color: C.accent,
+              tip: 'Number of team members who have submitted a daily report today vs total active members.',
+            },
+            {
+              val: reports.length,
+              label: 'Reports this period',
+              color: C.blue,
+              sub: from === to ? 'today' : `${from} – ${to}`,
+              tip: 'Total individual report submissions within the selected date range.',
+            },
+            {
+              val: daysTracked,
+              label: 'Days with activity',
+              color: C.purple,
+              tip: 'Number of distinct calendar days within the range that have at least one report submitted — not counting days where everyone was off or no one logged anything.',
+            },
+            {
+              val: pendingTasks.length,
+              label: 'Pending tasks',
+              color: pendingTasks.length > 0 ? C.warn : C.success,
+              tip: 'Open tasks assigned to the team via Task Management that have not yet been marked complete.',
+            },
+          ].map((s, i) => (
+            <div key={i} style={{ ...cardStyle, textAlign:'center', position:'relative' }}>
+              {/* ℹ️ tooltip trigger */}
+              <InfoTip text={s.tip} C={C} />
+              <div style={{ fontSize:30, fontWeight:700, color:s.color, fontFamily:'monospace' }}>{s.val}</div>
+              <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>{s.label}</div>
+              {s.sub && <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>{s.sub}</div>}
             </div>
-            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Submitted today</div>
-          </div>
-          {/* Card 2: Reports submitted in range */}
-          <div style={{ ...cardStyle, textAlign:'center' }}>
-            <div style={{ fontSize:30, fontWeight:700, color:C.blue, fontFamily:'monospace' }}>
-              {reports.length}
-            </div>
-            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Reports this period</div>
-            <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>
-              {from === to ? 'today' : `${from} – ${to}`}
-            </div>
-          </div>
-          {/* Card 3: Days tracked */}
-          <div style={{ ...cardStyle, textAlign:'center' }}>
-            <div style={{ fontSize:30, fontWeight:700, color:C.purple, fontFamily:'monospace' }}>
-              {daysTracked}
-            </div>
-            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Days tracked</div>
-          </div>
-          {/* Card 4: Pending tasks */}
-          <div style={{ ...cardStyle, textAlign:'center' }}>
-            <div style={{ fontSize:30, fontWeight:700, color:pendingTasks.length>0?C.warn:C.success, fontFamily:'monospace' }}>
-              {pendingTasks.length}
-            </div>
-            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Pending tasks</div>
-          </div>
+          ))}
         </div>
 
         {/* Chart + Pending */}

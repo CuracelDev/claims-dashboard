@@ -310,7 +310,6 @@ function DailySummary({ teamMembers, date }) {
   const submitted = data.reports.map(r => r.team_member_id);
   const onLeave = data.leave.map(l => l.team_member_id);
   const pending = teamMembers.filter(m => !submitted.includes(m.id) && !onLeave.includes(m.id));
-  const totalOutput = data.reports.reduce((sum, r) => sum + Object.values(r.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0), 0);
 
   return (
     <div style={{ ...S.card, borderTop: `3px solid ${C.accent}`, marginBottom: 24 }}>
@@ -322,7 +321,6 @@ function DailySummary({ teamMembers, date }) {
           { val: data.reports.length, label: 'Submitted', color: C.accent },
           { val: onLeave.length, label: 'On Leave', color: C.warn },
           { val: pending.length, label: 'Pending', color: C.muted },
-          { val: totalOutput, label: 'Total Output', color: C.blue },
         ].map(s => (
           <div key={s.label} style={{ textAlign: 'center' }}>
             <div style={{ fontSize: 28, fontWeight: 700, color: s.color }}>{s.val}</div>
