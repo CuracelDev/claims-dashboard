@@ -499,7 +499,7 @@ function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
           <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', padding: '8px 0' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               {saveMsg && (
-                <span style={{ fontSize: 13, color: saveMsg.type === 'success' ? C.success : C.danger }}>
+                <span style={{ fontSize: 13, color: saveMsg.type === 'success' ? C.accent : C.danger }}>
                   {saveMsg.type === 'success' ? '✓' : '✗'} {saveMsg.text}
                 </span>
               )}
@@ -557,8 +557,10 @@ export default function ReportsPage() {
 
   const handleAuth = (session) => {
     setAuthSession(session);
-    // Default history filter to the signed-in user
-    setHistFilter(f => ({ ...f, person: String(session.memberId) }));
+    setHistFilter(f => ({
+      ...f,
+      person: session ? String(session.memberId) : ''
+    }));
   };
 
   const loadHistory = useCallback(() => {
