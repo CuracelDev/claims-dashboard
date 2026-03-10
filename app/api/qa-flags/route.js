@@ -84,8 +84,15 @@ export async function GET(request) {
     // Default: last 30 days
     const defaultFrom = new Date();
     defaultFrom.setDate(defaultFrom.getDate() - 30);
-    const fromDate = from || defaultFrom.toISOString();
-    const toDate   = to   || new Date().toISOString();
+
+    // If date-only (YYYY-MM-DD), expand to full UTC day so single-day picks work
+    // T23:59:59.999Z on "to" ensures the whole day is included
+    const fromDate = from
+      ? `${from}T00:00:00.000Z`
+      : defaultFrom.toISOString();
+    const toDate = to
+      ? `${to}T23:59:59.999Z`
+      : new Date().toISOString();
 
     let query = supabase
       .from("qa_flags")
