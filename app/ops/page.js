@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useTheme } from '../context/ThemeContext';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
@@ -13,7 +13,8 @@ const METRIC_LABELS = {
   providers_assigned:'Providers Assigned',
 };
 
-const TODAY = new Date().toISOString().split('T')[0];
+// Dynamic today — computed fresh each render, not stale module-level
+const getToday = () => new Date().toISOString().split('T')[0];
 
 const fmtDay = (d) => {
   const dt = new Date(d + 'T12:00:00');
@@ -29,19 +30,21 @@ const QUICK_RANGES = [
 ];
 
 function getRangeDates(range) {
-  const today = new Date(TODAY + 'T12:00:00');
+  const today = getToday();
+  const todayDate = new Date(today + 'T12:00:00');
   if (range.month) {
-    const from = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().split('T')[0];
-    return { from, to: TODAY };
+    const from = new Date(todayDate.getFullYear(), todayDate.getMonth(), 1).toISOString().split('T')[0];
+    return { from, to: today };
   }
-  if (range.days === 0) return { from: TODAY, to: TODAY };
-  const from = new Date(today);
-  from.setDate(today.getDate() - range.days + 1);
-  return { from: from.toISOString().split('T')[0], to: TODAY };
+  if (range.days === 0) return { from: today, to: today };
+  const from = new Date(todayDate);
+  from.setDate(todayDate.getDate() - range.days + 1);
+  return { from: from.toISOString().split('T')[0], to: today };
 }
 
 export default function OpsPage() {
   const { C } = useTheme();
+  const TODAY = getToday(); // Fresh on each render
 
   const [activeRange, setActiveRange] = useState(1);
   const [customFrom, setCustomFrom]   = useState('');
@@ -58,6 +61,21 @@ export default function OpsPage() {
   const { from, to } = useCustom && customFrom
     ? { from: customFrom, to: customTo }
     : getRangeDates(QUICK_RANGES[activeRange]);
+
+  // Sync inputs to quick range dates so user can see the active range
+  const handleQuickRange = (i) => {
+    setActiveRange(i);
+    setUseCustom(false);
+    const { from: f, to: t } = getRangeDates(QUICK_RANGES[i]);
+    setCustomFrom(f);
+    setCustomTo(t);
+  };
+
+  useEffect(() => {
+    // Initialise inputs with default range (This week)
+    const { from: f, to: t } = getRangeDates(QUICK_RANGES[1]);
+    setCustomFrom(f); setCustomTo(t);
+  }, []);
 
   useEffect(() => {
     fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
@@ -89,9 +107,22 @@ export default function OpsPage() {
   const allDates = [...new Set(reports.map(r => r.report_date))].sort();
   const chartData = allDates.map(d => ({
     date: d,
-    fields: reports.filter(r => r.report_date===d)
-      .reduce((s,r) => s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length, 0),
+    output: reports.filter(r => r.report_date===d)
+      .reduce((s,r) => s+Object.values(r.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0), 0),
   }));
+
+  const daysTracked = new Set(reports.map(r => r.report_date)).size;
+  // totalOutput retained for the TOTAL row in the breakdown table
+  const totalOutput = reports.reduce((s,r)=>s+Object.values(r.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0),0);
+
+  // Top metric across the range
+  const metricTotals = {};
+  reports.forEach(r => {
+    Object.entries(r.metrics||{}).forEach(([k,v]) => {
+      metricTotals[k] = (metricTotals[k]||0) + (parseInt(v)||0);
+    });
+  });
+  const topMetric = Object.entries(metricTotals).sort((a,b)=>b[1]-a[1])[0];
 
   const getDaysInRange = () => {
     const start = new Date(from + 'T12:00:00');
@@ -161,7 +192,7 @@ export default function OpsPage() {
         {/* Range controls */}
         <div style={{ ...cardStyle, marginBottom:24, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
           {QUICK_RANGES.map((r,i) => (
-            <button key={r.label} onClick={() => { setActiveRange(i); setUseCustom(false); }} style={{
+            <button key={r.label} onClick={() => handleQuickRange(i)} style={{
               padding:'7px 14px', borderRadius:8, fontSize:13, fontWeight:500, cursor:'pointer',
               border:`1px solid ${!useCustom&&activeRange===i ? C.accent : C.border}`,
               background:!useCustom&&activeRange===i ? `${C.accent}18` : 'transparent',
@@ -171,31 +202,51 @@ export default function OpsPage() {
           <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)} style={{ ...inputStyle, marginLeft:8 }} />
           <span style={{ color:C.muted }}>→</span>
           <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)} style={inputStyle} />
-          <button onClick={() => setUseCustom(true)} style={{
+          <button onClick={() => { setUseCustom(true); setActiveRange(-1); }} style={{
             padding:'7px 14px', background:C.accent, color:'#0B0F1A',
             border:'none', borderRadius:8, fontWeight:700, fontSize:13, cursor:'pointer',
           }}>Apply</button>
         </div>
 
-        {/* Stats */}
+        {/* Stats — 4 actionable cards */}
         <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:24 }}>
-          {[
-            { val:`${todayReports.length}/${teamMembers.length}`, label:'Submitted today',  color:C.accent },
-            { val:reports.reduce((s,r)=>s+Object.values(r.metrics||{}).reduce((a,b)=>a+(parseInt(b)||0),0),0).toLocaleString(), label:'Total output (range)', color:C.blue },
-            { val:new Set(reports.map(r=>r.report_date)).size, label:'Days tracked', color:C.purple },
-            { val:pendingTasks.length, label:'Pending tasks', color:pendingTasks.length>0?C.warn:C.success },
-          ].map((s,i) => (
-            <div key={i} style={{ ...cardStyle, textAlign:'center' }}>
-              <div style={{ fontSize:30, fontWeight:700, color:s.color, fontFamily:'monospace' }}>{s.val}</div>
-              <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>{s.label}</div>
+          {/* Card 1: Submitted today */}
+          <div style={{ ...cardStyle, textAlign:'center' }}>
+            <div style={{ fontSize:30, fontWeight:700, color:C.accent, fontFamily:'monospace' }}>
+              {todayReports.length}/{teamMembers.length}
             </div>
-          ))}
+            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Submitted today</div>
+          </div>
+          {/* Card 2: Reports submitted in range */}
+          <div style={{ ...cardStyle, textAlign:'center' }}>
+            <div style={{ fontSize:30, fontWeight:700, color:C.blue, fontFamily:'monospace' }}>
+              {reports.length}
+            </div>
+            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Reports this period</div>
+            <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>
+              {from === to ? 'today' : `${from} – ${to}`}
+            </div>
+          </div>
+          {/* Card 3: Days tracked */}
+          <div style={{ ...cardStyle, textAlign:'center' }}>
+            <div style={{ fontSize:30, fontWeight:700, color:C.purple, fontFamily:'monospace' }}>
+              {daysTracked}
+            </div>
+            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Days tracked</div>
+          </div>
+          {/* Card 4: Pending tasks */}
+          <div style={{ ...cardStyle, textAlign:'center' }}>
+            <div style={{ fontSize:30, fontWeight:700, color:pendingTasks.length>0?C.warn:C.success, fontFamily:'monospace' }}>
+              {pendingTasks.length}
+            </div>
+            <div style={{ fontSize:12, color:C.sub, marginTop:4 }}>Pending tasks</div>
+          </div>
         </div>
 
         {/* Chart + Pending */}
         <div style={{ display:'grid', gridTemplateColumns:'1fr 260px', gap:18, marginBottom:24 }}>
           <div style={cardStyle}>
-            <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:14 }}>Daily Fields Filled</div>
+            <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:14 }}>Daily Output</div>
             {chartData.length===0 ? (
               <div style={{ textAlign:'center', padding:40, color:C.muted }}>No data for this range</div>
             ) : (
@@ -205,9 +256,9 @@ export default function OpsPage() {
                     const dt = new Date(d+'T12:00:00');
                     return `${dt.getMonth()+1}-${String(dt.getDate()).padStart(2,'0')}`;
                   }} tick={{ fontSize:10, fill:C.sub }} />
-                  <YAxis tick={{ fontSize:10, fill:C.sub }} />
+                  <YAxis tick={{ fontSize:10, fill:C.sub }} tickFormatter={v => v>=1000?`${(v/1000).toFixed(0)}k`:v} />
                   <Tooltip contentStyle={{ background:C.elevated, border:`1px solid ${C.border}`, borderRadius:8, fontSize:12 }} labelFormatter={d => fmtDay(d)} />
-                  <Bar dataKey="fields" radius={[4,4,0,0]}>
+                  <Bar dataKey="output" radius={[4,4,0,0]} name="Output">
                     {chartData.map((_,i) => <Cell key={i} fill={C.accent} />)}
                   </Bar>
                 </BarChart>
@@ -244,7 +295,7 @@ export default function OpsPage() {
                 <div key={m.id} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'7px 0', borderBottom:`1px solid ${C.border}` }}>
                   <span style={{ fontSize:12, color:C.text }}>{m.name}</span>
                   <span style={{ fontSize:12, color:total>0?C.accent:C.muted, fontWeight:600 }}>
-                    {total>0 ? total : '—'}
+                    {total>0 ? total.toLocaleString() : '—'}
                     {dCount>0 && <span style={{ fontSize:10, color:C.muted, marginLeft:4 }}>({dCount}d)</span>}
                   </span>
                 </div>
@@ -316,7 +367,7 @@ export default function OpsPage() {
                               {Object.entries(r.metrics||{}).filter(([,v])=>parseInt(v)>0).map(([key,val]) => (
                                 <span key={key} style={{ background:C.elevated, border:`1px solid ${C.border}`, borderRadius:6, padding:'3px 8px', fontSize:11 }}>
                                   <span style={{ color:C.sub }}>{METRIC_LABELS[key]||key}: </span>
-                                  <span style={{ color:C.text, fontWeight:600 }}>{val}</span>
+                                  <span style={{ color:C.text, fontWeight:600 }}>{Number(val).toLocaleString()}</span>
                                 </span>
                               ))}
                             </div>
@@ -335,7 +386,7 @@ export default function OpsPage() {
                       <td key={m.id} style={{ textAlign:'center', padding:'10px 6px' }}>
                         {total>0 ? (
                           <span style={{ color:C.accent, fontWeight:700 }}>
-                            {total} <span style={{ fontSize:10, color:C.muted }}>({dCount}d)</span>
+                            {total.toLocaleString()} <span style={{ fontSize:10, color:C.muted }}>({dCount}d)</span>
                           </span>
                         ) : <span style={{ color:C.muted }}>—</span>}
                       </td>
@@ -343,7 +394,7 @@ export default function OpsPage() {
                   })}
                   <td style={{ textAlign:'center', padding:'10px 6px' }}>
                     <span style={{ fontWeight:700, color:C.accent }}>
-                      {reports.reduce((s,r)=>s+Object.values(r.metrics||{}).filter(v=>parseInt(v)>0).length,0)}
+                      {totalOutput.toLocaleString()}
                     </span>
                   </td>
                 </tr>

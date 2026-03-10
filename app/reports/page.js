@@ -367,11 +367,19 @@ function makeS(C) {
 }
 
 // ── Report Form (shown after PIN auth) ────────────────────────────────────────
-function ReportForm({ teamMembers, authSession }) {
+function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
   const { C } = useTheme();
   const S = makeS(C);
   const [selectedMember] = useState(String(authSession.memberId));
   const [reportDate, setReportDate] = useState(todayStr());
+
+  // When editing a historical report, jump to that date
+  useEffect(() => {
+    if (editPreset?.date) {
+      setReportDate(editPreset.date);
+      if (onPresetUsed) onPresetUsed();
+    }
+  }, [editPreset]);
   const [metrics, setMetrics] = useState({});
   const [tasksCompleted, setTasksCompleted] = useState('');
   const [notes, setNotes] = useState('');
@@ -552,7 +560,11 @@ export default function ReportsPage() {
     if (existing) setAuthSession(existing);
   }, []);
 
-  const handleAuth = (session) => setAuthSession(session);
+  const handleAuth = (session) => {
+    setAuthSession(session);
+    // Default history filter to the signed-in user
+    setHistFilter(f => ({ ...f, person: String(session.memberId) }));
+  };
 
   const loadHistory = useCallback(() => {
     setLoadingHist(true);
@@ -566,7 +578,12 @@ export default function ReportsPage() {
 
   useEffect(() => { if (tab === 'history') loadHistory(); }, [tab, loadHistory]);
 
-  const handleEditReport = (report) => setTab('form');
+  const [editPreset, setEditPreset] = useState(null);
+
+  const handleEditReport = (report) => {
+    setEditPreset({ date: report.report_date });
+    setTab('form');
+  };
 
   const tabBtn = (key, label) => (
     <button key={key} onClick={() => setTab(key)} style={{
@@ -593,7 +610,7 @@ export default function ReportsPage() {
         {tab === 'form' && (
           <div style={{ maxWidth: 720 }}>
             <ReportPinGate members={teamMembers} onAuth={handleAuth} existingSession={authSession}>
-              {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} />}
+              {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} editPreset={editPreset} onPresetUsed={() => setEditPreset(null)} />}
             </ReportPinGate>
           </div>
         )}

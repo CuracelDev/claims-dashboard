@@ -38,6 +38,69 @@ const METRIC_GROUPS = [
 
 const ALL_METRICS = METRIC_GROUPS.flatMap(g => g.metrics);
 
+/* ─── Weekly Targets ──────────────────────────────────────── */
+// Edit these numbers to update team targets for the period
+const WEEKLY_TARGETS = [
+  { key: 'care_items_mapped',  label: 'Care Items Mapped',   target: 400000 },
+  { key: 'resolved_cares',     label: 'Resolved Cares',      target: 50000  },
+  { key: 'care_items_grouped', label: 'Care Items Grouped',  target: 20000  },
+  { key: 'providers_mapped',   label: 'Providers Mapped',    target: 500    },
+];
+
+function TargetTracker({ teamTotals, C, dateLabel }) {
+  if (!teamTotals || Object.keys(teamTotals).length === 0) return null;
+  const activeTargets = WEEKLY_TARGETS.filter(t => (teamTotals[t.key] || 0) > 0 || t.key === 'care_items_mapped');
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20, marginBottom: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: C.text }}>🎯 Target Tracker</div>
+        <span style={{ fontSize: 12, color: C.sub }}>{dateLabel}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 14 }}>
+        {activeTargets.map(t => {
+          const actual = teamTotals[t.key] || 0;
+          const pct = Math.min((actual / t.target) * 100, 100);
+          const rawPct = (actual / t.target) * 100;
+          const hit = rawPct >= 100;
+          const close = rawPct >= 70;
+          const color = hit ? '#00E5A0' : close ? '#F59E0B' : '#EF4444';
+          const bgColor = hit ? '#00E5A010' : close ? '#F59E0B10' : '#EF444410';
+          const borderColor = hit ? '#00E5A033' : close ? '#F59E0B33' : '#EF444433';
+          return (
+            <div key={t.key} style={{ background: bgColor, border: `1.5px solid ${borderColor}`, borderRadius: 10, padding: 14 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: C.text, lineHeight: 1.3, flex: 1 }}>{t.label}</div>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 20,
+                  background: color + '22', color,
+                  marginLeft: 8, whiteSpace: 'nowrap',
+                }}>
+                  {hit ? '✅ Hit' : rawPct >= 70 ? '⚡ Close' : '❌ Off track'}
+                </span>
+              </div>
+              <div style={{ fontSize: 22, fontWeight: 700, color, fontFamily: 'monospace', marginBottom: 4 }}>
+                {actual.toLocaleString()}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>
+                of {t.target.toLocaleString()} target · <span style={{ color, fontWeight: 600 }}>{rawPct.toFixed(1)}%</span>
+              </div>
+              <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{
+                  height: '100%', width: `${pct}%`, borderRadius: 3,
+                  background: `linear-gradient(90deg, ${color}88, ${color})`,
+                  transition: 'width 0.6s ease',
+                }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+
 function getWeekBounds(dateStr) {
   const d = new Date(dateStr + 'T12:00:00');
   const day = d.getDay();
@@ -209,6 +272,8 @@ export default function WeeklyPage() {
                 </div>
               </div>
             </div>
+
+            <TargetTracker teamTotals={teamTotals} C={C} dateLabel={`${fmt(from)} – ${fmt(to)}`} />
 
             {/* ── Main Metric Table (Excel-style) ── */}
             <div style={{ ...card, overflowX: 'auto', marginBottom: 20 }}>
