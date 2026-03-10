@@ -9,7 +9,6 @@ function getSupabase() {
   );
 }
 
-// ── Slack API helpers ─────────────────────────────────────────────────────
 async function slackPost(method, body) {
   const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
@@ -31,13 +30,66 @@ async function getTeamMembers() {
   return data || [];
 }
 
-// ── Block Kit builders ────────────────────────────────────────────────────
-function buildTaskModal(trigger_id, prefill = {}) {
+// ── Menu shown when bot is mentioned ─────────────────────────
+function buildMenuBlocks(userName) {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `👋 Hey *${userName}*! I'm the Claims Intel bot. Here's what I can do:`,
+      },
+    },
+    { type: "divider" },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "📋 Assign a Task", emoji: true },
+          style: "primary",
+          action_id: "open_task_modal",
+          value: JSON.stringify({}),
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "📊 Today's Reports", emoji: true },
+          action_id: "check_reports",
+          value: "today",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "⏳ Pending Tasks", emoji: true },
+          action_id: "check_pending_tasks",
+          value: "pending",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "🎯 Weekly Targets", emoji: true },
+          action_id: "check_targets",
+          value: "targets",
+        },
+      ],
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "💡 You can also type a command directly e.g. `@claimsbot assign task` or `@claimsbot reports today`",
+        },
+      ],
+    },
+  ];
+}
+
+function buildTaskModal(trigger_id, meta = {}, members = []) {
   return {
     trigger_id,
     view: {
       type: "modal",
       callback_id: "create_task_modal",
+      private_metadata: JSON.stringify(meta),
       title: { type: "plain_text", text: "Assign a Task" },
       submit: { type: "plain_text", text: "Create Task" },
       close: { type: "plain_text", text: "Cancel" },
@@ -50,7 +102,6 @@ function buildTaskModal(trigger_id, prefill = {}) {
             type: "plain_text_input",
             action_id: "title_input",
             placeholder: { type: "plain_text", text: "What needs to be done?" },
-            initial_value: prefill.title || "",
           },
         },
         {
@@ -73,7 +124,7 @@ function buildTaskModal(trigger_id, prefill = {}) {
             type: "multi_static_select",
             action_id: "assignees_input",
             placeholder: { type: "plain_text", text: "Select team members" },
-            options: (prefill.members || []).map(m => ({
+            options: members.map(m => ({
               text: { type: "plain_text", text: m.name },
               value: String(m.id),
             })),
@@ -86,14 +137,11 @@ function buildTaskModal(trigger_id, prefill = {}) {
           element: {
             type: "static_select",
             action_id: "priority_input",
-            initial_option: {
-              text: { type: "plain_text", text: "🟡 Medium" },
-              value: "medium",
-            },
+            initial_option: { text: { type: "plain_text", text: "🟡 Medium" }, value: "medium" },
             options: [
-              { text: { type: "plain_text", text: "🔴 High" },   value: "high" },
+              { text: { type: "plain_text", text: "🔴 High" },   value: "high"   },
               { text: { type: "plain_text", text: "🟡 Medium" }, value: "medium" },
-              { text: { type: "plain_text", text: "🟢 Low" },    value: "low" },
+              { text: { type: "plain_text", text: "🟢 Low" },    value: "low"    },
             ],
           },
         },
@@ -116,7 +164,7 @@ function buildTaskModal(trigger_id, prefill = {}) {
             type: "plain_text_input",
             action_id: "assigned_by_input",
             placeholder: { type: "plain_text", text: "Your name" },
-            initial_value: prefill.assigned_by || "",
+            initial_value: meta.assigned_by || "",
           },
         },
       ],
@@ -124,102 +172,159 @@ function buildTaskModal(trigger_id, prefill = {}) {
   };
 }
 
-function buildTaskConfirmMessage(task, assigneeNames) {
-  const priorityEmoji = { high: "🔴", medium: "🟡", low: "🟢" }[task.priority] || "🟡";
-  return [
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `✅ *Task assigned successfully!*`,
-      },
-    },
-    {
-      type: "section",
-      fields: [
-        { type: "mrkdwn", text: `*Task:*\n${task.title}` },
-        { type: "mrkdwn", text: `*Priority:*\n${priorityEmoji} ${task.priority}` },
-        { type: "mrkdwn", text: `*Assigned to:*\n${assigneeNames.join(", ")}` },
-        { type: "mrkdwn", text: `*Due:*\n${task.due_date || "No deadline"}` },
-      ],
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "View on Dashboard →" },
-          url: "https://claims-dashboard.vercel.app/tasks",
-          action_id: "view_dashboard",
-        },
-      ],
-    },
-  ];
+// ── Fetch daily reports summary ───────────────────────────────
+async function getTodayReports() {
+  const supabase = getSupabase();
+  const today = new Date().toISOString().split("T")[0];
+  const { data: reports } = await supabase
+    .from("daily_reports")
+    .select("team_member_id, metrics, status")
+    .eq("report_date", today);
+  const { data: members } = await supabase
+    .from("team_members")
+    .select("id, name")
+    .eq("is_active", true);
+  const submitted = (reports || []).map(r => {
+    const m = (members || []).find(x => x.id === r.team_member_id);
+    return m?.name || "Unknown";
+  });
+  const pending = (members || []).filter(m => !submitted.includes(m.name)).map(m => m.name);
+  return { submitted, pending, total: (members || []).length };
 }
 
-// ── Main handler ──────────────────────────────────────────────────────────
+// ── Fetch pending tasks ───────────────────────────────────────
+async function getPendingTasks() {
+  const supabase = getSupabase();
+  const { data } = await supabase
+    .from("tasks")
+    .select("title, priority, due_date, assigned_to, team_members(name)")
+    .in("status", ["todo", "in_progress"])
+    .order("due_date", { ascending: true })
+    .limit(5);
+  return data || [];
+}
+
+// ── Fetch active targets ──────────────────────────────────────
+async function getActiveTargets() {
+  const supabase = getSupabase();
+  const today = new Date().toISOString().split("T")[0];
+  const { data } = await supabase
+    .from("weekly_targets")
+    .select("*")
+    .lte("start_date", today)
+    .gte("end_date", today);
+  return data || [];
+}
+
+// ── Main handler ──────────────────────────────────────────────
 export async function POST(request) {
   const contentType = request.headers.get("content-type") || "";
 
-  // ── Handle URL verification challenge ──────────────────────────────────
+  // ── JSON events ───────────────────────────────────────────
   if (contentType.includes("application/json")) {
     const body = await request.json();
 
-    // Slack URL verification
     if (body.type === "url_verification") {
       return Response.json({ challenge: body.challenge });
     }
 
-    // ── Handle Events ───────────────────────────────────────────────────
     if (body.type === "event_callback") {
       const event = body.event;
 
-      // Bot mentioned in a channel
       if (event.type === "app_mention") {
-        const text = (event.text || "").toLowerCase();
-        const trigger_id = body.trigger_id;
+        const text = (event.text || "").toLowerCase().replace(/<@.*?>/g, "").trim();
 
-        // Respond immediately to avoid Slack timeout
-        // Then open modal or send quick reply
-        const members = await getTeamMembers();
-
-        // Extract who tagged the bot to pre-fill assigned_by
-        let assigned_by = "";
+        // Get caller's name
+        let userName = "there";
         try {
           const userInfo = await slackPost("users.info", { user: event.user });
-          assigned_by = userInfo.user?.real_name || userInfo.user?.name || "";
+          userName = userInfo.user?.real_name || userInfo.user?.name || "there";
         } catch (e) {}
 
-        // Post interactive message in channel
+        const meta = { channel: event.channel, thread_ts: event.ts, assigned_by: userName };
+
+        // ── Keyword shortcuts ──────────────────────────────
+        if (text.includes("assign") || text.includes("task")) {
+          const members = await getTeamMembers();
+          await slackPost("chat.postMessage", {
+            channel: event.channel,
+            thread_ts: event.ts,
+            text: "Opening task form...",
+            blocks: [
+              { type: "section", text: { type: "mrkdwn", text: `📋 *Assign a Task* — click below to fill in the details:` } },
+              { type: "actions", elements: [{
+                type: "button", text: { type: "plain_text", text: "✏️ Open Task Form" },
+                style: "primary", action_id: "open_task_modal",
+                value: JSON.stringify(meta),
+              }]},
+            ],
+          });
+          return Response.json({ ok: true });
+        }
+
+        if (text.includes("report") || text.includes("today") || text.includes("status")) {
+          const { submitted, pending, total } = await getTodayReports();
+          await slackPost("chat.postMessage", {
+            channel: event.channel,
+            thread_ts: event.ts,
+            text: "Today's report status",
+            blocks: [
+              { type: "section", text: { type: "mrkdwn", text: `📊 *Daily Reports — Today*` } },
+              { type: "section", fields: [
+                { type: "mrkdwn", text: `*✅ Submitted (${submitted.length}/${total}):*\n${submitted.length ? submitted.join(", ") : "_None yet_"}` },
+                { type: "mrkdwn", text: `*⏳ Pending (${pending.length}):*\n${pending.length ? pending.join(", ") : "_All done!_"}` },
+              ]},
+              { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "View Dashboard →" }, url: "https://claims-dashboard.vercel.app/reports", action_id: "view_reports" }]},
+            ],
+          });
+          return Response.json({ ok: true });
+        }
+
+        if (text.includes("pending") || text.includes("tasks")) {
+          const tasks = await getPendingTasks();
+          const priorityEmoji = { high: "🔴", medium: "🟡", low: "🟢" };
+          await slackPost("chat.postMessage", {
+            channel: event.channel,
+            thread_ts: event.ts,
+            text: "Pending tasks",
+            blocks: [
+              { type: "section", text: { type: "mrkdwn", text: `⏳ *Pending Tasks (${tasks.length})* — showing up to 5` } },
+              ...tasks.map(t => ({
+                type: "section",
+                text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.team_members?.name || "Unassigned"}${t.due_date ? ` · Due ${t.due_date}` : ""}` },
+              })),
+              ...(tasks.length === 0 ? [{ type: "section", text: { type: "mrkdwn", text: "_No pending tasks_ 🎉" } }] : []),
+              { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "View Task Board →" }, url: "https://claims-dashboard.vercel.app/tasks", action_id: "view_tasks" }]},
+            ],
+          });
+          return Response.json({ ok: true });
+        }
+
+        if (text.includes("target") || text.includes("goal")) {
+          const targets = await getActiveTargets();
+          await slackPost("chat.postMessage", {
+            channel: event.channel,
+            thread_ts: event.ts,
+            text: "Weekly targets",
+            blocks: [
+              { type: "section", text: { type: "mrkdwn", text: `🎯 *Active Weekly Targets (${targets.length})*` } },
+              ...targets.map(t => ({
+                type: "section",
+                text: { type: "mrkdwn", text: `• *${t.name}* — target: ${t.target_value?.toLocaleString() || "—"} · ${t.start_date} → ${t.end_date}` },
+              })),
+              ...(targets.length === 0 ? [{ type: "section", text: { type: "mrkdwn", text: "_No active targets this week_" } }] : []),
+              { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "View Targets →" }, url: "https://claims-dashboard.vercel.app/targets", action_id: "view_targets" }]},
+            ],
+          });
+          return Response.json({ ok: true });
+        }
+
+        // ── Default: show the menu ─────────────────────────
         await slackPost("chat.postMessage", {
           channel: event.channel,
           thread_ts: event.ts,
-          text: "👋 Ready to assign a task! Click below to fill in the details.",
-          blocks: [
-            {
-              type: "section",
-              text: {
-                type: "mrkdwn",
-                text: `👋 *Hey <@${event.user}>!* Ready to assign a task?`,
-              },
-            },
-            {
-              type: "actions",
-              elements: [
-                {
-                  type: "button",
-                  text: { type: "plain_text", text: "✏️ Create Task" },
-                  style: "primary",
-                  action_id: "open_task_modal",
-                  value: JSON.stringify({
-                    channel: event.channel,
-                    thread_ts: event.ts,
-                    assigned_by,
-                  }),
-                },
-              ],
-            },
-          ],
+          text: `👋 Hey ${userName}! Here's what I can do.`,
+          blocks: buildMenuBlocks(userName),
         });
 
         return Response.json({ ok: true });
@@ -227,127 +332,138 @@ export async function POST(request) {
     }
   }
 
-  // ── Handle Interactivity (button clicks, modal submissions) ───────────
+  // ── Interactivity (button clicks + modal submissions) ─────
   if (contentType.includes("application/x-www-form-urlencoded")) {
     const text = await request.text();
     const params = new URLSearchParams(text);
     const payload = JSON.parse(params.get("payload") || "{}");
 
-    // Button click — open modal
+    // Button clicks
     if (payload.type === "block_actions") {
       const action = payload.actions?.[0];
+      const channel = payload.channel?.id || payload.container?.channel_id;
+      const thread_ts = payload.message?.thread_ts || payload.message?.ts;
 
       if (action?.action_id === "open_task_modal") {
         const meta = JSON.parse(action.value || "{}");
+        const metaWithThread = { ...meta, channel: meta.channel || channel, thread_ts: meta.thread_ts || thread_ts };
         const members = await getTeamMembers();
+        await slackPost("views.open", buildTaskModal(payload.trigger_id, metaWithThread, members));
+        return Response.json({ ok: true });
+      }
 
-        await slackPost("views.open", buildTaskModal(payload.trigger_id, {
-          members,
-          assigned_by: meta.assigned_by || "",
-          _meta: meta,
-        }));
+      if (action?.action_id === "check_reports") {
+        const { submitted, pending, total } = await getTodayReports();
+        await slackPost("chat.postMessage", {
+          channel,
+          thread_ts,
+          text: "Today's reports",
+          blocks: [
+            { type: "section", text: { type: "mrkdwn", text: `📊 *Daily Reports — Today*` } },
+            { type: "section", fields: [
+              { type: "mrkdwn", text: `*✅ Submitted (${submitted.length}/${total}):*\n${submitted.length ? submitted.join(", ") : "_None yet_"}` },
+              { type: "mrkdwn", text: `*⏳ Pending (${pending.length}):*\n${pending.length ? pending.join(", ") : "_All done!_"}` },
+            ]},
+          ],
+        });
+        return Response.json({ ok: true });
+      }
 
-        // Store channel/thread in private_metadata for modal submit
-        await slackPost("views.update", {
-          view_id: payload.view?.id,
-        }).catch(() => {});
+      if (action?.action_id === "check_pending_tasks") {
+        const tasks = await getPendingTasks();
+        const priorityEmoji = { high: "🔴", medium: "🟡", low: "🟢" };
+        await slackPost("chat.postMessage", {
+          channel, thread_ts,
+          text: "Pending tasks",
+          blocks: [
+            { type: "section", text: { type: "mrkdwn", text: `⏳ *Pending Tasks (${tasks.length})*` } },
+            ...tasks.map(t => ({ type: "section", text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.team_members?.name||"Unassigned"}${t.due_date?` · Due ${t.due_date}`:""}` } })),
+            ...(tasks.length===0?[{ type:"section", text:{type:"mrkdwn", text:"_No pending tasks_ 🎉"} }]:[]),
+          ],
+        });
+        return Response.json({ ok: true });
+      }
 
+      if (action?.action_id === "check_targets") {
+        const targets = await getActiveTargets();
+        await slackPost("chat.postMessage", {
+          channel, thread_ts,
+          text: "Weekly targets",
+          blocks: [
+            { type: "section", text: { type: "mrkdwn", text: `🎯 *Active Weekly Targets (${targets.length})*` } },
+            ...targets.map(t => ({ type:"section", text:{type:"mrkdwn", text:`• *${t.name}* — ${t.target_value?.toLocaleString()||"—"}`} })),
+            ...(targets.length===0?[{type:"section",text:{type:"mrkdwn",text:"_No active targets_"}}]:[]),
+          ],
+        });
         return Response.json({ ok: true });
       }
     }
 
-    // Modal submitted
+    // Modal submission
     if (payload.type === "view_submission" && payload.view?.callback_id === "create_task_modal") {
       const values = payload.view.state.values;
+      const title       = values.task_title?.title_input?.value;
+      const description = values.task_description?.description_input?.value || null;
+      const assigneeIds = values.task_assignees?.assignees_input?.selected_options?.map(o => parseInt(o.value)) || [];
+      const priority    = values.task_priority?.priority_input?.selected_option?.value || "medium";
+      const due_date    = values.task_due_date?.due_date_input?.selected_date || null;
+      const assigned_by = values.task_assigned_by?.assigned_by_input?.value || "Slack";
 
-      const title        = values.task_title?.title_input?.value;
-      const description  = values.task_description?.description_input?.value || null;
-      const assigneeIds  = values.task_assignees?.assignees_input?.selected_options?.map(o => parseInt(o.value)) || [];
-      const priority     = values.task_priority?.priority_input?.selected_option?.value || "medium";
-      const due_date     = values.task_due_date?.due_date_input?.selected_date || null;
-      const assigned_by  = values.task_assigned_by?.assigned_by_input?.value || "Slack";
-
-      // Get private metadata (channel + thread)
       let meta = {};
-      try { meta = JSON.parse(payload.view.private_metadata || "{}"); } catch (e) {}
+      try { meta = JSON.parse(payload.view.private_metadata || "{}"); } catch(e) {}
 
       const supabase = getSupabase();
-      const members = await getTeamMembers();
-
-      // Create one task per assignee
+      const members  = await getTeamMembers();
       const createdTasks = [];
+
       for (const memberId of assigneeIds) {
         const member = members.find(m => m.id === memberId);
         if (!member) continue;
 
-        const { data: task, error } = await supabase
-          .from("tasks")
-          .insert({
-            title,
-            description,
-            assigned_to: memberId,
-            assigned_by,
-            due_date,
-            priority,
-            status: "todo",
-            category: "ad_hoc",
-          })
-          .select()
-          .single();
+        const { data: task, error } = await supabase.from("tasks").insert({
+          title, description, assigned_to: memberId, assigned_by,
+          due_date, priority, status: "todo", category: "ad_hoc",
+        }).select().single();
 
         if (error) continue;
         createdTasks.push({ task, member });
 
-        // DM the assignee
         if (member.slack_user_id) {
-          const priorityEmoji = { high: "🔴", medium: "🟡", low: "🟢" }[priority] || "🟡";
+          const pEmoji = { high:"🔴", medium:"🟡", low:"🟢" }[priority]||"🟡";
           await slackPost("chat.postMessage", {
             channel: member.slack_user_id,
-            text: `You've been assigned a new task!`,
+            text: `New task assigned to you by ${assigned_by}`,
             blocks: [
-              {
-                type: "section",
-                text: {
-                  type: "mrkdwn",
-                  text: `📋 *New task assigned to you by ${assigned_by}*`,
-                },
-              },
-              {
-                type: "section",
-                fields: [
-                  { type: "mrkdwn", text: `*Task:*\n${title}` },
-                  { type: "mrkdwn", text: `*Priority:*\n${priorityEmoji} ${priority}` },
-                  { type: "mrkdwn", text: `*Due:*\n${due_date || "No deadline"}` },
-                  ...(description ? [{ type: "mrkdwn", text: `*Notes:*\n${description}` }] : []),
-                ],
-              },
-              {
-                type: "actions",
-                elements: [
-                  {
-                    type: "button",
-                    text: { type: "plain_text", text: "View Task Board →" },
-                    url: "https://claims-dashboard.vercel.app/tasks",
-                    action_id: "view_tasks",
-                  },
-                ],
-              },
+              { type:"section", text:{type:"mrkdwn", text:`📋 *New task from ${assigned_by}*`} },
+              { type:"section", fields:[
+                { type:"mrkdwn", text:`*Task:*\n${title}` },
+                { type:"mrkdwn", text:`*Priority:*\n${pEmoji} ${priority}` },
+                { type:"mrkdwn", text:`*Due:*\n${due_date||"No deadline"}` },
+                ...(description?[{type:"mrkdwn",text:`*Notes:*\n${description}`}]:[]),
+              ]},
+              { type:"actions", elements:[{type:"button", text:{type:"plain_text",text:"View Task Board →"}, url:"https://claims-dashboard.vercel.app/tasks", action_id:"view_tasks"}]},
             ],
           });
         }
       }
 
-      // Post confirmation back to original channel/thread
       if (meta.channel && createdTasks.length > 0) {
-        const assigneeNames = createdTasks.map(c => c.member.name);
+        const names = createdTasks.map(c => c.member.name);
+        const pEmoji = { high:"🔴", medium:"🟡", low:"🟢" }[priority]||"🟡";
         await slackPost("chat.postMessage", {
           channel: meta.channel,
           thread_ts: meta.thread_ts,
-          text: `Task assigned to ${assigneeNames.join(", ")}`,
-          blocks: buildTaskConfirmMessage(
-            { title, priority, due_date },
-            assigneeNames
-          ),
+          text: `Task assigned to ${names.join(", ")}`,
+          blocks: [
+            { type:"section", text:{type:"mrkdwn", text:`✅ *Task assigned to ${names.join(", ")}*`} },
+            { type:"section", fields:[
+              { type:"mrkdwn", text:`*Task:*\n${title}` },
+              { type:"mrkdwn", text:`*Priority:*\n${pEmoji} ${priority}` },
+              { type:"mrkdwn", text:`*Assigned to:*\n${names.join(", ")}` },
+              { type:"mrkdwn", text:`*Due:*\n${due_date||"No deadline"}` },
+            ]},
+            { type:"actions", elements:[{type:"button", text:{type:"plain_text",text:"View Dashboard →"}, url:"https://claims-dashboard.vercel.app/tasks", action_id:"view_dashboard"}]},
+          ],
         });
       }
 

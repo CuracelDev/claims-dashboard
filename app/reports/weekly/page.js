@@ -138,7 +138,7 @@ export default function WeeklyPage() {
         <p style={{ margin: '4px 0 0', fontSize: 13, color: C.sub }}>Team performance aggregated by period</p>
       </div>
 
-      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '24px 32px', boxSizing: 'border-box' }}>
+      <div style={{ padding: '20px 24px', boxSizing: 'border-box' }}>
 
         {/* Period controls */}
         <div style={{ ...card, padding: '16px 20px', marginBottom: 20 }}>

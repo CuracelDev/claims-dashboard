@@ -174,7 +174,7 @@ export default function OpsPage() {
     <div style={{ minHeight:'100vh', background:C.bg, color:C.text, paddingBottom:60, transition:'background 0.2s' }}>
 
       {/* Header */}
-      <div style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:'20px 32px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+      <div style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:'18px 24px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
         <div>
           <h1 style={{ margin:0, fontSize:22, fontWeight:700, color:C.text }}>Operations Overview</h1>
           <p style={{ margin:'4px 0 0', fontSize:13, color:C.sub }}>Curacel Health Ops · Team performance</p>
@@ -184,7 +184,7 @@ export default function OpsPage() {
         </div>
       </div>
 
-      <div style={{ padding:'24px 32px', maxWidth:1160, margin:'0 auto', boxSizing:'border-box' }}>
+      <div style={{ padding:'20px 24px', boxSizing:'border-box' }}>
 
         {/* Today score cards */}
         <div style={{ marginBottom:8, fontSize:11, fontWeight:600, color:C.muted, letterSpacing:'0.07em' }}>
