@@ -496,10 +496,7 @@ function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
             </div>
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0' }}>
-            <div style={{ fontSize: 14, color: C.sub }}>
-              Total output: <span style={{ color: C.accent, fontWeight: 700, fontSize: 22 }}>{totalOutput}</span>
-            </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', padding: '8px 0' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               {saveMsg && (
                 <span style={{ fontSize: 13, color: saveMsg.type === 'success' ? C.success : C.danger }}>
@@ -594,7 +591,7 @@ export default function ReportsPage() {
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60, transition: 'background 0.2s' }}>
-      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 32px' }}>
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '18px 24px' }}>
         <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, color: C.text }}>Daily Reports</h1>
         <p style={{ margin: '4px 0 0', fontSize: 14, color: C.sub }}>Health Ops team reporting</p>
       </div>
@@ -604,9 +601,9 @@ export default function ReportsPage() {
         {tabBtn('team', '👥 Team View')}
       </div>
 
-      <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px 32px' }}>
+      <div style={{ padding: '20px 24px' }}>
         {tab === 'form' && (
-          <div style={{ maxWidth: 720 }}>
+          <div style={{ maxWidth: '100%' }}>
             <ReportPinGate members={teamMembers} onAuth={handleAuth} existingSession={authSession}>
               {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} editPreset={editPreset} onPresetUsed={() => setEditPreset(null)} />}
             </ReportPinGate>
