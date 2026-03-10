@@ -68,7 +68,7 @@ export default function WeeklyPage() {
   const { C } = useTheme();
   const today = new Date().toISOString().split('T')[0];
 
-  const [activeQ, setActiveQ]     = useState(1);
+  const [activeQ, setActiveQ]     = useState(0);
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo]     = useState(today);
   const [from, setFrom] = useState('');
@@ -78,7 +78,7 @@ export default function WeeklyPage() {
   const [error, setError]     = useState(null);
 
   useEffect(() => {
-    const [f, t] = QUICK[1].fn();
+    const [f, t] = QUICK[0].fn();
     setFrom(f); setTo(t);
   }, []);
 
