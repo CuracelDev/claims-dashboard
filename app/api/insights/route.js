@@ -1,13 +1,6 @@
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 function toLocalYMD(date) {
   const y = date.getFullYear();
@@ -66,13 +59,13 @@ function normalizeDate(value) {
 }
 
 export async function GET() {
-  const supabase = getSupabase();
-  const TODAY = todayStr();
-  const YESTERDAY = yesterdayStr();
-  const WEEK_FROM = weekStart(TODAY);
-  const lw = lastWeekRange();
-
   try {
+    const supabase = getSupabase();
+    const TODAY = todayStr();
+    const YESTERDAY = yesterdayStr();
+    const WEEK_FROM = weekStart(TODAY);
+    const lw = lastWeekRange();
+
     const [membersRes, reportsRes, targetsRes, logsRes, leaveRes] = await Promise.all([
       supabase
         .from('team_members')
@@ -265,10 +258,7 @@ export async function GET() {
 
     let qa_flags = null;
     try {
-      const { data: qaRows } = await supabase
-        .from('qa_flags')
-        .select('created_at');
-
+      const { data: qaRows } = await supabase.from('qa_flags').select('created_at');
       const qaAll = qaRows || [];
       const qaTodayCount = qaAll.filter((r) => normalizeDate(r.created_at) === TODAY).length;
       const qaYesterdayCount = qaAll.filter((r) => normalizeDate(r.created_at) === YESTERDAY).length;
@@ -329,6 +319,9 @@ export async function GET() {
     });
   } catch (err) {
     console.error('[insights route error]', err);
-    return Response.json({ error: err?.message || 'Unknown server error' }, { status: 500 });
+    return Response.json(
+      { error: err?.message || 'Unknown server error' },
+      { status: 500 }
+    );
   }
 }
