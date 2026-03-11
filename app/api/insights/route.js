@@ -1,6 +1,3 @@
-// PATH: app/api/insights/route.js
-// Single intelligence endpoint — powers InsightBanner across all pages
-
 import { createClient } from '@supabase/supabase-js';
 
 export const dynamic = 'force-dynamic';
@@ -12,177 +9,252 @@ function getSupabase() {
   );
 }
 
+function toLocalYMD(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function parseYMD(ymd) {
+  const [y, m, d] = String(ymd).split('-').map(Number);
+  return new Date(y, m - 1, d, 12, 0, 0, 0);
+}
+
 function localDateStr(offsetDays = 0) {
   const d = new Date();
+  d.setHours(12, 0, 0, 0);
   if (offsetDays) d.setDate(d.getDate() + offsetDays);
-  return d.getFullYear() + '-' +
-    String(d.getMonth() + 1).padStart(2, '0') + '-' +
-    String(d.getDate()).padStart(2, '0');
+  return toLocalYMD(d);
 }
-const todayStr = () => localDateStr();
+
+const todayStr = () => localDateStr(0);
 const yesterdayStr = () => localDateStr(-1);
+
 function weekStart(dateStr) {
-  const d = new Date(dateStr + 'T12:00:00');
+  const d = parseYMD(dateStr);
   const day = d.getDay();
-  const mon = new Date(d); mon.setDate(d.getDate() + (day === 0 ? -6 : 1 - day));
-  return mon.toISOString().split('T')[0];
+  const mon = new Date(d);
+  mon.setDate(d.getDate() + (day === 0 ? -6 : 1 - day));
+  return toLocalYMD(mon);
 }
+
 function lastWeekRange() {
-  const d = new Date(); d.setDate(d.getDate() - 7);
-  const ds = d.toISOString().split('T')[0];
+  const d = parseYMD(todayStr());
+  d.setDate(d.getDate() - 7);
+  const ds = toLocalYMD(d);
   const start = weekStart(ds);
-  const end = new Date(start + 'T12:00:00');
+  const end = parseYMD(start);
   end.setDate(end.getDate() + 6);
-  return { from: start, to: end.toISOString().split('T')[0] };
+  return { from: start, to: toLocalYMD(end) };
 }
+
 function pct(a, b) {
   if (!b) return null;
   return Math.round(((a - b) / b) * 100);
 }
 
+function normalizeDate(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return toLocalYMD(parsed);
+
+  return null;
+}
+
 export async function GET() {
   const supabase = getSupabase();
-  const TODAY     = todayStr();
+  const TODAY = todayStr();
   const YESTERDAY = yesterdayStr();
   const WEEK_FROM = weekStart(TODAY);
-  const lw        = lastWeekRange();
+  const lw = lastWeekRange();
 
   try {
-    // ── Parallel fetches ──────────────────────────────────────────────
     const [membersRes, reportsRes, targetsRes, logsRes, leaveRes] = await Promise.all([
-      supabase.from('team_members').select('id, name, display_name, is_active').eq('is_active', true),
-      supabase.from('daily_reports').select('team_member_id, report_date, metrics, created_at').order('report_date', { ascending: false }).limit(200),
-      supabase.from('weekly_targets').select('*').lte('start_date', TODAY).gte('end_date', TODAY),
-      supabase.from('target_logs').select('target_id, date, value').gte('date', WEEK_FROM),
-      supabase.from('leave_records').select('team_member_id').lte('start_date', TODAY).gte('end_date', TODAY),
+      supabase
+        .from('team_members')
+        .select('id, name, display_name, is_active')
+        .eq('is_active', true),
+
+      supabase
+        .from('daily_reports')
+        .select('id, team_member_id, report_date, metrics, created_at, status')
+        .gte('report_date', lw.from)
+        .lte('report_date', TODAY)
+        .order('report_date', { ascending: false })
+        .order('created_at', { ascending: false }),
+
+      supabase
+        .from('weekly_targets')
+        .select('*')
+        .lte('start_date', TODAY)
+        .gte('end_date', TODAY),
+
+      supabase
+        .from('target_logs')
+        .select('target_id, date, value')
+        .gte('date', lw.from),
+
+      supabase
+        .from('leave_records')
+        .select('team_member_id')
+        .lte('start_date', TODAY)
+        .gte('end_date', TODAY),
     ]);
 
-    const members  = membersRes.data  || [];
-    const reports  = reportsRes.data  || [];
-    const targets  = targetsRes.data  || [];
-    const logs     = logsRes.data     || [];
-    const onLeave  = (leaveRes.data   || []).map(l => String(l.team_member_id));
+    if (membersRes.error) throw membersRes.error;
+    if (reportsRes.error) throw reportsRes.error;
+    if (targetsRes.error) throw targetsRes.error;
+    if (logsRes.error) throw logsRes.error;
+    if (leaveRes.error) throw leaveRes.error;
 
-    const memberMap = {};
-    for (const m of members) memberMap[String(m.id)] = m;
+    const members = membersRes.data || [];
+    const rawReports = reportsRes.data || [];
+    const targets = targetsRes.data || [];
+    const logs = logsRes.data || [];
+    const onLeave = (leaveRes.data || []).map((l) => String(l.team_member_id));
 
-    // ── 1. Submission status ──────────────────────────────────────────
-    const submittedToday = reports
-      .filter(r => r.report_date?.slice(0, 10) === TODAY)
-      .map(r => String(r.team_member_id));
+    const dedupeMap = new Map();
+    for (const r of rawReports) {
+      const rd = normalizeDate(r.report_date);
+      if (!rd) continue;
+      const key = `${r.team_member_id}__${rd}`;
+      if (!dedupeMap.has(key)) {
+        dedupeMap.set(key, { ...r, report_date: rd });
+      }
+    }
+    const reports = Array.from(dedupeMap.values());
+
+    const submittedTodayIds = [
+      ...new Set(
+        reports
+          .filter((r) => r.report_date === TODAY)
+          .map((r) => String(r.team_member_id))
+      ),
+    ];
 
     const pendingMembers = members
-      .filter(m => !submittedToday.includes(String(m.id)) && !onLeave.includes(String(m.id)))
-      .map(m => m.display_name || m.name);
+      .filter(
+        (m) =>
+          !submittedTodayIds.includes(String(m.id)) &&
+          !onLeave.includes(String(m.id))
+      )
+      .map((m) => m.display_name || m.name);
 
     const submission = {
-      submitted:  submittedToday.length,
-      total:      members.length,
-      on_leave:   onLeave.length,
-      pending:    pendingMembers,
+      submitted: submittedTodayIds.length,
+      total: members.length,
+      on_leave: onLeave.length,
+      pending: pendingMembers,
     };
 
-    // ── 2. Today vs Yesterday metric deltas ───────────────────────────
-    const sumMetrics = (dateStr) => {
-      const dayReports = reports.filter(r => r.report_date?.slice(0, 10) === dateStr);
+    const sumMetricsForReports = (rows) => {
       const totals = {};
-      for (const r of dayReports) {
+      for (const r of rows) {
         const m = r.metrics || {};
         for (const [k, v] of Object.entries(m)) {
-          const n = parseInt(v); if (!isNaN(n)) totals[k] = (totals[k] || 0) + n;
+          const n = Number(v);
+          if (Number.isFinite(n)) totals[k] = (totals[k] || 0) + n;
         }
       }
       return totals;
     };
 
-    const todayTotals     = sumMetrics(TODAY);
-    const yesterdayTotals = sumMetrics(YESTERDAY);
+    const todayTotals = sumMetricsForReports(
+      reports.filter((r) => r.report_date === TODAY)
+    );
+
+    const yesterdayTotals = sumMetricsForReports(
+      reports.filter((r) => r.report_date === YESTERDAY)
+    );
 
     const KEY_METRICS = [
-      { key: 'care_items_mapped',  label: 'Care Items Mapped' },
-      { key: 'resolved_cares',     label: 'Resolved Cares' },
-      { key: 'providers_mapped',   label: 'Providers Mapped' },
+      { key: 'care_items_mapped', label: 'Care Items Mapped' },
+      { key: 'resolved_cares', label: 'Resolved Cares' },
+      { key: 'providers_mapped', label: 'Providers Mapped' },
       { key: 'care_items_grouped', label: 'Care Items Grouped' },
       { key: 'flagged_care_items', label: 'QA Flags' },
     ];
 
-    const today_vs_yesterday = KEY_METRICS.map(m => ({
-      key:       m.key,
-      label:     m.label,
-      today:     todayTotals[m.key] || 0,
+    const today_vs_yesterday = KEY_METRICS.map((m) => ({
+      key: m.key,
+      label: m.label,
+      today: todayTotals[m.key] || 0,
       yesterday: yesterdayTotals[m.key] || 0,
       pct_change: pct(todayTotals[m.key] || 0, yesterdayTotals[m.key] || 0),
     }));
 
-    // ── 3. This week vs Last week ─────────────────────────────────────
-    const sumRange = (from, to) => {
-      const rangeReports = reports.filter(r => {
-        const d = r.report_date?.slice(0, 10);
-        return d >= from && d <= to;
-      });
-      const totals = {};
-      for (const r of rangeReports) {
-        const m = r.metrics || {};
-        for (const [k, v] of Object.entries(m)) {
-          const n = parseInt(v); if (!isNaN(n)) totals[k] = (totals[k] || 0) + n;
-        }
-      }
-      return totals;
-    };
+    const inRange = (d, from, to) => d >= from && d <= to;
 
-    const thisWeekTotals = sumRange(WEEK_FROM, TODAY);
-    const lastWeekTotals = sumRange(lw.from, lw.to);
+    const thisWeekTotals = sumMetricsForReports(
+      reports.filter((r) => inRange(r.report_date, WEEK_FROM, TODAY))
+    );
 
-    const week_vs_lastweek = KEY_METRICS.map(m => ({
-      key:        m.key,
-      label:      m.label,
-      this_week:  thisWeekTotals[m.key] || 0,
-      last_week:  lastWeekTotals[m.key] || 0,
+    const lastWeekTotals = sumMetricsForReports(
+      reports.filter((r) => inRange(r.report_date, lw.from, lw.to))
+    );
+
+    const week_vs_lastweek = KEY_METRICS.map((m) => ({
+      key: m.key,
+      label: m.label,
+      this_week: thisWeekTotals[m.key] || 0,
+      last_week: lastWeekTotals[m.key] || 0,
       pct_change: pct(thisWeekTotals[m.key] || 0, lastWeekTotals[m.key] || 0),
     }));
 
-    // ── 4. Targets pace ───────────────────────────────────────────────
-    const targetInsights = targets.map(t => {
-      const tLogs = logs.filter(l => l.target_id === t.id);
+    const targetInsights = targets.map((t) => {
+      const tLogs = logs.filter((l) => l.target_id === t.id);
       let actual = 0;
 
-      if (t.metric_key && todayTotals[t.metric_key] !== undefined) {
-        // Auto-pull from daily reports for current week
-        actual = thisWeekTotals[t.metric_key] || 0;
+      if (t.metric_key) {
+        const scopedReports = reports.filter(
+          (r) => r.report_date >= t.start_date && r.report_date <= t.end_date
+        );
+        actual = scopedReports.reduce(
+          (sum, r) => sum + (Number(r.metrics?.[t.metric_key]) || 0),
+          0
+        );
       } else if (t.type === 'number') {
         actual = tLogs.reduce((sum, l) => sum + (parseFloat(l.value) || 0), 0);
       } else if (t.type === 'yesno') {
-        actual = tLogs.some(l => l.value === 'yes' || l.value === 'true') ? 1 : 0;
+        actual = tLogs.some((l) => l.value === 'yes' || l.value === 'true') ? 1 : 0;
       } else if (t.type === 'percentage') {
-        const latest = tLogs.sort((a, b) => b.date > a.date ? 1 : -1)[0];
+        const latest = [...tLogs].sort((a, b) => (b.date > a.date ? 1 : -1))[0];
         actual = latest ? parseFloat(latest.value) || 0 : 0;
       }
 
       const target_value = parseFloat(t.target_value) || 0;
-      const pct_complete = target_value > 0 ? Math.min(100, Math.round((actual / target_value) * 100)) : null;
+      const pct_complete =
+        target_value > 0 ? Math.min(100, Math.round((actual / target_value) * 100)) : null;
 
-      // Days remaining
-      const end = new Date(t.end_date + 'T12:00:00');
+      const end = parseYMD(t.end_date);
       const now = new Date();
-      const days_left = Math.max(0, Math.ceil((end - now) / (1000 * 60 * 60 * 24)));
+      now.setHours(12, 0, 0, 0);
+      const days_left = Math.max(0, Math.ceil((end - now) / 86400000));
 
-      // Pace: needed per day vs achieved per day
-      const start = new Date(t.start_date + 'T12:00:00');
-      const total_days = Math.max(1, Math.ceil((end - start) / (1000 * 60 * 60 * 24)));
+      const start = parseYMD(t.start_date);
+      const total_days = Math.max(1, Math.ceil((end - start) / 86400000) + 1);
       const days_elapsed = Math.max(1, total_days - days_left);
       const needed_per_day = target_value / total_days;
       const achieved_per_day = actual / days_elapsed;
       const pace_ratio = needed_per_day > 0 ? achieved_per_day / needed_per_day : 1;
 
-      const pace = pct_complete >= 100 ? 'hit'
-        : pace_ratio >= 0.8 ? 'on_track'
-        : pace_ratio >= 0.5 ? 'at_risk'
-        : 'behind';
+      const pace =
+        pct_complete >= 100
+          ? 'hit'
+          : pace_ratio >= 0.8
+          ? 'on_track'
+          : pace_ratio >= 0.5
+          ? 'at_risk'
+          : 'behind';
 
       return {
-        id:           t.id,
-        name:         t.name,
-        type:         t.type,
+        id: t.id,
+        name: t.name,
+        type: t.type,
         target_value,
         actual,
         pct_complete,
@@ -191,35 +263,50 @@ export async function GET() {
       };
     });
 
-    // ── 5. QA flag spike ──────────────────────────────────────────────
     let qa_flags = null;
     try {
-      const { data: qaToday }     = await supabase.from('qa_flags').select('id', { count: 'exact' }).eq('created_at::date', TODAY);
-      const { data: qaYesterday } = await supabase.from('qa_flags').select('id', { count: 'exact' }).eq('created_at::date', YESTERDAY);
-      const todayCount     = qaToday?.length     || 0;
-      const yesterdayCount = qaYesterday?.length || 0;
+      const { data: qaRows } = await supabase
+        .from('qa_flags')
+        .select('created_at');
+
+      const qaAll = qaRows || [];
+      const qaTodayCount = qaAll.filter((r) => normalizeDate(r.created_at) === TODAY).length;
+      const qaYesterdayCount = qaAll.filter((r) => normalizeDate(r.created_at) === YESTERDAY).length;
+
       qa_flags = {
-        today:      todayCount,
-        yesterday:  yesterdayCount,
-        pct_change: pct(todayCount, yesterdayCount),
-        spike:      todayCount > 0 && yesterdayCount > 0 && todayCount > yesterdayCount * 1.3,
+        today: qaTodayCount,
+        yesterday: qaYesterdayCount,
+        pct_change: pct(qaTodayCount, qaYesterdayCount),
+        spike:
+          qaTodayCount > 0 &&
+          qaYesterdayCount > 0 &&
+          qaTodayCount > qaYesterdayCount * 1.3,
       };
     } catch (_) {
-      qa_flags = null; // qa_flags table may not have date cast support — safe fallback
+      qa_flags = null;
     }
 
-    // ── 6. Freshness ──────────────────────────────────────────────────
-    const recentReport = reports[0];
+    const newestReport = [...reports].sort((a, b) => {
+      const av = new Date(a.created_at).getTime();
+      const bv = new Date(b.created_at).getTime();
+      return bv - av;
+    })[0];
+
     const freshness = {
-      last_report_at: recentReport?.created_at || null,
-      last_report_date: recentReport?.report_date?.slice(0, 10) || null,
+      last_report_at: newestReport?.created_at || null,
+      last_report_date: newestReport?.report_date || null,
     };
 
-    // ── 7. Derived KPIs ───────────────────────────────────────────────
-    const activeMembers = members.filter(m => !onLeave.includes(String(m.id))).length;
-    const submission_rate = activeMembers > 0 ? Math.round((submission.submitted / activeMembers) * 100) : 0;
-    const targets_hit = targetInsights.filter(t => t.pace === 'hit' || t.pct_complete >= 100).length;
-    const target_attainment = targets.length > 0 ? Math.round((targets_hit / targets.length) * 100) : null;
+    const activeMembers = members.filter((m) => !onLeave.includes(String(m.id))).length;
+    const submission_rate =
+      activeMembers > 0 ? Math.round((submission.submitted / activeMembers) * 100) : 0;
+
+    const targets_hit = targetInsights.filter(
+      (t) => t.pace === 'hit' || (t.pct_complete ?? 0) >= 100
+    ).length;
+
+    const target_attainment =
+      targets.length > 0 ? Math.round((targets_hit / targets.length) * 100) : null;
 
     const kpis = {
       submission_rate,
@@ -240,9 +327,8 @@ export async function GET() {
       freshness,
       kpis,
     });
-
   } catch (err) {
-    console.error('[insights route error]', err.message);
-    return Response.json({ error: err.message }, { status: 500 });
+    console.error('[insights route error]', err);
+    return Response.json({ error: err?.message || 'Unknown server error' }, { status: 500 });
   }
 }
