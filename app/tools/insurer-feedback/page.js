@@ -45,8 +45,15 @@ function normalizeRow(raw, feedbackDate, insurerOverride) {
     care_item: get(['items','item','careitem','care_item','service','procedure','treatment']),
     issue_category: get(['adjudication','issuecategory','issue_category','category','errortype']),
     issue_description: get(['qacomment','qa_comment','issuedescription','issue_description','issue','comment','remarks','feedback','observation']),
-    recommendation: get(['resolution','resolution2','recommendation','suggestedaction']),
-    action_taken: get(['claimitemcomment','claim_item_comment','actiontaken','claimstatus','claim_status']),
+    payable_status: (() => {
+      const key = Object.keys(raw).find(k => k === 'RESOLUTION ' || k === 'RESOLUTION');
+      return key ? String(raw[key] ?? '').trim() : '';
+    })(),
+    resolution_status: (() => {
+      const key = Object.keys(raw).find(k => k === 'Resolution');
+      return key ? String(raw[key] ?? '').trim() : '';
+    })(),
+    action_taken: get(['claimstatus','claim_status','claimitemcomment','claim_item_comment']),
     status: 'Open',
     owner: get(['name','owner','assignee','resolvedby']),
     feedback_date: parseDate(get(['encounterdate','encounter_date','feedbackdate','submitteddate','date'])),
@@ -297,7 +304,7 @@ export default function InsurerFeedbackPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead>
                 <tr style={{ borderBottom: '1px solid ' + C.border }}>
-                  {['Invoice No','Member No','Diagnosis','Care Item','Category','QA Comment','Status','Date',''].map(h => (
+                  {['Invoice No','Member No','Diagnosis','Care Item','Category','QA Comment','Payable','Status','Date',''].map(h => (
                     <th key={h} style={{ color: C.sub, fontWeight: 600, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.5px', padding: '12px 14px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
                   ))}
                 </tr>
@@ -316,6 +323,13 @@ export default function InsurerFeedbackPage() {
                     <td style={{ padding: '10px 14px', color: C.text, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.care_item || '—'}</td>
                     <td style={{ padding: '10px 14px', color: C.warn, maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '12px' }}>{item.issue_category || '—'}</td>
                     <td style={{ padding: '10px 14px', color: C.sub, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.issue_description || '—'}</td>
+                    <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                      {item.payable_status ? (
+                        <span style={{ background: item.payable_status === 'PAYABLE' ? '#00E5A022' : '#EF444422', color: item.payable_status === 'PAYABLE' ? '#00E5A0' : '#EF4444', fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px' }}>
+                          {item.payable_status === 'PAYABLE' ? '✓ Payable' : '✕ Not Payable'}
+                        </span>
+                      ) : '—'}
+                    </td>
                     <td style={{ padding: '10px 14px' }}><StatusBadge status={item.status} /></td>
                     <td style={{ padding: '10px 14px', color: C.sub, whiteSpace: 'nowrap' }}>{item.feedback_date || '—'}</td>
                     <td style={{ padding: '10px 14px' }} onClick={e => e.stopPropagation()}>
@@ -351,7 +365,8 @@ export default function InsurerFeedbackPage() {
                 { label: 'Care Item', value: selectedItem.care_item },
                 { label: 'Issue Category', value: selectedItem.issue_category },
                 { label: 'QA Comment', value: selectedItem.issue_description },
-                { label: 'Resolution', value: selectedItem.recommendation },
+                { label: 'Payable Status', value: selectedItem.payable_status },
+                { label: 'Status (Insurer)', value: selectedItem.resolution_status },
                 { label: 'Action Taken', value: selectedItem.action_taken },
                 { label: 'Notes', value: selectedItem.notes },
               ].map(f => f.value ? (
