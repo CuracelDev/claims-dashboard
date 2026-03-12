@@ -73,10 +73,15 @@ export default function InsurerFeedbackPage() {
   const [filterDiagnosis, setFilterDiagnosis] = useState('');
   const [filterCareItem, setFilterCareItem] = useState('');
   const [filterCategory, setFilterCategory] = useState('');
+  const [filterCategory, setFilterCategory] = useState('');
   const [selectedItem, setSelectedItem] = useState(null);
   const [feedbackDate, setFeedbackDate] = useState('');
   const [insurer, setInsurer] = useState('JBL Uganda');
   const [updatingId, setUpdatingId] = useState(null);
+  const [aiInsight, setAiInsight] = useState('');
+  const [aiLoading, setAiLoading] = useState(false);
+  const [slackSending, setSlackSending] = useState(false);
+  const [slackSent, setSlackSent] = useState(false);
   const [aiInsight, setAiInsight] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
 
@@ -107,6 +112,46 @@ export default function InsurerFeedbackPage() {
       setAiInsight(result.content?.map(c => c.text || '').join('') || 'Unable to generate insight.');
     } catch (e) { setAiInsight('Failed to generate insight. Please try again.'); }
     setAiLoading(false);
+  }
+
+  async function generateInsight() {
+    if (!items.length) return;
+    setAiLoading(true); setAiInsight(''); setSlackSent(false);
+    try {
+      const total = items.length;
+      const open = items.filter(i => i.status === 'Open').length;
+      const fixed = items.filter(i => i.status === 'Fixed').length;
+      const pending = items.filter(i => i.status === 'Pending Insurer').length;
+      const cnt = (key) => items.reduce((acc, i) => { const v = i[key]; if (v) acc[v] = (acc[v]||0)+1; return acc; }, {});
+      const top = (obj, n=5) => Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n);
+      const topCats = top(cnt('issue_category'));
+      const topItems = top(cnt('care_item'));
+      const topDx = top(cnt('diagnosis'));
+      const prompt = 'You are a health insurance claims operations analyst. Analyze this insurer feedback data and give sharp operational intelligence.\n\nSUMMARY:\n- Total: ' + total + '\n- Open: ' + open + ' (' + Math.round(open/total*100) + '%)\n- Fixed: ' + fixed + ' (' + Math.round(fixed/total*100) + '%)\n- Pending Insurer: ' + pending + '\n- Resolution Rate: ' + Math.round(fixed/total*100) + '%\n\nTOP ISSUE CATEGORIES:\n' + topCats.map(([k,v]) => '- ' + k + ': ' + v + ' cases').join('\n') + '\n\nMOST FLAGGED CARE ITEMS:\n' + topItems.map(([k,v]) => '- ' + k + ': ' + v + ' flags').join('\n') + '\n\nTOP DIAGNOSES:\n' + topDx.map(([k,v]) => '- ' + k + ': ' + v + ' cases').join('\n') + '\n\nProvide these sections:\n1. SITUATION SUMMARY (2 sentences)\n2. TOP 3 CRITICAL PATTERNS\n3. RECURRING PROBLEMS\n4. THIS WEEK\'S RECOMMENDATION\n5. RESOLUTION RATE ASSESSMENT\n\nBe direct and operational. Plain text only, no symbols.';
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] }),
+      });
+      const data = await res.json();
+      setAiInsight(data.content?.map(c => c.text || '').join('') || 'Unable to generate insight.');
+    } catch (e) { setAiInsight('Failed to generate insight. Please try again.'); }
+    setAiLoading(false);
+  }
+
+  async function sendToSlack() {
+    if (!aiInsight) return;
+    setSlackSending(true);
+    try {
+      const total = items.length;
+      const open = items.filter(i => i.status === 'Open').length;
+      const fixed = items.filter(i => i.status === 'Fixed').length;
+      const res = await fetch('/api/tools/insurer-feedback-slack', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ insight: aiInsight, total, open, fixed, insurer }),
+      });
+      if (res.ok) setSlackSent(true);
+    } catch (e) { console.error(e); }
+    setSlackSending(false);
   }
 
   async function fetchItems() {
@@ -171,6 +216,7 @@ export default function InsurerFeedbackPage() {
   const diagnoses = [...new Set(items.map(i => i.diagnosis).filter(Boolean))].sort();
   const careItems = [...new Set(items.map(i => i.care_item).filter(Boolean))].sort();
   const categories = [...new Set(items.map(i => i.issue_category).filter(Boolean))].sort();
+  const categories = [...new Set(items.map(i => i.issue_category).filter(Boolean))].sort();
 
   const filtered = items.filter(i => {
     const q = search.toLowerCase();
@@ -230,6 +276,9 @@ export default function InsurerFeedbackPage() {
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '16px' }}>
           <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)} style={{ ...inp, maxWidth: 180 }}>
             <option value="">All Categories</option>{categories.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)} style={{ ...inp, maxWidth: 180 }}>
+            <option value=''>All Categories</option>{categories.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search claim, member, issue..." style={{ ...inp, maxWidth: 260 }} />
           <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ ...inp, maxWidth: 160 }}>
