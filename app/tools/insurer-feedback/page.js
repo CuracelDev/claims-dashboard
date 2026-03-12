@@ -21,28 +21,40 @@ function StatusBadge({ status }) {
   );
 }
 
-function normalizeRow(raw, feedbackDate, insurer) {
+function normalizeRow(raw, feedbackDate, insurerOverride) {
   const get = (keys) => {
     for (const k of keys) {
-      const found = Object.keys(raw).find(r => r.toLowerCase().replace(/[^a-z0-9]/g, '') === k.toLowerCase().replace(/[^a-z0-9]/g, ''));
-      if (found && raw[found] !== undefined && raw[found] !== '') return String(raw[found]).trim();
+      const found = Object.keys(raw).find(r => r.trim().toLowerCase().replace(/[^a-z0-9]/g, '') === k.toLowerCase().replace(/[^a-z0-9]/g, ''));
+      if (found && raw[found] !== undefined && String(raw[found]).trim() !== '') return String(raw[found]).trim();
     }
     return '';
   };
+
+  // Handle Excel serial dates (e.g. 46044 -> real date)
+  const parseDate = (val) => {
+    if (!val) return feedbackDate || '';
+    const n = Number(val);
+    if (!isNaN(n) && n > 40000 && n < 60000) {
+      const date = new Date((n - 25569) * 86400 * 1000);
+      return date.toISOString().split('T')[0];
+    }
+    return String(val).trim();
+  };
+
   return {
-    insurer: insurer || 'JBL Uganda',
-    claim_id: get(['claim_id','claimid','claim','claimno','claim_no','claimnumber']),
-    insurance_number: get(['insurance_number','insuranceno','insurance_no','memberno','member_no','enrollee_no','enrolleeno','policy_no']),
-    diagnosis: get(['diagnosis','icd','icd_code','diagnosis_code','condition']),
-    care_item: get(['care_item','careitem','service','service_item','item','procedure','treatment']),
-    issue_category: get(['issue_category','issuecategory','category','issue_type','issuetype','error_type']),
-    issue_description: get(['issue_description','issuedescription','issue','comment','remarks','remark','feedback','reason']),
-    recommendation: get(['recommendation','action_required','actionrequired','suggested_action','resolution']),
-    action_taken: get(['action_taken','actiontaken','response','our_response']),
+    insurer: get(['insurer']) || insurerOverride || 'JBL Uganda',
+    claim_id: get(['invoicenumber','invoice_number','claimid','claim_id','claimno','claim_no']),
+    insurance_number: get(['insuranceno','insurance_no','memberno','member_no','enrolleeno','enrollee_no']),
+    diagnosis: get(['diagnoses','diagnosis','icd','dx','condition']),
+    care_item: get(['items','item','careitem','care_item','service','procedure','treatment']),
+    issue_category: get(['adjudication','issuecategory','issue_category','category','errortype','error_type','adjudicationtype']),
+    issue_description: get(['qacomment','qa_comment','issuedescription','issue_description','issue','comment','remarks','feedback','observation']),
+    recommendation: get(['resolution','resolution2','recommendation','suggestedaction','action_required']),
+    action_taken: get(['claimitemcomment','claim_item_comment','actiontaken','action_taken','our_response']),
     status: 'Open',
-    owner: '',
-    feedback_date: feedbackDate || '',
-    notes: get(['notes','note','additional_comments']),
+    owner: get(['name','owner','assignee','resolvedby']),
+    feedback_date: parseDate(get(['encounterdate','encounter_date','feedbackdate','feedback_date','date'])),
+    notes: get(['signsandsymptoms','signs_and_symptoms','notes','note','iterror','it_error']),
   };
 }
 
