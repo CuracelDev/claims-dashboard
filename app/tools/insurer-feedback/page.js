@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { useTheme } from '../../../context/ThemeContext';
+import { useTheme } from '../../context/ThemeContext';
 
 const STATUS_META = {
   'Open':            { bg: '#EF444422', color: '#EF4444', dot: '#EF4444' },
