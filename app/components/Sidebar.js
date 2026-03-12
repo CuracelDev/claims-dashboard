@@ -29,6 +29,12 @@ const NAV = [
     ],
   },
   {
+    section: 'TOOLS',
+    items: [
+      { href: '/tools', icon: '🛠️', label: 'Operational Tools', sub: 'Utilities & batch ops' },
+    ],
+  },
+  {
     section: 'COMING SOON',
     items: [
       { href: '/errors', icon: '🔴', label: 'Error Tracking',    disabled: true },

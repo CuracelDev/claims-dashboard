@@ -1,0 +1,49 @@
+'use client';
+import { useRouter } from 'next/navigation';
+
+const C = {
+  bg: '#0B0F1A', card: '#111827', elevated: '#1A2235', border: '#1E2D45',
+  text: '#E8EDF5', sub: '#7A8FA6', muted: '#4A5568', accent: '#00E5A0',
+  accentDim: '#00B87D', blue: '#5B8DEF', purple: '#A78BFA',
+  warn: '#F59E0B', danger: '#EF4444', inputBg: '#0F1726', sidebarBg: '#0D1220',
+};
+
+const tools = [
+  { id: 'batch-splitter', name: 'Batch File Splitter', description: 'Split large CSV or Excel files into operational batches for processing.', icon: '⚡', status: 'live', tags: ['CSV', 'Excel', 'Batch'] },
+  { id: 'insurer-feedback', name: 'Insurer Feedback Intelligence', description: 'Analyze and categorize insurer feedback patterns automatically.', icon: '🔍', status: 'coming', tags: ['AI', 'Feedback', 'Analysis'] },
+  { id: 'lookup-matcher', name: 'Lookup Matcher', description: 'Match and reconcile records across datasets quickly.', icon: '🔗', status: 'coming', tags: ['Matching', 'Reconciliation'] },
+  { id: 'sheet-formatter', name: 'Sheet Formatter', description: 'Standardize and format operational spreadsheets to template.', icon: '📋', status: 'coming', tags: ['Excel', 'Formatting'] },
+];
+
+export default function ToolsPage() {
+  const router = useRouter();
+  return (
+    <div style={{ minHeight: '100vh', background: C.bg, padding: '32px', fontFamily: 'system-ui, sans-serif' }}>
+      <div style={{ marginBottom: '32px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+          <span style={{ fontSize: '22px' }}>🛠️</span>
+          <h1 style={{ color: C.text, fontSize: '24px', fontWeight: 700, margin: 0 }}>Operational Tools</h1>
+        </div>
+        <p style={{ color: C.sub, fontSize: '14px', margin: 0 }}>Utilities to support daily claims operations work.</p>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '16px' }}>
+        {tools.map((tool) => (
+          <div key={tool.id} onClick={() => tool.status === 'live' && router.push(`/tools/${tool.id}`)}
+            style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '24px', cursor: tool.status === 'live' ? 'pointer' : 'default', opacity: tool.status === 'live' ? 1 : 0.55, position: 'relative' }}>
+            <div style={{ position: 'absolute', top: '16px', right: '16px' }}>
+              {tool.status === 'live'
+                ? <span style={{ background: '#00E5A020', color: C.accent, fontSize: '10px', fontWeight: 700, padding: '3px 8px', borderRadius: '20px' }}>Live</span>
+                : <span style={{ background: '#4A556830', color: C.sub, fontSize: '10px', fontWeight: 700, padding: '3px 8px', borderRadius: '20px' }}>Soon</span>}
+            </div>
+            <div style={{ fontSize: '28px', marginBottom: '14px' }}>{tool.icon}</div>
+            <h3 style={{ color: C.text, fontSize: '16px', fontWeight: 700, margin: '0 0 8px 0' }}>{tool.name}</h3>
+            <p style={{ color: C.sub, fontSize: '13px', margin: '0 0 16px 0', lineHeight: '1.5' }}>{tool.description}</p>
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              {tool.tags.map(tag => <span key={tag} style={{ background: C.elevated, color: C.sub, fontSize: '11px', padding: '3px 8px', borderRadius: '6px' }}>{tag}</span>)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
