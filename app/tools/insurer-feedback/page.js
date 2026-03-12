@@ -72,12 +72,42 @@ export default function InsurerFeedbackPage() {
   const [filterStatus, setFilterStatus] = useState('');
   const [filterDiagnosis, setFilterDiagnosis] = useState('');
   const [filterCareItem, setFilterCareItem] = useState('');
+  const [filterCategory, setFilterCategory] = useState('');
   const [selectedItem, setSelectedItem] = useState(null);
   const [feedbackDate, setFeedbackDate] = useState('');
   const [insurer, setInsurer] = useState('JBL Uganda');
   const [updatingId, setUpdatingId] = useState(null);
+  const [aiInsight, setAiInsight] = useState('');
+  const [aiLoading, setAiLoading] = useState(false);
 
   useEffect(() => { fetchItems(); }, []);
+
+  async function generateInsight() {
+    if (!items.length) return;
+    setAiLoading(true); setAiInsight('');
+    try {
+      const total = items.length;
+      const open = items.filter(i => i.status === 'Open').length;
+      const fixed = items.filter(i => i.status === 'Fixed').length;
+      const pending = items.filter(i => i.status === 'Pending Insurer').length;
+      const inReview = items.filter(i => i.status === 'In Review').length;
+      const count = (arr, key) => arr.reduce((acc, i) => { const v = i[key]; if (v) acc[v] = (acc[v]||0)+1; return acc; }, {});
+      const top = (obj, n=5) => Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n);
+      const topCategories = top(count(items, 'issue_category'));
+      const topCareItems = top(count(items, 'care_item'));
+      const topDiagnoses = top(count(items, 'diagnosis'));
+      const topInsurers = top(count(items, 'insurer'), 3);
+      const prompt = "You are an expert health insurance claims operations analyst. Analyze this insurer feedback data.\n\nFEEDBACK SUMMARY:\n- Total: " + total + "\n- Open: " + open + " (" + Math.round(open/total*100) + "%)\n- Fixed: " + fixed + " (" + Math.round(fixed/total*100) + "%)\n- Pending: " + pending + "\n\nTOP ISSUE CATEGORIES:\n" + topCategories.map(([k,v]) => "- " + k + ": " + v).join("\n") + "\n\nMOST FLAGGED CARE ITEMS:\n" + topCareItems.map(([k,v]) => "- " + k + ": " + v).join("\n") + "\n\nTOP DIAGNOSES:\n" + topDiagnoses.map(([k,v]) => "- " + k + ": " + v).join("\n") + "\n\nProvide: 1) 2-sentence situation summary 2) Top 3 critical patterns 3) Recurring problems 4) One specific recommendation this week 5) Resolution rate assessment. Be direct and operational. Plain text only.";
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] }),
+      });
+      const result = await response.json();
+      setAiInsight(result.content?.map(c => c.text || '').join('') || 'Unable to generate insight.');
+    } catch (e) { setAiInsight('Failed to generate insight. Please try again.'); }
+    setAiLoading(false);
+  }
 
   async function fetchItems() {
     setLoading(true);
@@ -140,6 +170,7 @@ export default function InsurerFeedbackPage() {
   const inReview = items.filter(i => i.status === 'In Review').length;
   const diagnoses = [...new Set(items.map(i => i.diagnosis).filter(Boolean))].sort();
   const careItems = [...new Set(items.map(i => i.care_item).filter(Boolean))].sort();
+  const categories = [...new Set(items.map(i => i.issue_category).filter(Boolean))].sort();
 
   const filtered = items.filter(i => {
     const q = search.toLowerCase();
@@ -197,6 +228,9 @@ export default function InsurerFeedbackPage() {
         </div>
 
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '16px' }}>
+          <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)} style={{ ...inp, maxWidth: 180 }}>
+            <option value="">All Categories</option>{categories.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search claim, member, issue..." style={{ ...inp, maxWidth: 260 }} />
           <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ ...inp, maxWidth: 160 }}>
             <option value="">All Statuses</option>
