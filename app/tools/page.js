@@ -10,7 +10,7 @@ const C = {
 
 const tools = [
   { id: 'batch-splitter', name: 'Batch File Splitter', description: 'Split large CSV or Excel files into operational batches for processing.', icon: '⚡', status: 'live', tags: ['CSV', 'Excel', 'Batch'] },
-  { id: 'insurer-feedback', name: 'Insurer Feedback Intelligence', description: 'Analyze and categorize insurer feedback patterns automatically.', icon: '🔍', status: 'coming', tags: ['AI', 'Feedback', 'Analysis'] },
+  { id: 'insurer-feedback', name: 'Insurer Feedback Intelligence', description: 'Analyze and categorize insurer feedback patterns automatically.', icon: '🔍', status: 'live', tags: ['AI', 'Feedback', 'Analysis'] },
   { id: 'lookup-matcher', name: 'Lookup Matcher', description: 'Match and reconcile records across datasets quickly.', icon: '🔗', status: 'coming', tags: ['Matching', 'Reconciliation'] },
   { id: 'sheet-formatter', name: 'Sheet Formatter', description: 'Standardize and format operational spreadsheets to template.', icon: '📋', status: 'coming', tags: ['Excel', 'Formatting'] },
 ];
