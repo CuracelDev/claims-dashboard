@@ -325,8 +325,15 @@ export default function InsurerFeedbackPage() {
                     <td style={{ padding: '10px 14px', color: C.sub, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.issue_description || '—'}</td>
                     <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
                       {item.payable_status ? (
-                        <span style={{ background: item.payable_status === 'PAYABLE' ? '#00E5A022' : '#EF444422', color: item.payable_status === 'PAYABLE' ? '#00E5A0' : '#EF4444', fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px' }}>
-                          {item.payable_status === 'PAYABLE' ? '✓ Payable' : '✕ Not Payable'}
+                        <span style={{
+                          background: /not payable|exclusion|excluded/i.test(item.payable_status) ? '#EF444422' : '#00E5A022',
+                          color: /not payable|exclusion|excluded/i.test(item.payable_status) ? '#EF4444' : '#00E5A0',
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          padding: '3px 10px',
+                          borderRadius: '20px'
+                        }}>
+                          {/not payable|exclusion|excluded/i.test(item.payable_status) ? '✕ Not Payable' : '✓ Payable'}
                         </span>
                       ) : '—'}
                     </td>
@@ -365,8 +372,8 @@ export default function InsurerFeedbackPage() {
                 { label: 'Care Item', value: selectedItem.care_item },
                 { label: 'Issue Category', value: selectedItem.issue_category },
                 { label: 'QA Comment', value: selectedItem.issue_description },
-                { label: 'Payable Status', value: selectedItem.payable_status },
-                { label: 'Status (Insurer)', value: selectedItem.resolution_status },
+                { label: 'Payable', value: selectedItem.payable_status },
+                { label: 'Status', value: selectedItem.resolution_status || selectedItem.status },
                 { label: 'Action Taken', value: selectedItem.action_taken },
                 { label: 'Notes', value: selectedItem.notes },
               ].map(f => f.value ? (
