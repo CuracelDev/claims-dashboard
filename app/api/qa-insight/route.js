@@ -1,104 +1,123 @@
-export const dynamic = "force-dynamic";
+// PATH: app/api/qa-insight/route.js
+import Anthropic from '@anthropic-ai/sdk';
+
+export const dynamic = 'force-dynamic';
+
+async function slackPost(text, blocks) {
+  const res = await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      channel: 'health-ops',   // ← your channel
+      text,
+      blocks,
+    }),
+  });
+  return res.json();
+}
 
 export async function POST(request) {
   try {
-    const body = await request.json();
-    const { aggregations, total, date_range, send_to_slack = false } = body;
+    const { aggregations, total, date_range, send_to_slack } = await request.json();
 
-    if (!aggregations) {
-      return Response.json({ error: "No aggregation data provided" }, { status: 400 });
+    if (!aggregations || total === 0) {
+      return Response.json({ error: 'No data to analyse' }, { status: 400 });
     }
 
-    // Build context for Claude
-    const { by_issue = [], by_insurer = [], top_providers = [], daily_trend = [] } = aggregations;
+    // ── Build prompt ──────────────────────────────────────────────────
+    const dateLabel = date_range?.from === date_range?.to
+      ? `On ${date_range?.from}`
+      : `From ${date_range?.from} to ${date_range?.to}`;
 
-    const fromDate = date_range?.from ? new Date(date_range.from).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" }) : "N/A";
-    const toDate   = date_range?.to   ? new Date(date_range.to).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" }) : "N/A";
+    const summaryLines = Object.entries(aggregations.by_issue || {})
+      .sort((a, b) => b[1] - a[1])
+      .map(([type, count]) => `- ${type}: ${count}`)
+      .join('\n');
 
-    // Trend direction
-    const trendDays = daily_trend.slice(-7);
-    const firstHalf = trendDays.slice(0, Math.floor(trendDays.length / 2)).reduce((s, d) => s + d.total, 0);
-    const secondHalf = trendDays.slice(Math.floor(trendDays.length / 2)).reduce((s, d) => s + d.total, 0);
-    const trendDirection = secondHalf > firstHalf ? "increasing" : secondHalf < firstHalf ? "decreasing" : "stable";
+    const insurerLines = Object.entries(aggregations.by_insurer || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([insurer, count]) => `- ${insurer}: ${count} flags`)
+      .join('\n');
 
-    const prompt = `You are a senior claims quality analyst for Curacel, an AI-powered insurance infrastructure company operating across Africa and the Middle East.
+    const providerLines = Object.entries(aggregations.by_provider || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([provider, count]) => `- ${provider}: ${count} flags`)
+      .join('\n');
 
-Analyse this QA flag data and write a concise, professional insight summary (3–4 sentences max). Be direct, specific, and actionable. Mention numbers. Flag any concerning patterns. Suggest one clear action if warranted. Do not use bullet points — write in flowing prose only.
+    const prompt = `You are a senior health insurance QA analyst for Curacel, an AI-powered insurance infrastructure company operating across African markets.
 
-Period: ${fromDate} to ${toDate}
-Total flags: ${total}
-Trend: ${trendDirection} over the last ${trendDays.length} days
+${dateLabel}, ${total} QA flags were raised with the following breakdown:
 
-Issue breakdown:
-${by_issue.map(i => `- ${i.issue}: ${i.count} flags`).join("\n") || "No issues"}
+Issue Types:
+${summaryLines || 'No breakdown available'}
 
-By insurer:
-${by_insurer.map(i => `- ${i.insurer}: ${i.count} flags`).join("\n") || "No insurer data"}
+Top Insurers by flags:
+${insurerLines || 'No breakdown available'}
 
-Top flagged providers:
-${top_providers.slice(0, 5).map(p => `- ${p.name}: ${p.count} flags`).join("\n") || "No provider data"}
+Top Flagged Providers:
+${providerLines || 'No breakdown available'}
 
-Write the insight now:`;
+Write a concise, sharp, operational QA intelligence brief (3-5 sentences max). Lead with the most significant finding. Identify any patterns suggesting systemic issues. End with one specific, actionable recommended next step. Be direct, factual, and use precise numbers. Do not add markdown headers or bullet points — write in flowing prose.`;
 
-    // Call Anthropic API
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-opus-4-5",
-        max_tokens: 300,
-        messages: [{ role: "user", content: prompt }],
-      }),
+    // ── Call Anthropic ────────────────────────────────────────────────
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const message = await client.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
     });
 
-    const aiData = await aiRes.json();
-    if (!aiRes.ok) throw new Error(aiData.error?.message || "AI generation failed");
+    const insight = message.content[0]?.text || 'Unable to generate insight.';
 
-    const insight = aiData.content?.[0]?.text?.trim();
-    if (!insight) throw new Error("Empty response from AI");
-
-    // Optionally send to Slack
-    let slackOk = null;
+    // ── Send to Slack if requested ────────────────────────────────────
     if (send_to_slack) {
-      const slackMessage = [
-        `🧠 *QA AI Insight — ${fromDate} to ${toDate}*`,
-        ``,
-        insight,
-        ``,
-        `*${total} total flags* · ${by_issue[0]?.issue || "—"} most common · ${by_insurer[0]?.insurer || "—"} most affected`,
-        ``,
-        `_<https://claims-dashboard.vercel.app/qa|View QA Dashboard →>_`,
-      ].join("\n");
+      const dateStr = date_range?.from === date_range?.to
+        ? date_range?.from
+        : `${date_range?.from} → ${date_range?.to}`;
 
-      const slackRes = await fetch("https://slack.com/api/chat.postMessage", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          channel: process.env.SLACK_HEALTH_OPS_CHANNEL_ID || "#health-ops",
-          text: slackMessage,
-          unfurl_links: false,
-        }),
-      });
-      const slackData = await slackRes.json();
-      slackOk = slackData.ok;
+      const slackResult = await slackPost(
+        `🚩 QA Intelligence Brief — ${dateStr}`,
+        [
+          {
+            type: 'header',
+            text: { type: 'plain_text', text: `🚩 QA Intelligence Brief`, emoji: true },
+          },
+          {
+            type: 'context',
+            elements: [{ type: 'mrkdwn', text: `📅 *${dateStr}*  ·  ${total} total flags` }],
+          },
+          { type: 'divider' },
+          {
+            type: 'section',
+            text: { type: 'mrkdwn', text: insight },
+          },
+          { type: 'divider' },
+          {
+            type: 'context',
+            elements: [{
+              type: 'mrkdwn',
+              text: `🤖 AI-generated by Claims Intel  ·  <https://claims-dashboard.vercel.app/qa|View QA Dashboard →>`,
+            }],
+          },
+        ]
+      );
+
+      if (!slackResult.ok) {
+        console.error('[qa-insight] Slack error:', slackResult.error);
+        // Return insight anyway even if Slack fails
+        return Response.json({ insight, slack_error: slackResult.error });
+      }
     }
 
-    return Response.json({
-      insight,
-      sent_to_slack: send_to_slack ? slackOk : null,
-      period: { from: fromDate, to: toDate },
-      total,
-    });
+    return Response.json({ insight });
 
   } catch (err) {
-    console.error("POST /api/qa-insight error:", err);
+    console.error('[qa-insight error]', err.message);
     return Response.json({ error: err.message }, { status: 500 });
   }
 }
