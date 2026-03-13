@@ -8,6 +8,7 @@
     "start": "next start"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@supabase/supabase-js": "^2.98.0",
     "googleapis": "^140.0.1",
     "jszip": "^3.10.1",
