@@ -11,7 +11,7 @@ async function slackPost(text, blocks) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      channel: 'health-ops',   // ← your channel
+      channel: 'C03TBH0RL76',   // ← your channel
       text,
       blocks,
     }),
