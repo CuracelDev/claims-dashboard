@@ -329,7 +329,7 @@ export default function QADashboard() {
             <StatCard label="Top Issue"      value={byIssue[0]?.count || 0}      sub={byIssue[0]?.issue || "—"} icon="⚠️" color={C.warn} delay={.1}
               onClick={() => { setActiveIssue(activeIssue === byIssue[0]?.issue ? null : byIssue[0]?.issue); setPage(1); }}/>
             <StatCard label="Most Affected"  value={byInsurer[0]?.count || 0}    sub={byInsurer[0]?.insurer || "—"} icon="🏥" color="#5B8DEF" delay={.15}/>
-            <StatCard label="Top Provider"   value={topProviders[0]?.count || 0} sub={topProviders[0]?.name || "—"} icon="🏨" color="#A78BFA" delay={.2}/>
+            <StatCard label="Top Provider"   value={topProviders[0]?.count || 0} sub={topProviders[0]?.provider_name || topProviders[0]?.name || "—"} icon="🏨" color="#A78BFA" delay={.2}/>
             <StatCard label="Days in Range"  value={Math.ceil((new Date(to) - new Date(from)) / 86400000) + 1} sub={`${from} → ${to}`} icon="📅" color={C.accent} delay={.25}/>
           </div>
         )}
@@ -429,9 +429,9 @@ export default function QADashboard() {
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                     {topProviders.map((p, i) => (
-                      <div key={p.name} style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <div key={p.provider_name || p.name} style={{ display: "flex", alignItems: "center", gap: 12 }}>
                         <span style={{ fontSize: 11, color: C.muted, width: 18, textAlign: "right", fontFamily: "monospace" }}>{i + 1}</span>
-                        <span style={{ fontSize: 12, color: C.text, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</span>
+                        <span style={{ fontSize: 12, color: C.text, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.provider_name || p.name}</span>
                         <span style={{ fontSize: 12, fontWeight: 600, color: C.warn, fontFamily: "monospace" }}>{p.count}</span>
                       </div>
                     ))}

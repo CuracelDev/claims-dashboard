@@ -130,9 +130,10 @@ export async function GET(request) {
         insurerCounts[f.insurer_name] = (insurerCounts[f.insurer_name] || 0) + 1;
       }
 
-      // Provider
-      if (f.provider_name) {
-        providerCounts[f.provider_name] = (providerCounts[f.provider_name] || 0) + 1;
+      // Provider — skip null, empty, or literal "undefined" strings
+      const pName = f.provider_name;
+      if (pName && pName !== 'undefined' && pName.trim() !== '') {
+        providerCounts[pName] = (providerCounts[pName] || 0) + 1;
       }
 
       // Daily
@@ -147,7 +148,7 @@ export async function GET(request) {
     const topProviders = Object.entries(providerCounts)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10)
-      .map(([name, count]) => ({ name, count }));
+      .map(([provider_name, count]) => ({ provider_name, count }));
 
     // Daily trend sorted
     const dailyTrend = Object.values(dailyCounts)
