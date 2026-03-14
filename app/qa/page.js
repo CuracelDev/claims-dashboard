@@ -79,7 +79,13 @@ function InsightCard({ data, dateRange }) {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error);
       setInsight(json.insight);
-      if (sendSlack) setSlackSent(true);
+      if (sendSlack) {
+        if (json.slack_error) {
+          setError(`Slack error: ${json.slack_error}. Check bot is invited to the channel.`);
+        } else {
+          setSlackSent(true);
+        }
+      }
     } catch (e) {
       setError(e.message);
     } finally {
