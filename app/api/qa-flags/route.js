@@ -130,9 +130,9 @@ export async function GET(request) {
         insurerCounts[f.insurer_name] = (insurerCounts[f.insurer_name] || 0) + 1;
       }
 
-      // Provider — skip null, empty, or literal "undefined" strings
-      const pName = f.provider_name;
-      if (pName && pName !== 'undefined' && pName.trim() !== '') {
+      // Provider — skip null, empty, or any "undefined"-like values
+      const pName = f.provider_name ? String(f.provider_name).trim() : null;
+      if (pName && pName.toLowerCase() !== 'undefined' && pName.toLowerCase() !== 'null') {
         providerCounts[pName] = (providerCounts[pName] || 0) + 1;
       }
 

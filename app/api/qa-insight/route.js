@@ -44,8 +44,12 @@ export async function POST(request) {
       .join('\n');
 
     const providerLines = (aggregations.top_providers || [])
+      .filter(r => {
+        const n = r.provider_name || r.provider || r.name || '';
+        return n && n.toLowerCase() !== 'undefined' && n.toLowerCase() !== 'null';
+      })
       .slice(0, 3)
-      .map(r => `- ${r.provider_name || r.provider}: ${r.count} flags`)
+      .map(r => `- ${r.provider_name || r.provider || r.name}: ${r.count} flags`)
       .join('\n');
 
     const prompt = `You are a senior health insurance QA analyst for Curacel, an AI-powered insurance infrastructure company operating across African markets.
