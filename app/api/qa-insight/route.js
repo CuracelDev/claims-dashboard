@@ -32,21 +32,20 @@ export async function POST(request) {
       ? `On ${date_range?.from}`
       : `From ${date_range?.from} to ${date_range?.to}`;
 
-    const summaryLines = Object.entries(aggregations.by_issue || {})
-      .sort((a, b) => b[1] - a[1])
-      .map(([type, count]) => `- ${type}: ${count}`)
+    // aggregations are arrays of objects: [{ issue, count }], [{ insurer, count }], [{ provider_name, count }]
+    const summaryLines = (aggregations.by_issue || [])
+      .slice(0, 8)
+      .map(r => `- ${r.issue}: ${r.count}`)
       .join('\n');
 
-    const insurerLines = Object.entries(aggregations.by_insurer || {})
-      .sort((a, b) => b[1] - a[1])
+    const insurerLines = (aggregations.by_insurer || [])
       .slice(0, 5)
-      .map(([insurer, count]) => `- ${insurer}: ${count} flags`)
+      .map(r => `- ${r.insurer}: ${r.count} flags`)
       .join('\n');
 
-    const providerLines = Object.entries(aggregations.by_provider || {})
-      .sort((a, b) => b[1] - a[1])
+    const providerLines = (aggregations.top_providers || [])
       .slice(0, 3)
-      .map(([provider, count]) => `- ${provider}: ${count} flags`)
+      .map(r => `- ${r.provider_name || r.provider}: ${r.count} flags`)
       .join('\n');
 
     const prompt = `You are a senior health insurance QA analyst for Curacel, an AI-powered insurance infrastructure company operating across African markets.
