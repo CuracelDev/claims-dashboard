@@ -31,8 +31,8 @@ const NAV = [
   {
     section: 'TOOLS',
     items: [
-      { href: '/tools',  icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops' },
-      { href: '/tools/insurer-feedback',   icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
+      { href: '/tools', icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops', exact: true },
+      { href: '/tools/insurer-feedback', icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
     ],
   },
   {
@@ -63,7 +63,7 @@ export default function Sidebar() {
 
   return (
     <aside style={{
-      width: 240, minHeight: '100vh', background: C.sidebarBg,
+      width: 240, height: '100vh', background: C.sidebarBg,
       borderRight: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column',
       position: 'fixed', top: 0, left: 0, zIndex: 100,
       transition: 'background 0.2s, border-color 0.2s',
