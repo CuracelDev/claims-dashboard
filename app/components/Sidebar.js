@@ -31,8 +31,8 @@ const NAV = [
   {
     section: 'TOOLS',
     items: [
-      { href: '/operational-tools',  icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops' },
-      { href: '/insurer-feedback',   icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
+      { href: '/tools',  icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops' },
+      { href: '/tools/insurer-feedback',   icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
     ],
   },
   {
