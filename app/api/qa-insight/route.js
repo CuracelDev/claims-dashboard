@@ -1,20 +1,17 @@
 // PATH: app/api/qa-insight/route.js
 import Anthropic from '@anthropic-ai/sdk';
+import { getSettings } from '../../lib/settings';
 
 export const dynamic = 'force-dynamic';
 
-async function slackPost(text, blocks) {
+async function slackPost(channel, text, blocks) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      channel: 'C03TBH0RL76',   // ← your channel
-      text,
-      blocks,
-    }),
+    body: JSON.stringify({ channel, text, blocks }),
   });
   return res.json();
 }
@@ -83,7 +80,14 @@ Write a concise, sharp, operational QA intelligence brief (3-5 sentences max). L
         ? date_range?.from
         : `${date_range?.from} → ${date_range?.to}`;
 
+      const cfg = await getSettings();
+      const qaChannel = cfg('slack_channel_qa_insight', 'C03TBH0RL76');
+      const featureSlack = cfg('feature_slack_sends', 'true');
+      if (featureSlack === 'false') {
+        return Response.json({ insight, slack_error: 'slack_disabled_by_settings' });
+      }
       const slackResult = await slackPost(
+        qaChannel,
         `🚩 QA Intelligence Brief — ${dateStr}`,
         [
           {
