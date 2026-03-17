@@ -116,9 +116,16 @@ Write a concise, sharp, operational QA intelligence brief (3-5 sentences max). L
 
       if (!slackResult.ok) {
         console.error('[qa-insight] Slack error:', slackResult.error);
-        // Return insight anyway even if Slack fails
         return Response.json({ insight, slack_error: slackResult.error });
       }
+
+      // Return ts + channel so frontend can show Undo/Delete button
+      return Response.json({
+        insight,
+        slack_sent: true,
+        slack_ts: slackResult.ts,
+        slack_channel: qaChannel,
+      });
     }
 
     return Response.json({ insight });
