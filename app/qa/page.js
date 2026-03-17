@@ -59,6 +59,10 @@ function InsightCard({ data, dateRange }) {
   const [loading, setLoading]       = useState(false);
   const [sending, setSending]       = useState(false);
   const [slackSent, setSlackSent]   = useState(false);
+  const [slackMeta, setSlackMeta]   = useState(null);  // { ts, channel } for undo
+  const [undoTimer, setUndoTimer]   = useState(null);
+  const [deleting, setDeleting]     = useState(false);
+  const [deleted, setDeleted]       = useState(false);
   const [error, setError]           = useState(null);
 
   async function generate(sendSlack = false) {
@@ -84,6 +88,13 @@ function InsightCard({ data, dateRange }) {
           setError(`Slack error: ${json.slack_error}. Check bot is invited to the channel.`);
         } else {
           setSlackSent(true);
+          setDeleted(false);
+          if (json.slack_ts && json.slack_channel) {
+            setSlackMeta({ ts: json.slack_ts, channel: json.slack_channel });
+            // Auto-clear undo button after 5 minutes
+            const t = setTimeout(() => setSlackMeta(null), 5 * 60 * 1000);
+            setUndoTimer(t);
+          }
         }
       }
     } catch (e) {
@@ -149,10 +160,38 @@ function InsightCard({ data, dateRange }) {
           </button>
 
           {insight && (
-            <button onClick={() => generate(true)} disabled={sending || slackSent}
-              style={{ background: slackSent ? `${C.success}22` : C.elevated, color: slackSent ? C.success : C.sub, border: `1px solid ${slackSent ? C.success : C.border}`, borderRadius: 8, padding: "9px 18px", fontSize: 12, fontWeight: 600, cursor: sending || slackSent ? "default" : "pointer", whiteSpace: "nowrap", transition: "all .2s" }}>
-              {sending ? "Sending..." : slackSent ? "✓ Sent to Slack" : "📤 Send to Slack"}
+            <button onClick={() => generate(true)} disabled={sending || slackSent || deleted}
+              style={{ background: slackSent ? `${C.accent}22` : C.elevated, color: slackSent ? C.accent : C.sub, border: `1px solid ${slackSent ? C.accent + '44' : C.border}`, borderRadius: 8, padding: "9px 18px", fontSize: 12, fontWeight: 600, cursor: sending || slackSent ? "default" : "pointer", whiteSpace: "nowrap", transition: "all .2s" }}>
+              {sending ? "Sending..." : deleted ? "🗑 Deleted" : slackSent ? "✓ Sent to Slack" : "📤 Send to Slack"}
             </button>
+            {slackMeta && !deleted && (
+              <button
+                onClick={async () => {
+                  setDeleting(true);
+                  try {
+                    const res = await fetch('/api/slack-delete', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(slackMeta),
+                    });
+                    const r = await res.json();
+                    if (r.ok) {
+                      setDeleted(true);
+                      setSlackSent(false);
+                      setSlackMeta(null);
+                      if (undoTimer) clearTimeout(undoTimer);
+                    } else {
+                      setError(`Delete failed: ${r.error}`);
+                    }
+                  } catch (e) { setError(e.message); }
+                  setDeleting(false);
+                }}
+                disabled={deleting}
+                style={{ background: `${C.danger}15`, color: C.danger, border: `1px solid ${C.danger}44`, borderRadius: 8, padding: "9px 14px", fontSize: 12, fontWeight: 600, cursor: deleting ? "not-allowed" : "pointer", whiteSpace: "nowrap" }}
+              >
+                {deleting ? "Deleting..." : "🗑 Undo Send"}
+              </button>
+            )}
           )}
         </div>
       </div>
