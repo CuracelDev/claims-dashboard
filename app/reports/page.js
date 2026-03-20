@@ -643,6 +643,54 @@ export default function ReportsPage() {
   useEffect(() => { if (tab === 'history') loadHistory(); }, [tab, loadHistory]);
 
   const [editPreset, setEditPreset] = useState(null);
+  const [showImport, setShowImport]   = useState(false);
+  const [importing,  setImporting]    = useState(false);
+  const [importResult, setImportResult] = useState(null);
+
+  const handleImport = async (file) => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const text = await file.text();
+      const lines = text.trim().split('\n');
+      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const rows = lines.slice(1).map(line => {
+        const vals = line.split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = vals[i] || ''; });
+        return obj;
+      }).filter(r => r.member_name);
+
+      const res = await fetch('/api/reports/bulk-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows }),
+      });
+      const data = await res.json();
+      setImportResult(data);
+      if (data.imported > 0) loadHistory();
+    } catch (e) {
+      setImportResult({ error: e.message });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const downloadTemplate = () => {
+    const headers = [
+      'member_name','report_date','claims_kenya','claims_tanzania','claims_uganda',
+      'claims_uap','claims_defmis','claims_hadiel','claims_axa','providers_mapped',
+      'care_items_mapped','care_items_grouped','resolved_cares','auto_pa_reviewed',
+      'flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned',
+      'tasks_completed','notes'
+    ].join(',');
+    const example = 'Emmanuel,09/03/2026,0,0,104,0,0,0,0,0,22180,3,4106,0,98194,0,0,0,,';
+    const blob = new Blob([headers + '\n' + example], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'reports-import-template.csv'; a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const handleEditReport = (report) => {
     setEditPreset({ date: report.report_date });
@@ -693,7 +741,70 @@ export default function ReportsPage() {
               </div>
               <button onClick={loadHistory} style={{ padding: '9px 20px', background: C.accent, color: '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>Apply</button>
               <button onClick={() => setHistFilter({ person: '', date: '' })} style={{ padding: '9px 20px', background: C.elevated, color: C.sub, border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 13, cursor: 'pointer' }}>Clear</button>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                <button onClick={downloadTemplate} style={{ padding: '9px 16px', background: C.elevated, color: C.sub, border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 12, cursor: 'pointer' }}>
+                  ⬇ Template
+                </button>
+                <button onClick={() => { setShowImport(s => !s); setImportResult(null); }} style={{ padding: '9px 16px', background: showImport ? C.accent : `${C.accent}18`, color: showImport ? C.bg : C.accent, border: `1px solid ${C.accent}44`, borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+                  📥 Import Past Reports
+                </button>
+              </div>
             </div>
+
+            {showImport && (
+              <div style={{ ...S.card, borderTop: `3px solid ${C.accent}`, marginBottom: 16 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.accent, marginBottom: 8 }}>📥 Import Past Reports</div>
+                <div style={{ fontSize: 12, color: C.sub, marginBottom: 14, lineHeight: 1.6 }}>
+                  Upload a CSV file with historical report data. Max 500 rows per upload.<br />
+                  Date format must be <strong style={{ color: C.text }}>DD/MM/YYYY</strong>. Download the template to get started.
+                </div>
+                <label style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 8,
+                  padding: '10px 20px', background: C.elevated,
+                  border: `2px dashed ${C.border}`, borderRadius: 10,
+                  cursor: importing ? 'not-allowed' : 'pointer',
+                  color: C.sub, fontSize: 13, fontWeight: 600,
+                  transition: 'all 0.15s',
+                }}>
+                  {importing ? '⏳ Importing...' : '📂 Choose CSV file'}
+                  <input
+                    type="file" accept=".csv" style={{ display: 'none' }}
+                    disabled={importing}
+                    onChange={e => { if (e.target.files[0]) handleImport(e.target.files[0]); }}
+                  />
+                </label>
+
+                {importResult && !importResult.error && (
+                  <div style={{ marginTop: 16, background: `${C.accent}10`, border: `1px solid ${C.accent}33`, borderRadius: 10, padding: '14px 16px' }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.accent, marginBottom: 8 }}>Import Complete</div>
+                    <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+                      {[
+                        { label: 'Imported', val: importResult.imported, color: C.accent },
+                        { label: 'Skipped (duplicates)', val: importResult.skipped, color: C.warn },
+                        { label: 'Failed', val: importResult.failed, color: C.danger },
+                      ].map(s => (
+                        <div key={s.label} style={{ textAlign: 'center' }}>
+                          <div style={{ fontSize: 24, fontWeight: 700, color: s.color }}>{s.val}</div>
+                          <div style={{ fontSize: 11, color: C.sub }}>{s.label}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {importResult.failed_rows?.length > 0 && (
+                      <div style={{ marginTop: 12, fontSize: 11, color: C.danger }}>
+                        {importResult.failed_rows.slice(0, 3).map((r, i) => (
+                          <div key={i}>Row {r.row}: {r.reason}</div>
+                        ))}
+                        {importResult.failed_rows.length > 3 && <div>...and {importResult.failed_rows.length - 3} more</div>}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {importResult?.error && (
+                  <div style={{ marginTop: 12, fontSize: 12, color: C.danger }}>⚠️ {importResult.error}</div>
+                )}
+              </div>
+            )}
             {loadingHist ? (
               <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>Loading…</div>
             ) : reports.length === 0 ? (
