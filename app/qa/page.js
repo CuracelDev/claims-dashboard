@@ -160,6 +160,7 @@ function InsightCard({ data, dateRange }) {
           </button>
 
           {insight && (
+            <>
             <button onClick={() => generate(true)} disabled={sending || slackSent || deleted}
               style={{ background: slackSent ? `${C.accent}22` : C.elevated, color: slackSent ? C.accent : C.sub, border: `1px solid ${slackSent ? C.accent + '44' : C.border}`, borderRadius: 8, padding: "9px 18px", fontSize: 12, fontWeight: 600, cursor: sending || slackSent ? "default" : "pointer", whiteSpace: "nowrap", transition: "all .2s" }}>
               {sending ? "Sending..." : deleted ? "🗑 Deleted" : slackSent ? "✓ Sent to Slack" : "📤 Send to Slack"}
@@ -192,6 +193,7 @@ function InsightCard({ data, dateRange }) {
                 {deleting ? "Deleting..." : "🗑 Undo Send"}
               </button>
             )}
+            </>
           )}
         </div>
       </div>
