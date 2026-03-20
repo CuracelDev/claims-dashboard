@@ -205,13 +205,13 @@ function TaskCard({ task, onStatusChange, onDelete }) {
 
 /* ── Create Task Modal ───────────────────────────────────── */
 function CreateTaskModal({ members, onClose, onCreated }) {
-  const sessionName = getMemberName() || "";
   const [form, setForm] = useState({
-    title: "", description: "", assigned_to: [], assigned_by: sessionName,
+    title: "", description: "", assigned_to: [], assigned_by: "",
     due_date: "", priority: "medium", category: "ad_hoc",
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  useEffect(() => { const n = getMemberName(); if (n) set('assigned_by', n); }, []);
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
