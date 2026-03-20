@@ -646,6 +646,7 @@ export default function ReportsPage() {
   const [showImport, setShowImport]   = useState(false);
   const [importing,  setImporting]    = useState(false);
   const [importResult, setImportResult] = useState(null);
+  const [importMode,   setImportMode]   = useState('skip');
 
   const handleImport = async (file) => {
     setImporting(true);
@@ -664,7 +665,7 @@ export default function ReportsPage() {
       const res = await fetch('/api/reports/bulk-import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rows }),
+        body: JSON.stringify({ rows, mode: importMode }),
       });
       const data = await res.json();
       setImportResult(data);
@@ -757,6 +758,17 @@ export default function ReportsPage() {
                 <div style={{ fontSize: 12, color: C.sub, marginBottom: 14, lineHeight: 1.6 }}>
                   Upload a CSV file with historical report data. Max 500 rows per upload.<br />
                   Date format must be <strong style={{ color: C.text }}>DD/MM/YYYY</strong>. Download the template to get started.
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                  {[['skip','Skip duplicates'],['update','Sheet wins (overwrite)']].map(([val, label]) => (
+                    <button key={val} onClick={() => setImportMode(val)} style={{
+                      padding: '6px 14px', borderRadius: 20, fontSize: 12, fontWeight: 600,
+                      cursor: 'pointer',
+                      background: importMode === val ? (val === 'update' ? `${C.warn}22` : `${C.accent}22`) : C.elevated,
+                      border: `1px solid ${importMode === val ? (val === 'update' ? C.warn : C.accent) : C.border}`,
+                      color: importMode === val ? (val === 'update' ? C.warn : C.accent) : C.sub,
+                    }}>{label}</button>
+                  ))}
                 </div>
                 <label style={{
                   display: 'inline-flex', alignItems: 'center', gap: 8,

@@ -72,23 +72,18 @@ export async function POST(request) {
     memberMap[key] = parseInt(m.id);
   });
 
-  // ── Load existing (member_id, report_date) pairs ─────────────
-  const { data: existing } = await supabase
-    .from('daily_reports')
-    .select('team_member_id, report_date');
+  // ── Get mode: 'skip' (default) or 'update' (sheet wins) ─────
+  const mode = body.mode || 'skip';
 
-  const existingSet = new Set(
-    (existing || []).map((r) => `${r.team_member_id}|${r.report_date}`)
-  );
-
-  // ── Validate and build insert rows ───────────────────────────
-  const toInsert = [];
-  const skipped  = [];
-  const failed   = [];
+  // ── Validate and build upsert rows ───────────────────────────
+  const toUpsert  = [];
+  const skipped   = [];
+  const failed    = [];
+  const seenKeys  = new Set();
 
   for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const rowNum = i + 2; // 1-indexed, +1 for header
+    const row    = rows[i];
+    const rowNum = i + 2;
 
     // Resolve member
     const nameKey  = String(row.member_name || '').toLowerCase().trim();
@@ -105,67 +100,77 @@ export async function POST(request) {
       continue;
     }
 
-    // Duplicate check
+    // Dedup within upload
     const dupKey = `${memberId}|${reportDate}`;
-    if (existingSet.has(dupKey)) {
-      skipped.push({ row: rowNum, reason: 'Already exists', member: row.member_name, date: reportDate });
+    if (seenKeys.has(dupKey)) {
+      skipped.push({ row: rowNum, reason: 'Duplicate in file', member: row.member_name, date: reportDate });
       continue;
     }
+    seenKeys.add(dupKey);
 
-    // Mark as seen so duplicate rows within the same upload are also caught
-    existingSet.add(dupKey);
-
-    toInsert.push({
+    toUpsert.push({
       team_member_id: memberId,
       report_date:    reportDate,
       status:         'imported',
       metrics: {
-        claims_kenya:          toInt(row.claims_kenya),
-        claims_tanzania:       toInt(row.claims_tanzania),
-        claims_uganda:         toInt(row.claims_uganda),
-        claims_uap:            toInt(row.claims_uap),
-        claims_defmis:         toInt(row.claims_defmis),
-        claims_hadiel:         toInt(row.claims_hadiel),
-        claims_axa:            toInt(row.claims_axa),
-        providers_mapped:      toInt(row.providers_mapped),
-        care_items_mapped:     toInt(row.care_items_mapped),
-        care_items_grouped:    toInt(row.care_items_grouped),
-        resolved_cares:        toInt(row.resolved_cares),
-        auto_pa_reviewed:      toInt(row.auto_pa_reviewed),
-        flagged_care_items:    toInt(row.flagged_care_items),
-        icd10_adjusted:        toInt(row.icd10_adjusted),
-        benefits_set_up:       toInt(row.benefits_set_up),
-        providers_assigned:    toInt(row.providers_assigned),
-        tasks_completed:       toInt(row.tasks_completed),
+        claims_kenya:       toInt(row.claims_kenya),
+        claims_tanzania:    toInt(row.claims_tanzania),
+        claims_uganda:      toInt(row.claims_uganda),
+        claims_uap:         toInt(row.claims_uap),
+        claims_defmis:      toInt(row.claims_defmis),
+        claims_hadiel:      toInt(row.claims_hadiel),
+        claims_axa:         toInt(row.claims_axa),
+        providers_mapped:   toInt(row.providers_mapped),
+        care_items_mapped:  toInt(row.care_items_mapped),
+        care_items_grouped: toInt(row.care_items_grouped),
+        resolved_cares:     toInt(row.resolved_cares),
+        auto_pa_reviewed:   toInt(row.auto_pa_reviewed),
+        flagged_care_items: toInt(row.flagged_care_items),
+        icd10_adjusted:     toInt(row.icd10_adjusted),
+        benefits_set_up:    toInt(row.benefits_set_up),
+        providers_assigned: toInt(row.providers_assigned),
+        tasks_completed:    toInt(row.tasks_completed),
       },
       notes: row.notes || null,
     });
   }
 
-  // ── Batch insert ─────────────────────────────────────────────
+  // ── Batch upsert or insert ────────────────────────────────────
   let imported = 0;
   const insertErrors = [];
 
-  for (let i = 0; i < toInsert.length; i += BATCH_SIZE) {
-    const batch = toInsert.slice(i, i + BATCH_SIZE);
-    const { error: insertErr } = await supabase
-      .from('daily_reports')
-      .insert(batch);
+  for (let i = 0; i < toUpsert.length; i += BATCH_SIZE) {
+    const batch = toUpsert.slice(i, i + BATCH_SIZE);
 
-    if (insertErr) {
-      insertErrors.push(`Batch ${Math.floor(i / BATCH_SIZE) + 1}: ${insertErr.message}`);
+    let result;
+    if (mode === 'update') {
+      // Upsert — sheet always wins, updates existing rows
+      result = await supabase
+        .from('daily_reports')
+        .upsert(batch, { onConflict: 'team_member_id,report_date', ignoreDuplicates: false });
+    } else {
+      // Insert only — skip existing rows
+      result = await supabase
+        .from('daily_reports')
+        .upsert(batch, { onConflict: 'team_member_id,report_date', ignoreDuplicates: true });
+    }
+
+    if (result.error) {
+      insertErrors.push(`Batch ${Math.floor(i / BATCH_SIZE) + 1}: ${result.error.message}`);
     } else {
       imported += batch.length;
     }
   }
 
+  const updatedLabel = mode === 'update' ? 'imported/updated' : 'imported';
   return Response.json({
     imported,
-    skipped: skipped.length,
-    failed:  failed.length + insertErrors.length,
-    skipped_rows: skipped,
-    failed_rows:  failed,
+    skipped:       skipped.length,
+    failed:        failed.length + insertErrors.length,
+    skipped_rows:  skipped,
+    failed_rows:   failed,
     insert_errors: insertErrors,
-    summary: `${imported} imported · ${skipped.length} skipped (duplicates) · ${failed.length} failed (invalid)`,
+    mode,
+    summary: `${imported} ${updatedLabel} · ${skipped.length} skipped · ${failed.length} failed`,
   });
 }
