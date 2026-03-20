@@ -35,8 +35,8 @@ const NAV = [
   {
     section: 'TOOLS',
     items: [
-      { href: '/tools',                    icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops', exact: true },
-      { href: '/tools/insurer-feedback',   icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
+      { href: '/tools',                  icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops', exact: true },
+      { href: '/tools/insurer-feedback', icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
     ],
   },
   {
@@ -56,14 +56,15 @@ const NAV = [
 ];
 
 export default function Sidebar() {
-  const pathname  = usePathname();
-  const router    = useRouter();
+  const pathname = usePathname();
+  const router   = useRouter();
   const { theme, C, toggle } = useTheme();
 
-  const [guestMode,   setGuestMode]   = useState(false);
-  const [memberName,  setMemberName]  = useState('');
-  const [signingOut,  setSigningOut]  = useState(false);
-  const [tooltip,     setTooltip]     = useState(null); // href of hovered locked item
+  const [guestMode,  setGuestMode]  = useState(false);
+  const [memberName, setMemberName] = useState('');
+  const [signingOut, setSigningOut] = useState(false);
+  const [tooltip,    setTooltip]    = useState(null);
+  const [loginBanner, setLoginBanner] = useState(false);
 
   useEffect(() => {
     const session = getSession();
@@ -93,6 +94,11 @@ export default function Sidebar() {
     router.replace('/login');
   }
 
+  function handleLockedClick() {
+    setLoginBanner(true);
+    setTimeout(() => setLoginBanner(false), 3000);
+  }
+
   return (
     <aside style={{
       width: 240, height: '100vh', background: C.sidebarBg,
@@ -118,8 +124,7 @@ export default function Sidebar() {
 
       {/* Session banner */}
       <div style={{
-        padding: '8px 14px',
-        borderBottom: `1px solid ${C.border}`,
+        padding: '8px 14px', borderBottom: `1px solid ${C.border}`,
         background: guestMode ? `${C.muted}18` : `${C.accent}10`,
         display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
       }}>
@@ -138,20 +143,26 @@ export default function Sidebar() {
             }}>Sign In</span>
           </Link>
         ) : (
-          <button
-            onClick={handleSignOut}
-            disabled={signingOut}
-            style={{
-              fontSize: 10, fontWeight: 700, color: C.danger,
-              border: `1px solid ${C.danger}44`, borderRadius: 6,
-              padding: '2px 8px', cursor: 'pointer',
-              background: 'transparent',
-            }}
-          >
+          <button onClick={handleSignOut} disabled={signingOut} style={{
+            fontSize: 10, fontWeight: 700, color: C.danger,
+            border: `1px solid ${C.danger}44`, borderRadius: 6,
+            padding: '2px 8px', cursor: 'pointer', background: 'transparent',
+          }}>
             {signingOut ? '...' : 'Sign Out'}
           </button>
         )}
       </div>
+
+      {/* Login required banner */}
+      {loginBanner && (
+        <div style={{
+          background: `${C.accent}15`, borderBottom: `1px solid ${C.accent}33`,
+          padding: '8px 14px', fontSize: 11, color: C.accent,
+          fontWeight: 600, textAlign: 'center', animation: 'fadeIn 0.2s ease',
+        }}>
+          🔐 Sign in to access this module
+        </div>
+      )}
 
       {/* Nav */}
       <nav style={{ flex: 1, padding: '12px 10px', overflowY: 'auto' }}>
@@ -163,10 +174,12 @@ export default function Sidebar() {
             }}>
               {group.section}
             </div>
-            {group.items.map(item => {
-              const active  = isActive(item);
-              const locked  = guestMode && !GUEST_ROUTES.includes(item.href) && !item.disabled;
 
+            {group.items.map(item => {
+              const active = isActive(item);
+              const locked = guestMode && !GUEST_ROUTES.includes(item.href) && !item.disabled;
+
+              // Disabled (coming soon)
               if (item.disabled) {
                 return (
                   <div key={item.href} style={{
@@ -183,18 +196,25 @@ export default function Sidebar() {
                 );
               }
 
+              // Locked (guest trying to access protected route)
               if (locked) {
                 return (
                   <div
                     key={item.href}
-                    onMouseEnter={() => setTooltip(item.href)}
-                    onMouseLeave={() => setTooltip(null)}
-                    onClick={() => router.push('/login')}
+                    onClick={handleLockedClick}
+                    onMouseEnter={(e) => {
+                      setTooltip(item.href);
+                      e.currentTarget.style.background = `${C.accent}10`;
+                    }}
+                    onMouseLeave={(e) => {
+                      setTooltip(null);
+                      e.currentTarget.style.background = 'transparent';
+                    }}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 10,
                       padding: '8px 10px', borderRadius: 8, marginBottom: 2,
-                      opacity: 0.4, cursor: 'pointer',
-                      position: 'relative',
+                      opacity: 0.45, cursor: 'pointer', position: 'relative',
+                      transition: 'background 0.15s',
                     }}
                   >
                     <span style={{ fontSize: 15 }}>{item.icon}</span>
@@ -205,7 +225,8 @@ export default function Sidebar() {
                     <span style={{ fontSize: 11 }}>🔒</span>
                     {tooltip === item.href && (
                       <div style={{
-                        position: 'absolute', left: 248, top: '50%', transform: 'translateY(-50%)',
+                        position: 'absolute', left: 248, top: '50%',
+                        transform: 'translateY(-50%)',
                         background: C.card, border: `1px solid ${C.border}`,
                         borderRadius: 8, padding: '6px 12px',
                         fontSize: 11, color: C.text, whiteSpace: 'nowrap',
@@ -219,15 +240,20 @@ export default function Sidebar() {
                 );
               }
 
+              // Normal nav item
               return (
                 <Link key={item.href} href={item.href} style={{ textDecoration: 'none' }}>
-                  <div style={{
-                    display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '8px 10px', borderRadius: 8, marginBottom: 2,
-                    background: active ? `${C.accent}15` : 'transparent',
-                    border: active ? `1px solid ${C.accent}30` : '1px solid transparent',
-                    cursor: 'pointer', transition: 'all .15s',
-                  }}>
+                  <div
+                    onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = `${C.accent}08`; }}
+                    onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 10,
+                      padding: '8px 10px', borderRadius: 8, marginBottom: 2,
+                      background: active ? `${C.accent}15` : 'transparent',
+                      border: active ? `1px solid ${C.accent}30` : '1px solid transparent',
+                      cursor: 'pointer', transition: 'all .15s',
+                    }}
+                  >
                     <span style={{ fontSize: 15 }}>{item.icon}</span>
                     <div>
                       <div style={{
@@ -246,40 +272,35 @@ export default function Sidebar() {
 
       {/* Footer */}
       <div style={{ padding: '12px 18px', borderTop: `1px solid ${C.border}` }}>
-        <button
-          onClick={toggle}
-          style={{
-            width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8,
-            padding: '8px 12px', cursor: 'pointer', marginBottom: 10,
-            transition: 'all 0.2s',
-          }}
-        >
+        <button onClick={toggle} style={{
+          width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8,
+          padding: '8px 12px', cursor: 'pointer', marginBottom: 10, transition: 'all 0.2s',
+        }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ fontSize: 14 }}>{theme === 'dark' ? '🌙' : '☀️'}</span>
             <span style={{ fontSize: 12, color: C.sub }}>{theme === 'dark' ? 'Dark Mode' : 'Light Mode'}</span>
           </div>
           <div style={{
             width: 32, height: 18, borderRadius: 9, position: 'relative',
-            background: theme === 'dark' ? C.accent : C.muted,
-            transition: 'background 0.2s',
+            background: theme === 'dark' ? C.accent : C.muted, transition: 'background 0.2s',
           }}>
             <div style={{
               width: 12, height: 12, borderRadius: '50%', background: '#fff',
               position: 'absolute', top: 3,
-              left: theme === 'dark' ? 16 : 4,
-              transition: 'left 0.2s',
+              left: theme === 'dark' ? 16 : 4, transition: 'left 0.2s',
             }} />
           </div>
         </button>
         <div style={{ fontSize: 10, color: C.muted }}>v6.0 — Phase 7</div>
         <div style={{
-          fontSize: 10, marginTop: 4,
+          fontSize: 10, marginTop: 4, fontWeight: 600,
           background: 'linear-gradient(90deg, #7B61FF, #00E5A0)',
           WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-          fontWeight: 600,
         }}>Built by Fade & TomBoy ✦</div>
       </div>
+
+      <style>{`@keyframes fadeIn { from { opacity:0 } to { opacity:1 } }`}</style>
     </aside>
   );
 }
