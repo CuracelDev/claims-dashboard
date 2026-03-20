@@ -127,6 +127,7 @@ export default function Sidebar() {
         padding: '8px 14px', borderBottom: `1px solid ${C.border}`,
         background: guestMode ? `${C.muted}18` : `${C.accent}10`,
         display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+        position: 'relative', zIndex: 10,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ fontSize: 12 }}>{guestMode ? '👤' : '🔐'}</span>
