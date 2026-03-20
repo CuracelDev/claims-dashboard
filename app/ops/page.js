@@ -697,7 +697,6 @@ export default function OpsPage() {
         )}
       </div>
 
-      </>)}
       {drilldown && (
         <DrilldownModal
           member={drilldown}
