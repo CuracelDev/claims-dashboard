@@ -211,7 +211,7 @@ function CreateTaskModal({ members, onClose, onCreated }) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  useEffect(() => { const n = getMemberName(); if (n) set('assigned_by', n); }, []);
+  useEffect(() => { try { const s = JSON.parse(localStorage.getItem("claims_intel_session") || "{}"); if (s.member_name) set("assigned_by", s.member_name); } catch {} }, []);
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
