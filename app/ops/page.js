@@ -1,5 +1,6 @@
 'use client';
 import { useState, useEffect, useMemo, useCallback } from 'react';
+import AttendanceGrid from './components/AttendanceGrid';
 import { useTheme } from '../context/ThemeContext';
 import InsightBanner from '../components/InsightBanner';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LineChart, Line } from 'recharts';
@@ -309,6 +310,7 @@ export default function OpsPage() {
   const [loading, setLoading] = useState(true);
   const [teamMembers, setTeamMembers] = useState([]);
   const [drilldown, setDrilldown] = useState(null);
+  const [opsTab, setOpsTab] = useState('overview');
   const [insightData, setInsightData] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
 
@@ -430,6 +432,20 @@ export default function OpsPage() {
       <div style={{ padding: '20px 24px' }}>
         <InsightBanner autoRefresh={false} />
 
+        {/* Tab selector */}
+        <div style={{ display: 'flex', gap: 0, marginBottom: 20, background: C.card, borderRadius: 8, border: `1px solid ${C.border}`, padding: 3, width: 'fit-content' }}>
+          {[['overview','📊 Overview'],['attendance','📅 Attendance']].map(([key, label]) => (
+            <button key={key} onClick={() => setOpsTab(key)} style={{
+              padding: '7px 18px', borderRadius: 6, fontSize: 12,
+              fontWeight: opsTab === key ? 700 : 400, cursor: 'pointer', border: 'none',
+              background: opsTab === key ? C.accent : 'transparent',
+              color: opsTab === key ? '#0B0F1A' : C.sub,
+            }}>{label}</button>
+          ))}
+        </div>
+
+        {opsTab === 'attendance' && <AttendanceGrid teamMembers={teamMembers} C={C} />}
+        {opsTab === 'overview' && (<>
         <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
           {QUICK_RANGES.map((r, i) => (
             <button
@@ -681,6 +697,8 @@ export default function OpsPage() {
         )}
       </div>
 
+      </>)}
+      </>)}
       {drilldown && (
         <DrilldownModal
           member={drilldown}
