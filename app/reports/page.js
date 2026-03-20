@@ -1,8 +1,7 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
-import ReportPinGate, { getSession } from '../components/ReportPinGate';
-import InsightBanner from '../components/InsightBanner';
+import { getSession } from '../lib/auth';
 
 const METRIC_GROUPS = [
   {
@@ -552,17 +551,12 @@ export default function ReportsPage() {
 
   useEffect(() => {
     fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
-    const existing = getSession();
-    if (existing) setAuthSession(existing);
+    const session = getSession();
+    if (session && session.member_id) {
+      setAuthSession({ memberId: session.member_id, memberName: session.member_name });
+      setHistFilter(f => ({ ...f, person: String(session.member_id) }));
+    }
   }, []);
-
-  const handleAuth = (session) => {
-    setAuthSession(session);
-    setHistFilter(f => ({
-      ...f,
-      person: session ? String(session.memberId) : ''
-    }));
-  };
 
   const loadHistory = useCallback(() => {
     setLoadingHist(true);
@@ -605,12 +599,9 @@ export default function ReportsPage() {
       </div>
 
       <div style={{ padding: '20px 24px' }}>
-        <InsightBanner />
         {tab === 'form' && (
           <div style={{ maxWidth: '100%' }}>
-            <ReportPinGate members={teamMembers} onAuth={handleAuth} existingSession={authSession}>
-              {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} editPreset={editPreset} onPresetUsed={() => setEditPreset(null)} />}
-            </ReportPinGate>
+            {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} editPreset={editPreset} onPresetUsed={() => setEditPreset(null)} />}
           </div>
         )}
 
