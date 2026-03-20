@@ -205,8 +205,9 @@ function TaskCard({ task, onStatusChange, onDelete }) {
 
 /* ── Create Task Modal ───────────────────────────────────── */
 function CreateTaskModal({ members, onClose, onCreated }) {
+  const sessionName = getMemberName() || "";
   const [form, setForm] = useState({
-    title: "", description: "", assigned_to: [], assigned_by: "",
+    title: "", description: "", assigned_to: [], assigned_by: sessionName,
     due_date: "", priority: "medium", category: "ad_hoc",
   });
   const [saving, setSaving] = useState(false);
@@ -219,10 +220,7 @@ function CreateTaskModal({ members, onClose, onCreated }) {
       setError("Title and assignee are required.");
       return;
     }
-    if (!form.assigned_by) {
-      setError("Please select who is assigning this task.");
-      return;
-    }
+
     setSaving(true);
     setError("");
     try {
@@ -279,7 +277,10 @@ function CreateTaskModal({ members, onClose, onCreated }) {
           </div>
           <div>
             <label style={label}>Assigned By *</label>
-            <select style={inp} value={form.assigned_by} onChange={e => set("assigned_by", e.target.value)}>
+            <div style={{ ...inp, background: C.elevated, color: C.accent, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+              🔒 {form.assigned_by || "Unknown"}
+            </div>
+            <select style={{ display: "none" }} value={form.assigned_by} onChange={e => set("assigned_by", e.target.value)}>
               <option value="">Who is assigning?</option>
               {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
             </select>
