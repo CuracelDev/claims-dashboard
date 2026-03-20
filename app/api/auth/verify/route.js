@@ -65,6 +65,16 @@ export async function POST(request) {
     return Response.json({ valid: false, error: 'Session creation failed' }, { status: 500 });
   }
 
+  // Write audit log
+  await supabase.from('audit_log').insert({
+    member_id:   parseInt(member.id),
+    member_name: member.display_name || member.name,
+    action:      'auth.login',
+    entity_type: 'session',
+    entity_id:   null,
+    source:      'app',
+  });
+
   return Response.json({
     valid: true,
     session_token: session.session_token,

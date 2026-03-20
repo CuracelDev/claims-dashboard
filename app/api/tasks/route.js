@@ -133,6 +133,19 @@ export async function POST(request) {
       }
     }
 
+    // Audit log
+    try {
+      await supabase.from('audit_log').insert({
+        member_id:   null,
+        member_name: assigned_by || 'Admin',
+        action:      'task.create',
+        entity_type: 'task',
+        entity_id:   task.id || null,
+        details:     { title, assigned_to: parseInt(assigned_to), priority: priority || 'medium' },
+        source:      'app',
+      });
+    } catch {}
+
     return Response.json({ task }, { status: 201 });
   } catch (err) {
     console.error("POST /api/tasks error:", err);

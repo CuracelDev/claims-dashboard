@@ -1,7 +1,6 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
-import InsightBanner from '../components/InsightBanner';
 
 const toLocalYMD = (date) => {
   const y = date.getFullYear();
@@ -67,7 +66,7 @@ const PERIOD_PRESETS = [
 const calcProgress = (target, logs, autoValue) => {
   const manualTotal = logs.reduce((s, l) => s + (parseFloat(l.value) || 0), 0);
   const actual =
-    target.metric_key && autoValue != null ? Math.max(manualTotal, autoValue) : manualTotal;
+    target.metric_key && autoValue != null ? manualTotal + autoValue : manualTotal;
 
   if (target.type === 'yesno') {
     const done = logs.some((l) => l.value === 'yes');
@@ -752,7 +751,6 @@ export default function TargetsPage() {
       </div>
 
       <div style={{ padding: '16px 24px' }}>
-        <InsightBanner />
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 16 }}>
           {[

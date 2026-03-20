@@ -377,7 +377,16 @@ export default function TasksPage() {
   async function fetchMembers() {
     const res = await fetch("/api/team");
     const data = await res.json();
-    setMembers(data.data || []);
+    const list = data.data || [];
+    setMembers(list);
+    // Auto-select from session
+    try {
+      const session = JSON.parse(localStorage.getItem("claims_intel_session") || "{}");
+      if (session.member_id) {
+        const match = list.find(m => m.id === parseInt(session.member_id));
+        if (match) setSelectedMember(String(match.id));
+      }
+    } catch {}
   }
 
   async function fetchTasks() {
