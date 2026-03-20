@@ -41,6 +41,29 @@ const weekEnd = () => {
   return toLocalYMD(d);
 };
 
+const twoWeeksEnd = () => {
+  const d = parseYMD(weekStart());
+  d.setDate(d.getDate() + 13);
+  return toLocalYMD(d);
+};
+
+const monthStart = () => {
+  const d = new Date();
+  return toLocalYMD(new Date(d.getFullYear(), d.getMonth(), 1));
+};
+
+const monthEnd = () => {
+  const d = new Date();
+  return toLocalYMD(new Date(d.getFullYear(), d.getMonth() + 1, 0));
+};
+
+const PERIOD_PRESETS = [
+  { label: 'This week',  fn: () => ({ start: weekStart(),  end: weekEnd()     }) },
+  { label: '2 weeks',    fn: () => ({ start: weekStart(),  end: twoWeeksEnd() }) },
+  { label: 'This month', fn: () => ({ start: monthStart(), end: monthEnd()    }) },
+  { label: 'Custom',     fn: null },
+];
+
 const calcProgress = (target, logs, autoValue) => {
   const manualTotal = logs.reduce((s, l) => s + (parseFloat(l.value) || 0), 0);
   const actual =
@@ -56,8 +79,9 @@ const calcProgress = (target, logs, autoValue) => {
     return { actual: val, pct: Math.min((val / target.target_value) * 100, 100), raw: val };
   }
 
-  const pct = target.target_value > 0 ? Math.min((actual / target.target_value) * 100, 100) : 0;
-  return { actual, pct, raw: actual };
+  const rawPct = target.target_value > 0 ? (actual / target.target_value) * 100 : 0;
+  const pct = Math.min(rawPct, 100);
+  return { actual, pct, raw: actual, rawPct };
 };
 
 const statusColor = (pct, C) => (pct >= 100 ? '#00E5A0' : pct >= 60 ? C.warn : C.danger);
@@ -220,6 +244,7 @@ function NewTargetModal({ C, onSave, onClose }) {
   });
 
   const set = (k, v) => setForm((p) => ({ ...p, [k]: v }));
+  const [selectedPreset, setSelectedPreset] = useState('This week');
 
   const S = {
     overlay: {
@@ -330,6 +355,28 @@ function NewTargetModal({ C, onSave, onClose }) {
           </>
         )}
 
+        <label style={S.label}>Period *</label>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+          {PERIOD_PRESETS.map((p) => (
+            <button
+              key={p.label}
+              onClick={() => {
+                setSelectedPreset(p.label);
+                if (p.fn) { const { start, end } = p.fn(); set('start_date', start); set('end_date', end); }
+              }}
+              style={{
+                padding: '5px 12px', borderRadius: 20, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                border: `1px solid ${selectedPreset === p.label ? C.accent : C.border}`,
+                background: selectedPreset === p.label ? C.accent + '18' : C.elevated,
+                color: selectedPreset === p.label ? C.accent : C.sub, transition: 'all 0.15s',
+              }}
+            >{p.label}</button>
+          ))}
+        </div>
+        {selectedPreset !== 'Custom' && (
+          <div style={{ fontSize: 12, color: C.sub, marginBottom: 10 }}>{form.start_date} → {form.end_date}</div>
+        )}
+        {selectedPreset === 'Custom' && (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <div>
             <label style={S.label}>Start *</label>
@@ -340,6 +387,7 @@ function NewTargetModal({ C, onSave, onClose }) {
             <input type="date" value={form.end_date} onChange={(e) => set('end_date', e.target.value)} style={S.input} />
           </div>
         </div>
+        )}
 
         <label style={S.label}>Linked Metric (auto-pulls from daily reports)</label>
         <select
@@ -898,7 +946,7 @@ export default function TargetsPage() {
                               minWidth: 34,
                             }}
                           >
-                            {prog.pct.toFixed(0)}%
+                            {(prog.rawPct ?? prog.pct).toFixed(0)}%
                           </span>
                         </div>
                       </td>
