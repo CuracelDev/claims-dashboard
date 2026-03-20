@@ -1,11 +1,7 @@
 'use client';
+import { useTheme } from '../context/ThemeContext';
 import { useState, useEffect } from 'react';
 
-const C = {
-  accent: "#00E5A0", bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
-  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
-  danger: "#FF5C5C", success: "#34D399", blue: "#5B8DEF", purple: "#A78BFA", warn: "#FFB84D",
-};
 const cardStyle = { background: '#111827', border: '1px solid #1E2D3D', borderRadius: 12, padding: 20, marginBottom: 16 };
 const inputStyle = { background: '#0B0F1A', border: '1px solid #1E2D3D', borderRadius: 8, color: '#F0F4F8', padding: '8px 12px', fontSize: 13, outline: 'none', boxSizing: 'border-box' };
 const labelStyle = { fontSize: 11, color: '#8899AA', marginBottom: 4, display: 'block' };
@@ -104,6 +100,7 @@ function EditMemberModal({ member, onSave, onClose }) {
 }
 
 export default function TeamPage() {
+  const { C } = useTheme();
   const [members, setMembers] = useState([]);
   const [metrics, setMetrics] = useState([]);
   const [activeTab, setActiveTab] = useState('members');

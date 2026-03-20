@@ -18,6 +18,7 @@ const tools = [
 
 export default function ToolsPage() {
   const router = useRouter();
+  const { C } = useTheme();
   return (
     <div style={{ minHeight: '100vh', background: C.bg, padding: '32px', fontFamily: 'system-ui, sans-serif' }}>
       <div style={{ marginBottom: '32px' }}>

@@ -1,14 +1,10 @@
 'use client';
+import { useTheme } from '../../context/ThemeContext';
 import { useState, useRef } from 'react';
 
-const C = {
-  bg: '#0B0F1A', card: '#111827', elevated: '#1A2235', border: '#1E2D45',
-  text: '#E8EDF5', sub: '#7A8FA6', muted: '#4A5568', accent: '#00E5A0',
-  accentDim: '#00B87D', blue: '#5B8DEF', purple: '#A78BFA',
-  warn: '#F59E0B', danger: '#EF4444', inputBg: '#0F1726', sidebarBg: '#0D1220',
-};
 
 export default function BatchSplitterPage() {
+  const { C } = useTheme();
   const [file, setFile] = useState(null);
   const [batchSize, setBatchSize] = useState(5000);
   const [status, setStatus] = useState('idle');

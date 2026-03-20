@@ -79,7 +79,7 @@ export default function AttendanceGrid({ teamMembers, C }) {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
             <thead>
               <tr style={{ background: C.elevated }}>
-                <th style={{ padding: '10px 16px', textAlign: 'left', color: C.muted, fontWeight: 600, fontSize: 11, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap', minWidth: 130 }}>
+                <th style={{ padding: '10px 16px', textAlign: 'left', color: C.muted, fontWeight: 600, fontSize: 11, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap', minWidth: 130, position: 'sticky', left: 0, background: C.elevated, zIndex: 3 }}>
                   Member
                 </th>
                 {days.map(d => (
@@ -99,7 +99,7 @@ export default function AttendanceGrid({ teamMembers, C }) {
                 const score = getMemberScore(memberGrid);
                 return (
                   <tr key={m.id} style={{ background: mi % 2 === 0 ? 'transparent' : `${C.elevated}44` }}>
-                    <td style={{ padding: '10px 16px', color: C.text, fontWeight: 600, fontSize: 12, borderBottom: `1px solid ${C.border}33`, whiteSpace: 'nowrap' }}>
+                    <td style={{ padding: '10px 16px', color: C.text, fontWeight: 600, fontSize: 12, borderBottom: `1px solid ${C.border}33`, whiteSpace: 'nowrap', position: 'sticky', left: 0, background: C.card, zIndex: 2 }}>
                       {m.display_name || m.name}
                     </td>
                     {days.map(d => {
