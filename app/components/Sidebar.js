@@ -30,6 +30,7 @@ const NAV = [
       { href: '/qa',      icon: '🔍', label: 'QA Flag Tracker', sub: 'Claims quality audit' },
       { href: '/ops',     icon: '⚡', label: 'Ops Overview',     sub: 'Team performance' },
       { href: '/targets', icon: '🎯', label: 'Targets',          sub: 'Weekly goals & alerts' },
+      { href: '/audit',   icon: '🗂️', label: 'Audit Log',         sub: 'Activity trail' },
     ],
   },
   {
