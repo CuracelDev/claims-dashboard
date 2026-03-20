@@ -365,6 +365,77 @@ function makeS(C) {
 }
 
 // ── Report Form (shown after PIN auth) ────────────────────────────────────────
+
+function MissedDaysBanner({ memberId, onSelectDate }) {
+  const { C } = useTheme();
+  const [missed, setMissed] = useState([]);
+
+  useEffect(() => {
+    if (!memberId) return;
+    const today = new Date();
+    today.setHours(12, 0, 0, 0);
+    const dayOfWeek = today.getDay();
+    const monday = new Date(today);
+    monday.setDate(today.getDate() + (dayOfWeek === 0 ? -6 : 1 - dayOfWeek));
+    const days = [];
+    const cursor = new Date(monday);
+    while (cursor < today) {
+      days.push(cursor.toISOString().split('T')[0]);
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    if (days.length === 0) { setMissed([]); return; }
+    const from = days[0];
+    const to = days[days.length - 1];
+    Promise.all([
+      fetch('/api/reports?member_id=' + memberId + '&from=' + from + '&to=' + to).then(r => r.json()),
+      fetch('/api/leave?member_id=' + memberId + '&from=' + from + '&to=' + to).then(r => r.json()).catch(() => ({ data: [] })),
+    ]).then(([rRes, lRes]) => {
+      const submitted = (rRes.data || []).map(r => r.report_date);
+      const onLeave = (lRes.data || []).flatMap(l => {
+        const dates = [];
+        const s = new Date(l.start_date + 'T12:00:00');
+        const e = new Date(l.end_date + 'T12:00:00');
+        const d = new Date(s);
+        while (d <= e) { dates.push(d.toISOString().split('T')[0]); d.setDate(d.getDate() + 1); }
+        return dates;
+      });
+      setMissed(days.filter(d => !submitted.includes(d) && !onLeave.includes(d)));
+    }).catch(() => setMissed([]));
+  }, [memberId]);
+
+  if (missed.length === 0) return null;
+
+  return (
+    <div style={{
+      background: '#F59E0B10', border: '1px solid #F59E0B44',
+      borderRadius: 10, padding: '12px 16px', marginBottom: 16,
+      display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10,
+    }}>
+      <span style={{ fontSize: 13, color: '#F59E0B', fontWeight: 600 }}>
+        ⚠️ Missing reports for:
+      </span>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {missed.map(d => (
+          <button
+            key={d}
+            onClick={() => onSelectDate(d)}
+            style={{
+              padding: '4px 12px', borderRadius: 20, fontSize: 12, fontWeight: 600,
+              cursor: 'pointer', background: '#F59E0B18',
+              border: '1px solid #F59E0B66', color: '#F59E0B', transition: 'all 0.15s',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = '#F59E0B'; e.currentTarget.style.color = '#0B1929'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#F59E0B18'; e.currentTarget.style.color = '#F59E0B'; }}
+          >
+            {new Date(d + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })}
+          </button>
+        ))}
+      </div>
+      <span style={{ fontSize: 11, color: '#6B7A99' }}>Click a date to fill in or mark leave</span>
+    </div>
+  );
+}
+
 function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
   const { C } = useTheme();
   const S = makeS(C);
@@ -453,6 +524,7 @@ function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
 
   return (
     <>
+      <MissedDaysBanner memberId={selectedMember} onSelectDate={(d) => setReportDate(d)} />
       <DailySummary teamMembers={teamMembers} date={reportDate} />
 
       {editingReport && (
