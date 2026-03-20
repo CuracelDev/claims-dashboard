@@ -280,10 +280,7 @@ function CreateTaskModal({ members, onClose, onCreated }) {
             <div style={{ ...inp, background: C.elevated, color: C.accent, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
               🔒 {form.assigned_by || "Unknown"}
             </div>
-            <select style={{ display: "none" }} value={form.assigned_by} onChange={e => set("assigned_by", e.target.value)}>
-              <option value="">Who is assigning?</option>
-              {members.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
-            </select>
+
           </div>
           <div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
