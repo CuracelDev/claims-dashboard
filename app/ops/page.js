@@ -444,9 +444,13 @@ export default function OpsPage() {
           ))}
         </div>
 
-        {opsTab === 'attendance' && <AttendanceGrid teamMembers={teamMembers} C={C} />}
-        {opsTab === 'overview' && (<>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+        {opsTab === 'attendance' && (
+          <AttendanceGrid teamMembers={teamMembers} C={C} />
+        )}
+
+        {opsTab === 'overview' && (
+          <div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
           {QUICK_RANGES.map((r, i) => (
             <button
               key={i}
@@ -520,16 +524,7 @@ export default function OpsPage() {
 
             {rangeIdx === 0 && insightData?.today_vs_yesterday?.length > 0 && (
               <div style={S.section}>
-                <div
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 600,
-                    color: C.sub,
-                    marginBottom: 12,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.05em',
-                  }}
-                >
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                   Today vs Yesterday
                 </div>
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -551,16 +546,7 @@ export default function OpsPage() {
 
             {members.length > 0 && (
               <div style={S.section}>
-                <div
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 600,
-                    color: C.sub,
-                    marginBottom: 12,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.05em',
-                  }}
-                >
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                   Member Breakdown — click row to drill down
                 </div>
                 <div style={S.card}>
@@ -578,9 +564,7 @@ export default function OpsPage() {
                           <th style={{ ...S.th, textAlign: 'center' }}>Days</th>
                         </tr>
                         <tr style={{ background: '#0B1929' }}>
-                          <td style={{ padding: '6px 14px', fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
-                            Team avg
-                          </td>
+                          <td style={{ padding: '6px 14px', fontSize: 11, color: C.muted, fontStyle: 'italic' }}>Team avg</td>
                           {KEY_METRICS.map((m) => (
                             <td key={m.key} style={{ padding: '6px 14px', fontSize: 11, color: C.muted, textAlign: 'right' }}>
                               {(avgMetrics[m.key] || 0).toLocaleString()}
@@ -593,13 +577,7 @@ export default function OpsPage() {
                         {members.map((p) => (
                           <MemberRow
                             key={p.person?.id || p.person?.name}
-                            member={{
-                              ...p,
-                              id: p.person?.id,
-                              name: p.person?.name,
-                              totals: p.totals,
-                              days_reported: p.days_reported,
-                            }}
+                            member={{ ...p, id: p.person?.id, name: p.person?.name, totals: p.totals, days_reported: p.days_reported }}
                             memberMap={memberMap}
                             avgMetrics={avgMetrics}
                             onDrilldown={() => setDrilldown(p)}
@@ -627,16 +605,7 @@ export default function OpsPage() {
 
             {claimsChartData.length > 0 && (
               <div style={S.section}>
-                <div
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 600,
-                    color: C.sub,
-                    marginBottom: 12,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.05em',
-                  }}
-                >
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                   Claims Piles by Insurer
                 </div>
                 <div style={{ ...S.card, padding: '16px 0 8px' }}>
@@ -644,10 +613,7 @@ export default function OpsPage() {
                     <BarChart data={claimsChartData} margin={{ top: 0, right: 24, bottom: 0, left: 0 }}>
                       <XAxis dataKey="name" tick={{ fill: '#6B7A99', fontSize: 11 }} axisLine={false} tickLine={false} />
                       <YAxis hide />
-                      <Tooltip
-                        contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }}
-                        formatter={(v) => v.toLocaleString()}
-                      />
+                      <Tooltip contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }} formatter={(v) => v.toLocaleString()} />
                       <Bar dataKey="value" radius={[4, 4, 0, 0]}>
                         {claimsChartData.map((_, i) => (
                           <Cell key={i} fill={['#00E5A0', '#5B8DEF', '#A78BFA', '#F59E0B', '#FF4D4D', '#22D3EE', '#F97316'][i % 7]} />
@@ -661,16 +627,7 @@ export default function OpsPage() {
 
             {insightData?.week_vs_lastweek?.length > 0 && rangeIdx === 1 && (
               <div style={S.section}>
-                <div
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 600,
-                    color: C.sub,
-                    marginBottom: 12,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.05em',
-                  }}
-                >
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                   This Week vs Last Week
                 </div>
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -695,8 +652,10 @@ export default function OpsPage() {
             )}
           </>
         )}
+          </div>
+        )}
+
       </div>
-      </>)}
 
       {drilldown && (
         <DrilldownModal
