@@ -77,27 +77,9 @@ export default function LoginPage() {
       .catch(() => setLoading(false));
   }, []);
 
-  async function handleSelectMember(member) {
+  function handleSelectMember(member) {
     setSelected(member);
     setPin(''); setError(''); setPinSent(false);
-    // Auto-send PIN on selection if they have a slack_user_id
-    if (member.slack_user_id) {
-      setSending(true);
-      try {
-        const res = await fetch('/api/auth/generate-pin', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ member_id: member.id }),
-        });
-        const data = await res.json();
-        if (data.ok) setPinSent(true);
-        else setError(data.error || 'Could not send PIN.');
-      } catch {
-        setError('Something went wrong.');
-      } finally {
-        setSending(false);
-      }
-    }
   }
 
   function handleBack() {
@@ -263,22 +245,33 @@ export default function LoginPage() {
               <div>
                 <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{selected.name}</div>
                 <div style={{ fontSize: 12, color: C.sub }}>
-                  {sending ? 'Sending PIN to Slack...' : pinSent ? 'PIN sent — check Slack' : !selected.slack_user_id ? 'No Slack account linked' : 'Sending PIN to Slack...'}
+                  {sending ? 'Sending PIN...' : pinSent ? 'PIN sent — check Slack' : !selected.slack_user_id ? 'No Slack account linked' : 'Click below to get your PIN'}
                 </div>
               </div>
             </div>
 
-            {/* Sending state */}
-            {sending && (
-              <div style={{ textAlign: 'center', padding: '20px 0' }}>
-                <div style={{ fontSize: 13, color: C.sub }}>📲 Sending PIN to your Slack DM...</div>
-              </div>
-            )}
             {/* No Slack linked */}
-            {!sending && !selected.slack_user_id && (
+            {!selected.slack_user_id && (
               <div style={{ textAlign: 'center', padding: '8px 0 16px' }}>
                 <div style={{ fontSize: 13, color: C.warn, marginBottom: 8 }}>⚠ No Slack account linked.</div>
                 <div style={{ fontSize: 12, color: C.sub }}>Ask your team lead to add your Slack ID in Team Management.</div>
+              </div>
+            )}
+            {/* Send PIN button */}
+            {selected.slack_user_id && !pinSent && !sending && (
+              <button
+                onClick={handleSendPin}
+                style={{
+                  width: '100%', marginBottom: 16,
+                  background: `linear-gradient(135deg, #7B61FF, ${C.accent})`,
+                  border: 'none', borderRadius: 10, padding: '13px 0',
+                  fontSize: 14, fontWeight: 700, color: C.bg, cursor: 'pointer',
+                }}
+              >📲 Send PIN to Slack</button>
+            )}
+            {sending && (
+              <div style={{ textAlign: 'center', padding: '12px 0 16px', fontSize: 13, color: C.sub }}>
+                📲 Sending PIN to your Slack DM...
               </div>
             )}
 
