@@ -13,7 +13,7 @@ export async function GET() {
 
   const { data, error } = await supabase
     .from('team_members')
-    .select('id, name, display_name')
+    .select('id, name, display_name, report_pin')
     .eq('is_active', true)
     .order('name');
 
@@ -25,6 +25,7 @@ export async function GET() {
     members: data.map((m) => ({
       id: parseInt(m.id),
       name: m.display_name || m.name,
+      has_pin: !!m.report_pin,
       initials: (m.display_name || m.name)
         .split(' ')
         .map((w) => w[0])
