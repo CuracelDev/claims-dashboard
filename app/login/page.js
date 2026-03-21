@@ -4,7 +4,7 @@
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { setSession, setGuestSession, isSessionValid } from '../lib/auth';
+import { setSession, setGuestSession, isSessionValid, resetSession } from '../lib/auth';
 
 const AVATAR_COLOURS = [
   '#7B61FF', '#00E5A0', '#5B8DEF', '#F59E0B',
