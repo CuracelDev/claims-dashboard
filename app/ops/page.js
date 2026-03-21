@@ -608,7 +608,7 @@ export default function OpsPage() {
                 <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                   Claims Piles by Insurer
                 </div>
-                <div style={{ ...S.card, padding: '16px 0 8px' }}>
+                <div style={{ ...S.card, padding: '16px 0 8px', background: C.card }}>
                   <ResponsiveContainer width="100%" height={200}>
                     <BarChart data={claimsChartData} margin={{ top: 0, right: 24, bottom: 0, left: 0 }}>
                       <XAxis dataKey="name" tick={{ fill: '#6B7A99', fontSize: 11 }} axisLine={false} tickLine={false} />
