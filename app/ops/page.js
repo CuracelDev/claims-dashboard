@@ -613,7 +613,7 @@ export default function OpsPage() {
                     <BarChart data={claimsChartData} margin={{ top: 0, right: 24, bottom: 0, left: 0 }} style={{ background: 'transparent' }}>
                       <XAxis dataKey="name" tick={{ fill: '#6B7A99', fontSize: 11 }} axisLine={false} tickLine={false} />
                       <YAxis hide />
-                      <Tooltip contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }} formatter={(v) => v.toLocaleString()} />
+                      <Tooltip contentStyle={{ background: '#0B1929', border: '1px solid #00E5A044', borderRadius: 8, fontSize: 12, color: '#E8EEF7' }} itemStyle={{ color: '#00E5A0' }} labelStyle={{ color: '#E8EEF7', fontWeight: 600 }} formatter={(v) => v.toLocaleString()} />
                       <Bar dataKey="value" radius={[4, 4, 0, 0]}>
                         {claimsChartData.map((_, i) => (
                           <Cell key={i} fill={['#00E5A0', '#5B8DEF', '#A78BFA', '#F59E0B', '#FF4D4D', '#22D3EE', '#F97316'][i % 7]} fillOpacity={1} />
