@@ -65,7 +65,9 @@ export default function LoginPage() {
   const [shake,      setShake]      = useState(false);
 
   useEffect(() => {
-    if (isSessionValid()) router.replace('/');
+    // Only auto-redirect authenticated users — guests should be able to sign in
+    const s = typeof window !== 'undefined' && JSON.parse(localStorage.getItem('claims_intel_session') || 'null');
+    if (s && s.mode === 'auth' && Date.now() < s.expires_at) router.replace('/');
   }, []);
 
   useEffect(() => {
