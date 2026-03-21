@@ -124,7 +124,8 @@ export default function LoginPage() {
       });
       const data = await res.json();
       if (data.valid) {
-        setSession({ sessionToken: data.session_token, memberId: data.member_id, memberName: data.member_name });
+        resetSession();
+    setSession({ sessionToken: data.session_token, memberId: data.member_id, memberName: data.member_name });
         router.replace('/');
       } else {
         setError(data.error || 'Incorrect PIN. Try again.');
@@ -140,6 +141,7 @@ export default function LoginPage() {
   }
 
   function handleGuest() {
+    resetSession();
     setGuestSession();
     router.replace('/');
   }
