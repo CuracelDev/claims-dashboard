@@ -2,6 +2,12 @@
 import { useState, useEffect } from "react";
 
 /* ── colour tokens (matches app/page.js exactly) ─────────── */
+const C = {
+  accent: "#00E5A0", accentDim: "#00B87D",
+  bg: "#0B0F1A", card: "#111827", elevated: "#1A2332",
+  border: "#1E2D3D", text: "#F0F4F8", sub: "#8899AA", muted: "#556677",
+  danger: "#FF5C5C", warn: "#FFB84D", success: "#34D399",
+};
 
 const PRIORITY_CONFIG = {
   high:   { label: "High",   color: "#FF5C5C", emoji: "🔴" },
@@ -358,7 +364,6 @@ function CreateTaskModal({ members, onClose, onCreated }) {
 
 /* ── Main Page ───────────────────────────────────────────── */
 export default function TasksPage() {
-  const { C } = useTheme();
   const [members, setMembers] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [selectedMember, setSelectedMember] = useState("");
