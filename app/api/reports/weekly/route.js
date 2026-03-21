@@ -38,7 +38,10 @@ function sumMetricValues(metrics) {
 
 export async function GET(request) {
   try {
-    const supabase = getSupabase();
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
     const { searchParams } = new URL(request.url);
 
     const rawFrom = searchParams.get('from');
