@@ -73,7 +73,8 @@ export async function GET(request) {
       .gte('report_date', from)
       .lte('report_date', to)
       .order('report_date', { ascending: false })
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(10000);
 
     if (reportsError) throw reportsError;
 
