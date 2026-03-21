@@ -64,6 +64,7 @@ function InsightCard({ data, dateRange }) {
   const [deleting, setDeleting]     = useState(false);
   const [deleted, setDeleted]       = useState(false);
   const [error, setError]           = useState(null);
+  const [detail, setDetail]           = useState('short');
 
   async function generate(sendSlack = false) {
     if (sendSlack) { setSending(true); }
@@ -78,6 +79,7 @@ function InsightCard({ data, dateRange }) {
           total: data?.total || 0,
           date_range: dateRange,
           send_to_slack: sendSlack,
+          detail,
         }),
       });
       const json = await res.json();
