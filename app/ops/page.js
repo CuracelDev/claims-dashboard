@@ -2,7 +2,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import AttendanceGrid from './components/AttendanceGrid';
 import { useTheme } from '../context/ThemeContext';
-import InsightBanner from '../components/InsightBanner';
+import AINarrative from '../components/AINarrative';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LineChart, Line } from 'recharts';
 
 const METRIC_LABELS = {
@@ -430,7 +430,7 @@ export default function OpsPage() {
       </div>
 
       <div style={{ padding: '20px 24px' }}>
-        <InsightBanner autoRefresh={false} />
+        <AINarrative />
 
         {/* Tab selector */}
         <div style={{ display: 'flex', gap: 0, marginBottom: 20, background: C.card, borderRadius: 8, border: `1px solid ${C.border}`, padding: 3, width: 'fit-content' }}>
@@ -616,7 +616,7 @@ export default function OpsPage() {
                       <Tooltip contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }} formatter={(v) => v.toLocaleString()} />
                       <Bar dataKey="value" radius={[4, 4, 0, 0]}>
                         {claimsChartData.map((_, i) => (
-                          <Cell key={i} fill={['#00E5A0', '#5B8DEF', '#A78BFA', '#F59E0B', '#FF4D4D', '#22D3EE', '#F97316'][i % 7]} />
+                          <Cell key={i} fill={['#00E5A0', '#5B8DEF', '#A78BFA', '#F59E0B', '#FF4D4D', '#22D3EE', '#F97316'][i % 7]} fillOpacity={1} />
                         ))}
                       </Bar>
                     </BarChart>
