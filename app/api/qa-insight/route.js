@@ -18,7 +18,7 @@ async function slackPost(channel, text, blocks) {
 
 export async function POST(request) {
   try {
-    const { aggregations, total, date_range, send_to_slack } = await request.json();
+    const { aggregations, total, date_range, send_to_slack, detail } = await request.json();
 
     if (!aggregations || total === 0) {
       return Response.json({ error: 'No data to analyse' }, { status: 400 });
@@ -62,7 +62,7 @@ ${insurerLines || 'No breakdown available'}
 Top Flagged Providers:
 ${providerLines || 'No breakdown available'}
 
-Write a concise, sharp, operational QA intelligence brief (3-5 sentences max). Lead with the most significant finding. Identify any patterns suggesting systemic issues. End with one specific, actionable recommended next step. Be direct, factual, and use precise numbers. Do not add markdown headers or bullet points — write in flowing prose.`;
+${detail === 'detailed' ? 'Write a detailed QA intelligence report (6-8 sentences). Cover: (1) overall flag volume and trend, (2) top 2-3 issue types with specific counts and percentages, (3) most affected insurers or providers, (4) patterns suggesting systemic issues, (5) risk assessment, (6) two specific recommended actions. Be direct and data-driven. No markdown. No bullets. Plain prose only.' : 'Write a concise QA intelligence brief (3-5 sentences). Lead with the most significant finding. Identify patterns suggesting systemic issues. End with one specific actionable next step. Be direct, factual, precise numbers. No markdown. No bullets. Plain prose only.'}\`;
 
     // ── Call Anthropic ────────────────────────────────────────────────
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });

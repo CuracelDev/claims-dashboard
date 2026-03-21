@@ -154,6 +154,16 @@ function InsightCard({ data, dateRange }) {
 
         {/* Action buttons */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8, flexShrink: 0 }}>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            {[['short','Brief'],['detailed','Detailed']].map(([val, label]) => (
+              <button key={val} onClick={() => setDetail(val)} style={{
+                padding: '4px 12px', borderRadius: 20, fontSize: 11, fontWeight: 600,
+                cursor: 'pointer', border: `1px solid ${detail === val ? C.accent : C.border}`,
+                background: detail === val ? C.accent + '18' : 'transparent',
+                color: detail === val ? C.accent : C.sub,
+              }}>{label}</button>
+            ))}
+          </div>
           <button onClick={() => generate(false)} disabled={loading || !hasData}
             style={{ background: loading ? C.elevated : `linear-gradient(135deg,${C.accent},${C.accentDim})`, color: loading ? C.muted : C.bg, border: "none", borderRadius: 8, padding: "9px 18px", fontSize: 12, fontWeight: 700, cursor: loading || !hasData ? "not-allowed" : "pointer", opacity: !hasData ? 0.4 : 1, whiteSpace: "nowrap", transition: "opacity .2s" }}>
             {loading ? "Generating..." : insight ? "↺ Regenerate" : "✦ Generate Insight"}

@@ -610,7 +610,7 @@ export default function OpsPage() {
                 </div>
                 <div style={{ ...S.card, padding: '16px 0 8px', background: C.card }}>
                   <ResponsiveContainer width="100%" height={200}>
-                    <BarChart data={claimsChartData} margin={{ top: 0, right: 24, bottom: 0, left: 0 }}>
+                    <BarChart data={claimsChartData} margin={{ top: 0, right: 24, bottom: 0, left: 0 }} style={{ background: 'transparent' }}>
                       <XAxis dataKey="name" tick={{ fill: '#6B7A99', fontSize: 11 }} axisLine={false} tickLine={false} />
                       <YAxis hide />
                       <Tooltip contentStyle={{ background: '#111E2E', border: '1px solid #1E2D45', borderRadius: 8, fontSize: 12 }} formatter={(v) => v.toLocaleString()} />

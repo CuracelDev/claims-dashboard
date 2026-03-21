@@ -21,6 +21,7 @@ export default function AINarrative() {
   const [collapsed,  setCollapsed]  = useState(false);
   const [rawData,    setRawData]    = useState(null);
   const [error,      setError]      = useState(null);
+  const [detail,     setDetail]     = useState('short');
 
   const fetchData = useCallback(async () => {
     const res  = await fetch('/api/insights');
@@ -40,7 +41,7 @@ export default function AINarrative() {
       const res  = await fetch('/api/ops-narrative', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
+        body: JSON.stringify({ ...data, detail }),
       });
       const json = await res.json();
       if (json.error) throw new Error(json.error);
@@ -124,6 +125,16 @@ export default function AINarrative() {
               <div style={{ fontSize: 13, color: C.sub, marginBottom: 16 }}>
                 Click Generate to get an AI-powered analysis of current team performance.
               </div>
+              <div style={{ display: 'flex', gap: 6, marginBottom: 14, justifyContent: 'center' }}>
+                {[['short','Brief summary'],['detailed','Detailed report']].map(([val, label]) => (
+                  <button key={val} onClick={e => { e.stopPropagation(); setDetail(val); }} style={{
+                    padding: '5px 14px', borderRadius: 20, fontSize: 11, fontWeight: 600,
+                    cursor: 'pointer', border: `1px solid ${detail === val ? '#00E5A0' : '#1E2D45'}`,
+                    background: detail === val ? '#00E5A018' : 'transparent',
+                    color: detail === val ? '#00E5A0' : '#6B7A99',
+                  }}>{label}</button>
+                ))}
+              </div>
               <button
                 onClick={e => { e.stopPropagation(); generate(); }}
                 style={{
@@ -169,6 +180,14 @@ export default function AINarrative() {
 
               {/* Action buttons */}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {[['short','Brief'],['detailed','Detailed']].map(([val, label]) => (
+                  <button key={val} onClick={e => { e.stopPropagation(); setDetail(val); }} style={{
+                    padding: '5px 12px', borderRadius: 20, fontSize: 11, fontWeight: 600,
+                    cursor: 'pointer', border: `1px solid ${detail === val ? '#00E5A0' : C.border}`,
+                    background: detail === val ? '#00E5A018' : 'transparent',
+                    color: detail === val ? '#00E5A0' : C.sub,
+                  }}>{label}</button>
+                ))}
                 <button
                   onClick={e => { e.stopPropagation(); generate(); }}
                   style={{
