@@ -76,9 +76,9 @@ ${instruction}`;
         ? date_range?.from
         : `${date_range?.from} - ${date_range?.to}`;
 
-      const cfg = await getSettings();
-      const qaChannel = cfg('slack_channel_qa_insight', 'C03TBH0RL76');
-      const featureSlack = cfg('feature_slack_sends', 'true');
+      const settings = await getSettings();
+      const qaChannel = settings['slack_channel_qa_insight'] ?? 'C03TBH0RL76';
+      const featureSlack = settings['feature_slack_sends'] ?? 'true';
 
       if (featureSlack === 'false') {
         return Response.json({ insight, slack_error: 'slack_disabled_by_settings' });
