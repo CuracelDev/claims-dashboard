@@ -81,7 +81,7 @@ export default function PrismPage() {
         text: data.success
           ? data.prism_reply
             ? data.prism_reply
-            : `Message sent to Prism ✓ — waiting for reply in #healthops-alerts 👀`
+            : `Message sent to Prism ✓ — reply will appear in the #test channel in Slack. Logged under Intelligence Log.`
           : `Something went wrong: ${data.error}`,
         ts: new Date().toISOString(),
         category: data.category,
