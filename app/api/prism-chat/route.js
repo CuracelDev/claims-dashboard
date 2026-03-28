@@ -18,10 +18,7 @@ export async function POST(request) {
         blocks: [
           {
             type: 'section',
-            text: {
-              type: 'mrkdwn',
-              text: `<@U0AF86M8TRS> ${message}`,
-            },
+            text: { type: 'mrkdwn', text: `<@U0AF86M8TRS> ${message}` },
           },
           {
             type: 'context',

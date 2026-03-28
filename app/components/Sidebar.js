@@ -31,6 +31,7 @@ const NAV = [
       { href: '/ops',     icon: '⚡', label: 'Ops Overview',     sub: 'Team performance' },
       { href: '/targets', icon: '🎯', label: 'Targets',          sub: 'Weekly goals & alerts' },
       { href: '/audit',   icon: '🗂️', label: 'Audit Log',         sub: 'Activity trail' },
+      { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops' },
     ],
   },
   {
@@ -51,7 +52,7 @@ const NAV = [
     items: [
       { href: '/errors', icon: '🔴', label: 'Error Tracking',    disabled: true },
       { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',       disabled: true },
-      { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops' },
+      
     ],
   },
 ];
