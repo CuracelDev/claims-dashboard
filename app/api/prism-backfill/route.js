@@ -5,7 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 export const dynamic = 'force-dynamic';
 
 const PRISM_ID = 'U0AF86M8TRS';
-const CHANNEL = 'C0ALCPCE9FZ';
+const CHANNEL = 'C03TBH0RL76';
 const CLAIMS_BOT_ID = 'U0AGVJNJ20M';
 
 function getSupabase() {
@@ -66,7 +66,7 @@ export async function GET(request) {
 
     for (const msg of history.messages || []) {
       // Only messages from Claims Dashboard bot mentioning Prism
-      if (msg.user !== CLAIMS_BOT_ID && msg.bot_id !== 'B0AH2KJ3KBN') continue;
+      // Skip bot messages — only real user messages to Prism
       // Check text field OR blocks for Prism mention
       const textHasPrism = msg.text?.includes(`<@${PRISM_ID}>`);
       const blockHasPrism = JSON.stringify(msg.blocks || []).includes(PRISM_ID);
@@ -91,13 +91,15 @@ export async function GET(request) {
         continue;
       }
 
-      // Get sender name from blocks context
-      let sent_by = 'Claims Dashboard';
-      const context = msg.blocks?.find(b => b.type === 'context');
-      if (context) {
-        const match = context.elements?.[0]?.text?.match(/by \*([^*]+)\*/);
-        if (match) sent_by = match[1];
-      }
+      // Use slack user ID as sender (will show as ID, readable enough)
+      const USER_NAMES = {
+        'U016XUR9PAQ': 'Muyiwa',
+        'U04F378PJ04': 'Sophie',
+        'U073WM5UV8E': 'Emmanuel',
+        'U0AF86M8TRS': 'Prism',
+        'U0AGVJNJ20M': 'Claims Dashboard',
+      };
+      const sent_by = USER_NAMES[msg.user] || msg.user || 'Unknown';
 
       // Categorise
       const { category, summary } = await categorise(cleanMsg);
