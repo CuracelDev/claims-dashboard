@@ -29,6 +29,7 @@ export default function PrismLogPage() {
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('All');
+  const [expanded, setExpanded] = useState({});
 
   const categories = ['All', 'Pipeline Health', 'QA Analysis', 'Escalation', 'Weekly Review', 'Task Assignment', 'Reminder', 'Custom Query', 'General'];
 
@@ -48,6 +49,10 @@ export default function PrismLogPage() {
   const dateLabel = (ts) => new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   const timeLabel = (ts) => new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 
+  function toggleExpand(id) {
+    setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
+  }
+
   return (
     <div style={{ padding: '28px 32px', background: C.bg, minHeight: '100vh' }}>
 
@@ -61,7 +66,7 @@ export default function PrismLogPage() {
           }}>✦</div>
           <div style={{ fontSize: 18, fontWeight: 700, color: C.text }}>Prism Intelligence Log</div>
         </div>
-        <div style={{ fontSize: 12, color: C.muted }}>All requests sent to Prism, auto-categorised by AI</div>
+        <div style={{ fontSize: 12, color: C.muted }}>All requests sent to Prism, auto-categorised by AI. Click any row to see Prism's reply.</div>
       </div>
 
       {/* Stats */}
@@ -69,7 +74,7 @@ export default function PrismLogPage() {
         {[
           { label: 'Total Requests', value: logs.length },
           { label: 'This Week', value: logs.filter(l => new Date(l.created_at) > new Date(Date.now() - 7 * 86400000)).length },
-          { label: 'Categories', value: [...new Set(logs.map(l => l.category))].length },
+          { label: 'With Replies', value: logs.filter(l => l.prism_reply).length },
           { label: 'Team Members', value: [...new Set(logs.map(l => l.sent_by))].length },
         ].map(stat => (
           <div key={stat.label} style={{
@@ -107,33 +112,82 @@ export default function PrismLogPage() {
         <div style={{ textAlign: 'center', color: C.muted, padding: 60 }}>No requests found.</div>
       ) : (
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+
+          {/* Header */}
           <div style={{
-            display: 'grid', gridTemplateColumns: '130px 110px 140px 1fr 80px',
+            display: 'grid', gridTemplateColumns: '130px 100px 140px 1fr 90px 32px',
             padding: '10px 16px', borderBottom: `1px solid ${C.border}`,
             background: C.elevated,
           }}>
-            {['Date', 'Sent By', 'Category', 'Summary', 'Status'].map(h => (
+            {['Date', 'Sent By', 'Category', 'Summary', 'Status', ''].map(h => (
               <div key={h} style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</div>
             ))}
           </div>
 
           {filtered.map((log, i) => (
-            <div key={log.id} style={{
-              display: 'grid', gridTemplateColumns: '130px 110px 140px 1fr 80px',
-              padding: '12px 16px', alignItems: 'center',
-              borderBottom: i < filtered.length - 1 ? `1px solid ${C.border}` : 'none',
-              background: i % 2 === 0 ? 'transparent' : `${C.elevated}50`,
-            }}>
-              <div>
-                <div style={{ fontSize: 11, color: C.text, fontWeight: 500 }}>{dateLabel(log.created_at)}</div>
-                <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{timeLabel(log.created_at)}</div>
+            <div key={log.id}>
+              {/* Main Row */}
+              <div
+                onClick={() => log.prism_reply && toggleExpand(log.id)}
+                style={{
+                  display: 'grid', gridTemplateColumns: '130px 100px 140px 1fr 90px 32px',
+                  padding: '12px 16px', alignItems: 'center',
+                  borderBottom: !expanded[log.id] && i < filtered.length - 1 ? `1px solid ${C.border}` : 'none',
+                  background: expanded[log.id] ? `${C.accent}08` : i % 2 === 0 ? 'transparent' : `${C.elevated}50`,
+                  cursor: log.prism_reply ? 'pointer' : 'default',
+                  transition: 'background 0.15s',
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 11, color: C.text, fontWeight: 500 }}>{dateLabel(log.created_at)}</div>
+                  <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{timeLabel(log.created_at)}</div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{log.sent_by}</div>
+                  {log.flagged_user && <span title="Unknown user">🏴</span>}
+                </div>
+                <div><CategoryBadge category={log.category} /></div>
+                <div style={{ fontSize: 12, color: C.text, lineHeight: 1.4, paddingRight: 12 }}>{log.summary}</div>
+                <div style={{ fontSize: 10, fontWeight: 700, color: log.status === 'sent' ? '#10B981' : C.muted }}>
+                  {log.prism_reply ? '✅ Replied' : '📤 Sent'}
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, textAlign: 'center' }}>
+                  {log.prism_reply ? (expanded[log.id] ? '▴' : '▾') : ''}
+                </div>
               </div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{log.sent_by}</div>
-              <div><CategoryBadge category={log.category} /></div>
-              <div style={{ fontSize: 12, color: C.text, lineHeight: 1.4, paddingRight: 12 }}>{log.summary}</div>
-              <div style={{ fontSize: 10, fontWeight: 700, color: log.status === 'sent' ? '#10B981' : C.muted }}>
-                {log.status === 'sent' ? '✅ Sent' : log.status}
-              </div>
+
+              {/* Expanded Reply */}
+              {expanded[log.id] && log.prism_reply && (
+                <div style={{
+                  padding: '0 16px 16px 16px',
+                  borderBottom: i < filtered.length - 1 ? `1px solid ${C.border}` : 'none',
+                  background: `${C.accent}08`,
+                }}>
+                  {/* User message */}
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                      👤 {log.sent_by} asked
+                    </div>
+                    <div style={{
+                      padding: '10px 14px', borderRadius: 8, borderBottomLeftRadius: 2,
+                      background: C.elevated, border: `1px solid ${C.border}`,
+                      fontSize: 12, color: C.text, lineHeight: 1.6, whiteSpace: 'pre-wrap',
+                    }}>{log.message}</div>
+                  </div>
+
+                  {/* Prism reply */}
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#7B61FF', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                      ✦ Prism replied
+                    </div>
+                    <div style={{
+                      padding: '10px 14px', borderRadius: 8, borderBottomLeftRadius: 2,
+                      background: '#7B61FF12', border: '1px solid #7B61FF25',
+                      fontSize: 12, color: C.text, lineHeight: 1.6, whiteSpace: 'pre-wrap',
+                    }}>{log.prism_reply}</div>
+                  </div>
+                </div>
+              )}
             </div>
           ))}
         </div>
