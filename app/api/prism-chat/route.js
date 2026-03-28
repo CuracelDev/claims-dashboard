@@ -26,10 +26,10 @@ async function slackPost(body) {
   return res.json();
 }
 
-async function pollForReply(ts, maxWait = 15000) {
+async function pollForReply(ts, maxWait = 30000) {
   const start = Date.now();
   while (Date.now() - start < maxWait) {
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 4000));
     const res = await fetch(
       `https://slack.com/api/conversations.replies?channel=${CHANNEL}&ts=${ts}`,
       { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
@@ -80,7 +80,7 @@ export async function POST(request) {
     // Post to Slack
     const slackData = await slackPost({
       channel: CHANNEL,
-      text: `<@${PRISM_ID}> ${message}`,
+      text: message,
       blocks: [
         {
           type: 'section',
