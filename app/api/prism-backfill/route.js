@@ -67,9 +67,16 @@ export async function GET(request) {
     for (const msg of history.messages || []) {
       // Only messages from Claims Dashboard bot mentioning Prism
       if (msg.user !== CLAIMS_BOT_ID && msg.bot_id !== 'B0AH2KJ3KBN') continue;
-      if (!msg.text?.includes(`<@${PRISM_ID}>`)) continue;
+      // Check text field OR blocks for Prism mention
+      const textHasPrism = msg.text?.includes(`<@${PRISM_ID}>`);
+      const blockHasPrism = JSON.stringify(msg.blocks || []).includes(PRISM_ID);
+      if (!textHasPrism && !blockHasPrism) continue;
 
-      const cleanMsg = stripMentions(msg.text);
+      // Pull message from block text if available, else fall back to msg.text
+      let rawText = msg.text || '';
+      const sectionBlock = (msg.blocks || []).find(b => b.type === 'section');
+      if (sectionBlock?.text?.text) rawText = sectionBlock.text.text;
+      const cleanMsg = stripMentions(rawText);
       if (!cleanMsg) continue;
 
       // Check if already logged
