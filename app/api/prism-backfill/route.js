@@ -6,7 +6,14 @@ export const dynamic = 'force-dynamic';
 
 const PRISM_ID = 'U0AF86M8TRS';
 const CHANNEL = 'C03TBH0RL76';
-const CLAIMS_BOT_ID = 'U0AGVJNJ20M';
+
+const USER_NAMES = {
+  'U016XUR9PAQ': 'Muyiwa',
+  'U04F378PJ04': 'Sophie',
+  'U073WM5UV8E': 'Emmanuel',
+  'U0AF86M8TRS': 'Prism',
+  'U0AGVJNJ20M': 'Claims Dashboard',
+};
 
 function getSupabase() {
   return createClient(
@@ -52,31 +59,48 @@ export async function GET(request) {
   }
 
   try {
-    const weekAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
+    const monthAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
     const res = await fetch(
-      `https://slack.com/api/conversations.history?channel=${CHANNEL}&oldest=${weekAgo}&limit=50`,
+      `https://slack.com/api/conversations.history?channel=${CHANNEL}&oldest=${monthAgo}&limit=100`,
       { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
     );
     const history = await res.json();
     if (!history.ok) throw new Error(history.error);
 
+    // Collect all messages including thread replies
+    const allMessages = [];
+    for (const msg of history.messages || []) {
+      allMessages.push(msg);
+      if (msg.reply_count > 0) {
+        try {
+          const threadRes = await fetch(
+            `https://slack.com/api/conversations.replies?channel=${CHANNEL}&ts=${msg.thread_ts || msg.ts}&limit=50`,
+            { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
+          );
+          const thread = await threadRes.json();
+          if (thread.ok) {
+            for (const reply of thread.messages || []) {
+              if (reply.ts !== msg.ts) allMessages.push(reply);
+            }
+          }
+        } catch {}
+      }
+    }
+
     const supabase = getSupabase();
     const inserted = [];
     const skipped = [];
 
-    for (const msg of history.messages || []) {
-      // Only messages from Claims Dashboard bot mentioning Prism
-      // Skip bot messages — only real user messages to Prism
-      // Check text field OR blocks for Prism mention
+    for (const msg of allMessages) {
+      // Only messages mentioning Prism
       const textHasPrism = msg.text?.includes(`<@${PRISM_ID}>`);
       const blockHasPrism = JSON.stringify(msg.blocks || []).includes(PRISM_ID);
       if (!textHasPrism && !blockHasPrism) continue;
 
-      // Pull message from block text if available, else fall back to msg.text
-      let rawText = msg.text || '';
-      const sectionBlock = (msg.blocks || []).find(b => b.type === 'section');
-      if (sectionBlock?.text?.text) rawText = sectionBlock.text.text;
-      const cleanMsg = stripMentions(rawText);
+      // Skip Prism's own messages
+      if (msg.user === PRISM_ID) continue;
+
+      const cleanMsg = stripMentions(msg.text);
       if (!cleanMsg) continue;
 
       // Check if already logged
@@ -91,20 +115,9 @@ export async function GET(request) {
         continue;
       }
 
-      // Use slack user ID as sender (will show as ID, readable enough)
-      const USER_NAMES = {
-        'U016XUR9PAQ': 'Muyiwa',
-        'U04F378PJ04': 'Sophie',
-        'U073WM5UV8E': 'Emmanuel',
-        'U0AF86M8TRS': 'Prism',
-        'U0AGVJNJ20M': 'Claims Dashboard',
-      };
       const sent_by = USER_NAMES[msg.user] || msg.user || 'Unknown';
-
-      // Categorise
       const { category, summary } = await categorise(cleanMsg);
 
-      // Insert
       const { error } = await supabase.from('prism_logs').insert({
         sent_by,
         message: cleanMsg,
