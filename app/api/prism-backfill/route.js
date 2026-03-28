@@ -52,7 +52,7 @@ export async function GET(request) {
   }
 
   try {
-    const weekAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+    const weekAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
     const res = await fetch(
       `https://slack.com/api/conversations.history?channel=${CHANNEL}&oldest=${weekAgo}&limit=50`,
       { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
