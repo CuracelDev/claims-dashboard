@@ -6,7 +6,7 @@
     },
     {
       "path": "/api/qa-daily-summary?secret=DataOps2026",
-      "schedule": "25 0 * * *"
+      "schedule": "0 5 * * *"
     }
   ]
 }

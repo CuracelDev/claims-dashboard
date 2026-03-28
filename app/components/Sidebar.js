@@ -31,7 +31,10 @@ const NAV = [
       { href: '/ops',     icon: '⚡', label: 'Ops Overview',     sub: 'Team performance' },
       { href: '/targets', icon: '🎯', label: 'Targets',          sub: 'Weekly goals & alerts' },
       { href: '/audit',   icon: '🗂️', label: 'Audit Log',         sub: 'Activity trail' },
-      { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops' },
+      { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops', children: [
+        { href: '/slack', icon: '💬', label: 'Chat' },
+        { href: '/slack/log', icon: '📋', label: 'Intelligence Log' },
+      ]},
     ],
   },
   {
@@ -67,6 +70,7 @@ export default function Sidebar() {
   const [signingOut, setSigningOut] = useState(false);
   const [tooltip,    setTooltip]    = useState(null);
   const [loginBanner, setLoginBanner] = useState(false);
+  const [expanded, setExpanded] = useState({ '/slack': true });
 
   useEffect(() => {
     const session = getSession();
@@ -237,6 +241,57 @@ export default function Sidebar() {
                         boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
                       }}>
                         🔐 Login required
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+
+              // Parent with children
+              if (item.children) {
+                const isExpanded = expanded[item.href];
+                return (
+                  <div key={item.href}>
+                    <div
+                      onClick={() => setExpanded(prev => ({ ...prev, [item.href]: !prev[item.href] }))}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = `${C.accent}08`; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 10,
+                        padding: '8px 10px', borderRadius: 8, marginBottom: 2,
+                        cursor: 'pointer', transition: 'all .15s',
+                      }}
+                    >
+                      <span style={{ fontSize: 15 }}>{item.icon}</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 13, fontWeight: 400, color: C.text }}>{item.label}</div>
+                        {item.sub && <div style={{ fontSize: 10, color: C.muted, marginTop: 1 }}>{item.sub}</div>}
+                      </div>
+                      <span style={{ fontSize: 10, color: C.muted }}>{isExpanded ? '▾' : '▸'}</span>
+                    </div>
+                    {isExpanded && (
+                      <div style={{ marginLeft: 24, marginBottom: 4 }}>
+                        {item.children.map(child => {
+                          const childActive = pathname === child.href;
+                          return (
+                            <Link key={child.href} href={child.href} style={{ textDecoration: 'none' }}>
+                              <div
+                                onMouseEnter={(e) => { if (!childActive) e.currentTarget.style.background = `${C.accent}08`; }}
+                                onMouseLeave={(e) => { if (!childActive) e.currentTarget.style.background = 'transparent'; }}
+                                style={{
+                                  display: 'flex', alignItems: 'center', gap: 8,
+                                  padding: '6px 10px', borderRadius: 8, marginBottom: 2,
+                                  background: childActive ? `${C.accent}15` : 'transparent',
+                                  border: childActive ? `1px solid ${C.accent}30` : '1px solid transparent',
+                                  cursor: 'pointer', transition: 'all .15s',
+                                }}
+                              >
+                                <span style={{ fontSize: 12 }}>{child.icon}</span>
+                                <div style={{ fontSize: 12, fontWeight: childActive ? 600 : 400, color: childActive ? C.accent : C.muted }}>{child.label}</div>
+                              </div>
+                            </Link>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
