@@ -51,7 +51,7 @@ const NAV = [
     items: [
       { href: '/errors', icon: '🔴', label: 'Error Tracking',    disabled: true },
       { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',       disabled: true },
-      { href: '/slack',  icon: '💬', label: 'Slack Intelligence', disabled: true },
+      { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops' },
     ],
   },
 ];
