@@ -30,15 +30,26 @@ async function pollForReply(ts, maxWait = 30000) {
   const start = Date.now();
   while (Date.now() - start < maxWait) {
     await new Promise(r => setTimeout(r, 4000));
-    const res = await fetch(
+    // Check thread replies on our message
+    const threadRes = await fetch(
       `https://slack.com/api/conversations.replies?channel=${CHANNEL}&ts=${ts}`,
       { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
     );
-    const data = await res.json();
-    if (data.ok) {
-      const reply = (data.messages || []).find(
+    const threadData = await threadRes.json();
+    if (threadData.ok) {
+      const reply = (threadData.messages || []).find(
         m => m.user === PRISM_ID && m.ts !== ts
       );
+      if (reply) return reply.text;
+    }
+    // Also check recent channel messages for any Prism response
+    const histRes = await fetch(
+      `https://slack.com/api/conversations.history?channel=${CHANNEL}&oldest=${ts}&limit=10`,
+      { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
+    );
+    const histData = await histRes.json();
+    if (histData.ok) {
+      const reply = (histData.messages || []).find(m => m.user === PRISM_ID);
       if (reply) return reply.text;
     }
   }
