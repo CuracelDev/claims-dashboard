@@ -5,7 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 export const dynamic = 'force-dynamic';
 
 const PRISM_ID = 'U0AF86M8TRS';
-const CHANNEL = 'C03TBH0RL76';
+const CHANNEL = 'C06DVSADD6J';
 
 function getSupabase() {
   return createClient(
