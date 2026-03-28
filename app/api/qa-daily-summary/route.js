@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { getSettings } from "../../lib/settings";
 
 export const dynamic = "force-dynamic";
 
@@ -10,7 +11,6 @@ function getSupabase() {
 }
 
 export async function GET(request) {
-  // Allow manual trigger with secret
   const { searchParams } = new URL(request.url);
   const secret = searchParams.get("secret");
   if (secret !== process.env.CRON_SECRET && secret !== "DataOps2026") {
@@ -20,9 +20,8 @@ export async function GET(request) {
   try {
     const supabase = getSupabase();
 
-    // Yesterday's date range (Lagos time UTC+1)
     const now = new Date();
-    const lagosOffset = 60; // minutes
+    const lagosOffset = 60;
     const lagosNow = new Date(now.getTime() + lagosOffset * 60000);
     const yesterday = new Date(lagosNow);
     yesterday.setDate(yesterday.getDate() - 1);
@@ -38,7 +37,6 @@ export async function GET(request) {
 
     if (error) throw error;
 
-    // Build summary
     const total = flags.length;
     const byInsurer = {};
     const byIssue = {};
@@ -55,7 +53,6 @@ export async function GET(request) {
       }
     }
 
-    // Format date nicely
     const dateLabel = new Date(yDate + "T12:00:00Z").toLocaleDateString("en-GB", {
       weekday: "long", day: "numeric", month: "long", year: "numeric"
     });
@@ -105,7 +102,14 @@ export async function GET(request) {
       ].join("\n");
     }
 
-    // Post to Slack
+    const settings = await getSettings();
+    const qaChannel = settings['slack_channel_qa_insight'] ?? 'C0ALCPCE9FZ';
+    const featureSlack = settings['feature_slack_sends'] ?? 'true';
+
+    if (featureSlack === 'false') {
+      return Response.json({ success: true, date: yDate, total_flags: total, slack_ok: false, slack_error: 'slack_disabled_by_settings' });
+    }
+
     const slackRes = await fetch("https://slack.com/api/chat.postMessage", {
       method: "POST",
       headers: {
@@ -113,7 +117,7 @@ export async function GET(request) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        channel: process.env.SLACK_HEALTH_OPS_CHANNEL_ID || "#health-ops",
+        channel: qaChannel,
         text: message,
         unfurl_links: false,
       }),
@@ -126,6 +130,7 @@ export async function GET(request) {
       date: yDate,
       total_flags: total,
       slack_ok: slackData.ok,
+      slack_channel: qaChannel,
       slack_error: slackData.error || null,
     });
 
@@ -137,11 +142,11 @@ export async function GET(request) {
 
 function categoriseIssue(issue) {
   const s = issue.toLowerCase();
-  if (s.includes("missing vetting"))   return "Missing Vetting Comment";
-  if (s.includes("approved >"))        return "Approved > Submitted";
+  if (s.includes("missing vetting"))     return "Missing Vetting Comment";
+  if (s.includes("approved >"))          return "Approved > Submitted";
   if (s.includes("unit price mismatch")) return "Unit Price Mismatch";
-  if (s.includes("submitted calc"))    return "Calculation Error";
+  if (s.includes("submitted calc"))      return "Calculation Error";
   if (s.includes("approved unit price")) return "Approved Price Mismatch";
-  if (s.includes("high quantity"))     return "High Quantity Outlier";
+  if (s.includes("high quantity"))       return "High Quantity Outlier";
   return "Other";
 }
