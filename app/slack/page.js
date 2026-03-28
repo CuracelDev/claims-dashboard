@@ -79,7 +79,9 @@ export default function PrismPage() {
       setMessages(prev => [...prev, {
         role: 'prism',
         text: data.success
-          ? `Got it — posted to Prism in Slack. Categorised as *${data.category}*. Check #healthops-alerts for the response 👀`
+          ? data.prism_reply
+            ? data.prism_reply
+            : `Message sent to Prism ✓ — waiting for reply in #healthops-alerts 👀`
           : `Something went wrong: ${data.error}`,
         ts: new Date().toISOString(),
         category: data.category,
