@@ -1,3 +1,4 @@
+// app/api/reports/route.js
 import { getSupabase } from '../../../lib/supabase';
 export const dynamic = 'force-dynamic';
 
@@ -10,7 +11,6 @@ export async function GET(request) {
     const memberId = searchParams.get('member_id');
     const limit = parseInt(searchParams.get('limit') || '50');
 
-    // Single report lookup
     if (personId && date) {
       const { data, error } = await supabase
         .from('daily_reports')
@@ -22,7 +22,6 @@ export async function GET(request) {
       return Response.json({ data });
     }
 
-    // Team view for a date
     if (date) {
       const { data, error } = await supabase
         .from('daily_reports')
@@ -34,7 +33,6 @@ export async function GET(request) {
       return Response.json({ data: data || [] });
     }
 
-    // History
     let q = supabase
       .from('daily_reports')
       .select('*, team_members(name, display_name, role)')
@@ -71,7 +69,6 @@ export async function POST(request) {
 
     const memberId = parseInt(team_member_id);
 
-    // Convert all metric values to numbers (inputs come as strings)
     const safeMetrics = {};
     if (metrics && typeof metrics === 'object' && !Array.isArray(metrics)) {
       for (const [k, v] of Object.entries(metrics)) {
@@ -89,7 +86,7 @@ export async function POST(request) {
       status: status || 'submitted',
     };
 
-    // Check if exists — use limit(1) not maybeSingle() to avoid crash on duplicate rows
+    // Check if exists
     const { data: existingRows } = await supabase
       .from('daily_reports')
       .select('id')
@@ -99,19 +96,16 @@ export async function POST(request) {
       .limit(1);
     const existing = existingRows?.[0];
 
-    let data, error;
+    let data, error, isEdit;
     if (existing?.id) {
+      isEdit = true;
       ({ data, error } = await supabase
         .from('daily_reports')
-        .update({
-          metrics: safeMetrics,
-          tasks_completed: tasks_completed || null,
-          notes: notes || null,
-          status: status || 'submitted',
-        })
+        .update({ metrics: safeMetrics, tasks_completed: tasks_completed || null, notes: notes || null, status: status || 'submitted' })
         .eq('id', existing.id)
         .select().single());
     } else {
+      isEdit = false;
       ({ data, error } = await supabase
         .from('daily_reports')
         .insert(payload)
@@ -119,6 +113,27 @@ export async function POST(request) {
     }
 
     if (error) return Response.json({ error: error.message }, { status: 500 });
+
+    // Look up member name for audit
+    const { data: member } = await supabase
+      .from('team_members')
+      .select('name, display_name')
+      .eq('id', memberId)
+      .maybeSingle();
+
+    // Audit log
+    try {
+      await supabase.from('audit_log').insert({
+        member_id:   memberId,
+        member_name: member?.display_name || member?.name || 'Unknown',
+        action:      isEdit ? 'report.edit' : 'report.submit',
+        entity_type: 'daily_report',
+        entity_id:   data?.id || null,
+        details:     { report_date, status: status || 'submitted' },
+        source:      'app',
+      });
+    } catch {}
+
     return Response.json({ data });
 
   } catch (err) {

@@ -1,7 +1,6 @@
-// PATH: app/api/settings/route.js
+// app/api/settings/route.js
 import { createClient } from '@supabase/supabase-js';
 import { clearSettingsCache } from '../../lib/settings';
-
 export const dynamic = 'force-dynamic';
 
 function getSupabase() {
@@ -11,7 +10,6 @@ function getSupabase() {
   );
 }
 
-// GET /api/settings — fetch all settings (optionally by category)
 export async function GET(request) {
   const supabase = getSupabase();
   const { searchParams } = new URL(request.url);
@@ -25,15 +23,16 @@ export async function GET(request) {
   return Response.json({ settings: data || [], map });
 }
 
-// PATCH /api/settings — update one or many settings
-// Body: { updates: [{ key, value }] }
 export async function PATCH(request) {
   const supabase = getSupabase();
   try {
-    const { updates } = await request.json();
+    const body = await request.json();
+    const { updates, updated_by_name } = body;
+
     if (!Array.isArray(updates) || updates.length === 0) {
       return Response.json({ error: 'No updates provided' }, { status: 400 });
     }
+
     const results = [];
     for (const { key, value } of updates) {
       const { data, error } = await supabase
@@ -45,9 +44,23 @@ export async function PATCH(request) {
       if (error) results.push({ key, success: false, error: error.message });
       else results.push({ key, success: true, data });
     }
+
     const allOk = results.every(r => r.success);
-    // Bust the settings cache so next read gets fresh data immediately
     if (allOk) clearSettingsCache();
+
+    // Audit log
+    try {
+      await supabase.from('audit_log').insert({
+        member_id:   null,
+        member_name: updated_by_name || 'Admin',
+        action:      'settings.update',
+        entity_type: 'platform_settings',
+        entity_id:   null,
+        details:     { keys: updates.map(u => u.key) },
+        source:      'app',
+      });
+    } catch {}
+
     return Response.json({ results, ok: allOk });
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });

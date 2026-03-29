@@ -1,6 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
-
-export const dynamic = "force-dynamic";
+// app/api/tasks/[id]/route.js
+import { createClient } from '@supabase/supabase-js';
+export const dynamic = 'force-dynamic';
 
 function getSupabase() {
   return createClient(
@@ -9,7 +9,7 @@ function getSupabase() {
   );
 }
 
-// PATCH /api/tasks/[id] — update status (todo → in_progress → done)
+// PATCH /api/tasks/[id] — update status
 export async function PATCH(request, { params }) {
   try {
     const supabase = getSupabase();
@@ -17,91 +17,80 @@ export async function PATCH(request, { params }) {
     const body = await request.json();
     const { status, completed_by_name } = body;
 
-    const validStatuses = ["todo", "in_progress", "done"];
+    const validStatuses = ['todo', 'in_progress', 'done'];
     if (!validStatuses.includes(status)) {
-      return Response.json({ error: "Invalid status" }, { status: 400 });
+      return Response.json({ error: 'Invalid status' }, { status: 400 });
     }
 
     const updatePayload = { status };
-    if (status === "done") {
+    if (status === 'done') {
       updatePayload.completed_at = new Date().toISOString();
     } else {
       updatePayload.completed_at = null;
     }
 
     const { data: task, error } = await supabase
-      .from("tasks")
+      .from('tasks')
       .update(updatePayload)
-      .eq("id", id)
-      .select(`
-        *,
-        team_members!tasks_assigned_to_fkey(id, name, slack_user_id)
-      `)
+      .eq('id', id)
+      .select(`*, team_members!tasks_assigned_to_fkey(id, name, slack_user_id)`)
       .single();
 
     if (error) throw error;
 
-    // If marked done: notify assigner via Slack DM
-    if (status === "done" && task.assigned_by && process.env.SLACK_BOT_TOKEN) {
+    // Slack DM if marked done
+    if (status === 'done' && task.assigned_by && process.env.SLACK_BOT_TOKEN) {
       try {
-        // Look up assigner's slack_user_id by name
         const { data: assigner } = await supabase
-          .from("team_members")
-          .select("slack_user_id, name")
-          .ilike("name", task.assigned_by)
+          .from('team_members')
+          .select('slack_user_id, name')
+          .ilike('name', task.assigned_by)
           .single();
 
         if (assigner?.slack_user_id) {
-          const openRes = await fetch("https://slack.com/api/conversations.open", {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-              "Content-Type": "application/json",
-            },
+          const openRes = await fetch('https://slack.com/api/conversations.open', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ users: assigner.slack_user_id }),
           });
           const openData = await openRes.json();
 
           if (openData.ok) {
-            const completedBy = completed_by_name || task.team_members?.name || "A team member";
-            await fetch("https://slack.com/api/chat.postMessage", {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-                "Content-Type": "application/json",
-              },
+            const completedBy = completed_by_name || task.team_members?.name || 'A team member';
+            await fetch('https://slack.com/api/chat.postMessage', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 channel: openData.channel.id,
                 blocks: [
-                  {
-                    type: "section",
-                    text: {
-                      type: "mrkdwn",
-                      text: `✅ *Task completed!*\n*${completedBy}* just completed: *${task.title}*`,
-                    },
-                  },
-                  {
-                    type: "context",
-                    elements: [
-                      {
-                        type: "mrkdwn",
-                        text: `Completed at ${new Date().toLocaleString("en-GB", { timeZone: "Africa/Lagos", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })} Lagos time`,
-                      },
-                    ],
-                  },
+                  { type: 'section', text: { type: 'mrkdwn', text: `✅ *Task completed!*\n*${completedBy}* just completed: *${task.title}*` } },
+                  { type: 'context', elements: [{ type: 'mrkdwn', text: `Completed at ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} Lagos time` }] },
                 ],
               }),
             });
           }
         }
       } catch (slackErr) {
-        console.error("Slack completion DM error (non-fatal):", slackErr);
+        console.error('Slack completion DM error (non-fatal):', slackErr);
       }
     }
 
+    // Audit log
+    try {
+      await supabase.from('audit_log').insert({
+        member_id:   null,
+        member_name: completed_by_name || 'App',
+        action:      'task.update',
+        entity_type: 'task',
+        entity_id:   parseInt(id),
+        details:     { status, title: task.title },
+        source:      'app',
+      });
+    } catch {}
+
     return Response.json({ task });
   } catch (err) {
-    console.error("PATCH /api/tasks/[id] error:", err);
+    console.error('PATCH /api/tasks/[id] error:', err);
     return Response.json({ error: err.message }, { status: 500 });
   }
 }
@@ -112,12 +101,32 @@ export async function DELETE(request, { params }) {
     const supabase = getSupabase();
     const { id } = params;
 
-    const { error } = await supabase.from("tasks").delete().eq("id", id);
+    // Fetch task title before deleting for audit context
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('title, assigned_by')
+      .eq('id', id)
+      .maybeSingle();
+
+    const { error } = await supabase.from('tasks').delete().eq('id', id);
     if (error) throw error;
+
+    // Audit log
+    try {
+      await supabase.from('audit_log').insert({
+        member_id:   null,
+        member_name: task?.assigned_by || 'Admin',
+        action:      'task.delete',
+        entity_type: 'task',
+        entity_id:   parseInt(id),
+        details:     { title: task?.title },
+        source:      'app',
+      });
+    } catch {}
 
     return Response.json({ success: true });
   } catch (err) {
-    console.error("DELETE /api/tasks/[id] error:", err);
+    console.error('DELETE /api/tasks/[id] error:', err);
     return Response.json({ error: err.message }, { status: 500 });
   }
 }
