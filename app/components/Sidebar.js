@@ -30,9 +30,10 @@ const NAV = [
       { href: '/qa',      icon: '🔍', label: 'QA Flag Tracker', sub: 'Claims quality audit' },
       { href: '/ops',     icon: '⚡', label: 'Ops Overview',     sub: 'Team performance' },
       { href: '/targets', icon: '🎯', label: 'Targets',          sub: 'Weekly goals & alerts' },
-      { href: '/audit',   icon: '🗂️', label: 'Audit Log',         sub: 'Activity trail' },
+      { href: '/errors',  icon: '⚠️', label: 'Error Tracker',    sub: 'Claim errors from Slack' },
+      { href: '/audit',   icon: '🗂️', label: 'Audit Log',        sub: 'Activity trail' },
       { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops', children: [
-        { href: '/slack', icon: '💬', label: 'Chat' },
+        { href: '/slack',     icon: '💬', label: 'Chat' },
         { href: '/slack/log', icon: '📋', label: 'Intelligence Log' },
       ]},
     ],
@@ -53,9 +54,7 @@ const NAV = [
   {
     section: 'COMING SOON',
     items: [
-      { href: '/errors', icon: '🔴', label: 'Error Tracking',    disabled: true },
-      { href: '/okrs',   icon: '🎯', label: 'OKR Tracker',       disabled: true },
-      
+      { href: '/okrs', icon: '🎯', label: 'OKR Tracker', disabled: true },
     ],
   },
 ];
@@ -186,7 +185,6 @@ export default function Sidebar() {
               const active = isActive(item);
               const locked = guestMode && !GUEST_ROUTES.includes(item.href) && !item.disabled;
 
-              // Disabled (coming soon)
               if (item.disabled) {
                 return (
                   <div key={item.href} style={{
@@ -203,20 +201,13 @@ export default function Sidebar() {
                 );
               }
 
-              // Locked (guest trying to access protected route)
               if (locked) {
                 return (
                   <div
                     key={item.href}
                     onClick={handleLockedClick}
-                    onMouseEnter={(e) => {
-                      setTooltip(item.href);
-                      e.currentTarget.style.background = `${C.accent}10`;
-                    }}
-                    onMouseLeave={(e) => {
-                      setTooltip(null);
-                      e.currentTarget.style.background = 'transparent';
-                    }}
+                    onMouseEnter={(e) => { setTooltip(item.href); e.currentTarget.style.background = `${C.accent}10`; }}
+                    onMouseLeave={(e) => { setTooltip(null); e.currentTarget.style.background = 'transparent'; }}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 10,
                       padding: '8px 10px', borderRadius: 8, marginBottom: 2,
@@ -247,7 +238,6 @@ export default function Sidebar() {
                 );
               }
 
-              // Parent with children
               if (item.children) {
                 const isExpanded = expanded[item.href];
                 return (
@@ -298,7 +288,6 @@ export default function Sidebar() {
                 );
               }
 
-              // Normal nav item
               return (
                 <Link key={item.href} href={item.href} style={{ textDecoration: 'none' }}>
                   <div
