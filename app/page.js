@@ -111,7 +111,7 @@ export default function Dashboard() {
   const [memberName, setMemberName] = useState('');
 
   useEffect(() => {
-    const name = localStorage.getItem('member_name') || '';
+    const raw = localStorage.getItem('claims_intel_session'); const name = raw ? (JSON.parse(raw)?.member_name || '') : '';
     setMemberName(name.split(' ')[0]);
   }, []);
 
