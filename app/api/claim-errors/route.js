@@ -23,6 +23,7 @@ export async function GET(request) {
     const from       = searchParams.get('from');
     const to         = searchParams.get('to');
 
+    // ── Paginated filtered query ──────────────────────────
     let query = supabase
       .from('claim_errors')
       .select('*', { count: 'exact' })
@@ -39,8 +40,8 @@ export async function GET(request) {
     const { data, error, count } = await query;
     if (error) throw error;
 
-    // Summary stats
-    const { data: stats } = await supabase
+    // ── Stats from ALL rows (unfiltered) ──────────────────
+    const { data: allRows } = await supabase
       .from('claim_errors')
       .select('error_type, hmo, env, channel_name');
 
@@ -49,15 +50,15 @@ export async function GET(request) {
     const byEnv     = {};
     const byChannel = {};
 
-    (stats || []).forEach(r => {
-      if (r.error_type) byType[r.error_type]       = (byType[r.error_type]       || 0) + 1;
-      if (r.hmo)        byHmo[r.hmo]               = (byHmo[r.hmo]               || 0) + 1;
-      if (r.env)        byEnv[r.env]               = (byEnv[r.env]               || 0) + 1;
+    for (const r of (allRows || [])) {
+      if (r.error_type)   byType[r.error_type]      = (byType[r.error_type]      || 0) + 1;
+      if (r.hmo)          byHmo[r.hmo]              = (byHmo[r.hmo]              || 0) + 1;
+      if (r.env)          byEnv[r.env]              = (byEnv[r.env]              || 0) + 1;
       if (r.channel_name) byChannel[r.channel_name] = (byChannel[r.channel_name] || 0) + 1;
-    });
+    }
 
     return Response.json({
-      data: data || [],
+      data:  data  || [],
       count: count || 0,
       stats: { byType, byHmo, byEnv, byChannel },
     });
