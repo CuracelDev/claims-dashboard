@@ -46,11 +46,11 @@ function StatPill({ label, value, color }) {
 export default function ErrorTrackerPage() {
   const { C } = useTheme();
 
-  const [logs,    setLogs]    = useState([]);
-  const [total,   setTotal]   = useState(0);
-  const [stats,   setStats]   = useState({ byType: {}, byHmo: {}, byEnv: {}, byChannel: {} });
-  const [loading, setLoading] = useState(true);
-  const [page,    setPage]    = useState(1);
+  const [logs,     setLogs]     = useState([]);
+  const [total,    setTotal]    = useState(0);
+  const [stats,    setStats]    = useState({ byType: {}, byHmo: {}, byEnv: {}, byChannel: {} });
+  const [loading,  setLoading]  = useState(true);
+  const [page,     setPage]     = useState(1);
   const [expanded, setExpanded] = useState(null);
 
   const [filters, setFilters] = useState({
@@ -73,9 +73,20 @@ export default function ErrorTrackerPage() {
     fetch(`/api/claim-errors?${p}`)
       .then(r => r.json())
       .then(d => {
-        setLogs(d.data || []);
+        const rows = d.data || [];
+
+        // Compute stats client-side from returned rows
+        const byType = {}, byHmo = {}, byEnv = {}, byChannel = {};
+        rows.forEach(r => {
+          if (r.error_type)   byType[r.error_type]      = (byType[r.error_type]      || 0) + 1;
+          if (r.hmo)          byHmo[r.hmo]              = (byHmo[r.hmo]              || 0) + 1;
+          if (r.env)          byEnv[r.env]              = (byEnv[r.env]              || 0) + 1;
+          if (r.channel_name) byChannel[r.channel_name] = (byChannel[r.channel_name] || 0) + 1;
+        });
+
+        setLogs(rows);
         setTotal(d.count || 0);
-        setStats(d.stats || { byType: {}, byHmo: {}, byEnv: {}, byChannel: {} });
+        setStats({ byType, byHmo, byEnv, byChannel });
         setLoading(false);
       })
       .catch(() => setLoading(false));
@@ -138,11 +149,11 @@ export default function ErrorTrackerPage() {
 
         {/* Stats row */}
         <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
-          <StatPill label="Total Errors"     value={totalCount}   color="#FF4D4D" />
-          <StatPill label="Import Failures"  value={importCount}  color="#FF4D4D" />
-          <StatPill label="Ref Failures"     value={refCount}     color="#FFB84D" />
-          <StatPill label="Top HMO"          value={topHmo}       color="#5B8DEF" />
-          <StatPill label="Channels"         value={Object.keys(stats.byChannel).length} color="#A78BFA" />
+          <StatPill label="Total Errors"    value={totalCount}                          color="#FF4D4D" />
+          <StatPill label="Import Failures" value={importCount}                         color="#FF4D4D" />
+          <StatPill label="Ref Failures"    value={refCount}                            color="#FFB84D" />
+          <StatPill label="Top HMO"         value={topHmo}                              color="#5B8DEF" />
+          <StatPill label="Channels"        value={Object.keys(stats.byChannel).length} color="#A78BFA" />
         </div>
 
         {/* Filters */}
