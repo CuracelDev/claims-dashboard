@@ -100,11 +100,27 @@ export default function Dashboard() {
   const { C } = useTheme();
   const CHART = CHART_COLORS;
   const PERIODS = PERIOD_COLORS;
+
   /* ── data state ─────────────────────────────────────── */
   const [rawData, setRawData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastUpdate, setLastUpdate] = useState(null);
+
+  /* ── greeting state ─────────────────────────────────── */
+  const [memberName, setMemberName] = useState('');
+
+  useEffect(() => {
+    const name = localStorage.getItem('member_name') || '';
+    setMemberName(name.split(' ')[0]);
+  }, []);
+
+  const greeting = (() => {
+    const h = new Date().getHours();
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  })();
 
   /* ── filter state ───────────────────────────────────── */
   const [startDate, setStartDate] = useState("");
@@ -230,7 +246,6 @@ export default function Dashboard() {
     return { min: dates[0] || "", max: dates[dates.length - 1] || "" };
   }, [rawData]);
 
-  // Auto-select defaults for compare
   useEffect(() => {
     if (compMonths.size === 0 && availableMonths.length > 0)
       setCompMonths(new Set(availableMonths.slice(-3)));
@@ -380,16 +395,12 @@ export default function Dashboard() {
     const prevMonthStart = new Date(today.getFullYear(), today.getMonth() - 2, 1);
 
     return {
-      weekly: [
-        { id: 1, from: ds(lastMonday), to: ds(lastSunday), label: "Last Week" },
-      ],
+      weekly: [{ id: 1, from: ds(lastMonday), to: ds(lastSunday), label: "Last Week" }],
       wow: [
         { id: 1, from: ds(addDays(lastMonday, -7)), to: ds(addDays(lastMonday, -1)), label: "2 Weeks Ago" },
         { id: 2, from: ds(lastMonday), to: ds(lastSunday), label: "Last Week" },
       ],
-      monthly: [
-        { id: 1, from: ds(lastMonthStart), to: ds(lastMonthEnd), label: new Date(lastMonth+"-15").toLocaleDateString("en",{month:"long",year:"numeric"}) },
-      ],
+      monthly: [{ id: 1, from: ds(lastMonthStart), to: ds(lastMonthEnd), label: new Date(lastMonth+"-15").toLocaleDateString("en",{month:"long",year:"numeric"}) }],
       mom: [
         { id: 1, from: ds(prevMonthStart), to: ds(prevMonthEnd), label: new Date(prevMonth+"-15").toLocaleDateString("en",{month:"long",year:"numeric"}) },
         { id: 2, from: ds(lastMonthStart), to: ds(lastMonthEnd), label: new Date(lastMonth+"-15").toLocaleDateString("en",{month:"long",year:"numeric"}) },
@@ -414,11 +425,7 @@ export default function Dashboard() {
   const applyReportPreset = (type) => {
     setReportType(type);
     const presets = getReportPresets();
-    if (type === "custom") {
-      // don't clear periods, let user build them
-    } else {
-      setReportPeriods(presets[type] || []);
-    }
+    if (type !== "custom") setReportPeriods(presets[type] || []);
   };
 
   const addReportPeriod = () => {
@@ -446,9 +453,7 @@ export default function Dashboard() {
     setReportSending(true);
     const periods = reportComputed;
     const hasDelta = periods.length > 1;
-
     const lines = [`📋 *Claims Intelligence Report*`, ``];
-
     periods.forEach((p, i) => {
       lines.push(`*${p.label}* (${p.from} → ${p.to})`);
       lines.push(`  🏥 Total Claims: *${fmt(p.total)}*`);
@@ -461,8 +466,6 @@ export default function Dashboard() {
       }
       lines.push(``);
     });
-
-    // Top insurers for last period
     const last = periods[periods.length - 1];
     if (last) {
       const sorted = Object.entries(last.byInsurer).sort((a,b) => b[1]-a[1]).slice(0, 10);
@@ -478,10 +481,8 @@ export default function Dashboard() {
         lines.push(`${i+1}. ${name}: *${fmt(count)}*${delta}`);
       });
     }
-
     lines.push(``, `_Sent from Claims Intelligence Dashboard_`);
     const message = lines.join("\n");
-
     try {
       const res = await fetch("/api/slack", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -522,7 +523,6 @@ export default function Dashboard() {
     const insBreakdown = {};
     slackData.forEach(r => { insBreakdown[r.insurer] = (insBreakdown[r.insurer]||0) + r.claims_count; });
     const sorted = Object.entries(insBreakdown).sort((a,b) => b[1]-a[1]);
-
     const message = [
       `📊 *Claims Intelligence Report*`,
       `📅 Period: ${startDate} → ${endDate}`,
@@ -535,7 +535,6 @@ export default function Dashboard() {
       ...sorted.map(([name, count], i) => `${i+1}. ${name}: *${fmt(count)}* (${(count/slackTotal*100).toFixed(1)}%)`),
       ``, `_Sent from Claims Intelligence Dashboard_`
     ].join("\n");
-
     try {
       const res = await fetch("/api/slack", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -609,6 +608,20 @@ export default function Dashboard() {
       </div>
 
       <div style={{ padding: "20px 28px", maxWidth: 1440, margin: "0 auto" }}>
+
+        {/* ── GREETING ────────────────────────────────────── */}
+        {memberName && (
+          <div style={{ marginBottom: 20, animation: 'slideUp .4s ease both' }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color: C.text, letterSpacing: -0.5 }}>
+              {greeting} {memberName} 👋
+            </div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
+              Live operational overview · {new Date().toLocaleDateString('en-GB', {
+                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+              })}
+            </div>
+          </div>
+        )}
 
         {/* ── FILTERS BAR ──────────────────────────────── */}
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 20px", marginBottom: 16, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 14, animation: "slideUp .4s ease both" }}>
@@ -781,13 +794,10 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* ═══════════ COMPARE VIEW (WoW / MoM) ══════════ */}
+        {/* ═══════════ COMPARE VIEW ══════════════════════ */}
         {view === "compare" && (
           <div style={{ animation: "fadeIn .4s ease" }}>
-
-            {/* Compare controls */}
             <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "16px 20px", marginBottom: 14 }}>
-              {/* Mode toggle */}
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
                 <button onClick={() => setCompMode("month")} style={btn(compMode === "month")}>📊 Month-over-Month</button>
                 <button onClick={() => setCompMode("custom")} style={btn(compMode === "custom")}>📅 Custom Periods</button>
@@ -800,8 +810,6 @@ export default function Dashboard() {
                   ))}
                 </div>
               </div>
-
-              {/* Period selection */}
               <div style={{ marginBottom: 14 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
                   <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>
@@ -815,8 +823,6 @@ export default function Dashboard() {
                   </>}
                   {compMode === "custom" && <button onClick={() => setCustomPeriods([])} style={{ ...btn(false), fontSize: 10, padding: "3px 10px" }}>Clear All</button>}
                 </div>
-
-                {/* Range picker */}
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, padding: "10px 14px", background: C.elevated, borderRadius: 8, border: `1px solid ${C.border}`, flexWrap: "wrap" }}>
                   <span style={{ fontSize: 11, color: C.accent, fontWeight: 600 }}>📅 Range:</span>
                   {compMode === "month" ? (<>
@@ -829,7 +835,7 @@ export default function Dashboard() {
                       <option value="">To month...</option>
                       {availableMonths.map(m => <option key={m} value={m}>{new Date(m+"-15").toLocaleDateString("en",{month:"short",year:"numeric"})}</option>)}
                     </select>
-                    <button onClick={() => { applyMonthRange(monthRangeFrom, monthRangeTo); }} disabled={!monthRangeFrom || !monthRangeTo}
+                    <button onClick={() => applyMonthRange(monthRangeFrom, monthRangeTo)} disabled={!monthRangeFrom || !monthRangeTo}
                       style={{ background: C.accent, color: C.bg, border: "none", borderRadius: 6, padding: "5px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer", opacity: (!monthRangeFrom || !monthRangeTo) ? .4 : 1 }}>Apply Range</button>
                   </>) : (<>
                     <input type="date" value={newPeriodFrom} onChange={e => setNewPeriodFrom(e.target.value)} style={{ ...inp, fontSize: 11, padding: "5px 8px" }}/>
@@ -841,8 +847,6 @@ export default function Dashboard() {
                   </>)}
                   {compMode === "month" && <span style={{ fontSize: 10, color: C.muted, fontStyle: "italic" }}>or pick individually below</span>}
                 </div>
-
-                {/* Individual chips */}
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                   {compMode === "month" ? (
                     availableMonths.map(m => {
@@ -861,10 +865,7 @@ export default function Dashboard() {
                     customPeriods.length === 0 ? (
                       <div style={{ fontSize: 12, color: C.muted, padding: "8px 0" }}>No periods added yet. Use the date pickers above to add comparison periods.</div>
                     ) : [...customPeriods].sort((a,b) => a.from.localeCompare(b.from)).map((p, idx) => (
-                      <div key={p.id} style={{
-                        background: `${PERIODS[idx%PERIODS.length]}15`, border: `1px solid ${PERIODS[idx%PERIODS.length]}`,
-                        borderRadius: 10, padding: "8px 14px", fontSize: 11, display: "flex", alignItems: "center", gap: 10,
-                      }}>
+                      <div key={p.id} style={{ background: `${PERIODS[idx%PERIODS.length]}15`, border: `1px solid ${PERIODS[idx%PERIODS.length]}`, borderRadius: 10, padding: "8px 14px", fontSize: 11, display: "flex", alignItems: "center", gap: 10 }}>
                         <span style={{ width: 10, height: 10, borderRadius: "50%", background: PERIODS[idx%PERIODS.length], flexShrink: 0 }}/>
                         <span style={{ fontWeight: 600, color: PERIODS[idx%PERIODS.length] }}>{p.label}</span>
                         <span style={{ color: C.sub, fontSize: 10 }}>{p.from} → {p.to}</span>
@@ -875,8 +876,6 @@ export default function Dashboard() {
                   )}
                 </div>
               </div>
-
-              {/* Insurer checkboxes */}
               <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
                   <div style={{ fontSize: 11, color: C.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Insurers</div>
@@ -886,14 +885,12 @@ export default function Dashboard() {
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 4 }}>
                   {allInsurers.map((ins, i) => (
-                    <Checkbox key={ins} checked={compInsurers.has(ins)} onChange={() => toggleCompInsurer(ins)}
-                      label={ins} color={CHART[i%CHART.length]}/>
+                    <Checkbox key={ins} checked={compInsurers.has(ins)} onChange={() => toggleCompInsurer(ins)} label={ins} color={CHART[i%CHART.length]}/>
                   ))}
                 </div>
               </div>
             </div>
 
-            {/* Period summary cards */}
             <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
               {compWithDeltas.map((p, i) => (
                 <div key={i} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "18px 22px", flex: 1, minWidth: 200, position: "relative", overflow: "hidden" }}>
@@ -913,16 +910,12 @@ export default function Dashboard() {
               ))}
             </div>
 
-            {/* Compare Overview */}
             {compView === "overview" && (
               <div>
                 <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20, marginBottom: 14 }}>
                   <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>{compMode === "month" ? "Month-over-Month" : "Period-over-Period"} Total Claims</div>
                   <ResponsiveContainer width="100%" height={280}>
-                    <BarChart data={compWithDeltas.map(p => ({
-                      name: compMode === "month" ? new Date(p.month+"-15").toLocaleDateString("en",{month:"short",year:"2-digit"}) : p.label,
-                      total: p.total, avg: p.avg,
-                    }))}>
+                    <BarChart data={compWithDeltas.map(p => ({ name: compMode === "month" ? new Date(p.month+"-15").toLocaleDateString("en",{month:"short",year:"2-digit"}) : p.label, total: p.total, avg: p.avg }))}>
                       <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false}/>
                       <XAxis dataKey="name" tick={{ fontSize: 11, fill: C.sub }}/>
                       <YAxis tick={{ fontSize: 10, fill: C.muted }}/>
@@ -933,7 +926,6 @@ export default function Dashboard() {
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
-                {/* Growth summary */}
                 <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
                   <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>Growth Summary</div>
                   <div style={{ overflow: "auto" }}>
@@ -965,7 +957,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Compare Overlay Chart */}
             {compView === "chart" && (
               <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
                 <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
@@ -988,7 +979,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Compare Table */}
             {compView === "table" && (
               <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
                 <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 14, fontWeight: 600 }}>📋 Insurer Comparison Across Periods</div>
@@ -1056,8 +1046,6 @@ export default function Dashboard() {
               <>
                 <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>💬 Send to Slack</div>
                 <div style={{ fontSize: 13, color: C.sub, marginBottom: 16 }}>Share this claims report with your team</div>
-
-                {/* Channel checkboxes */}
                 <div style={{ marginBottom: 16 }}>
                   <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, fontWeight: 600 }}>Channels</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -1066,8 +1054,6 @@ export default function Dashboard() {
                     ))}
                   </div>
                 </div>
-
-                {/* Insurer selection for Slack */}
                 <div style={{ marginBottom: 16 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                     <div style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>Include Insurers</div>
@@ -1076,13 +1062,10 @@ export default function Dashboard() {
                   </div>
                   <div style={{ maxHeight: 160, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
                     {allInsurers.map((ins,i) => (
-                      <Checkbox key={ins} checked={slackInsurers.has(ins)} onChange={() => { const n = new Set(slackInsurers); n.has(ins) ? n.delete(ins) : n.add(ins); setSlackInsurers(n); }}
-                        label={ins} color={CHART[i%CHART.length]}/>
+                      <Checkbox key={ins} checked={slackInsurers.has(ins)} onChange={() => { const n = new Set(slackInsurers); n.has(ins) ? n.delete(ins) : n.add(ins); setSlackInsurers(n); }} label={ins} color={CHART[i%CHART.length]}/>
                     ))}
                   </div>
                 </div>
-
-                {/* Preview */}
                 <div style={{ background: C.elevated, borderRadius: 8, padding: 14, marginBottom: 16, border: `1px solid ${C.border}`, fontSize: 12, color: C.sub, lineHeight: 1.8 }}>
                   <div style={{ fontWeight: 600, color: C.text, marginBottom: 4 }}>Preview:</div>
                   📊 <strong style={{ color: C.accent }}>Claims Report</strong> ({startDate} → {endDate})<br/>
@@ -1091,13 +1074,9 @@ export default function Dashboard() {
                   🔥 Peak: <strong style={{ color: C.text }}>{peak ? `${fmt(peak.total)} (${peak.date})` : "—"}</strong><br/>
                   🏢 Insurers: <strong style={{ color: C.text }}>{slackInsurers.size}</strong> selected
                 </div>
-
                 <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                   <button onClick={() => setShowSlack(false)} style={{ ...abtn(C.muted), padding: "10px 20px" }}>Cancel</button>
-                  <button onClick={sendSlack} disabled={sending || slackChans.size === 0} style={{
-                    background: C.accent, color: C.bg, border: "none", borderRadius: 8, padding: "10px 24px",
-                    fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: (sending || slackChans.size === 0) ? .5 : 1,
-                  }}>{sending ? "Sending..." : "Send Report"}</button>
+                  <button onClick={sendSlack} disabled={sending || slackChans.size === 0} style={{ background: C.accent, color: C.bg, border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: (sending || slackChans.size === 0) ? .5 : 1 }}>{sending ? "Sending..." : "Send Report"}</button>
                 </div>
               </>
             )}
@@ -1121,8 +1100,6 @@ export default function Dashboard() {
               <>
                 <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>📋 Report Builder</div>
                 <div style={{ fontSize: 13, color: C.sub, marginBottom: 16 }}>Build a comparison report and send to Slack</div>
-
-                {/* Report type presets */}
                 <div style={{ marginBottom: 16 }}>
                   <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, fontWeight: 600 }}>Report Type</div>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -1147,8 +1124,6 @@ export default function Dashboard() {
                     ))}
                   </div>
                 </div>
-
-                {/* Custom period builder */}
                 {reportType === "custom" && (
                   <div style={{ marginBottom: 14, padding: 12, background: C.elevated, borderRadius: 8, border: `1px solid ${C.border}` }}>
                     <div style={{ fontSize: 11, color: "#A78BFA", fontWeight: 600, marginBottom: 8 }}>Add Custom Period</div>
@@ -1162,8 +1137,6 @@ export default function Dashboard() {
                     </div>
                   </div>
                 )}
-
-                {/* Selected periods with live data */}
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, fontWeight: 600 }}>Periods ({reportPeriods.length})</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -1172,11 +1145,7 @@ export default function Dashboard() {
                     ) : [...reportPeriods].sort((a,b) => a.from.localeCompare(b.from)).map((p, idx) => {
                       const comp = reportComputed[idx];
                       return (
-                        <div key={p.id} style={{
-                          background: C.elevated, border: `1px solid ${C.border}`,
-                          borderRadius: 8, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10,
-                          borderLeft: `3px solid ${PERIODS[idx % PERIODS.length]}`,
-                        }}>
+                        <div key={p.id} style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, borderLeft: `3px solid ${PERIODS[idx % PERIODS.length]}` }}>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{p.label}</div>
                             <div style={{ fontSize: 10, color: C.muted }}>{p.from} → {p.to}</div>
@@ -1196,8 +1165,6 @@ export default function Dashboard() {
                     })}
                   </div>
                 </div>
-
-                {/* Channels */}
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, fontWeight: 600 }}>Send to Channels</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -1206,8 +1173,6 @@ export default function Dashboard() {
                     ))}
                   </div>
                 </div>
-
-                {/* Insurer selection */}
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                     <div style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>Insurers</div>
@@ -1217,13 +1182,10 @@ export default function Dashboard() {
                   </div>
                   <div style={{ maxHeight: 120, overflowY: "auto", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
                     {allInsurers.map((ins,i) => (
-                      <Checkbox key={ins} checked={reportInsurers.has(ins)} onChange={() => { const n = new Set(reportInsurers); n.has(ins) ? n.delete(ins) : n.add(ins); setReportInsurers(n); }}
-                        label={ins} color={CHART[i%CHART.length]}/>
+                      <Checkbox key={ins} checked={reportInsurers.has(ins)} onChange={() => { const n = new Set(reportInsurers); n.has(ins) ? n.delete(ins) : n.add(ins); setReportInsurers(n); }} label={ins} color={CHART[i%CHART.length]}/>
                     ))}
                   </div>
                 </div>
-
-                {/* Preview */}
                 <div style={{ background: C.elevated, borderRadius: 8, padding: 14, marginBottom: 16, border: `1px solid ${C.border}`, fontSize: 11, color: C.sub, lineHeight: 1.8, maxHeight: 180, overflowY: "auto" }}>
                   <div style={{ fontWeight: 600, color: C.text, marginBottom: 6, fontSize: 12 }}>Preview:</div>
                   📋 <strong style={{ color: "#A78BFA" }}>Claims Intelligence Report</strong><br/>
@@ -1249,13 +1211,9 @@ export default function Dashboard() {
                     </div>
                   )}
                 </div>
-
                 <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                   <button onClick={() => setShowReport(false)} style={{ ...abtn(C.muted), padding: "10px 20px" }}>Cancel</button>
-                  <button onClick={sendReport} disabled={reportSending || reportChans.size === 0 || reportPeriods.length === 0} style={{
-                    background: "#A78BFA", color: C.bg, border: "none", borderRadius: 8, padding: "10px 24px",
-                    fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: (reportSending || reportChans.size === 0 || reportPeriods.length === 0) ? .5 : 1,
-                  }}>{reportSending ? "Sending..." : `📨 Send to ${reportChans.size} channel${reportChans.size > 1 ? "s" : ""}`}</button>
+                  <button onClick={sendReport} disabled={reportSending || reportChans.size === 0 || reportPeriods.length === 0} style={{ background: "#A78BFA", color: C.bg, border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: (reportSending || reportChans.size === 0 || reportPeriods.length === 0) ? .5 : 1 }}>{reportSending ? "Sending..." : `📨 Send to ${reportChans.size} channel${reportChans.size > 1 ? "s" : ""}`}</button>
                 </div>
               </>
             )}
