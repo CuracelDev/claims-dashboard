@@ -30,6 +30,82 @@ async function getTeamMembers() {
   return data || [];
 }
 
+// ── Error parsers ─────────────────────────────────────────────
+
+function parseImportError(text) {
+  // Matches: "Failed to import JHL claim on ..."
+  if (!text.includes("Failed to import")) return null;
+
+  const invId        = text.match(/Inv ID:\s*([^\n]+)/)?.[1]?.trim() || null;
+  const providerCode = text.match(/Provider Code:\s*([^\n]+)/)?.[1]?.trim() || null;
+  const errorMsg     = text.match(/Error:\s*"?([^\n"]+)"?/)?.[1]?.trim() || null;
+  const hmo          = text.match(/by HMO:\s*([^\n]+)/)?.[1]?.trim() || null;
+  const env          = text.match(/ENV:\s*([^\n\s]+)/)?.[1]?.trim() || null;
+
+  return {
+    error_type:    'import_failure',
+    hmo,
+    env,
+    inv_id:        invId,
+    provider_code: providerCode,
+    error_message: errorMsg,
+    refs:          null,
+  };
+}
+
+function parseRefError(text) {
+  // Matches: "Failed claims refs and messages:"
+  if (!text.includes("Failed claims refs") && !text.includes("Ref:")) return null;
+
+  const refs = [];
+  const refRegex = /Ref:\s*([A-Z0-9]+)\s*-\s*Error:\s*([^\n]+)/g;
+  let match;
+  while ((match = refRegex.exec(text)) !== null) {
+    refs.push({ ref: match[1].trim(), error: match[2].trim() });
+  }
+  if (refs.length === 0) return null;
+
+  // Try to extract HMO / env if present
+  const hmo = text.match(/HMO:\s*([^\n]+)/)?.[1]?.trim() || null;
+  const env = text.match(/ENV:\s*([^\n\s]+)/)?.[1]?.trim() || null;
+
+  // Build a summary error message from first ref
+  const errorMsg = refs[0]?.error || null;
+
+  return {
+    error_type:    'ref_failure',
+    hmo,
+    env,
+    inv_id:        null,
+    provider_code: null,
+    error_message: errorMsg,
+    refs,
+  };
+}
+
+function parseErrorMessage(text) {
+  return parseImportError(text) || parseRefError(text) || null;
+}
+
+// ── Save error to Supabase ─────────────────────────────────────
+async function saveClaimError({ channel_id, channel_name, message_ts, raw_message, parsed }) {
+  const supabase = getSupabase();
+  const { error } = await supabase.from("claim_errors").insert({
+    channel_id,
+    channel_name,
+    message_ts,
+    raw_message,
+    error_type:    parsed.error_type,
+    hmo:           parsed.hmo,
+    env:           parsed.env,
+    inv_id:        parsed.inv_id,
+    provider_code: parsed.provider_code,
+    error_message: parsed.error_message,
+    refs:          parsed.refs,
+  });
+  if (error) console.error("[claim_errors] insert error:", error.message);
+}
+
 // ── Menu shown when bot is mentioned ─────────────────────────
 function buildMenuBlocks(userName) {
   return [
@@ -172,7 +248,6 @@ function buildTaskModal(trigger_id, meta = {}, members = []) {
   };
 }
 
-// ── Fetch daily reports summary ───────────────────────────────
 async function getTodayReports() {
   const supabase = getSupabase();
   const today = new Date().toISOString().split("T")[0];
@@ -192,7 +267,6 @@ async function getTodayReports() {
   return { submitted, pending, total: (members || []).length };
 }
 
-// ── Fetch pending tasks ───────────────────────────────────────
 async function getPendingTasks() {
   const supabase = getSupabase();
   const { data: tasks } = await supabase
@@ -201,21 +275,17 @@ async function getPendingTasks() {
     .in("status", ["todo", "in_progress"])
     .order("due_date", { ascending: true })
     .limit(5);
-
   if (!tasks || tasks.length === 0) return [];
-
   const memberIds = [...new Set(tasks.map(t => t.assigned_to).filter(Boolean))];
   const { data: members } = await supabase
     .from("team_members")
     .select("id, name")
     .in("id", memberIds);
-
   const memberMap = {};
   (members || []).forEach(m => { memberMap[m.id] = m.name; });
   return tasks.map(t => ({ ...t, member_name: memberMap[t.assigned_to] || "Unassigned" }));
 }
 
-// ── Fetch active targets ──────────────────────────────────────
 async function getActiveTargets() {
   const supabase = getSupabase();
   const today = new Date().toISOString().split("T")[0];
@@ -231,7 +301,6 @@ async function getActiveTargets() {
 export async function POST(request) {
   const contentType = request.headers.get("content-type") || "";
 
-  // ── JSON events ───────────────────────────────────────────
   if (contentType.includes("application/json")) {
     const body = await request.json();
 
@@ -242,10 +311,37 @@ export async function POST(request) {
     if (body.type === "event_callback") {
       const event = body.event;
 
+      // ── Passive message listener — error tracking ──────────
+      if (
+        event.type === "message" &&
+        !event.subtype &&           // ignore edits, deletes, joins
+        !event.bot_id &&            // ignore other bots
+        event.text
+      ) {
+        const parsed = parseErrorMessage(event.text);
+        if (parsed) {
+          // Get channel name if available
+          let channel_name = null;
+          try {
+            const info = await slackPost("conversations.info", { channel: event.channel });
+            channel_name = info.channel?.name || null;
+          } catch {}
+
+          await saveClaimError({
+            channel_id:   event.channel,
+            channel_name,
+            message_ts:   event.ts,
+            raw_message:  event.text,
+            parsed,
+          });
+        }
+        return Response.json({ ok: true });
+      }
+
+      // ── App mention handler ────────────────────────────────
       if (event.type === "app_mention") {
         const text = (event.text || "").toLowerCase().replace(/<@.*?>/g, "").trim();
 
-        // Get caller's name
         let userName = "there";
         try {
           const userInfo = await slackPost("users.info", { user: event.user });
@@ -254,7 +350,6 @@ export async function POST(request) {
 
         const meta = { channel: event.channel, thread_ts: event.ts, assigned_by: userName };
 
-        // ── Keyword shortcuts ──────────────────────────────
         if (text.includes("assign") || text.includes("task")) {
           const members = await getTeamMembers();
           await slackPost("chat.postMessage", {
@@ -300,10 +395,7 @@ export async function POST(request) {
             text: "Pending tasks",
             blocks: [
               { type: "section", text: { type: "mrkdwn", text: `⏳ *Pending Tasks (${tasks.length})* — showing up to 5` } },
-              ...tasks.map(t => ({
-                type: "section",
-                text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.member_name || "Unassigned"}${t.due_date ? ` · Due ${t.due_date}` : ""}` },
-              })),
+              ...tasks.map(t => ({ type: "section", text: { type: "mrkdwn", text: `${{ high:"🔴",medium:"🟡",low:"🟢" }[t.priority]||"🟡"} *${t.title}* — ${t.member_name||"Unassigned"}${t.due_date?` · Due ${t.due_date}`:""}` } })),
               ...(tasks.length === 0 ? [{ type: "section", text: { type: "mrkdwn", text: "_No pending tasks_ 🎉" } }] : []),
               { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "View Task Board →" }, url: "https://claims-dashboard.vercel.app/tasks", action_id: "view_tasks" }]},
             ],
@@ -319,10 +411,7 @@ export async function POST(request) {
             text: "Weekly targets",
             blocks: [
               { type: "section", text: { type: "mrkdwn", text: `🎯 *Active Weekly Targets (${targets.length})*` } },
-              ...targets.map(t => ({
-                type: "section",
-                text: { type: "mrkdwn", text: `• *${t.name}* — target: ${t.target_value?.toLocaleString() || "—"} · ${t.start_date} → ${t.end_date}` },
-              })),
+              ...targets.map(t => ({ type: "section", text: { type: "mrkdwn", text: `• *${t.name}* — target: ${t.target_value?.toLocaleString()||"—"} · ${t.start_date} → ${t.end_date}` } })),
               ...(targets.length === 0 ? [{ type: "section", text: { type: "mrkdwn", text: "_No active targets this week_" } }] : []),
               { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "View Targets →" }, url: "https://claims-dashboard.vercel.app/targets", action_id: "view_targets" }]},
             ],
@@ -330,7 +419,6 @@ export async function POST(request) {
           return Response.json({ ok: true });
         }
 
-        // ── Default: show the menu ─────────────────────────
         await slackPost("chat.postMessage", {
           channel: event.channel,
           thread_ts: event.ts,
@@ -343,13 +431,12 @@ export async function POST(request) {
     }
   }
 
-  // ── Interactivity (button clicks + modal submissions) ─────
+  // ── Interactivity ─────────────────────────────────────────
   if (contentType.includes("application/x-www-form-urlencoded")) {
     const text = await request.text();
     const params = new URLSearchParams(text);
     const payload = JSON.parse(params.get("payload") || "{}");
 
-    // Button clicks
     if (payload.type === "block_actions") {
       const action = payload.actions?.[0];
       const channel = payload.channel?.id || payload.container?.channel_id;
@@ -366,9 +453,7 @@ export async function POST(request) {
       if (action?.action_id === "check_reports") {
         const { submitted, pending, total } = await getTodayReports();
         await slackPost("chat.postMessage", {
-          channel,
-          thread_ts,
-          text: "Today's reports",
+          channel, thread_ts, text: "Today's reports",
           blocks: [
             { type: "section", text: { type: "mrkdwn", text: `📊 *Daily Reports — Today*` } },
             { type: "section", fields: [
@@ -382,13 +467,11 @@ export async function POST(request) {
 
       if (action?.action_id === "check_pending_tasks") {
         const tasks = await getPendingTasks();
-        const priorityEmoji = { high: "🔴", medium: "🟡", low: "🟢" };
         await slackPost("chat.postMessage", {
-          channel, thread_ts,
-          text: "Pending tasks",
+          channel, thread_ts, text: "Pending tasks",
           blocks: [
             { type: "section", text: { type: "mrkdwn", text: `⏳ *Pending Tasks (${tasks.length})*` } },
-            ...tasks.map(t => ({ type: "section", text: { type: "mrkdwn", text: `${priorityEmoji[t.priority]||"🟡"} *${t.title}* — ${t.member_name||"Unassigned"}${t.due_date?` · Due ${t.due_date}`:""}` } })),
+            ...tasks.map(t => ({ type: "section", text: { type: "mrkdwn", text: `${{ high:"🔴",medium:"🟡",low:"🟢" }[t.priority]||"🟡"} *${t.title}* — ${t.member_name||"Unassigned"}${t.due_date?` · Due ${t.due_date}`:""}` } })),
             ...(tasks.length===0?[{ type:"section", text:{type:"mrkdwn", text:"_No pending tasks_ 🎉"} }]:[]),
           ],
         });
@@ -398,8 +481,7 @@ export async function POST(request) {
       if (action?.action_id === "check_targets") {
         const targets = await getActiveTargets();
         await slackPost("chat.postMessage", {
-          channel, thread_ts,
-          text: "Weekly targets",
+          channel, thread_ts, text: "Weekly targets",
           blocks: [
             { type: "section", text: { type: "mrkdwn", text: `🎯 *Active Weekly Targets (${targets.length})*` } },
             ...targets.map(t => ({ type:"section", text:{type:"mrkdwn", text:`• *${t.name}* — ${t.target_value?.toLocaleString()||"—"}`} })),
@@ -410,7 +492,6 @@ export async function POST(request) {
       }
     }
 
-    // Modal submission
     if (payload.type === "view_submission" && payload.view?.callback_id === "create_task_modal") {
       const values = payload.view.state.values;
       const title       = values.task_title?.title_input?.value;
@@ -430,15 +511,12 @@ export async function POST(request) {
       for (const memberId of assigneeIds) {
         const member = members.find(m => m.id === memberId);
         if (!member) continue;
-
         const { data: task, error } = await supabase.from("tasks").insert({
           title, description, assigned_to: memberId, assigned_by,
           due_date, priority, status: "todo", category: "ad_hoc",
         }).select().single();
-
         if (error) continue;
         createdTasks.push({ task, member });
-
         if (member.slack_user_id) {
           const pEmoji = { high:"🔴", medium:"🟡", low:"🟢" }[priority]||"🟡";
           await slackPost("chat.postMessage", {
@@ -462,8 +540,7 @@ export async function POST(request) {
         const names = createdTasks.map(c => c.member.name);
         const pEmoji = { high:"🔴", medium:"🟡", low:"🟢" }[priority]||"🟡";
         await slackPost("chat.postMessage", {
-          channel: meta.channel,
-          thread_ts: meta.thread_ts,
+          channel: meta.channel, thread_ts: meta.thread_ts,
           text: `Task assigned to ${names.join(", ")}`,
           blocks: [
             { type:"section", text:{type:"mrkdwn", text:`✅ *Task assigned to ${names.join(", ")}*`} },
