@@ -23,13 +23,13 @@ export async function GET(request) {
     const from       = searchParams.get('from');
     const to         = searchParams.get('to');
 
-    // ── Paginated filtered query ──────────────────────────
     let query = supabase
       .from('claim_errors')
-      .select('*', { count: 'exact' })
+      .select('*')
       .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
+      .limit(limit);
 
+    if (offset > 0) query = query.range(offset, offset + limit - 1);
     if (hmo)        query = query.ilike('hmo', `%${hmo}%`);
     if (env)        query = query.eq('env', env);
     if (error_type) query = query.eq('error_type', error_type);
@@ -37,30 +37,27 @@ export async function GET(request) {
     if (from)       query = query.gte('created_at', `${from}T00:00:00.000Z`);
     if (to)         query = query.lte('created_at', `${to}T23:59:59.999Z`);
 
-    const { data, error, count } = await query;
+    const { data, error } = await query;
     if (error) throw error;
 
-    // ── Stats from ALL rows (unfiltered) ──────────────────
-    const { data: allRows } = await supabase
+    // Get total count separately
+    let countQuery = supabase
       .from('claim_errors')
-      .select('error_type, hmo, env, channel_name');
+      .select('*', { count: 'exact', head: true });
 
-    const byType    = {};
-    const byHmo     = {};
-    const byEnv     = {};
-    const byChannel = {};
+    if (hmo)        countQuery = countQuery.ilike('hmo', `%${hmo}%`);
+    if (env)        countQuery = countQuery.eq('env', env);
+    if (error_type) countQuery = countQuery.eq('error_type', error_type);
+    if (channel)    countQuery = countQuery.eq('channel_name', channel);
+    if (from)       countQuery = countQuery.gte('created_at', `${from}T00:00:00.000Z`);
+    if (to)         countQuery = countQuery.lte('created_at', `${to}T23:59:59.999Z`);
 
-    for (const r of (allRows || [])) {
-      if (r.error_type)   byType[r.error_type]      = (byType[r.error_type]      || 0) + 1;
-      if (r.hmo)          byHmo[r.hmo]              = (byHmo[r.hmo]              || 0) + 1;
-      if (r.env)          byEnv[r.env]              = (byEnv[r.env]              || 0) + 1;
-      if (r.channel_name) byChannel[r.channel_name] = (byChannel[r.channel_name] || 0) + 1;
-    }
+    const { count } = await countQuery;
 
     return Response.json({
       data:  data  || [],
       count: count || 0,
-      stats: { byType, byHmo, byEnv, byChannel },
+      stats: {},
     });
   } catch (err) {
     console.error('GET /api/claim-errors error:', err);
