@@ -9,8 +9,23 @@ const btn = (bg, color, disabled) => ({ padding: '8px 18px', background: disable
 const CATEGORIES = [{ key: 'mapping_data', label: '📦 Mapping & Data' }, { key: 'claims_piles', label: '📊 Claims Piles Checked' }, { key: 'quality_review', label: '✅ Quality & Review' }];
 const toKey = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
 
+function daysUntilBirthday(birthday) {
+  if (!birthday) return null;
+  const today = new Date();
+  const bday = new Date(birthday);
+  const next = new Date(today.getFullYear(), bday.getMonth(), bday.getDate());
+  if (next < today) next.setFullYear(today.getFullYear() + 1);
+  const diff = Math.round((next - today) / 86400000);
+  return diff;
+}
+
+function formatBirthday(birthday) {
+  if (!birthday) return null;
+  return new Date(birthday).toLocaleDateString('en-GB', { day: 'numeric', month: 'long' });
+}
+
 // ── Collision Dialog ──────────────────────────────────────────────────────
-function CollisionDialog({ collision, newName, onResolve, onCancel }) {
+function CollisionDialog({ collision, newName, onResolve, onCancel, C }) {
   const [initials, setInitials] = useState('');
   if (collision.type === 'returning') {
     return (
@@ -31,7 +46,7 @@ function CollisionDialog({ collision, newName, onResolve, onCancel }) {
     <div style={{ position: 'fixed', inset: 0, background: '#00000088', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <div style={{ background: C.card, borderRadius: 16, padding: 28, maxWidth: 440, width: '90%', border: `1px solid ${C.border}` }}>
         <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Name Already Exists</div>
-        <p style={{ color: C.sub, fontSize: 13, marginBottom: 20 }}>There's already an active member named <strong style={{ color: C.text }}>{collision.existing.name}</strong>. Add initials to distinguish the new member.</p>
+        <p style={{ color: C.sub, fontSize: 13, marginBottom: 20 }}>There's already an active member named <strong style={{ color: C.text }}>{collision.existing.name}</strong>. Add initials to distinguish.</p>
         <div style={{ marginBottom: 16 }}>
           <label style={labelStyle}>Initial (e.g. "A" → "{newName} A.")</label>
           <input value={initials} onChange={e => setInitials(e.target.value)} placeholder="Enter initial" style={{ ...inputStyle, width: '100%' }} maxLength={3} />
@@ -49,15 +64,16 @@ function CollisionDialog({ collision, newName, onResolve, onCancel }) {
 }
 
 // ── Edit Member Modal ────────────────────────────────────────────────────
-function EditMemberModal({ member, onSave, onClose }) {
+function EditMemberModal({ member, onSave, onClose, C }) {
   const [name, setName] = useState(member.name);
   const [role, setRole] = useState(member.role || '');
   const [slackId, setSlackId] = useState(member.slack_user_id || '');
+  const [birthday, setBirthday] = useState(member.birthday ? member.birthday.slice(0, 10) : '');
   const [saving, setSaving] = useState(false);
 
   const handleSave = async () => {
     setSaving(true);
-    await onSave(member.id, { name, role, slack_user_id: slackId });
+    await onSave(member.id, { name, role, slack_user_id: slackId, birthday: birthday || null });
     setSaving(false);
   };
 
@@ -80,15 +96,23 @@ function EditMemberModal({ member, onSave, onClose }) {
           <div>
             <label style={labelStyle}>Slack User ID</label>
             <input value={slackId} onChange={e => setSlackId(e.target.value)} placeholder="e.g. U0123ABCDE" style={{ ...inputStyle, width: '100%', fontFamily: 'monospace' }} />
-            <div style={{ fontSize: 10, color: C.muted, marginTop: 4 }}>
-              Slack → click their profile → ⋮ → Copy member ID. Needed for reminders.
-            </div>
+            <div style={{ fontSize: 10, color: '#8899AA', marginTop: 4 }}>Slack → click their profile → ⋮ → Copy member ID.</div>
           </div>
           {slackId && (
             <div style={{ background: slackId.startsWith('U') && slackId.length >= 9 ? '#00E5A015' : '#FF5C5C15', border: `1px solid ${slackId.startsWith('U') && slackId.length >= 9 ? '#00E5A033' : '#FF5C5C33'}`, borderRadius: 8, padding: '8px 12px', fontSize: 12, color: slackId.startsWith('U') && slackId.length >= 9 ? C.accent : C.danger }}>
               {slackId.startsWith('U') && slackId.length >= 9 ? '✓ Looks valid' : '⚠ Slack IDs start with U and are 9-11 characters'}
             </div>
           )}
+          <div>
+            <label style={labelStyle}>🎂 Birthday</label>
+            <input
+              type="date"
+              value={birthday}
+              onChange={e => setBirthday(e.target.value)}
+              style={{ ...inputStyle, width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: '#8899AA', marginTop: 4 }}>Year doesn't matter — only month & day are used for wishes.</div>
+          </div>
         </div>
         <div style={{ display: 'flex', gap: 10, marginTop: 24 }}>
           <button onClick={handleSave} disabled={saving || !name.trim()} style={btn(C.accent, '#0B0F1A', saving || !name.trim())}>{saving ? 'Saving…' : 'Save Changes'}</button>
@@ -119,6 +143,7 @@ export default function TeamPage() {
   const [newMetricMembers, setNewMetricMembers] = useState([]);
   const [addingMetric, setAddingMetric] = useState(false);
   const [metricMsg, setMetricMsg] = useState(null);
+  const [testingBirthday, setTestingBirthday] = useState(null);
 
   const load = () => {
     setLoading(true);
@@ -147,9 +172,8 @@ export default function TeamPage() {
       setAddMsg({ type: 'success', text: 'Member reactivated!' });
     } else {
       const nameToUse = resolution.displayName || pendingMember.name;
-      const res = await fetch('/api/team', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...pendingMember, name: pendingMember.name, display_name: resolution.displayName, force: true }) });
-      const result = await res.json();
-      if (result.data) setAddMsg({ type: 'success', text: `${nameToUse} added!` });
+      await fetch('/api/team', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...pendingMember, name: pendingMember.name, display_name: resolution.displayName, force: true }) });
+      setAddMsg({ type: 'success', text: `${nameToUse} added!` });
     }
     setNewName(''); setNewRole(''); setNewSlackId('');
     setPendingMember(null); load();
@@ -178,10 +202,28 @@ export default function TeamPage() {
     load();
   };
 
+  const handleTestBirthday = async (member) => {
+    setTestingBirthday(member.id);
+    const res = await fetch(`/api/birthday-wish?secret=DataOps2026&test_id=${member.id}`);
+    const data = await res.json();
+    alert(data.success ? `🎉 Birthday wish sent for ${member.name}!` : `Error: ${data.error}`);
+    setTestingBirthday(null);
+  };
+
   const activeMembers = members.filter(m => m.active !== false);
   const inactiveMembers = members.filter(m => m.active === false);
   const activeMetrics = metrics.filter(m => m.active !== false);
   const missingSlack = activeMembers.filter(m => !m.slack_user_id);
+
+  // Sort by upcoming birthday
+  const membersWithBirthdays = activeMembers
+    .filter(m => m.birthday)
+    .map(m => ({ ...m, daysUntil: daysUntilBirthday(m.birthday) }))
+    .sort((a, b) => a.daysUntil - b.daysUntil);
+
+  const todayBirthdays = membersWithBirthdays.filter(m => m.daysUntil === 0);
+  const upcomingBirthdays = membersWithBirthdays.filter(m => m.daysUntil > 0 && m.daysUntil <= 30);
+  const missingBirthdays = activeMembers.filter(m => !m.birthday);
 
   const tabBtn = (key, label) => (
     <button key={key} onClick={() => setActiveTab(key)} style={{ padding: '10px 20px', fontSize: 13, fontWeight: 500, border: 'none', cursor: 'pointer', background: 'transparent', borderBottom: activeTab === key ? `2px solid ${C.accent}` : '2px solid transparent', color: activeTab === key ? C.accent : C.sub }}>
@@ -191,15 +233,16 @@ export default function TeamPage() {
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60 }}>
-      {collision && <CollisionDialog collision={collision} newName={newName} onResolve={handleCollisionResolve} onCancel={() => { setCollision(null); setPendingMember(null); }} />}
-      {editingMember && <EditMemberModal member={editingMember} onSave={handleEditSave} onClose={() => setEditingMember(null)} />}
+      {collision && <CollisionDialog collision={collision} newName={newName} onResolve={handleCollisionResolve} onCancel={() => { setCollision(null); setPendingMember(null); }} C={C} />}
+      {editingMember && <EditMemberModal member={editingMember} onSave={handleEditSave} onClose={() => setEditingMember(null)} C={C} />}
 
       <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 32px' }}>
         <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>Team Management</h1>
-        <p style={{ margin: '4px 0 0', fontSize: 13, color: C.sub }}>Manage members and customize report metrics</p>
+        <p style={{ margin: '4px 0 0', fontSize: 13, color: C.sub }}>Manage members, metrics and birthdays</p>
       </div>
       <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '0 32px', display: 'flex' }}>
         {tabBtn('members', `👥 Members (${activeMembers.length})`)}
+        {tabBtn('birthdays', `🎂 Birthdays`)}
         {tabBtn('metrics', `📊 Metrics (${activeMetrics.length})`)}
       </div>
 
@@ -208,7 +251,6 @@ export default function TeamPage() {
         {/* ── MEMBERS TAB ── */}
         {activeTab === 'members' && (
           <div>
-            {/* Missing Slack IDs warning */}
             {missingSlack.length > 0 && (
               <div style={{ background: '#FFB84D15', border: '1px solid #FFB84D44', borderRadius: 10, padding: '12px 16px', marginBottom: 16, display: 'flex', gap: 10, alignItems: 'flex-start' }}>
                 <span style={{ fontSize: 18 }}>⚠️</span>
@@ -218,8 +260,6 @@ export default function TeamPage() {
                 </div>
               </div>
             )}
-
-            {/* Add member */}
             <div style={cardStyle}>
               <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 14 }}>➕ Add Team Member</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
@@ -242,7 +282,6 @@ export default function TeamPage() {
               </div>
             </div>
 
-            {/* Active members */}
             <div style={{ fontSize: 12, fontWeight: 600, color: C.sub, marginBottom: 10 }}>ACTIVE — {activeMembers.length} MEMBERS</div>
             {loading ? <div style={{ textAlign: 'center', padding: 40, color: C.sub }}>Loading…</div> : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12, marginBottom: 24 }}>
@@ -254,10 +293,10 @@ export default function TeamPage() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.display_name || m.name}</div>
                       <div style={{ fontSize: 11, color: C.sub }}>{m.role || 'No role'}</div>
-                      {m.slack_user_id
-                        ? <div style={{ fontSize: 10, color: C.success, marginTop: 2 }}>✓ Slack ID set</div>
-                        : <div style={{ fontSize: 10, color: C.warn, marginTop: 2 }}>⚠ No Slack ID</div>
-                      }
+                      <div style={{ fontSize: 10, marginTop: 2 }}>
+                        {m.slack_user_id ? <span style={{ color: C.success }}>✓ Slack</span> : <span style={{ color: C.warn }}>⚠ No Slack</span>}
+                        {m.birthday && <span style={{ color: C.muted, marginLeft: 8 }}>🎂 {formatBirthday(m.birthday)}</span>}
+                      </div>
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                       <button onClick={() => setEditingMember(m)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.sub, cursor: 'pointer', fontSize: 11, padding: '3px 8px' }}>✏️</button>
@@ -286,6 +325,89 @@ export default function TeamPage() {
                   ))}
                 </div>
               </>
+            )}
+          </div>
+        )}
+
+        {/* ── BIRTHDAYS TAB ── */}
+        {activeTab === 'birthdays' && (
+          <div>
+            {/* Today */}
+            {todayBirthdays.length > 0 && (
+              <div style={{ background: 'linear-gradient(135deg, #7B61FF20, #00E5A020)', border: '1px solid #7B61FF40', borderRadius: 14, padding: 20, marginBottom: 20 }}>
+                <div style={{ fontSize: 22, marginBottom: 8 }}>🎉 Today's Birthday{todayBirthdays.length > 1 ? 's' : ''}!</div>
+                {todayBirthdays.map(m => (
+                  <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
+                    <div style={{ width: 48, height: 48, borderRadius: 12, background: 'linear-gradient(135deg, #7B61FF, #00E5A0)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, fontWeight: 700, color: '#0B0F1A' }}>
+                      {m.name.charAt(0).toUpperCase()}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>🎂 {m.display_name || m.name}</div>
+                      <div style={{ fontSize: 12, color: C.muted }}>{m.role}</div>
+                    </div>
+                    <button
+                      onClick={() => handleTestBirthday(m)}
+                      disabled={testingBirthday === m.id}
+                      style={{ ...btn('linear-gradient(135deg, #7B61FF, #00E5A0)', '#0B0F1A', testingBirthday === m.id), marginLeft: 'auto' }}
+                    >
+                      {testingBirthday === m.id ? 'Sending…' : '🎉 Send Wish Now'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Upcoming 30 days */}
+            {upcomingBirthdays.length > 0 && (
+              <div style={cardStyle}>
+                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 14 }}>📅 Upcoming — Next 30 Days</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {upcomingBirthdays.map(m => (
+                    <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', background: C.elevated, borderRadius: 10 }}>
+                      <div style={{ width: 36, height: 36, borderRadius: 9, background: '#7B61FF20', border: '1px solid #7B61FF40', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15, fontWeight: 700, color: '#7B61FF' }}>
+                        {m.name.charAt(0).toUpperCase()}
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{m.display_name || m.name}</div>
+                        <div style={{ fontSize: 11, color: C.muted }}>{formatBirthday(m.birthday)}</div>
+                      </div>
+                      <div style={{
+                        fontSize: 11, fontWeight: 700, padding: '4px 12px', borderRadius: 20,
+                        background: m.daysUntil <= 7 ? '#EF444415' : '#7B61FF15',
+                        color: m.daysUntil <= 7 ? '#EF4444' : '#7B61FF',
+                        border: `1px solid ${m.daysUntil <= 7 ? '#EF444430' : '#7B61FF30'}`,
+                      }}>
+                        {m.daysUntil === 1 ? 'Tomorrow!' : `${m.daysUntil} days`}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* All members with birthdays */}
+            <div style={cardStyle}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 14 }}>🎂 All Team Birthdays</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {membersWithBirthdays.map(m => (
+                  <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 14px', background: C.elevated, borderRadius: 8 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, flex: 1 }}>{m.display_name || m.name}</div>
+                    <div style={{ fontSize: 12, color: C.muted }}>{formatBirthday(m.birthday)}</div>
+                    <button onClick={() => setEditingMember(m)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.sub, cursor: 'pointer', fontSize: 11, padding: '2px 8px' }}>✏️</button>
+                  </div>
+                ))}
+                {membersWithBirthdays.length === 0 && (
+                  <div style={{ textAlign: 'center', color: C.muted, padding: 20, fontSize: 13 }}>No birthdays set yet. Click ✏️ on any member to add their birthday.</div>
+                )}
+              </div>
+            </div>
+
+            {/* Missing birthdays */}
+            {missingBirthdays.length > 0 && (
+              <div style={{ background: '#FFB84D15', border: '1px solid #FFB84D44', borderRadius: 10, padding: '12px 16px' }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.warn, marginBottom: 4 }}>⚠️ Missing Birthdays</div>
+                <div style={{ fontSize: 12, color: C.sub }}>{missingBirthdays.map(m => m.name).join(', ')} — click ✏️ in the Members tab to add their birthday.</div>
+              </div>
             )}
           </div>
         )}
