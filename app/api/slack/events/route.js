@@ -314,7 +314,7 @@ export async function POST(request) {
       // ── Passive message listener — error tracking ──────────
       if (
         event.type === "message" &&
-        !event.subtype &&           // ignore edits, deletes, joins
+        
         
         event.text
       ) {
