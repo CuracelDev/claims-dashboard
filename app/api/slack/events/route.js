@@ -315,7 +315,7 @@ export async function POST(request) {
       if (
         event.type === "message" &&
         !event.subtype &&           // ignore edits, deletes, joins
-        !event.bot_id &&            // ignore other bots
+        
         event.text
       ) {
         const parsed = parseErrorMessage(event.text);
