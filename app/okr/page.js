@@ -327,7 +327,7 @@ export default function OKRPage() {
     setUploading(true);
     setUploadMsg('');
     try {
-      const XLSX = await import('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js').catch(() => null);
+      const XLSX = await import('xlsx').catch(() => null);
       if (!XLSX) {
         setUploadMsg('⚠️ Upload requires SheetJS. Paste data manually.');
         setUploading(false);
