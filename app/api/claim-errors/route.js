@@ -14,7 +14,7 @@ export async function GET(request) {
     const supabase = getSupabase();
     const { searchParams } = new URL(request.url);
 
-    const limit      = parseInt(searchParams.get('limit')  || '50');
+    const limit      = parseInt(searchParams.get('limit')  || '25');
     const offset     = parseInt(searchParams.get('offset') || '0');
     const hmo        = searchParams.get('hmo');
     const env        = searchParams.get('env');
@@ -39,13 +39,16 @@ export async function GET(request) {
     const { data, error, count } = await query;
     if (error) throw error;
 
-    return Response.json({
-      data:  data  || [],
-      count: count || 0,
-      stats: {},
+    return new Response(JSON.stringify({ data: data || [], count: count || 0, stats: {} }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Pragma': 'no-cache',
+      },
     });
   } catch (err) {
     console.error('GET /api/claim-errors error:', err);
-    return Response.json({ data: [], count: 0, error: err.message }, { status: 500 });
+    return new Response(JSON.stringify({ data: [], count: 0, error: err.message }), { status: 500 });
   }
 }
