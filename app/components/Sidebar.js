@@ -30,6 +30,7 @@ const NAV = [
       { href: '/qa',      icon: '🔍', label: 'QA Flag Tracker', sub: 'Claims quality audit' },
       { href: '/ops',     icon: '⚡', label: 'Ops Overview',     sub: 'Team performance' },
       { href: '/targets', icon: '🎯', label: 'Targets',          sub: 'Weekly goals & alerts' },
+      { href: '/okr',     icon: '📊', label: 'OKR Tracker',      sub: 'Quarterly objectives' },
       { href: '/errors',  icon: '⚠️', label: 'Error Tracker',    sub: 'Claim errors from Slack' },
       { href: '/audit',   icon: '🗂️', label: 'Audit Log',        sub: 'Activity trail' },
       { href: '/slack', icon: '✦', label: 'Ask Prism', sub: 'AI agent · health-ops', children: [
@@ -51,12 +52,6 @@ const NAV = [
       { href: '/settings', icon: '⚙️', label: 'Settings', sub: 'Slack, alerts & config' },
     ],
   },
-  {
-    section: 'COMING SOON',
-    items: [
-      { href: '/okr', icon: '🎯', label: 'OKR Tracker', disabled: false },
-    ],
-  },
 ];
 
 export default function Sidebar() {
@@ -64,12 +59,12 @@ export default function Sidebar() {
   const router   = useRouter();
   const { theme, C, toggle } = useTheme();
 
-  const [guestMode,  setGuestMode]  = useState(false);
-  const [memberName, setMemberName] = useState('');
-  const [signingOut, setSigningOut] = useState(false);
-  const [tooltip,    setTooltip]    = useState(null);
+  const [guestMode,   setGuestMode]   = useState(false);
+  const [memberName,  setMemberName]  = useState('');
+  const [signingOut,  setSigningOut]  = useState(false);
+  const [tooltip,     setTooltip]     = useState(null);
   const [loginBanner, setLoginBanner] = useState(false);
-  const [expanded, setExpanded] = useState({ '/slack': true });
+  const [expanded,    setExpanded]    = useState({ '/slack': true });
 
   useEffect(() => {
     const session = getSession();
@@ -183,23 +178,7 @@ export default function Sidebar() {
 
             {group.items.map(item => {
               const active = isActive(item);
-              const locked = guestMode && !GUEST_ROUTES.includes(item.href) && !item.disabled;
-
-              if (item.disabled) {
-                return (
-                  <div key={item.href} style={{
-                    display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '8px 10px', borderRadius: 8, marginBottom: 2,
-                    opacity: 0.35, cursor: 'not-allowed',
-                  }}>
-                    <span style={{ fontSize: 15 }}>{item.icon}</span>
-                    <div style={{ flex: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span style={{ fontSize: 13, color: C.muted }}>{item.label}</span>
-                      <span style={{ fontSize: 9, background: C.elevated, color: C.muted, padding: '1px 5px', borderRadius: 4 }}>Soon</span>
-                    </div>
-                  </div>
-                );
-              }
+              const locked = guestMode && !GUEST_ROUTES.includes(item.href);
 
               if (locked) {
                 return (
