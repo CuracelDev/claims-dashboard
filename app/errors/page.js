@@ -4,7 +4,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 25;
 
 const ERROR_TYPE_LABELS = {
   import_failure: 'Import Failure',
@@ -448,7 +448,7 @@ export default function ErrorTrackerPage() {
               </div>
 
               {/* Pagination */}
-              {totalPages > 1 && (
+              {total > 0 && (
                 <div style={{
                   padding: '12px 20px', borderTop: `1px solid ${C.border}`,
                   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
