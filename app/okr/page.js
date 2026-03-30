@@ -1,246 +1,325 @@
 'use client';
-// app/okr/page.js — OKR Tracker
+// app/okr/page.js — OKR Tracker (Q1 2026)
 
-import { useState, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Color logic ─────────────────────────────────────────────────────────────
+// Green ≥ 75% | Blue 60–74.9% | Orange 30–59.9% | Red < 30%
 
-function gradeColor(grade) {
-  if (grade === null || grade === undefined || isNaN(grade)) return '#888';
-  const pct = grade * 100;
-  if (pct >= 90) return '#5B8DEF';   // blue — on track / exceeded
-  if (pct >= 75) return '#22C55E';   // green — progressing
-  return '#F97316';                   // orange — at risk
+function gradeColor(pct) {
+  if (pct === null || pct === undefined || isNaN(pct)) return '#666';
+  if (pct >= 75) return '#22C55E';   // green — good
+  if (pct >= 60) return '#5B8DEF';   // blue — on track
+  if (pct >= 30) return '#F97316';   // orange — at risk
+  return '#EF4444';                   // red — critical
 }
 
-function gradeLabel(grade) {
-  if (grade === null || grade === undefined || isNaN(grade)) return '—';
-  const pct = grade * 100;
-  if (pct >= 90) return pct > 100 ? '🚀 Exceeded' : '✅ On Track';
-  if (pct >= 75) return '🟡 Progressing';
-  return '⚠️ At Risk';
-}
-
-function formatTarget(val) {
-  if (val === null || val === undefined || val === '') return '—';
-  const n = Number(val);
-  if (isNaN(n)) return String(val);
-  if (n > 0 && n <= 1 && String(val).includes('.')) return `${(n * 100).toFixed(0)}%`;
-  if (n >= 1 && n <= 100 && String(val).includes('%')) return `${n}%`;
-  return n >= 1000 ? n.toLocaleString() : String(n);
+function gradeLabel(pct) {
+  if (pct === null || pct === undefined || isNaN(pct)) return '—';
+  if (pct >= 75) return '🟢 Good';
+  if (pct >= 60) return '🔵 On Track';
+  if (pct >= 30) return '🟠 At Risk';
+  return '🔴 Critical';
 }
 
 function computeGrade(target, actual) {
-  const t = parseFloat(String(target).replace('%', ''));
-  const a = parseFloat(String(actual).replace('%', ''));
+  if (!target || !actual || String(actual).trim() === '') return null;
+  const t = parseFloat(String(target).replace(/[%,\s]/g, ''));
+  const a = parseFloat(String(actual).replace(/[%,\s]/g, ''));
   if (isNaN(t) || isNaN(a) || t === 0) return null;
-  return a / t;
+  return (a / t) * 100;
 }
 
-function parseExcelData(rows) {
-  // Try to find rows that look like OKR data from Q3/Q4 sheet structure
-  const parsed = [];
-  rows.forEach(row => {
-    const obj = row['Objective'] || row['objective'] || '';
-    const kr  = row['Key Result (s)'] || row['Key Results'] || row['key_result'] || '';
-    const target = row['Target'] || row['Targets'] || '';
-    const actual = row['Actual'] || row['Actuals'] || '';
-    const grade  = row['Grade'] || '';
-    const status = row['Status'] || '';
-    const startDate = row['Start Date'] || '';
-    const dueDate   = row['Due Date'] || '';
-
-    if (!kr || String(kr).trim() === '' || String(kr) === 'NaN') return;
-
-    const computedGrade = grade ? parseFloat(grade) : computeGrade(target, actual);
-
-    parsed.push({
-      objective:  String(obj || '').trim(),
-      keyResult:  String(kr).trim(),
-      target:     target,
-      actual:     actual,
-      grade:      computedGrade,
-      status:     String(status || '').trim(),
-      startDate:  startDate,
-      dueDate:    dueDate,
-    });
-  });
-  return parsed;
+function formatVal(val) {
+  if (!val && val !== 0) return '—';
+  const s = String(val);
+  const n = parseFloat(s.replace(/[%,\s]/g, ''));
+  if (s.includes('%')) return s;
+  if (!isNaN(n) && n >= 1000) return n.toLocaleString();
+  return s;
 }
 
-// ── Seed data from Q3 sheet ────────────────────────────────────────────────
+// ── Grade Pill ────────────────────────────────────────────────────────────────
 
-const SEED = {
-  Q1: [
-    { objective: 'Contribute to customer retention', keyResult: 'Drive 99% Accuracy on existing clinical rules', target: '99%', actual: '99%', grade: 1.0, status: 'In Progress', startDate: '1/1/2026', dueDate: '31/3/2026' },
-    { objective: 'Contribute to customer retention', keyResult: '100% tracking on auto-vet result from clients', target: '100%', actual: '100%', grade: 1.0, status: 'In Progress', startDate: '1/1/2026', dueDate: '31/3/2026' },
-    { objective: 'Contribute to customer retention', keyResult: 'Deliver claims results 100% in accordance with schedules agreed with clients', target: '100%', actual: '100%', grade: 1.0, status: 'In Progress', startDate: '1/1/2026', dueDate: '31/3/2026' },
-    { objective: 'Improve deal conversion from POCs', keyResult: 'Deliver POC claims results not more than 72 hours after data is shared', target: '100%', actual: '100%', grade: 1.0, status: 'In Progress', startDate: '1/1/2026', dueDate: '31/3/2026' },
-    { objective: 'Improve deal conversion from POCs', keyResult: 'Send a weekly reminder after 7 days of shared POC to get client feedback', target: '100%', actual: '100%', grade: 1.0, status: 'In Progress', startDate: '1/1/2026', dueDate: '31/3/2026' },
-  ],
-  Q2: [
-    { objective: 'Improve CVE to become world class standard', keyResult: 'Improve average detection product accuracy to 98%', target: '98%', actual: '99%', grade: 1.01, status: 'In Progress', startDate: '1/4/2025', dueDate: '30/6/2025' },
-    { objective: 'Improve CVE to become world class standard', keyResult: '2500 grouped care items', target: 2500, actual: 965, grade: 0.386, status: 'In Progress', startDate: '1/4/2025', dueDate: '30/6/2025' },
-    { objective: 'Improve CVE to become world class standard', keyResult: '1000 provider mapping', target: 1000, actual: 433, grade: 0.433, status: 'In Progress', startDate: '1/4/2025', dueDate: '30/6/2025' },
-    { objective: 'Improve CVE to become world class standard', keyResult: 'Improve process automation by 20%', target: '20%', actual: '75%', grade: 3.75, status: 'Done', startDate: '1/4/2025', dueDate: '30/6/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Ensure 100% of old and new client detection needs are met', target: '70%', actual: '95.3%', grade: 1.36, status: 'In Progress', startDate: '1/4/2025', dueDate: '30/6/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Improve average Detection TATs to 95% of client agreed timelines', target: '95%', actual: '99%', grade: 1.042, status: 'In Progress', startDate: '1/4/2025', dueDate: '30/6/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Achieve 90% customer satisfaction from internal QA', target: '90%', actual: '90%', grade: 1.0, status: 'In Progress', startDate: '1/4/2025', dueDate: '30/6/2025' },
-  ],
-  Q3: [
-    { objective: 'Improve accuracy & efficiency of CVE system', keyResult: '800 Provider tariff mapping', target: 800, actual: 299, grade: 0.3738, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Improve accuracy & efficiency of CVE system', keyResult: '10,000 care mapping', target: 10000, actual: 17356, grade: 1.7356, status: 'Done', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Improve accuracy & efficiency of CVE system', keyResult: 'Group 2,000 care items', target: 2000, actual: 1380, grade: 0.69, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Improve accuracy & efficiency of CVE system', keyResult: 'Customize 200 diagnoses on CVE for KE and TZ', target: 200, actual: 0, grade: 0, status: 'Pending', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Improve accuracy & efficiency of CVE system', keyResult: 'Review 30,000 claims pile', target: 30000, actual: 30576, grade: 1.0192, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Improve accuracy & efficiency of CVE system', keyResult: 'Eliminate 4,000+ duplicate diagnoses', target: 4000, actual: 1250, grade: 0.3125, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: '100% population of clinical rules for newly added diagnoses (107)', target: 107, actual: 107, grade: 1.0, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Achieve 90% customer satisfaction from internal QA', target: '90%', actual: '90%', grade: 1.0, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Carry out 100% of Detection POCs from Sales team', target: '100%', actual: '0%', grade: 0, status: 'Pending', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Achieve TAT of 24 hours across all Jubilee entities', target: '100%', actual: '95%', grade: 0.95, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-    { objective: 'Contribute to Acquisition & Retention', keyResult: 'Maintain average CVE accuracy of 99%', target: '99%', actual: '98.96%', grade: 0.9996, status: 'In Progress', startDate: '1/7/2025', dueDate: '30/9/2025' },
-  ],
-  Q4: [
-    { objective: 'Enhance efficiency of the Clinical Vetting Engine', keyResult: 'Map 600 providers tariffs', target: 600, actual: 0, grade: 0, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Enhance efficiency of the Clinical Vetting Engine', keyResult: '20,000 care mapping', target: 20000, actual: 0, grade: 0, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Enhance efficiency of the Clinical Vetting Engine', keyResult: 'Group 2,000 care items', target: 2000, actual: 380, grade: 0.19, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Enhance efficiency of the Clinical Vetting Engine', keyResult: 'Complete 50% Jubilee (KE & TZ) Customization', target: '50%', actual: '0%', grade: 0, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Strengthen Customer Acquisition & Retention', keyResult: 'Ensure client CVE result feedback/satisfaction is at >95%', target: '95%', actual: '89%', grade: 0.9368, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Strengthen Customer Acquisition & Retention', keyResult: 'Carry out 100% of Detection POCs from Sales team', target: 2, actual: 0, grade: 0, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Improve detection speed and output', keyResult: 'Achieve 100% TAT across all entities', target: '100%', actual: '95%', grade: 0.95, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Improve detection speed and output', keyResult: 'Maintain 99% CVE accuracy', target: '99%', actual: '99%', grade: 1.0, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Improve detection speed and output', keyResult: 'Clear 2,000+ controversial diagnoses', target: 2000, actual: 0, grade: 0, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-    { objective: 'Improve detection speed and output', keyResult: 'Review 20,000 claims pile', target: 20000, actual: 13067, grade: 0.65335, status: 'In Progress', startDate: '1/10/2025', dueDate: '31/12/2025' },
-  ],
-};
-
-// ── Grade Pill ────────────────────────────────────────────────────────────
-
-function GradePill({ grade, C }) {
-  if (grade === null || grade === undefined || isNaN(grade)) {
-    return <span style={{ fontSize: 12, color: C.muted }}>—</span>;
+function GradePill({ pct }) {
+  if (pct === null || pct === undefined || isNaN(pct)) {
+    return <span style={{ fontSize: 12, color: '#666', fontStyle: 'italic' }}>No actual yet</span>;
   }
-  const pct = grade * 100;
-  const color = gradeColor(grade);
+  const color = gradeColor(pct);
   return (
     <div style={{
-      background: color,
-      color: '#fff',
-      borderRadius: 8,
-      padding: '5px 12px',
-      fontSize: 13,
-      fontWeight: 700,
-      fontFamily: 'monospace',
-      textAlign: 'center',
-      minWidth: 72,
+      display: 'inline-flex', alignItems: 'center', gap: 6,
+      background: `${color}22`, border: `1px solid ${color}44`,
+      borderRadius: 8, padding: '4px 12px',
     }}>
-      {pct > 200 ? '>200%' : `${pct.toFixed(1)}%`}
+      <div style={{ width: 8, height: 8, borderRadius: '50%', background: color }} />
+      <span style={{ fontSize: 13, fontWeight: 700, color, fontFamily: 'monospace' }}>
+        {pct > 200 ? '>200%' : `${pct.toFixed(1)}%`}
+      </span>
     </div>
   );
 }
 
-// ── Editable Row ──────────────────────────────────────────────────────────
+// ── KR Row ────────────────────────────────────────────────────────────────────
 
-function OKRRow({ row, idx, onUpdate, C, inp, td }) {
+function KRRow({ row, onSave, onDelete, C, inp, td }) {
   const [editing, setEditing] = useState(false);
-  const [local, setLocal] = useState({ target: row.target, actual: row.actual });
+  const [saving, setSaving] = useState(false);
+  const [local, setLocal] = useState({ target: row.target || '', actual: row.actual || '', status: row.status || 'In Progress' });
 
-  const computedGrade = computeGrade(local.target, local.actual);
+  const pct = editing
+    ? computeGrade(local.target, local.actual)
+    : row.grade !== null && row.grade !== undefined ? row.grade * 100 : computeGrade(row.target, row.actual);
 
-  const save = () => {
-    onUpdate(idx, { ...row, target: local.target, actual: local.actual, grade: computedGrade });
+  const color = gradeColor(pct);
+
+  const handleSave = async () => {
+    setSaving(true);
+    await onSave(row.id, local);
     setEditing(false);
+    setSaving(false);
   };
 
-  const color = gradeColor(row.grade);
-
   return (
-    <tr
-      style={{ borderLeft: `3px solid ${color}`, cursor: 'pointer' }}
-      onClick={() => !editing && setEditing(true)}
-    >
-      <td style={{ ...td, color: C.muted, fontSize: 11, maxWidth: 160 }}>
-        <div style={{ fontSize: 11, color: C.muted, fontStyle: 'italic', lineHeight: 1.3 }}>{row.objective || '—'}</div>
+    <tr style={{ borderLeft: `3px solid ${pct !== null ? color : C.border}` }}>
+      {/* KR number */}
+      <td style={{ ...td, textAlign: 'center', width: 50 }}>
+        <span style={{
+          fontSize: 11, fontWeight: 700, color: C.accent,
+          background: `${C.accent}18`, borderRadius: 4, padding: '2px 7px',
+        }}>{row.kr_number}</span>
       </td>
-      <td style={{ ...td, color: C.text, maxWidth: 280 }}>
-        <div style={{ fontSize: 12, lineHeight: 1.4 }}>{row.keyResult}</div>
-        <div style={{ fontSize: 10, color: C.muted, marginTop: 3 }}>
-          {row.startDate && row.dueDate ? `${row.startDate} → ${row.dueDate}` : ''}
-        </div>
+
+      {/* Key Result */}
+      <td style={{ ...td, maxWidth: 340 }}>
+        <div style={{ fontSize: 12, color: C.text, lineHeight: 1.45 }}>{row.key_result}</div>
       </td>
-      <td style={{ ...td, textAlign: 'center' }}>
+
+      {/* Target */}
+      <td style={{ ...td, textAlign: 'center', width: 110 }}>
         {editing ? (
           <input
             value={local.target}
             onChange={e => setLocal(l => ({ ...l, target: e.target.value }))}
-            style={{ ...inp, width: 80, textAlign: 'center' }}
-            onClick={e => e.stopPropagation()}
+            style={{ ...inp, width: 90, textAlign: 'center' }}
           />
         ) : (
-          <span style={{ fontSize: 13, color: C.sub, fontWeight: 600 }}>{formatTarget(row.target)}</span>
+          <span style={{ fontSize: 13, color: C.sub, fontWeight: 600 }}>{formatVal(row.target)}</span>
         )}
       </td>
-      <td style={{ ...td, textAlign: 'center' }}>
+
+      {/* Actual */}
+      <td style={{ ...td, textAlign: 'center', width: 110 }}>
         {editing ? (
           <input
             value={local.actual}
             onChange={e => setLocal(l => ({ ...l, actual: e.target.value }))}
-            style={{ ...inp, width: 80, textAlign: 'center' }}
-            onClick={e => e.stopPropagation()}
+            style={{ ...inp, width: 90, textAlign: 'center' }}
+            placeholder="Enter actual"
           />
         ) : (
-          <span style={{ fontSize: 13, color: C.text, fontWeight: 700 }}>{formatTarget(row.actual)}</span>
+          <span style={{ fontSize: 13, color: C.text, fontWeight: 700 }}>
+            {row.actual ? formatVal(row.actual) : <span style={{ color: C.muted, fontStyle: 'italic', fontSize: 11 }}>–</span>}
+          </span>
         )}
       </td>
-      <td style={{ ...td, textAlign: 'center' }}>
-        <GradePill grade={editing ? computedGrade : row.grade} C={C} />
+
+      {/* Grade */}
+      <td style={{ ...td, textAlign: 'center', width: 140 }}>
+        <GradePill pct={pct} />
       </td>
-      <td style={{ ...td, textAlign: 'center' }}>
-        <span style={{
-          fontSize: 11, padding: '3px 8px', borderRadius: 4,
-          background: row.status === 'Done' ? '#22C55E22' : row.status === 'Pending' ? '#F9731622' : '#5B8DEF22',
-          color: row.status === 'Done' ? '#22C55E' : row.status === 'Pending' ? '#F97316' : '#5B8DEF',
-          fontWeight: 600,
-        }}>
-          {row.status || 'In Progress'}
-        </span>
-      </td>
-      <td style={{ ...td, textAlign: 'center' }}>
+
+      {/* Status */}
+      <td style={{ ...td, textAlign: 'center', width: 110 }}>
         {editing ? (
-          <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }} onClick={e => e.stopPropagation()}>
-            <button onClick={save} style={{
-              background: '#22C55E', color: '#fff', border: 'none',
-              borderRadius: 6, padding: '4px 10px', fontSize: 11, cursor: 'pointer',
-            }}>Save</button>
-            <button onClick={() => { setLocal({ target: row.target, actual: row.actual }); setEditing(false); }} style={{
-              background: 'transparent', color: C.muted, border: `1px solid ${C.border}`,
-              borderRadius: 6, padding: '4px 10px', fontSize: 11, cursor: 'pointer',
-            }}>Cancel</button>
+          <select value={local.status} onChange={e => setLocal(l => ({ ...l, status: e.target.value }))} style={{ ...inp, width: 110 }}>
+            <option>In Progress</option>
+            <option>Done</option>
+            <option>Pending</option>
+            <option>Blocked</option>
+          </select>
+        ) : (
+          <span style={{
+            fontSize: 11, padding: '3px 8px', borderRadius: 4, fontWeight: 600,
+            background: row.status === 'Done' ? '#22C55E22' : row.status === 'Blocked' ? '#EF444422' : row.status === 'Pending' ? '#F9731622' : '#5B8DEF22',
+            color: row.status === 'Done' ? '#22C55E' : row.status === 'Blocked' ? '#EF4444' : row.status === 'Pending' ? '#F97316' : '#5B8DEF',
+          }}>{row.status || 'In Progress'}</span>
+        )}
+      </td>
+
+      {/* Actions */}
+      <td style={{ ...td, textAlign: 'center', width: 100 }}>
+        {editing ? (
+          <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              style={{ background: '#22C55E', color: '#fff', border: 'none', borderRadius: 6, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
+            >{saving ? '…' : '✓ Save'}</button>
+            <button
+              onClick={() => { setLocal({ target: row.target || '', actual: row.actual || '', status: row.status || 'In Progress' }); setEditing(false); }}
+              style={{ background: 'transparent', color: C.muted, border: `1px solid ${C.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}
+            >✕</button>
           </div>
         ) : (
-          <span style={{ fontSize: 11, color: C.muted }}>✏️ Edit</span>
+          <button
+            onClick={() => setEditing(true)}
+            style={{ background: 'transparent', color: C.muted, border: `1px solid ${C.border}`, borderRadius: 6, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
+          >✏️ Edit</button>
         )}
       </td>
     </tr>
   );
 }
 
-// ── Summary Bar ───────────────────────────────────────────────────────────
+// ── Objective Block ───────────────────────────────────────────────────────────
 
-function SummaryBar({ data, C }) {
-  const valid = data.filter(r => r.grade !== null && !isNaN(r.grade));
-  const avg = valid.length ? valid.reduce((s, r) => s + r.grade, 0) / valid.length : 0;
-  const onTrack = valid.filter(r => r.grade >= 0.9).length;
-  const progressing = valid.filter(r => r.grade >= 0.75 && r.grade < 0.9).length;
-  const atRisk = valid.filter(r => r.grade < 0.75).length;
+function ObjectiveBlock({ objective, rows, onSave, onDelete, C, inp, td }) {
+  const gradedRows = rows.filter(r => {
+    const pct = r.grade !== null && r.grade !== undefined ? r.grade * 100 : computeGrade(r.target, r.actual);
+    return pct !== null;
+  });
+  const avgPct = gradedRows.length
+    ? gradedRows.reduce((s, r) => {
+        const pct = r.grade !== null && r.grade !== undefined ? r.grade * 100 : computeGrade(r.target, r.actual);
+        return s + pct;
+      }, 0) / gradedRows.length
+    : null;
+  const color = gradeColor(avgPct);
 
-  const pill = (label, value, color) => (
-    <div style={{
-      background: C.card, border: `1px solid ${C.border}`,
-      borderRadius: 10, padding: '12px 20px', flex: 1, minWidth: 120,
-      position: 'relative', overflow: 'hidden',
-    }}>
+  return (
+    <div style={{ marginBottom: 24 }}>
+      {/* Objective header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12,
+        padding: '10px 16px',
+        background: avgPct !== null ? `${color}18` : `${C.elevated}`,
+        borderLeft: `4px solid ${avgPct !== null ? color : C.border}`,
+        borderRadius: '10px 10px 0 0',
+      }}>
+        <span style={{ flex: 1, fontSize: 13, fontWeight: 700, color: avgPct !== null ? color : C.sub }}>
+          {objective}
+        </span>
+        {avgPct !== null && (
+          <span style={{ fontSize: 12, fontWeight: 700, color, fontFamily: 'monospace', background: `${color}22`, borderRadius: 6, padding: '2px 10px' }}>
+            {avgPct.toFixed(0)}% avg
+          </span>
+        )}
+      </div>
+
+      {/* Table */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: '0 0 10px 10px', overflow: 'hidden' }}>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <colgroup>
+              <col style={{ width: 50 }} />
+              <col />
+              <col style={{ width: 110 }} />
+              <col style={{ width: 110 }} />
+              <col style={{ width: 140 }} />
+              <col style={{ width: 110 }} />
+              <col style={{ width: 100 }} />
+            </colgroup>
+            <tbody>
+              {rows.map(row => (
+                <KRRow key={row.id} row={row} onSave={onSave} onDelete={onDelete} C={C} inp={inp} td={td} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main Page ─────────────────────────────────────────────────────────────────
+
+const QUARTERS = ['Q1', 'Q2', 'Q3', 'Q4'];
+const QUARTER_LABELS = { Q1: 'Jan – Mar 2026', Q2: 'Apr – Jun 2026', Q3: 'Jul – Sep 2026', Q4: 'Oct – Dec 2026' };
+
+export default function OKRPage() {
+  const { C } = useTheme();
+  const [quarter, setQuarter] = useState('Q1');
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState('');
+
+  const load = useCallback(async (q) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/okr?quarter=${q}`);
+      const d = await res.json();
+      setRows(d.data || []);
+    } catch {
+      setRows([]);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(quarter); }, [quarter, load]);
+
+  const handleSave = async (id, updates) => {
+    const grade = computeGrade(updates.target, updates.actual);
+    // Optimistic update
+    setRows(prev => prev.map(r => r.id === id ? { ...r, ...updates, grade: grade !== null ? grade / 100 : null } : r));
+    try {
+      const res = await fetch('/api/okr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'upsert', row: { id, ...updates, grade: grade !== null ? grade / 100 : null } }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error);
+      flashMsg('✅ Saved');
+    } catch (err) {
+      flashMsg('❌ Save failed: ' + err.message);
+    }
+  };
+
+  const handleAddKR = async (objective) => {
+    const kr_number = `KR${rows.filter(r => r.objective === objective).length + 1}`;
+    try {
+      const res = await fetch('/api/okr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'insert', row: { quarter, objective, kr_number, key_result: 'New Key Result', target: '', actual: '', status: 'In Progress', start_date: '', due_date: '' } }),
+      });
+      const d = await res.json();
+      if (d.ok) { load(quarter); flashMsg('✅ KR added'); }
+    } catch {}
+  };
+
+  const flashMsg = (m) => {
+    setMsg(m);
+    setTimeout(() => setMsg(''), 3000);
+  };
+
+  // Summary stats
+  const gradedRows = rows.filter(r => {
+    const pct = r.grade !== null && r.grade !== undefined ? r.grade * 100 : computeGrade(r.target, r.actual);
+    return pct !== null;
+  });
+  const avgPct = gradedRows.length ? gradedRows.reduce((s, r) => {
+    const pct = r.grade !== null && r.grade !== undefined ? r.grade * 100 : computeGrade(r.target, r.actual);
+    return s + pct;
+  }, 0) / gradedRows.length : null;
+
+  const counts = {
+    green: gradedRows.filter(r => { const p = r.grade !== null ? r.grade * 100 : computeGrade(r.target, r.actual); return p >= 75; }).length,
+    blue: gradedRows.filter(r => { const p = r.grade !== null ? r.grade * 100 : computeGrade(r.target, r.actual); return p >= 60 && p < 75; }).length,
+    orange: gradedRows.filter(r => { const p = r.grade !== null ? r.grade * 100 : computeGrade(r.target, r.actual); return p >= 30 && p < 60; }).length,
+    red: gradedRows.filter(r => { const p = r.grade !== null ? r.grade * 100 : computeGrade(r.target, r.actual); return p < 30; }).length,
+  };
+
+  // Group by objective
+  const objectives = [...new Set(rows.map(r => r.objective))];
+
+  const inp = { background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '6px 10px', color: C.text, fontSize: 12, outline: 'none' };
+  const td = { fontSize: 12, padding: '10px 14px', borderBottom: `1px solid ${C.border}33`, verticalAlign: 'middle' };
+
+  const statCard = (label, value, color) => (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 18px', flex: 1, minWidth: 110, position: 'relative', overflow: 'hidden' }}>
       <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: color }} />
       <div style={{ fontSize: 10, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
       <div style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: 'monospace' }}>{value}</div>
@@ -248,297 +327,116 @@ function SummaryBar({ data, C }) {
   );
 
   return (
-    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
-      {pill('Avg Grade', `${(avg * 100).toFixed(1)}%`, gradeColor(avg))}
-      {pill('Total KRs', valid.length, C.accent)}
-      {pill('On Track', onTrack, '#5B8DEF')}
-      {pill('Progressing', progressing, '#22C55E')}
-      {pill('At Risk', atRisk, '#F97316')}
-    </div>
-  );
-}
-
-// ── Mini Quarter Card ─────────────────────────────────────────────────────
-
-function QuarterCard({ quarter, data, active, onClick, C }) {
-  const valid = data.filter(r => r.grade !== null && !isNaN(r.grade));
-  const avg = valid.length ? valid.reduce((s, r) => s + r.grade, 0) / valid.length : 0;
-  const color = gradeColor(avg);
-
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        flex: 1, background: active ? color : C.card,
-        border: `2px solid ${active ? color : C.border}`,
-        borderRadius: 12, padding: '14px 20px', cursor: 'pointer',
-        transition: 'all 0.15s',
-      }}
-    >
-      <div style={{ fontSize: 13, fontWeight: 700, color: active ? '#fff' : C.sub, marginBottom: 4 }}>{quarter}</div>
-      <div style={{ fontSize: 20, fontWeight: 800, color: active ? '#fff' : C.text, fontFamily: 'monospace' }}>
-        {(avg * 100).toFixed(0)}%
-      </div>
-      <div style={{ fontSize: 10, color: active ? '#ffffff99' : C.muted, marginTop: 2 }}>
-        {valid.length} key results
-      </div>
-    </button>
-  );
-}
-
-// ── Main Page ─────────────────────────────────────────────────────────────
-
-export default function OKRPage() {
-  const { C } = useTheme();
-  const [quarter, setQuarter] = useState('Q3');
-  const [data, setData] = useState(SEED);
-  const [uploading, setUploading] = useState(false);
-  const [uploadMsg, setUploadMsg] = useState('');
-  const fileRef = useRef();
-
-  const currentData = data[quarter] || [];
-
-  const handleUpdate = useCallback((idx, updated) => {
-    setData(prev => ({
-      ...prev,
-      [quarter]: prev[quarter].map((r, i) => i === idx ? updated : r),
-    }));
-  }, [quarter]);
-
-  const handleAddRow = () => {
-    setData(prev => ({
-      ...prev,
-      [quarter]: [...prev[quarter], {
-        objective: 'New Objective',
-        keyResult: 'New Key Result',
-        target: '',
-        actual: '',
-        grade: null,
-        status: 'In Progress',
-        startDate: '',
-        dueDate: '',
-      }],
-    }));
-  };
-
-  const handleUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    setUploading(true);
-    setUploadMsg('');
-    try {
-      const XLSX = await import('xlsx').catch(() => null);
-      if (!XLSX) {
-        setUploadMsg('⚠️ Upload requires SheetJS. Paste data manually.');
-        setUploading(false);
-        return;
-      }
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array' });
-      const newData = { ...data };
-      const qSheets = { Q1: 'Q1', Q2: 'Q2', Q3: 'Q3', Q4: 'Q4' };
-      let loaded = 0;
-      Object.entries(qSheets).forEach(([q, sheet]) => {
-        if (wb.SheetNames.includes(sheet)) {
-          const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheet]);
-          const parsed = parseExcelData(rows);
-          if (parsed.length > 0) {
-            newData[q] = parsed;
-            loaded++;
-          }
-        }
-      });
-      setData(newData);
-      setUploadMsg(loaded > 0 ? `✅ Loaded ${loaded} quarter(s) from Excel` : '⚠️ No OKR data found — check sheet names (Q1, Q2, Q3, Q4)');
-    } catch (err) {
-      setUploadMsg('❌ Error reading file: ' + err.message);
-    }
-    setUploading(false);
-    fileRef.current.value = '';
-  };
-
-  const exportCSV = () => {
-    const headers = ['Quarter', 'Objective', 'Key Result', 'Target', 'Actual', 'Grade %', 'Status', 'Start Date', 'Due Date'];
-    const rows = Object.entries(data).flatMap(([q, qdata]) =>
-      qdata.map(r => [
-        q, r.objective, r.keyResult, r.target, r.actual,
-        r.grade !== null && !isNaN(r.grade) ? `${(r.grade * 100).toFixed(1)}%` : '',
-        r.status, r.startDate, r.dueDate,
-      ])
-    );
-    const csv = [headers, ...rows].map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-    a.download = `okr-tracker-${new Date().toISOString().split('T')[0]}.csv`;
-    a.click();
-  };
-
-  const inp = {
-    background: C.elevated, border: `1px solid ${C.border}`,
-    borderRadius: 8, padding: '6px 10px', color: C.text, fontSize: 12, outline: 'none',
-  };
-
-  const th = {
-    fontSize: 11, fontWeight: 600, color: C.muted,
-    padding: '10px 14px', textAlign: 'left',
-    borderBottom: `1px solid ${C.border}`,
-    background: C.elevated, whiteSpace: 'nowrap',
-  };
-
-  const td = {
-    fontSize: 12, padding: '10px 14px',
-    borderBottom: `1px solid ${C.border}33`,
-    verticalAlign: 'middle',
-  };
-
-  // Group by objective for better display
-  const grouped = currentData.reduce((acc, row, idx) => {
-    const key = row.objective || 'Other';
-    if (!acc[key]) acc[key] = [];
-    acc[key].push({ ...row, _idx: idx });
-    return acc;
-  }, {});
-
-  return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text }}>
 
       {/* Header */}
-      <div style={{
-        background: C.card, borderBottom: `1px solid ${C.border}`,
-        padding: '16px 24px', display: 'flex',
-        justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10,
-      }}>
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '16px 24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: C.text }}>🎯 OKR Tracker</h1>
-          <p style={{ margin: '2px 0 0', fontSize: 11, color: C.sub }}>
-            Data Operations · 2026 · Click any row to edit Target or Actual
-          </p>
+          <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>🎯 OKR Tracker</h1>
+          <p style={{ margin: '2px 0 0', fontSize: 11, color: C.sub }}>Data Operations · 2026 · Click ✏️ Edit on any row to update Target or Actual</p>
         </div>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button onClick={exportCSV} style={{
-            background: C.elevated, border: `1px solid ${C.border}`,
-            borderRadius: 8, padding: '7px 14px', color: C.accent,
-            fontSize: 12, cursor: 'pointer', fontWeight: 600,
-          }}>⬇ Export CSV</button>
-          <button onClick={() => fileRef.current.click()} disabled={uploading} style={{
-            background: C.elevated, border: `1px solid ${C.border}`,
-            borderRadius: 8, padding: '7px 14px', color: C.sub,
-            fontSize: 12, cursor: 'pointer',
-          }}>📂 {uploading ? 'Reading…' : 'Upload Excel'}</button>
-          <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={handleUpload} style={{ display: 'none' }} />
-        </div>
+        {msg && (
+          <div style={{ fontSize: 12, fontWeight: 600, color: msg.startsWith('✅') ? '#22C55E' : '#EF4444', background: msg.startsWith('✅') ? '#22C55E22' : '#EF444422', borderRadius: 8, padding: '6px 14px' }}>
+            {msg}
+          </div>
+        )}
       </div>
 
       <div style={{ padding: '16px 24px' }}>
 
-        {uploadMsg && (
-          <div style={{
-            marginBottom: 14, padding: '10px 16px', borderRadius: 8,
-            background: uploadMsg.startsWith('✅') ? '#22C55E22' : '#F9731622',
-            color: uploadMsg.startsWith('✅') ? '#22C55E' : '#F97316',
-            fontSize: 12, fontWeight: 600,
-          }}>{uploadMsg}</div>
+        {/* Quarter tabs */}
+        <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
+          {QUARTERS.map(q => (
+            <button
+              key={q}
+              onClick={() => { setQuarter(q); }}
+              style={{
+                flex: 1, minWidth: 140, padding: '12px 16px', borderRadius: 10, cursor: 'pointer',
+                border: `2px solid ${quarter === q ? C.accent : C.border}`,
+                background: quarter === q ? `${C.accent}18` : C.card,
+                textAlign: 'left',
+              }}
+            >
+              <div style={{ fontSize: 14, fontWeight: 700, color: quarter === q ? C.accent : C.sub }}>{q}</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{QUARTER_LABELS[q]}</div>
+              {q !== 'Q1' && <div style={{ fontSize: 10, color: C.muted, marginTop: 4, fontStyle: 'italic' }}>Not started</div>}
+            </button>
+          ))}
+        </div>
+
+        {/* Q2-Q4 empty state */}
+        {quarter !== 'Q1' && (
+          <div style={{ textAlign: 'center', padding: '80px 0', background: C.card, borderRadius: 12, border: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 40, marginBottom: 16 }}>📋</div>
+            <div style={{ fontSize: 16, color: C.sub, fontWeight: 600, marginBottom: 8 }}>{quarter} OKRs not set yet</div>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 24 }}>Set your {quarter} objectives and key results when the quarter begins.</div>
+            <button
+              onClick={() => handleAddKR('New Objective')}
+              style={{ background: C.accent, color: '#fff', border: 'none', borderRadius: 8, padding: '10px 24px', fontSize: 13, cursor: 'pointer', fontWeight: 600 }}
+            >+ Add First KR</button>
+          </div>
         )}
 
-        {/* Quarter selector */}
-        <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
-          {['Q1', 'Q2', 'Q3', 'Q4'].map(q => (
-            <QuarterCard
-              key={q}
-              quarter={q}
-              data={data[q] || []}
-              active={quarter === q}
-              onClick={() => setQuarter(q)}
-              C={C}
-            />
-          ))}
-        </div>
-
-        {/* Summary stats */}
-        <SummaryBar data={currentData} C={C} />
-
-        {/* Grade legend */}
-        <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center' }}>
-          <span style={{ fontSize: 11, color: C.muted }}>Grade key:</span>
-          {[
-            { label: '≥ 90% — On Track', color: '#5B8DEF' },
-            { label: '75–89% — Progressing', color: '#22C55E' },
-            { label: '< 75% — At Risk', color: '#F97316' },
-          ].map(({ label, color }) => (
-            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <div style={{ width: 10, height: 10, borderRadius: 3, background: color }} />
-              <span style={{ fontSize: 11, color: C.muted }}>{label}</span>
-            </div>
-          ))}
-        </div>
-
-        {/* OKR Table — grouped by objective */}
-        {Object.entries(grouped).map(([objective, rows]) => {
-          const avgGrade = rows.filter(r => r.grade !== null && !isNaN(r.grade)).reduce((s, r) => s + r.grade, 0) / rows.filter(r => r.grade !== null && !isNaN(r.grade)).length;
-          const color = gradeColor(avgGrade);
-          return (
-            <div key={objective} style={{ marginBottom: 20 }}>
-              {/* Objective header */}
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6,
-                padding: '8px 14px', background: `${color}18`,
-                borderRadius: '10px 10px 0 0', borderLeft: `4px solid ${color}`,
-              }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color, flex: 1 }}>{objective}</span>
-                <span style={{
-                  fontSize: 11, background: color, color: '#fff',
-                  borderRadius: 6, padding: '2px 10px', fontWeight: 700, fontFamily: 'monospace',
-                }}>
-                  {isNaN(avgGrade) ? '—' : `${(avgGrade * 100).toFixed(0)}% avg`}
-                </span>
-              </div>
-
-              {/* KR table */}
-              <div style={{
-                background: C.card, border: `1px solid ${C.border}`,
-                borderRadius: '0 0 10px 10px', overflow: 'hidden',
-              }}>
-                <div style={{ overflowX: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                    <thead>
-                      <tr>
-                        <th style={{ ...th, width: 160 }}>Objective</th>
-                        <th style={th}>Key Result</th>
-                        <th style={{ ...th, textAlign: 'center', width: 100 }}>Target</th>
-                        <th style={{ ...th, textAlign: 'center', width: 100 }}>Actual</th>
-                        <th style={{ ...th, textAlign: 'center', width: 100 }}>Grade</th>
-                        <th style={{ ...th, textAlign: 'center', width: 100 }}>Status</th>
-                        <th style={{ ...th, textAlign: 'center', width: 90 }}>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((row) => (
-                        <OKRRow
-                          key={row._idx}
-                          row={row}
-                          idx={row._idx}
-                          onUpdate={handleUpdate}
-                          C={C}
-                          inp={inp}
-                          td={td}
-                        />
-                      ))}
-                    </tbody>
-                  </table>
+        {/* Q1 content */}
+        {quarter === 'Q1' && (
+          <>
+            {/* Legend */}
+            <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+              <span style={{ fontSize: 11, color: C.muted }}>Grade:</span>
+              {[['≥ 75% — Good', '#22C55E'], ['60–74.9% — On Track', '#5B8DEF'], ['30–59.9% — At Risk', '#F97316'], ['< 30% — Critical', '#EF4444']].map(([label, color]) => (
+                <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 9, height: 9, borderRadius: 3, background: color }} />
+                  <span style={{ fontSize: 11, color: C.muted }}>{label}</span>
                 </div>
-              </div>
+              ))}
             </div>
-          );
-        })}
 
-        {/* Add Row */}
-        <button onClick={handleAddRow} style={{
-          background: 'transparent', border: `2px dashed ${C.border}`,
-          borderRadius: 10, padding: '12px 24px', color: C.muted,
-          fontSize: 13, cursor: 'pointer', width: '100%', marginTop: 4,
-        }}>
-          + Add Key Result to {quarter}
-        </button>
+            {/* Stats */}
+            {gradedRows.length > 0 && (
+              <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
+                {statCard('Avg Grade', avgPct !== null ? `${avgPct.toFixed(0)}%` : '—', gradeColor(avgPct))}
+                {statCard('Total KRs', rows.length, C.accent)}
+                {statCard('Good (≥75%)', counts.green, '#22C55E')}
+                {statCard('On Track', counts.blue, '#5B8DEF')}
+                {statCard('At Risk', counts.orange, '#F97316')}
+                {statCard('Critical', counts.red, '#EF4444')}
+              </div>
+            )}
+
+            {/* Table header */}
+            <div style={{ display: 'flex', gap: 0, background: C.elevated, borderRadius: '8px 8px 0 0', border: `1px solid ${C.border}`, borderBottom: 'none' }}>
+              {[['KR', 50], ['Key Result', null], ['Target', 110], ['Actual', 110], ['Grade', 140], ['Status', 110], ['', 100]].map(([label, width]) => (
+                <div key={label} style={{ padding: '8px 14px', fontSize: 11, fontWeight: 600, color: C.muted, width: width || 'auto', flex: width ? undefined : 1 }}>{label}</div>
+              ))}
+            </div>
+
+            {loading ? (
+              <div style={{ textAlign: 'center', padding: '60px 0', background: C.card, border: `1px solid ${C.border}`, borderTop: 'none', borderRadius: '0 0 10px 10px', color: C.muted, fontSize: 13 }}>Loading…</div>
+            ) : (
+              <>
+                {objectives.map(obj => (
+                  <ObjectiveBlock
+                    key={obj}
+                    objective={obj}
+                    rows={rows.filter(r => r.objective === obj)}
+                    onSave={handleSave}
+                    onDelete={() => {}}
+                    C={C}
+                    inp={inp}
+                    td={td}
+                  />
+                ))}
+
+                <button
+                  onClick={() => handleAddKR(objectives[0] || 'New Objective')}
+                  style={{ width: '100%', background: 'transparent', border: `2px dashed ${C.border}`, borderRadius: 10, padding: '12px', color: C.muted, fontSize: 13, cursor: 'pointer', marginTop: 4 }}
+                >
+                  + Add Key Result
+                </button>
+              </>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
