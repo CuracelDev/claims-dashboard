@@ -1,6 +1,6 @@
 'use client';
 // app/login/page.js — Claims Intel Login
-// Built by Fade & TomBoy ✦
+// Built by Fade & Moe ✦
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
@@ -349,7 +349,7 @@ export default function LoginPage() {
           fontSize: 11, marginTop: 5, fontWeight: 600,
           background: 'linear-gradient(90deg, #7B61FF, #00E5A0)',
           WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-        }}>Built by Fade & TomBoy ✦</div>
+        }}>Built by Fade & Moe ✦</div>
       </div>
 
       <style>{`

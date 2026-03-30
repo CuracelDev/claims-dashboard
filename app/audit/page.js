@@ -1,6 +1,6 @@
 'use client';
 // app/audit/page.js — Audit Log
-// Built by Fade & TomBoy ✦
+// Built by Fade & Moe ✦
 
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';

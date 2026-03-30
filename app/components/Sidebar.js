@@ -344,7 +344,7 @@ export default function Sidebar() {
           fontSize: 10, marginTop: 4, fontWeight: 600,
           background: 'linear-gradient(90deg, #7B61FF, #00E5A0)',
           WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-        }}>Built by Fade & TomBoy ✦</div>
+        }}>Built by Fade & Moe ✦</div>
       </div>
 
       <style>{`@keyframes fadeIn { from { opacity:0 } to { opacity:1 } }`}</style>
