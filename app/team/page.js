@@ -108,7 +108,7 @@ function EditMemberModal({ member, onSave, onClose, C }) {
             <input
               type="date"
               value={birthday}
-              onChange={e => setBirthday(e.target.value)}
+              onChange={e => setBirthday(e.target.value ? `2000-${e.target.value.slice(5)}` : "")}
               style={{ ...inputStyle, width: '100%' }}
             />
             <div style={{ fontSize: 10, color: '#8899AA', marginTop: 4 }}>Year doesn't matter — only month & day are used for wishes.</div>
