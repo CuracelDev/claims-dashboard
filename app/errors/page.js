@@ -74,8 +74,6 @@ export default function ErrorTrackerPage() {
       .then(r => r.json())
       .then(d => {
         const rows = d.data || [];
-
-        // Compute stats client-side from returned rows
         const byType = {}, byHmo = {}, byEnv = {}, byChannel = {};
         rows.forEach(r => {
           if (r.error_type)   byType[r.error_type]      = (byType[r.error_type]      || 0) + 1;
@@ -83,7 +81,6 @@ export default function ErrorTrackerPage() {
           if (r.env)          byEnv[r.env]              = (byEnv[r.env]              || 0) + 1;
           if (r.channel_name) byChannel[r.channel_name] = (byChannel[r.channel_name] || 0) + 1;
         });
-
         setLogs(rows);
         setTotal(d.count || 0);
         setStats({ byType, byHmo, byEnv, byChannel });
@@ -95,6 +92,29 @@ export default function ErrorTrackerPage() {
   useEffect(() => { load(); }, [load]);
 
   const totalPages = Math.ceil(total / PAGE_SIZE);
+
+  const exportCSV = () => {
+    const headers = ['Time', 'Type', 'HMO', 'Env', 'Channel', 'Inv ID', 'Provider Code', 'Error Message', 'Refs'];
+    const rows = logs.map(log => [
+      log.created_at ? new Date(log.created_at).toLocaleString('en-GB', { timeZone: 'Africa/Lagos' }) : '',
+      log.error_type || '',
+      log.hmo || '',
+      log.env || '',
+      log.channel_name ? `#${log.channel_name}` : log.channel_id || '',
+      log.inv_id || '',
+      log.provider_code || '',
+      (log.error_message || '').replace(/,/g, ';'),
+      Array.isArray(log.refs) ? log.refs.map(r => `${r.ref}: ${r.error}`).join(' | ') : '',
+    ]);
+    const csv = [headers, ...rows]
+      .map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `claim-errors-${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+  };
 
   const inp = {
     background: C.elevated, border: `1px solid ${C.border}`,
@@ -135,14 +155,26 @@ export default function ErrorTrackerPage() {
             Errors captured from Slack · {total.toLocaleString()} total
           </p>
         </div>
-        <button
-          onClick={load}
-          style={{
-            background: C.elevated, border: `1px solid ${C.border}`,
-            borderRadius: 8, padding: '7px 14px', color: C.sub,
-            fontSize: 12, cursor: 'pointer',
-          }}
-        >🔄 Refresh</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            onClick={exportCSV}
+            disabled={logs.length === 0}
+            style={{
+              background: C.elevated, border: `1px solid ${C.border}`,
+              borderRadius: 8, padding: '7px 14px', color: C.accent,
+              fontSize: 12, cursor: logs.length === 0 ? 'not-allowed' : 'pointer',
+              fontWeight: 600, opacity: logs.length === 0 ? 0.4 : 1,
+            }}
+          >⬇ Export CSV</button>
+          <button
+            onClick={load}
+            style={{
+              background: C.elevated, border: `1px solid ${C.border}`,
+              borderRadius: 8, padding: '7px 14px', color: C.sub,
+              fontSize: 12, cursor: 'pointer',
+            }}
+          >🔄 Refresh</button>
+        </div>
       </div>
 
       <div style={{ padding: '16px 24px' }}>
@@ -420,22 +452,56 @@ export default function ErrorTrackerPage() {
                 <div style={{
                   padding: '12px 20px', borderTop: `1px solid ${C.border}`,
                   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  flexWrap: 'wrap', gap: 8,
                 }}>
                   <div style={{ fontSize: 12, color: C.muted }}>
-                    Showing {((page - 1) * PAGE_SIZE) + 1}–{Math.min(page * PAGE_SIZE, total)} of {total.toLocaleString()}
+                    Showing <span style={{ color: C.text, fontWeight: 600 }}>{((page - 1) * PAGE_SIZE) + 1}–{Math.min(page * PAGE_SIZE, total)}</span> of <span style={{ color: C.text, fontWeight: 600 }}>{total.toLocaleString()}</span> errors
                   </div>
-                  <div style={{ display: 'flex', gap: 8 }}>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    <button
+                      onClick={() => setPage(1)}
+                      disabled={page === 1}
+                      style={{ ...inp, cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.4 : 1, padding: '7px 10px' }}
+                    >«</button>
                     <button
                       onClick={() => setPage(p => Math.max(1, p - 1))}
                       disabled={page === 1}
                       style={{ ...inp, cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.4 : 1 }}
                     >← Prev</button>
-                    <span style={{ fontSize: 12, color: C.sub, padding: '7px 12px' }}>{page} / {totalPages}</span>
+                    {Array.from({ length: totalPages }, (_, i) => i + 1)
+                      .filter(p => p === 1 || p === totalPages || Math.abs(p - page) <= 1)
+                      .reduce((acc, p, idx, arr) => {
+                        if (idx > 0 && p - arr[idx - 1] > 1) acc.push('...');
+                        acc.push(p);
+                        return acc;
+                      }, [])
+                      .map((p, idx) => p === '...' ? (
+                        <span key={`ellipsis-${idx}`} style={{ fontSize: 12, color: C.muted, padding: '0 4px' }}>…</span>
+                      ) : (
+                        <button
+                          key={p}
+                          onClick={() => setPage(p)}
+                          style={{
+                            ...inp, padding: '7px 11px',
+                            cursor: p === page ? 'default' : 'pointer',
+                            background: p === page ? C.accent : C.elevated,
+                            color: p === page ? C.bg : C.sub,
+                            border: `1px solid ${p === page ? C.accent : C.border}`,
+                            fontWeight: p === page ? 700 : 400,
+                          }}
+                        >{p}</button>
+                      ))
+                    }
                     <button
                       onClick={() => setPage(p => Math.min(totalPages, p + 1))}
                       disabled={page === totalPages}
                       style={{ ...inp, cursor: page === totalPages ? 'not-allowed' : 'pointer', opacity: page === totalPages ? 0.4 : 1 }}
                     >Next →</button>
+                    <button
+                      onClick={() => setPage(totalPages)}
+                      disabled={page === totalPages}
+                      style={{ ...inp, cursor: page === totalPages ? 'not-allowed' : 'pointer', opacity: page === totalPages ? 0.4 : 1, padding: '7px 10px' }}
+                    >»</button>
                   </div>
                 </div>
               )}
