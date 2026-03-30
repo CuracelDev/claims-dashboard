@@ -66,7 +66,7 @@ export async function PATCH(request) {
   const supabase = getSupabase();
   try {
     const body = await request.json();
-    const { id, name, role, slack_user_id, active, display_name } = body;
+    const { id, name, role, slack_user_id, active, display_name, birthday } = body;
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
     const updates = {};
@@ -75,6 +75,7 @@ export async function PATCH(request) {
     if (slack_user_id !== undefined) updates.slack_user_id = slack_user_id;
     if (active !== undefined) updates.active = active;
     if (display_name !== undefined) updates.display_name = display_name;
+    if (birthday !== undefined) updates.birthday = birthday;
 
     const { data, error } = await supabase
       .from('team_members')
