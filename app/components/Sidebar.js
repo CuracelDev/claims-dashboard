@@ -54,7 +54,7 @@ const NAV = [
   {
     section: 'COMING SOON',
     items: [
-      { href: '/okrs', icon: '🎯', label: 'OKR Tracker', disabled: true },
+      { href: '/okr', icon: '🎯', label: 'OKR Tracker', disabled: false },
     ],
   },
 ];
