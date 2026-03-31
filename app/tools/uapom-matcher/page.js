@@ -137,13 +137,22 @@ export default function UAPOMMatcherPage() {
   async function handleSingleRun() {
     if (!curacalFile || !uapomFile) return;
     setRunning(true); setResult(null); setError(null);
-    setProgress('Uploading files...');
     try {
-      const fd = new FormData();
-      fd.append('curacel', curacalFile);
-      fd.append('uapom', uapomFile);
-      setProgress('Running analysis... this may take 1-2 minutes');
-      const res = await fetch('/api/tools/uapom-matcher', { method: 'POST', body: fd });
+      // Step 1: Upload both files directly to Vercel Blob (bypasses 4.5MB limit)
+      setProgress('Uploading Curacel file to secure storage...');
+      const { upload } = await import('@vercel/blob/client');
+      const [curacalBlob, uapomBlob] = await Promise.all([
+        upload(curacalFile.name, curacalFile, { access: 'public', handleUploadUrl: '/api/tools/uapom-matcher/upload' }),
+        upload(uapomFile.name, uapomFile, { access: 'public', handleUploadUrl: '/api/tools/uapom-matcher/upload' }),
+      ]);
+      setProgress('Files uploaded. Running matching analysis... this may take 1-2 minutes');
+
+      // Step 2: Trigger analysis with blob URLs
+      const res = await fetch('/api/tools/uapom-matcher', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ curacalUrl: curacalBlob.url, uapomUrl: uapomBlob.url }),
+      });
       const data = await res.json();
       if (!res.ok || data.error) { setError(data.error || 'Analysis failed'); setRunning(false); return; }
       setResult(data); setProgress('');
