@@ -138,28 +138,28 @@ export default function UAPOMMatcherPage() {
     if (!curacalFile || !uapomFile) return;
     setRunning(true); setResult(null); setError(null);
     try {
-      // Step 1: Upload files through our API route to Vercel Blob
-      setProgress('Uploading Curacel file...');
-      const uploadFile = async (file) => {
-        const fd = new FormData();
-        fd.append('file', file);
-        fd.append('filename', file.name);
-        const res = await fetch('/api/tools/uapom-matcher/upload', { method: 'POST', body: fd });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        return data.url;
-      };
+      // Step 1: Upload directly from browser to Vercel Blob (bypasses 4.5MB function limit)
+      setProgress('Uploading Curacel file to secure storage...');
+      const { upload } = await import('@vercel/blob/client');
 
-      const curacalUrl = await uploadFile(curacalFile);
-      setProgress('Uploading UAPOM file...');
-      const uapomUrl = await uploadFile(uapomFile);
-      setProgress('Files uploaded. Running matching analysis... this may take 1-2 minutes');
+      const curacalBlob = await upload(curacalFile.name, curacalFile, {
+        access: 'public',
+        handleUploadUrl: '/api/tools/uapom-matcher/upload',
+      });
 
-      // Step 2: Trigger analysis with blob URLs
+      setProgress('Uploading UAPOM file to secure storage...');
+      const uapomBlob = await upload(uapomFile.name, uapomFile, {
+        access: 'public',
+        handleUploadUrl: '/api/tools/uapom-matcher/upload',
+      });
+
+      setProgress('Files uploaded ✓ Running matching analysis... this may take 1-2 minutes');
+
+      // Step 2: Trigger analysis with blob URLs (tiny JSON payload - no size limit)
       const res = await fetch('/api/tools/uapom-matcher', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ curacalUrl, uapomUrl }),
+        body: JSON.stringify({ curacalUrl: curacalBlob.url, uapomUrl: uapomBlob.url }),
       });
       const data = await res.json();
       if (!res.ok || data.error) { setError(data.error || 'Analysis failed'); setRunning(false); return; }
