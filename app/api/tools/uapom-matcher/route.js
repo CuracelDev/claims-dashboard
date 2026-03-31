@@ -340,8 +340,8 @@ export async function POST(request) {
 
     // Upload results to Vercel Blob
     const [masterBlob, zipBlob] = await Promise.all([
-      put(masterName, masterBuf, { access: 'public', token: process.env.BLOB_READ_WRITE_TOKEN }),
-      put(zipName,    zipBuf,    { access: 'public', token: process.env.BLOB_READ_WRITE_TOKEN }),
+      put(masterName, masterBuf, { access: 'public', token: process.env.BLOB_READ_WRITE_TOKEN, allowOverwrite: true }),
+      put(zipName, zipBuf, { access: 'public', token: process.env.BLOB_READ_WRITE_TOKEN, allowOverwrite: true }),
     ]);
 
     // Cleanup input blobs
