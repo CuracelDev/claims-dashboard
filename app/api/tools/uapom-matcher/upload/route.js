@@ -1,29 +1,24 @@
-import { handleUpload } from '@vercel/blob/client';
+import { put } from '@vercel/blob';
 import { NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request) {
-  const body = await request.json();
   try {
-    const response = await handleUpload({
-      body,
-      request,
-      onBeforeGenerateToken: async () => ({
-        allowedContentTypes: [
-          'text/csv',
-          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'application/vnd.ms-excel',
-          'application/octet-stream',
-        ],
-        maximumSizeInBytes: 200 * 1024 * 1024,
-      }),
-      onUploadCompleted: async ({ blob }) => {
-        console.log('[blob upload complete]', blob.url);
-      },
+    const formData = await request.formData();
+    const file = formData.get('file');
+    const filename = formData.get('filename') || file.name;
+
+    if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+
+    const blob = await put(filename, file, {
+      access: 'public',
+      token: process.env.BLOB_READ_WRITE_TOKEN,
     });
-    return NextResponse.json(response);
+
+    return NextResponse.json({ url: blob.url, filename });
   } catch (err) {
+    console.error('[blob upload]', err.message);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
