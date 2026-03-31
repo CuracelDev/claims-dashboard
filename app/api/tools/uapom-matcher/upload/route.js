@@ -10,6 +10,7 @@ export async function POST(request) {
       body,
       request,
       onBeforeGenerateToken: async () => ({
+        addRandomSuffix: true,
         allowedContentTypes: [
           'text/csv',
           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
