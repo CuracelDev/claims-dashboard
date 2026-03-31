@@ -239,7 +239,8 @@ export async function POST(request) {
         ? minD.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })
         : `${minD.toLocaleDateString('en-GB', { month: 'short' })} - ${maxD.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
     }
-    const safeLabel = dateLabel.replace(/\s+/g, '_').replace(/-/g, '_');
+    const timestamp = new Date().toISOString().slice(0,16).replace(/[-:T]/g,'');
+    const safeLabel = dateLabel.replace(/\s+/g, '_').replace(/-/g, '_') + '_' + timestamp;
 
     // Unmatched display rows
     const ucRows = unmatchedClaims.map(r => ({
