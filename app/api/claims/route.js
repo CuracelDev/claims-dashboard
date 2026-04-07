@@ -20,6 +20,7 @@ export async function GET(request) {
   const from = searchParams.get("from");
   const to = searchParams.get("to");
   const insurer = searchParams.get("insurer");
+  const dateField = searchParams.get("dateField") || "submitted_at";
 
   try {
     // Default to last 90 days if no dates provided
@@ -27,7 +28,7 @@ export async function GET(request) {
     const startDate = from || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
 
     // Fetch from Metabase
-    const metabaseData = await getDailyClaimsByInsurer({ startDate, endDate });
+    const metabaseData = await getDailyClaimsByInsurer({ startDate, endDate, dateField });
 
     // Transform to match frontend expected format
     const transformed = metabaseData.map(row => {
