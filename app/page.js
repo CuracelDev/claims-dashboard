@@ -125,6 +125,7 @@ export default function Dashboard() {
   /* ── filter state ───────────────────────────────────── */
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [dateField, setDateField] = useState("submitted_at");
   const [selected, setSelected] = useState(new Set());
   const [view, setView] = useState("overview");
   const [search, setSearch] = useState("");
@@ -168,7 +169,7 @@ export default function Dashboard() {
   const fetchData = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await fetch("/api/claims");
+      const res = await fetch(`/api/claims?dateField=${dateField}`);
       const json = await res.json();
       if (json.success) {
         setRawData(json.data);
@@ -187,9 +188,9 @@ export default function Dashboard() {
       } else setError(json.error);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
-  }, []);
+  }, [dateField]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => { fetchData(); }, [dateField]);
 
   /* ── derived: main views ────────────────────────────── */
   const allInsurers = useMemo(() => [...new Set(rawData.map(r => r.insurer))].sort(), [rawData]);
@@ -556,8 +557,11 @@ export default function Dashboard() {
   /* ── loading / error ────────────────────────────────── */
   if (loading) return (
     <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Sans',sans-serif" }}>
+      <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
       <div style={{ textAlign: "center" }}>
-        <div style={{ width: 48, height: 48, borderRadius: 12, background: `linear-gradient(135deg,${C.accent},#00B4D8)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 700, color: C.bg, margin: "0 auto 16px", animation: "pulse 1.5s infinite" }}>C</div>
+        <div style={{ width: 48, height: 48, margin: "0 auto 16px", position: "relative" }}>
+          <div style={{ width: 48, height: 48, borderRadius: "50%", border: `3px solid ${C.border}`, borderTopColor: C.accent, animation: "spin 0.8s linear infinite" }}/>
+        </div>
         <div style={{ color: C.sub, fontSize: 14 }}>Loading claims data...</div>
       </div>
     </div>
@@ -629,6 +633,11 @@ export default function Dashboard() {
           {view !== "compare" && (
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 11, color: C.sub }}>Date By</span>
+                <select value={dateField} onChange={e => setDateField(e.target.value)} style={{ ...inp, cursor: "pointer" }}>
+                  <option value="submitted_at">Submitted</option>
+                  <option value="created_at">Created</option>
+                </select>
                 <span style={{ fontSize: 11, color: C.sub }}>From</span>
                 <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={inp}/>
                 <span style={{ fontSize: 11, color: C.sub }}>To</span>
