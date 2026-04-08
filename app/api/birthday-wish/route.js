@@ -1,5 +1,7 @@
 // PATH: app/api/birthday-wish/route.js
-import Anthropic from '@anthropic-ai/sdk';
+// Note: Anthropic SDK kept for reference, now using Azure OpenAI
+// import Anthropic from '@anthropic-ai/sdk';
+import { chatCompletion, MODELS } from '../../../lib/azure-openai';
 import { createClient } from '@supabase/supabase-js';
 export const dynamic = 'force-dynamic';
 
@@ -21,10 +23,8 @@ async function slackPost(channel, text, blocks) {
 
 async function generateWish(name) {
   try {
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const res = await client.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 200,
+    const wish = await chatCompletion({
+      model: MODELS.GPT_41,
       messages: [{
         role: 'user',
         content: `Write a warm, heartfelt, and prayerful birthday message for a team member named ${name} at Curacel, an African insurance tech company. 
@@ -38,8 +38,10 @@ The message should:
 - No emojis in the text itself (those will be added separately)
 - No markdown, plain text only`,
       }],
+      maxTokens: 200,
+      temperature: 0.8,
     });
-    return res.content[0]?.text || `Happy Birthday ${name}! Wishing you a wonderful day filled with joy and blessings.`;
+    return wish || `Happy Birthday ${name}! Wishing you a wonderful day filled with joy and blessings.`;
   } catch {
     return `Happy Birthday ${name}! The whole Health Ops team is celebrating you today. May this new year of your life bring you abundant joy, good health, and everything your heart desires. You are deeply valued and appreciated — from the Health Ops team.`;
   }
