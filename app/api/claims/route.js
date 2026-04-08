@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { getDailyClaimsByInsurer } from "../../../lib/metabase";
-import { getInsurerName, INSURER_MAP } from "../../../lib/insurerMapping";
 
 export const dynamic = "force-dynamic";
 
@@ -32,7 +31,7 @@ export async function GET(request) {
 
     // Transform to match frontend expected format
     const transformed = metabaseData.map(row => {
-      const insurerName = getInsurerName(row.hmo_id) || `Unknown Insurer (${row.hmo_id})`;
+      const insurerName = row.hmo_name || `Unknown Insurer (${row.hmo_id})`;
       const dateStr = row.date instanceof Date 
         ? row.date.toISOString().split("T")[0]
         : (row.date || "").split("T")[0];

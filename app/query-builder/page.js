@@ -614,12 +614,13 @@ function CustomBuilder({ onSQL }) {
   );
 }
 
-/* ─── SQL Display (updated with Save + Count) ─────────────── */
-function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQL }) {
+/* ─── SQL Display (updated with Save + Count + Run) ───────── */
+function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQL, onRun, running }) {
   const { C } = useTheme();
   const [copied, setCopied] = useState(false);
   const [countCopied, setCountCopied] = useState(false);
   const lines = sql.split("\n").length;
+  const canRun = sql && !sql.startsWith("--");
   const copy = async (text, setCb) => {
     try { await navigator.clipboard.writeText(text); } catch { const t=document.createElement("textarea");t.value=text;document.body.appendChild(t);t.select();document.execCommand("copy");document.body.removeChild(t); }
     setCb(true); setTimeout(()=>setCb(false),2000);
@@ -637,12 +638,18 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
             padding:"5px 12px", background:limitOn?C.success+"22":C.danger+"22", color:limitOn?C.success:C.danger,
             border:`1px solid ${limitOn?C.success:C.danger}`, borderRadius:6, fontSize:11, fontWeight:600, fontFamily:"JetBrains Mono,monospace", cursor:"pointer",
           }}>{limitOn?`LIMIT ${LIMIT} ✓`:"No LIMIT"}</button>}
-          {/* ✅ Improvement #4: Result Count button */}
+          {/* Run Query button */}
+          {onRun && canRun && <button onClick={onRun} disabled={running} style={{
+            padding:"7px 16px", background:running?C.muted:C.success, color:"#fff",
+            border:"none", borderRadius:6, fontSize:12, fontWeight:700, fontFamily:"DM Sans,sans-serif", 
+            cursor:running?"wait":"pointer", opacity:running?.7:1,
+          }}>{running?"⏳ Running...":"▶ Run Query"}</button>}
+          {/* Result Count button */}
           {onShowCount && <button onClick={onShowCount} style={{
             padding:"5px 12px", background:C.purple+"22", color:C.purple,
             border:`1px solid ${C.purple}`, borderRadius:6, fontSize:11, fontWeight:600, fontFamily:"DM Sans,sans-serif", cursor:"pointer",
           }}>🔢 Count</button>}
-          {/* ✅ Improvement #3: Save Query button */}
+          {/* Save Query button */}
           {onSave && <button onClick={()=>onSave(sql)} style={{
             padding:"5px 12px", background:C.blue+"22", color:C.blue,
             border:`1px solid ${C.blue}`, borderRadius:6, fontSize:11, fontWeight:600, fontFamily:"DM Sans,sans-serif", cursor:"pointer",
@@ -673,7 +680,128 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
   );
 }
 
-/* ─── Saved Queries Panel (Improvement #3) ────────────────── */
+/* ─── Query Results Table ─────────────────────────────────── */
+function QueryResults({ data, error, loading, onClear }) {
+  const { C } = useTheme();
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
+  
+  if (loading) {
+    return (
+      <div style={{ background:C.card, borderRadius:12, border:`1.5px solid ${C.border}`, padding:40, textAlign:"center" }}>
+        <div style={{ fontSize:24, marginBottom:12 }}>⏳</div>
+        <div style={{ fontSize:14, color:C.text, fontWeight:600 }}>Running query...</div>
+        <div style={{ fontSize:12, color:C.muted, marginTop:4 }}>This may take a few seconds</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ background:C.danger+"10", borderRadius:12, border:`1.5px solid ${C.danger}40`, padding:20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            <span style={{ fontSize:18 }}>❌</span>
+            <span style={{ fontSize:14, fontWeight:600, color:C.danger }}>Query Error</span>
+          </div>
+          {onClear && <button onClick={onClear} style={{
+            padding:"4px 10px", background:C.danger+"22", color:C.danger, border:`1px solid ${C.danger}`,
+            borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", fontFamily:"DM Sans,sans-serif"
+          }}>Dismiss</button>}
+        </div>
+        <pre style={{ margin:0, fontSize:12, color:C.danger, whiteSpace:"pre-wrap", wordBreak:"break-word", fontFamily:"JetBrains Mono,monospace", lineHeight:1.5 }}>{error}</pre>
+      </div>
+    );
+  }
+
+  if (!data) return null;
+
+  const { rows, cols, rowCount, executionTime, limited } = data;
+  const totalPages = Math.ceil(rows.length / pageSize);
+  const displayRows = rows.slice(page * pageSize, (page + 1) * pageSize);
+
+  return (
+    <div style={{ background:C.card, borderRadius:12, border:`1.5px solid ${C.border}`, overflow:"hidden" }}>
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"12px 18px", background:C.elevated, borderBottom:`1.5px solid ${C.border}`, flexWrap:"wrap", gap:8 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontSize:14, fontWeight:600, color:C.text }}>📊 Query Results</span>
+          <span style={{ padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:500, background:C.success+"15", color:C.success, border:`1px solid ${C.success}40` }}>
+            {rowCount.toLocaleString()} rows
+          </span>
+          <span style={{ fontSize:11, color:C.muted }}>in {executionTime}ms</span>
+          {limited && <span style={{ padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:500, background:C.warn+"15", color:C.warn, border:`1px solid ${C.warn}40` }}>
+            Limited to 1000
+          </span>}
+        </div>
+        {onClear && <button onClick={onClear} style={{
+          padding:"5px 12px", background:C.muted+"22", color:C.muted, border:`1px solid ${C.muted}`,
+          borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", fontFamily:"DM Sans,sans-serif"
+        }}>Clear Results</button>}
+      </div>
+
+      {/* Table */}
+      <div style={{ overflowX:"auto", maxHeight:500 }}>
+        <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, fontFamily:"JetBrains Mono,monospace" }}>
+          <thead>
+            <tr style={{ background:C.elevated, position:"sticky", top:0 }}>
+              <th style={{ padding:"10px 12px", textAlign:"center", fontWeight:600, color:C.muted, borderBottom:`1.5px solid ${C.border}`, fontSize:10 }}>#</th>
+              {cols.map((col, i) => (
+                <th key={i} style={{ padding:"10px 14px", textAlign:"left", fontWeight:600, color:C.text, borderBottom:`1.5px solid ${C.border}`, whiteSpace:"nowrap" }}>
+                  {col}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {displayRows.map((row, ri) => (
+              <tr key={ri} style={{ background:ri%2===0?C.bg:C.elevated }}>
+                <td style={{ padding:"8px 12px", color:C.muted, borderBottom:`1px solid ${C.border}`, textAlign:"center", fontSize:10 }}>
+                  {page * pageSize + ri + 1}
+                </td>
+                {row.map((cell, ci) => (
+                  <td key={ci} style={{ padding:"8px 14px", color:C.text, borderBottom:`1px solid ${C.border}`, maxWidth:300, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                    {cell === null ? <span style={{color:C.muted,fontStyle:"italic"}}>NULL</span> : String(cell)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"12px 18px", background:C.elevated, borderTop:`1.5px solid ${C.border}` }}>
+          <span style={{ fontSize:11, color:C.muted }}>
+            Showing {page * pageSize + 1}-{Math.min((page + 1) * pageSize, rows.length)} of {rows.length}
+          </span>
+          <div style={{ display:"flex", gap:6 }}>
+            <button onClick={() => setPage(0)} disabled={page === 0} style={{
+              padding:"5px 10px", background:page===0?C.muted+"22":C.accent+"22", color:page===0?C.muted:C.accent,
+              border:`1px solid ${page===0?C.muted:C.accent}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:page===0?"not-allowed":"pointer"
+            }}>⏮ First</button>
+            <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0} style={{
+              padding:"5px 10px", background:page===0?C.muted+"22":C.accent+"22", color:page===0?C.muted:C.accent,
+              border:`1px solid ${page===0?C.muted:C.accent}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:page===0?"not-allowed":"pointer"
+            }}>← Prev</button>
+            <span style={{ padding:"5px 12px", fontSize:11, color:C.text, fontWeight:600 }}>Page {page + 1} of {totalPages}</span>
+            <button onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1} style={{
+              padding:"5px 10px", background:page>=totalPages-1?C.muted+"22":C.accent+"22", color:page>=totalPages-1?C.muted:C.accent,
+              border:`1px solid ${page>=totalPages-1?C.muted:C.accent}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:page>=totalPages-1?"not-allowed":"pointer"
+            }}>Next →</button>
+            <button onClick={() => setPage(totalPages - 1)} disabled={page >= totalPages - 1} style={{
+              padding:"5px 10px", background:page>=totalPages-1?C.muted+"22":C.accent+"22", color:page>=totalPages-1?C.muted:C.accent,
+              border:`1px solid ${page>=totalPages-1?C.muted:C.accent}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:page>=totalPages-1?"not-allowed":"pointer"
+            }}>Last ⏭</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Saved Queries Panel ─────────────────────────────────── */
 function SavedQueries({ onLoad, onDelete }) {
   const { C } = useTheme();
   const btnSmall = { padding:"5px 10px", border:`1px solid ${C.border}`, borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", background:C.elevated, color:C.sub, fontFamily:"DM Sans,sans-serif" };
@@ -728,6 +856,11 @@ export default function QueryBuilderPage() {
   const [limitOn, setLimitOn] = useState(true);
   const [countSQL, setCountSQL] = useState(""); // ✅ #4
   const [savedRefresh, setSavedRefresh] = useState(0); // ✅ #3 force re-render of saved queries
+  
+  // Query execution state
+  const [queryResults, setQueryResults] = useState(null);
+  const [queryError, setQueryError] = useState(null);
+  const [queryRunning, setQueryRunning] = useState(false);
 
   const cat = CATS[activeCat];
   const tpl = activeTpl ? cat?.templates?.[activeTpl] : null;
@@ -739,6 +872,7 @@ export default function QueryBuilderPage() {
     setActiveTpl(null);
     setFilters({});
     setAiSQL(""); setCustomSQL(""); setCountSQL("");
+    setQueryResults(null); setQueryError(null); // Clear results on category change
     if (!isAI && !isCustom) {
       const t = CATS[activeCat]?.templates;
       if (t) { const f = Object.keys(t)[0]; if (f) setActiveTpl(f); }
@@ -752,6 +886,7 @@ export default function QueryBuilderPage() {
     setFilters(hasDateRange ? { date_from: getFirstOfMonth(), date_to: getToday() } : {});
     setLimitOn(true);
     setCountSQL("");
+    setQueryResults(null); setQueryError(null); // Clear results on template change
   }, [activeTpl, activeCat]);
 
   const isH = activeTpl && HEAVY.has(activeTpl);
@@ -824,6 +959,41 @@ export default function QueryBuilderPage() {
   const handleLoadSaved = useCallback((savedSQL) => {
     setActiveCat("ai_assistant");
     setTimeout(() => setAiSQL(savedSQL), 50);
+  }, []);
+
+  /* Run query handler */
+  const handleRunQuery = useCallback(async () => {
+    if (!sql || sql.startsWith("--") || queryRunning) return;
+    
+    setQueryRunning(true);
+    setQueryError(null);
+    setQueryResults(null);
+
+    try {
+      const response = await fetch("/api/query/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sql })
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        setQueryError(data.error || "Query execution failed");
+      } else {
+        setQueryResults(data);
+      }
+    } catch (err) {
+      setQueryError(err.message || "Network error");
+    } finally {
+      setQueryRunning(false);
+    }
+  }, [sql, queryRunning]);
+
+  /* Clear query results */
+  const handleClearResults = useCallback(() => {
+    setQueryResults(null);
+    setQueryError(null);
   }, []);
 
   return (
@@ -902,9 +1072,19 @@ export default function QueryBuilderPage() {
                 onSave={handleSave}
                 onShowCount={sql && !sql.startsWith("--") ? handleShowCount : null}
                 countSQL={countSQL}
+                onRun={handleRunQuery}
+                running={queryRunning}
               />
 
-              {/* ✅ Improvement #3: Saved Queries section */}
+              {/* Query Results */}
+              <QueryResults 
+                data={queryResults}
+                error={queryError}
+                loading={queryRunning}
+                onClear={handleClearResults}
+              />
+
+              {/* Saved Queries section */}
               <SavedQueries key={savedRefresh} onLoad={handleLoadSaved} />
 
               {/* Quick Reference */}
