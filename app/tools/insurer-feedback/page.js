@@ -153,13 +153,15 @@ export default function InsurerFeedbackPage() {
       const topCats = top(cnt('issue_category'));
       const topItems = top(cnt('care_item'));
       const topDx = top(cnt('diagnosis'));
-      const prompt = 'You are a health insurance claims operations analyst. Analyze this insurer feedback data and give sharp operational intelligence.\n\nSUMMARY:\n- Total items: ' + total + '\n- Open: ' + open + ' (' + Math.round(open/total*100) + '%)\n- Fixed: ' + fixed + ' (' + Math.round(fixed/total*100) + '%)\n- Pending Insurer: ' + pending + '\n- Resolution Rate: ' + Math.round(fixed/total*100) + '%\n\nTOP ISSUE CATEGORIES:\n' + (topCats.length ? topCats.map(([k,v]) => '- ' + k + ': ' + v + ' cases').join('\n') : '- No categories mapped') + '\n\nMOST FLAGGED CARE ITEMS:\n' + (topItems.length ? topItems.map(([k,v]) => '- ' + k + ': ' + v + ' flags').join('\n') : '- No care items mapped') + '\n\nTOP DIAGNOSES:\n' + (topDx.length ? topDx.map(([k,v]) => '- ' + k + ': ' + v + ' cases').join('\n') : '- No diagnoses mapped') + '\n\nProvide these sections:\n1. SITUATION SUMMARY (2 sentences)\n2. TOP 3 CRITICAL PATTERNS\n3. RECURRING PROBLEMS\n4. THIS WEEKS RECOMMENDATION\n5. RESOLUTION RATE ASSESSMENT\n\nBe direct and operational. Plain text only, no symbols.';
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] }),
+      
+      // Call backend API instead of Anthropic directly
+      const res = await fetch('/api/tools/insurer-feedback-insight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ total, open, fixed, pending, topCats, topItems, topDx }),
       });
       const data = await res.json();
-      setAiInsight(data.content?.map(c => c.text || '').join('') || 'Unable to generate insight.');
+      setAiInsight(data.insight || 'Unable to generate insight.');
     } catch (e) { setAiInsight('Failed to generate insight. Please try again.'); }
     setAiLoading(false);
   }

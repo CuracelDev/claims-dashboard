@@ -1,5 +1,7 @@
 // PATH: app/api/prism-backfill/route.js
-import Anthropic from '@anthropic-ai/sdk';
+// Note: Anthropic SDK kept for reference, now using Azure OpenAI
+// import Anthropic from '@anthropic-ai/sdk';
+import { chatCompletionJSON, MODELS } from '../../../lib/azure-openai';
 import { createClient } from '@supabase/supabase-js';
 
 export const dynamic = 'force-dynamic';
@@ -26,26 +28,43 @@ function stripMentions(text) {
   return (text || '').replace(/<@[A-Z0-9]+>/g, '').replace(/\s+/g, ' ').trim();
 }
 
+// JSON schema for structured output
+const CATEGORISE_SCHEMA = {
+  type: 'object',
+  properties: {
+    category: {
+      type: 'string',
+      enum: ['Pipeline Health', 'QA Analysis', 'Escalation', 'Weekly Review', 'Task Assignment', 'Reminder', 'Custom Query', 'General'],
+    },
+    summary: {
+      type: 'string',
+      description: 'Single sentence summary, max 12 words',
+    },
+  },
+  required: ['category', 'summary'],
+  additionalProperties: false,
+};
+
 async function categorise(message) {
   try {
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const res = await client.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 150,
+    const result = await chatCompletionJSON({
+      model: MODELS.GPT_41,
       messages: [{
         role: 'user',
         content: `Categorise this message sent to an AI agent in a health insurance ops team.
 
 Message: "${message}"
 
-Return ONLY valid JSON with:
-- category: one of [Pipeline Health, QA Analysis, Escalation, Weekly Review, Task Assignment, Reminder, Custom Query, General]
-- summary: single sentence max 12 words
-
-No markdown, no preamble, just JSON.`,
+Provide:
+- category: the most appropriate category for this message
+- summary: a single sentence summary (max 12 words)`,
       }],
+      maxTokens: 150,
+      temperature: 0.3,
+      jsonSchema: CATEGORISE_SCHEMA,
+      schemaName: 'message_category',
     });
-    return JSON.parse(res.content[0]?.text || '{}');
+    return result || { category: 'General', summary: message.slice(0, 80) };
   } catch {
     return { category: 'General', summary: message.slice(0, 80) };
   }

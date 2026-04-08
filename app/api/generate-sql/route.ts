@@ -140,7 +140,48 @@ DYNAMIC DATE RULES (CRITICAL):
 
 IMPORTANT: Return ONLY the SQL query. No markdown, no explanation, no backtick fences.`;
 
-// ─── Anthropic API call ──────────────────────────────────────
+// ─── Azure OpenAI API call (primary) ─────────────────────────
+async function callAzureOpenAI(prompt: string): Promise<string> {
+  const apiKey = process.env.AZURE_OPENAI_API_KEY;
+  const baseUrl = process.env.AZURE_OPENAI_BASE_URL;
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || "2025-01-01-preview";
+  
+  if (!apiKey || !baseUrl) throw new Error("Azure OpenAI credentials not set");
+
+  const url = `${baseUrl}openai/deployments/gpt-4.1-mini/chat/completions?api-version=${apiVersion}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": apiKey,
+    },
+    body: JSON.stringify({
+      max_tokens: 2000,
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: SCHEMA_CONTEXT },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Azure OpenAI API error ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  const sql = (data.choices?.[0]?.message?.content || "")
+    .trim()
+    .replace(/^```sql\n?/i, "")
+    .replace(/\n?```$/, "")
+    .trim();
+
+  return sql || "";
+}
+
+// ─── Anthropic API call (fallback) ───────────────────────────
 async function callAnthropic(prompt: string): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
@@ -234,14 +275,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Choose provider (default: anthropic)
-    const provider = process.env.AI_PROVIDER || "anthropic";
+    // Choose provider (default: azure)
+    const provider = process.env.AI_PROVIDER || "azure";
     let sql: string;
 
     if (provider === "openai") {
       sql = await callOpenAI(prompt.trim());
-    } else {
+    } else if (provider === "anthropic") {
       sql = await callAnthropic(prompt.trim());
+    } else {
+      sql = await callAzureOpenAI(prompt.trim());
     }
 
     if (!sql) {

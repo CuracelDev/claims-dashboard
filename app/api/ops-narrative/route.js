@@ -1,5 +1,7 @@
 // app/api/ops-narrative/route.js
-import Anthropic from '@anthropic-ai/sdk';
+// Note: Anthropic SDK kept for reference, now using Azure OpenAI
+// import Anthropic from '@anthropic-ai/sdk';
+import { chatCompletion, MODELS } from '../../../lib/azure-openai';
 import { getSettings } from '../../lib/settings';
 
 export const dynamic = 'force-dynamic';
@@ -41,13 +43,12 @@ ${(week_vs_lastweek || []).filter(m => m.this_week > 0 || m.last_week > 0).map(m
 
 ${instruction}`;
 
-      const client  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      const message = await client.messages.create({
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 400,
-        messages:   [{ role: 'user', content: prompt }],
+      insight = await chatCompletion({
+        model: MODELS.GPT_41_MINI,
+        messages: [{ role: 'user', content: prompt }],
+        maxTokens: 400,
+        temperature: 0.7,
       });
-      insight = message.content[0].text;
     }
 
     // Send to Slack if requested
