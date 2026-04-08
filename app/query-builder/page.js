@@ -2,6 +2,7 @@
 
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { useTheme } from "../context/ThemeContext";
+import * as XLSX from "xlsx";
 // Sidebar is rendered by layout.js — no import needed here
 
 /* ─── Code syntax colors (stable, not theme-dependent) ─── */
@@ -684,7 +685,70 @@ function SQLDisplay({ sql, name, limitOn, onToggle, onSave, onShowCount, countSQ
 function QueryResults({ data, error, loading, onClear }) {
   const { C } = useTheme();
   const [page, setPage] = useState(0);
+  const [showDownloadMenu, setShowDownloadMenu] = useState(false);
   const pageSize = 50;
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    if (!showDownloadMenu) return;
+    const handleClick = () => setShowDownloadMenu(false);
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [showDownloadMenu]);
+
+  // Download handlers
+  const downloadCSV = useCallback(() => {
+    if (!data) return;
+    const { rows, cols } = data;
+    
+    // Escape CSV values
+    const escapeCSV = (val) => {
+      if (val === null || val === undefined) return '';
+      const str = String(val);
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+    
+    const csvContent = [
+      cols.map(escapeCSV).join(','),
+      ...rows.map(row => row.map(escapeCSV).join(','))
+    ].join('\n');
+    
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `query_results_${new Date().toISOString().split('T')[0]}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setShowDownloadMenu(false);
+  }, [data]);
+
+  const downloadXLSX = useCallback(() => {
+    if (!data) return;
+    const { rows, cols } = data;
+    
+    // Create worksheet data with headers
+    const wsData = [cols, ...rows];
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+    
+    // Auto-size columns
+    const colWidths = cols.map((col, i) => {
+      const maxLen = Math.max(
+        col.length,
+        ...rows.slice(0, 100).map(row => String(row[i] ?? '').length)
+      );
+      return { wch: Math.min(maxLen + 2, 50) };
+    });
+    ws['!cols'] = colWidths;
+    
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Query Results');
+    XLSX.writeFile(wb, `query_results_${new Date().toISOString().split('T')[0]}.xlsx`);
+    setShowDownloadMenu(false);
+  }, [data]);
   
   if (loading) {
     return (
@@ -734,10 +798,44 @@ function QueryResults({ data, error, loading, onClear }) {
             Limited to 1000
           </span>}
         </div>
-        {onClear && <button onClick={onClear} style={{
-          padding:"5px 12px", background:C.muted+"22", color:C.muted, border:`1px solid ${C.muted}`,
-          borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", fontFamily:"DM Sans,sans-serif"
-        }}>Clear Results</button>}
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          {/* Download dropdown */}
+          <div style={{ position:"relative" }} onClick={e => e.stopPropagation()}>
+            <button onClick={() => setShowDownloadMenu(p => !p)} style={{
+              padding:"5px 12px", background:C.accent+"22", color:C.accent, border:`1px solid ${C.accent}`,
+              borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", fontFamily:"DM Sans,sans-serif",
+              display:"flex", alignItems:"center", gap:4
+            }}>⬇ Download <span style={{fontSize:8}}>▼</span></button>
+            {showDownloadMenu && (
+              <div style={{
+                position:"absolute", top:"100%", right:0, marginTop:4, background:C.card,
+                border:`1.5px solid ${C.border}`, borderRadius:6, overflow:"hidden", zIndex:100,
+                boxShadow:"0 4px 12px rgba(0,0,0,0.15)", minWidth:120
+              }}>
+                <button onClick={downloadCSV} style={{
+                  display:"block", width:"100%", padding:"10px 14px", background:"transparent",
+                  border:"none", textAlign:"left", cursor:"pointer", fontSize:12, color:C.text,
+                  fontFamily:"DM Sans,sans-serif"
+                }} onMouseEnter={e => e.currentTarget.style.background = C.elevated}
+                   onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                  📄 CSV (.csv)
+                </button>
+                <button onClick={downloadXLSX} style={{
+                  display:"block", width:"100%", padding:"10px 14px", background:"transparent",
+                  border:"none", textAlign:"left", cursor:"pointer", fontSize:12, color:C.text,
+                  fontFamily:"DM Sans,sans-serif", borderTop:`1px solid ${C.border}`
+                }} onMouseEnter={e => e.currentTarget.style.background = C.elevated}
+                   onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                  📊 Excel (.xlsx)
+                </button>
+              </div>
+            )}
+          </div>
+          {onClear && <button onClick={onClear} style={{
+            padding:"5px 12px", background:C.muted+"22", color:C.muted, border:`1px solid ${C.muted}`,
+            borderRadius:5, fontSize:11, fontWeight:600, cursor:"pointer", fontFamily:"DM Sans,sans-serif"
+          }}>Clear Results</button>}
+        </div>
       </div>
 
       {/* Table */}
