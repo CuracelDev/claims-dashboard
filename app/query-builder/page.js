@@ -280,7 +280,7 @@ const CATS = {
 function Badge({ children, color, bg }) {
   const { C } = useTheme();
   const effectiveColor = color ?? C.accent;
-  return <span style={{ display:"inline-flex", alignItems:"center", gap:4, padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, background:bg||effectiveColor+"22", color:effectiveColor }}>{children}</span>;
+  return <span style={{ display:"inline-block", padding:"6px 14px", borderRadius:20, fontSize:11, fontWeight:600, background:bg||effectiveColor+"22", color:effectiveColor, textAlign:"center", lineHeight:1.4 }}>{children}</span>;
 }
 
 function FilterPanel({ filters: fl, values: v, onChange }) {
@@ -382,10 +382,10 @@ function AIAssistant({ onResult }) {
   return (
     <div style={{ padding:18, display:"flex", flexDirection:"column", gap:16 }}>
       <div style={{ background:`linear-gradient(135deg, ${C.purple}15, ${C.accent}10)`, borderRadius:10, padding:18, border:`1.5px solid ${C.purple}40` }}>
-        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:12 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
           <span style={{fontSize:22}}>🤖</span>
-          <div><div style={{fontSize:14,fontWeight:700,color:C.text}}>AI Query Generator</div><div style={{fontSize:12,color:C.sub}}>Describe what you need — I'll write the SQL</div></div>
-          <Badge color={C.purple}>Powered by Claude</Badge>
+          <div style={{flex:1}}><div style={{fontSize:14,fontWeight:700,color:C.text}}>AI Query Generator</div><div style={{fontSize:12,color:C.sub}}>Describe what you need — I'll write the SQL</div></div>
+          <Badge color={C.purple}>Powered by<br/>Azure OpenAI</Badge>
         </div>
         <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&(e.metaKey||e.ctrlKey))go();}}
           placeholder="e.g., Show me all approved claims for UAP in July 2025 with enrollee names and amounts..."
