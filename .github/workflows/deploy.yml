@@ -1,6 +1,7 @@
 name: Deploy to GCP (PM2)
 
 on:
+  workflow_dispatch:
   push:
     branches: [ master, main ]
 
