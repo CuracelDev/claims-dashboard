@@ -1,0 +1,10 @@
+console.log('DEBUG START');
+import pg from 'pg';
+console.log('PG IMPORTED');
+import { createClient } from '@supabase/supabase-js';
+console.log('SUPABASE IMPORTED');
+const supabase = createClient('https://example.com', 'key');
+console.log('SUPABASE INITIALIZED');
+const pool = new pg.Pool({ connectionString: 'postgresql://localhost' });
+console.log('POOL INITIALIZED');
+process.exit(0);

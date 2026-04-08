@@ -1,5 +1,6 @@
-const { createClient } = require('@supabase/supabase-js');
-const { Pool } = require('pg');
+import { createClient } from '@supabase/supabase-js';
+import pg from 'pg';
+const { Pool } = pg;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -12,9 +13,6 @@ const pgPool = new Pool({
     rejectUnauthorized: false
   }
 });
-
-console.log('Starting migration script...');
-console.log('Target DB:', process.env.DATABASE_URL.replace(/:[^:@]+@/, ':****@'));
 
 const tables = [
   'audit_log',
@@ -37,23 +35,21 @@ const tables = [
 ];
 
 async function migrate() {
-  console.log('Migrate function started...');
+  console.log('--- Migration Started ---');
   for (const table of tables) {
-    console.log(`Connecting to Supabase for table: ${table}...`);
+    console.log(`Table: ${table} | Fetching from Supabase...`);
     const { data, error } = await supabase.from(table).select('*');
     if (error) {
-      console.error(`Error fetching from ${table}:`, error);
-      continue;
-    }
-    console.log(`Fetched ${data.length} rows from ${table}.`);
-
-    if (data.length === 0) {
-      console.log(`Table ${table} is empty.`);
+      console.error(`  [ERROR] Supabase fetch failed for ${table}:`, error.message);
       continue;
     }
 
-    // This is a naive migration. For large tables, use streaming.
-    // Also, assumes columns match exactly.
+    if (!data || data.length === 0) {
+      console.log(`  [INFO] Table ${table} is empty.`);
+      continue;
+    }
+
+    console.log(`  [SUCCESS] Fetched ${data.length} rows. Migrating...`);
     const columns = Object.keys(data[0]);
     let count = 0;
     for (const row of data) {
@@ -63,15 +59,19 @@ async function migrate() {
       try {
         await pgPool.query(sql, values);
         count++;
-        if (count % 10 === 0) console.log(`  - Migrated ${count}/${data.length} rows for ${table}`);
+        if (count % 25 === 0) console.log(`    - Progress: ${count}/${data.length}`);
       } catch (err) {
-        console.error(`Error inserting into ${table}:`, err.message);
+        console.error(`    [ERROR] Insert failed for row in ${table}:`, err.message);
       }
     }
-    console.log(`Finished table ${table}: ${count} rows migrated.`);
+    console.log(`  [DONE] Table ${table} migration finished.`);
   }
-  console.log('Migration complete!');
+  console.log('--- Migration Complete! ---');
   process.exit(0);
 }
 
-migrate();
+migrate().catch(err => {
+  console.error('--- CRITICAL ERROR ---');
+  console.error(err);
+  process.exit(1);
+});

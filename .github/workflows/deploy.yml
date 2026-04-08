@@ -28,6 +28,9 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_WEBHOOK_HEALTHOPS: ${{ secrets.SLACK_WEBHOOK_HEALTHOPS }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
           METABASE_URL: ${{ secrets.METABASE_URL }}
           METABASE_USERNAME: ${{ secrets.METABASE_USERNAME }}
           METABASE_PASSWORD: ${{ secrets.METABASE_PASSWORD }}
@@ -56,6 +59,9 @@ jobs:
             SLACK_BOT_TOKEN="${{ secrets.SLACK_BOT_TOKEN }}"
             SLACK_WEBHOOK_HEALTHOPS="${{ secrets.SLACK_WEBHOOK_HEALTHOPS }}"
             ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}"
+            AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}"
+            AZURE_OPENAI_BASE_URL="${{ secrets.AZURE_OPENAI_BASE_URL }}"
+            AZURE_OPENAI_API_VERSION="${{ secrets.AZURE_OPENAI_API_VERSION }}"
             METABASE_URL="${{ secrets.METABASE_URL }}"
             METABASE_USERNAME="${{ secrets.METABASE_USERNAME }}"
             METABASE_PASSWORD="${{ secrets.METABASE_PASSWORD }}"
