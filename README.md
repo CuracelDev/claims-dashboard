@@ -6,12 +6,13 @@ Internal health operations platform for managing insurance claims, team performa
 
 | Layer | Technology |
 |-------|------------|
-| Framework | Next.js 14 (App Router) |
-| Database | Supabase (PostgreSQL) |
-| AI | Anthropic Claude |
+| Framework | Next.js 16 (App Router, Turbopack) |
+| Database | Supabase (PostgreSQL) or PostgreSQL on GCP |
+| AI | Azure OpenAI (GPT-4) |
+| Data Source | Metabase API |
 | Integrations | Slack, Google APIs, n8n |
 | Charting | Recharts |
-| Hosting | Vercel |
+| Hosting | Vercel or GCP (Docker) |
 
 ## Features
 
@@ -47,7 +48,11 @@ npm install
 Create `.env.local` in the project root:
 
 ```env
-# Supabase
+# Database (choose one)
+# Option 1: Direct PostgreSQL (for GCP deployment)
+DATABASE_URL=postgresql://user:password@host:5432/database
+
+# Option 2: Supabase (for local dev / Vercel)
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 
@@ -55,8 +60,18 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_WEBHOOK_HEALTHOPS=https://hooks.slack.com/services/...
 
-# AI
+# AI - Azure OpenAI (primary)
+AZURE_OPENAI_API_KEY=your-azure-openai-key
+AZURE_OPENAI_BASE_URL=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+
+# AI - Anthropic Claude (fallback/legacy)
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Metabase (Health database queries)
+METABASE_URL=https://your-metabase-instance.com
+METABASE_USERNAME=your-username
+METABASE_PASSWORD=your-password
 
 # Optional: Nova Health API (for insurer sync)
 NOVA_API_URL=https://api.health.curacel.co/nova-api
@@ -98,8 +113,14 @@ app/
     ├── nav.js           # Navigation config
     └── settings.js      # App settings
 lib/
-├── supabase.js          # Supabase client
+├── supabase.js          # Database client (auto-switches Supabase/PostgreSQL)
+├── supabase-compat.js   # PostgreSQL compatibility layer
+├── metabase.js          # Metabase API client
+├── azure-openai.js      # Azure OpenAI client
 └── insurerMapping.js    # HMO ID ↔ Name mappings
+public/
+├── curacel-logo.svg     # Favicon and branding
+└── curacel-logo.png     # Logo asset
 ```
 
 ## Database Schema (Supabase)
@@ -132,11 +153,16 @@ Insurer mappings are sourced from Nova Health:
 - Endpoint: `GET /nova-api/hmos`
 - Used to map Metabase `hmo_id` to insurer names
 
-### Metabase (WIP)
+### Metabase
 
-Direct Metabase integration for real-time claims data is in development on the `fix/metabase-switch` branch.
+Direct Metabase integration provides real-time claims data:
+- Claims dashboard pulls live aggregates via Metabase API
+- Query Builder generates and executes SQL via Metabase
+- Supports cached queries with configurable TTL
 
 ## Deployment
+
+### Vercel (Default)
 
 Deployed automatically via Vercel on push to `main`.
 
@@ -145,12 +171,36 @@ Deployed automatically via Vercel on push to `main`.
 vercel --prod
 ```
 
+### GCP (Docker)
+
+For GCP deployment with PostgreSQL:
+
+1. Set `DATABASE_URL` in your environment
+2. Deploy via GitHub Actions workflow (`.github/workflows/deploy.yml`)
+3. App runs on port 3030 by default
+
+```bash
+# Build and run locally with Docker
+docker build -t claims-dashboard .
+docker run -p 3030:3030 --env-file .env.local claims-dashboard
+```
+
 ## Contributing
 
 1. Create a feature branch from `main`
 2. Make changes and test locally
 3. Push and create a pull request
 4. Merge after review
+
+## Recent Changes
+
+### April 2026
+- **Azure OpenAI Migration** — Switched AI provider from Anthropic Claude to Azure OpenAI
+- **Metabase Integration** — Claims dashboard now pulls real-time data from Metabase
+- **GCP Deployment** — Added support for PostgreSQL on GCP with Docker deployment
+- **Supabase Compatibility Layer** — Database abstraction supports both Supabase and direct PostgreSQL
+- **UI Improvements** — Added Curacel favicon, fixed textarea overflow, improved badge styling
+- **Next.js 16** — Upgraded to Next.js 16 with Turbopack
 
 ## License
 
