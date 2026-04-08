@@ -8,6 +8,10 @@ const dmSans = DM_Sans({ subsets: ['latin'], variable: '--font-dm-sans' });
 export const metadata = {
   title: 'Claims Intel | Curacel Health Ops',
   description: 'Curacel Health Operations Platform',
+  icons: {
+    icon: '/curacel-logo.svg',
+    apple: '/curacel-logo.svg',
+  },
 };
 
 export default function RootLayout({ children }) {
