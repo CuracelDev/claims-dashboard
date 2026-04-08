@@ -389,7 +389,7 @@ function AIAssistant({ onResult }) {
         </div>
         <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&(e.metaKey||e.ctrlKey))go();}}
           placeholder="e.g., Show me all approved claims for UAP in July 2025 with enrollee names and amounts..."
-          style={{ ...inputS, minHeight:100, resize:"vertical", lineHeight:1.6, border:`1.5px solid ${C.purple}50` }} />
+          style={{ ...inputS, minHeight:100, resize:"vertical", lineHeight:1.6, border:`1.5px solid ${C.purple}50`, boxSizing:"border-box" }} />
         <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:12 }}>
           <button onClick={go} disabled={loading||!prompt.trim()} style={{
             padding:"10px 22px", background:loading?C.muted:C.accent, color:C.bg, border:"none", borderRadius:6,
