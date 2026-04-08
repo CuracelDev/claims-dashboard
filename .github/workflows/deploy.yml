@@ -25,19 +25,13 @@ jobs:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_WEBHOOK_HEALTHOPS: ${{ secrets.SLACK_WEBHOOK_HEALTHOPS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_USERNAME: ${{ secrets.METABASE_USERNAME }}
+          METABASE_PASSWORD: ${{ secrets.METABASE_PASSWORD }}
 
-      - name: Deploy to Server via SSH
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.REMOTE_HOST }}
-          username: ${{ secrets.REMOTE_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            mkdir -p ~/claims-dashboard
-            cd ~/claims-dashboard
-            # Optional: Backup current build
-            # mv .next .next_old || true
-            
       - name: Rsync files to server
         uses: appleboy/scp-action@master
         with:
@@ -55,5 +49,16 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd ~/claims-dashboard
+            cat <<EOF > .env
+            DATABASE_URL="${{ secrets.DATABASE_URL }}"
+            NEXT_PUBLIC_SUPABASE_URL="${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}"
+            SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}"
+            SLACK_BOT_TOKEN="${{ secrets.SLACK_BOT_TOKEN }}"
+            SLACK_WEBHOOK_HEALTHOPS="${{ secrets.SLACK_WEBHOOK_HEALTHOPS }}"
+            ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}"
+            METABASE_URL="${{ secrets.METABASE_URL }}"
+            METABASE_USERNAME="${{ secrets.METABASE_USERNAME }}"
+            METABASE_PASSWORD="${{ secrets.METABASE_PASSWORD }}"
+            EOF
             npm install --production
             pm2 restart claims-dashboard || pm2 start npm --name "claims-dashboard" -- start -- -p 3020
