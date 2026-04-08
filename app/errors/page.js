@@ -1,7 +1,7 @@
 'use client';
 // app/errors/page.js — Claim Error Tracker
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, Fragment } from 'react';
 import { useTheme } from '../context/ThemeContext';
 
 const PAGE_SIZE = 25;
@@ -319,9 +319,8 @@ export default function ErrorTrackerPage() {
                       const color = ERROR_TYPE_COLORS[log.error_type] || C.muted;
                       const isExp = expanded === log.id;
                       return (
-                        <>
+                        <Fragment key={log.id}>
                           <tr
-                            key={log.id}
                             onClick={() => setExpanded(isExp ? null : log.id)}
                             style={{
                               background: i % 2 === 0 ? 'transparent' : `${C.elevated}44`,
@@ -440,7 +439,7 @@ export default function ErrorTrackerPage() {
                               </td>
                             </tr>
                           )}
-                        </>
+                        </Fragment>
                       );
                     })}
                   </tbody>
