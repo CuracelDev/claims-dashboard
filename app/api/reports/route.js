@@ -2,6 +2,26 @@
 import { getSupabase } from '../../../lib/supabase';
 export const dynamic = 'force-dynamic';
 
+async function attachTeamMembers(supabase, reports) {
+  if (!Array.isArray(reports) || reports.length === 0) return reports || [];
+
+  const memberIds = [...new Set(reports.map((r) => r.team_member_id).filter(Boolean))];
+  if (memberIds.length === 0) return reports;
+
+  const { data: members, error } = await supabase
+    .from('team_members')
+    .select('id, name, display_name, role')
+    .in('id', memberIds);
+
+  if (error) throw error;
+
+  const memberMap = new Map((members || []).map((m) => [String(m.id), m]));
+  return reports.map((r) => ({
+    ...r,
+    team_members: memberMap.get(String(r.team_member_id)) || null,
+  }));
+}
+
 export async function GET(request) {
   try {
     const supabase = getSupabase();
@@ -25,23 +45,25 @@ export async function GET(request) {
     if (date) {
       const { data, error } = await supabase
         .from('daily_reports')
-        .select('*, team_members(name, display_name, role)')
+        .select('*')
         .eq('report_date', date)
         .order('created_at', { ascending: false })
         .limit(limit);
       if (error) return Response.json({ error: error.message }, { status: 500 });
-      return Response.json({ data: data || [] });
+      const withMembers = await attachTeamMembers(supabase, data || []);
+      return Response.json({ data: withMembers });
     }
 
     let q = supabase
       .from('daily_reports')
-      .select('*, team_members(name, display_name, role)')
+      .select('*')
       .order('report_date', { ascending: false })
       .limit(limit);
     if (memberId) q = q.eq('team_member_id', parseInt(memberId));
     const { data, error } = await q;
     if (error) return Response.json({ error: error.message }, { status: 500 });
-    return Response.json({ data: data || [] });
+    const withMembers = await attachTeamMembers(supabase, data || []);
+    return Response.json({ data: withMembers });
 
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });
