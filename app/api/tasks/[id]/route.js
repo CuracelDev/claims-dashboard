@@ -23,7 +23,12 @@ async function attachTaskMember(supabase, task) {
 export async function PATCH(request, context) {
   try {
     const supabase = getSupabase();
-    const { id } = await context.params;
+    const { id: rawId } = await context.params;
+    const id = parseInt(rawId);
+    if (isNaN(id)) {
+      console.error('PATCH /api/tasks/[id] invalid ID:', rawId);
+      return Response.json({ error: 'Invalid task ID' }, { status: 400 });
+    }
     const body = await request.json();
     const { status, completed_by_name } = body;
 
@@ -110,7 +115,12 @@ export async function PATCH(request, context) {
 export async function DELETE(request, context) {
   try {
     const supabase = getSupabase();
-    const { id } = await context.params;
+    const { id: rawId } = await context.params;
+    const id = parseInt(rawId);
+    if (isNaN(id)) {
+      console.error('DELETE /api/tasks/[id] invalid ID:', rawId);
+      return Response.json({ error: 'Invalid task ID' }, { status: 400 });
+    }
 
     // Fetch task title before deleting for audit context
     const { data: task } = await supabase
