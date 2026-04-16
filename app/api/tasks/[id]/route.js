@@ -49,36 +49,70 @@ export async function PATCH(request, context) {
     if (error) throw error;
     const enrichedTask = await attachTaskMember(supabase, task);
 
-    // Slack DM if marked done
-    if (status === 'done' && enrichedTask.assigned_by && process.env.SLACK_BOT_TOKEN) {
+    // Slack DM if marked done (notify both assigner and completer)
+    if (status === 'done' && process.env.SLACK_BOT_TOKEN) {
       try {
-        const { data: assigner } = await supabase
-          .from('team_members')
-          .select('slack_user_id, name')
-          .ilike('name', enrichedTask.assigned_by)
-          .single();
+        const completedBy = completed_by_name || enrichedTask.team_members?.name || 'A team member';
+        const messageBlocks = [
+          { type: 'section', text: { type: 'mrkdwn', text: `✅ *Task completed!*\n*${completedBy}* just completed: *${enrichedTask.title}*` } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `Completed at ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} Lagos time` }] },
+        ];
 
-        if (assigner?.slack_user_id) {
-          const openRes = await fetch('https://slack.com/api/conversations.open', {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ users: assigner.slack_user_id }),
-          });
-          const openData = await openRes.json();
+        // Notify assigner
+        if (enrichedTask.assigned_by) {
+          const { data: assigner } = await supabase
+            .from('team_members')
+            .select('slack_user_id, name')
+            .ilike('name', enrichedTask.assigned_by)
+            .single();
 
-          if (openData.ok) {
-            const completedBy = completed_by_name || enrichedTask.team_members?.name || 'A team member';
-            await fetch('https://slack.com/api/chat.postMessage', {
+          if (assigner?.slack_user_id) {
+            const openRes = await fetch('https://slack.com/api/conversations.open', {
               method: 'POST',
               headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                channel: openData.channel.id,
-                blocks: [
-                  { type: 'section', text: { type: 'mrkdwn', text: `✅ *Task completed!*\n*${completedBy}* just completed: *${enrichedTask.title}*` } },
-                  { type: 'context', elements: [{ type: 'mrkdwn', text: `Completed at ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} Lagos time` }] },
-                ],
-              }),
+              body: JSON.stringify({ users: assigner.slack_user_id }),
             });
+            const openData = await openRes.json();
+
+            if (openData.ok) {
+              await fetch('https://slack.com/api/chat.postMessage', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  channel: openData.channel.id,
+                  blocks: messageBlocks,
+                }),
+              });
+            }
+          }
+        }
+
+        // Notify completer
+        if (completed_by_name) {
+          const { data: completer } = await supabase
+            .from('team_members')
+            .select('slack_user_id, name')
+            .ilike('name', completed_by_name)
+            .single();
+
+          if (completer?.slack_user_id) {
+            const openRes = await fetch('https://slack.com/api/conversations.open', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ users: completer.slack_user_id }),
+            });
+            const openData = await openRes.json();
+
+            if (openData.ok) {
+              await fetch('https://slack.com/api/chat.postMessage', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  channel: openData.channel.id,
+                  blocks: messageBlocks,
+                }),
+              });
+            }
           }
         }
       } catch (slackErr) {
