@@ -743,27 +743,27 @@ export default function Dashboard() {
               <input placeholder="Search insurer..." value={search} onChange={e => setSearch(e.target.value)} style={{ ...inp, width: 200, fontSize: 12 }}/>
             </div>
             <div style={{ overflow: "auto", maxHeight: 520 }}>
-              <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
+              <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 11 }}>
                 <thead><tr>
-                  <th style={{ position: "sticky", left: 0, top: 0, zIndex: 10, background: C.elevated, padding: "10px 14px", textAlign: "left", borderBottom: `1px solid ${C.border}`, color: C.sub, fontWeight: 600, minWidth: 180 }}>Insurer</th>
-                  {pivot.dates.map(d => <th key={d} style={{ position: "sticky", top: 0, zIndex: 5, background: C.elevated, padding: "10px 10px", textAlign: "right", borderBottom: `1px solid ${C.border}`, color: C.sub, fontWeight: 500, whiteSpace: "nowrap", fontSize: 10 }}>{d.slice(5)}</th>)}
-                  <th style={{ position: "sticky", top: 0, right: 0, zIndex: 10, background: C.elevated, padding: "10px 14px", textAlign: "right", borderBottom: `1px solid ${C.border}`, color: C.accent, fontWeight: 700 }}>Total</th>
+                  <th style={{ position: "sticky", left: 0, top: 0, zIndex: 30, background: C.elevated, boxShadow: `2px 0 0 ${C.border}`, padding: "10px 14px", textAlign: "left", borderBottom: `1px solid ${C.border}`, color: C.sub, fontWeight: 600, minWidth: 180 }}>Insurer</th>
+                  {pivot.dates.map(d => <th key={d} style={{ position: "sticky", top: 0, zIndex: 20, background: C.elevated, padding: "10px 10px", textAlign: "right", borderBottom: `1px solid ${C.border}`, color: C.sub, fontWeight: 500, whiteSpace: "nowrap", fontSize: 10 }}>{d.slice(5)}</th>)}
+                  <th style={{ position: "sticky", top: 0, right: 0, zIndex: 30, background: C.elevated, boxShadow: `-2px 0 0 ${C.border}`, padding: "10px 14px", textAlign: "right", borderBottom: `1px solid ${C.border}`, color: C.accent, fontWeight: 700 }}>Total</th>
                 </tr></thead>
                 <tbody>
                   <tr style={{ background: `${C.accent}11` }}>
-                    <td style={{ position: "sticky", left: 0, background: `${C.accent}22`, padding: "10px 14px", fontWeight: 700, color: C.accent, borderBottom: `2px solid ${C.accent}44` }}>TOTAL</td>
+                    <td style={{ position: "sticky", left: 0, zIndex: 12, background: C.card, boxShadow: `inset 0 0 0 9999px ${C.accent}22, 2px 0 0 ${C.accent}44`, padding: "10px 14px", fontWeight: 700, color: C.accent, borderBottom: `2px solid ${C.accent}44` }}>TOTAL</td>
                     {pivot.dates.map(d => { let s=0; pivot.insurers.forEach(ins => s += pivot.map[`${d}_${ins}`]||0); return <td key={d} style={{ padding: "10px 10px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: C.accent, borderBottom: `2px solid ${C.accent}44` }}>{fmt(s)}</td>; })}
-                    <td style={{ position: "sticky", right: 0, background: `${C.accent}22`, padding: "10px 14px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: C.accent, fontSize: 13, borderBottom: `2px solid ${C.accent}44` }}>{fmt(total)}</td>
+                    <td style={{ position: "sticky", right: 0, zIndex: 12, background: C.card, boxShadow: `inset 0 0 0 9999px ${C.accent}22, -2px 0 0 ${C.accent}44`, padding: "10px 14px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: C.accent, fontSize: 13, borderBottom: `2px solid ${C.accent}44` }}>{fmt(total)}</td>
                   </tr>
                   {pivot.insurers.filter(ins => ins.toLowerCase().includes(search.toLowerCase())).map((ins, idx) => {
                     let rt = 0;
                     return (
                       <tr key={ins} style={{ background: idx%2 ? `${C.elevated}44` : "transparent" }}>
-                        <td style={{ position: "sticky", left: 0, background: idx%2 ? C.elevated : C.card, padding: "8px 14px", fontWeight: 500, color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 10, background: idx%2 ? C.elevated : C.card, boxShadow: `2px 0 0 ${C.border}`, padding: "8px 14px", fontWeight: 500, color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" }}>
                           <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: CHART[allInsurers.indexOf(ins)%CHART.length], marginRight: 8 }}/>{ins}
                         </td>
                         {pivot.dates.map(d => { const v = pivot.map[`${d}_${ins}`]||0; rt+=v; return <td key={d} style={{ padding: "8px 10px", textAlign: "right", fontFamily: "monospace", color: v===0 ? C.muted : C.text, fontSize: 10, borderBottom: `1px solid ${C.border}` }}>{fmt(v)}</td>; })}
-                        <td style={{ position: "sticky", right: 0, background: idx%2 ? C.elevated : C.card, padding: "8px 14px", textAlign: "right", fontFamily: "monospace", fontWeight: 600, color: C.text, borderBottom: `1px solid ${C.border}` }}>{fmt(rt)}</td>
+                        <td style={{ position: "sticky", right: 0, zIndex: 10, background: idx%2 ? C.elevated : C.card, boxShadow: `-2px 0 0 ${C.border}`, padding: "8px 14px", textAlign: "right", fontFamily: "monospace", fontWeight: 600, color: C.text, borderBottom: `1px solid ${C.border}` }}>{fmt(rt)}</td>
                       </tr>
                     );
                   })}
