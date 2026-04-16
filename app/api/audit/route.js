@@ -30,7 +30,7 @@ export async function GET(request) {
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
-    if (memberId) query = query.eq('member_id', parseInt(memberId));
+    if (memberId) query = query.eq('member_id', memberId);
     if (action)   query = query.ilike('action', `%${action}%`);
     if (from)     query = query.gte('created_at', `${from}T00:00:00.000Z`);
     if (to)       query = query.lte('created_at', `${to}T23:59:59.999Z`);

@@ -1,13 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
+import { getSupabase } from "../../../lib/supabase";
 
 export const dynamic = "force-dynamic";
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 async function slackDM(userId, text) {
   // Open DM channel
@@ -48,7 +41,7 @@ export async function POST(request) {
       const { data: member, error: mErr } = await supabase
         .from("team_members")
         .select("id, name, slack_user_id, report_pin")
-        .eq("id", parseInt(member_id))
+        .eq("id", member_id)
         .single();
 
       if (mErr || !member) return Response.json({ error: "Member not found" }, { status: 404 });
@@ -81,7 +74,7 @@ export async function POST(request) {
       const { data: member, error: mErr } = await supabase
         .from("team_members")
         .select("id, name, report_pin")
-        .eq("id", parseInt(member_id))
+        .eq("id", member_id)
         .single();
 
       if (mErr || !member) return Response.json({ error: "Member not found" }, { status: 404 });

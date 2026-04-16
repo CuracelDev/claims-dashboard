@@ -35,7 +35,7 @@ export async function GET(request) {
       const { data, error } = await supabase
         .from('daily_reports')
         .select('*')
-        .eq('team_member_id', parseInt(personId))
+        .eq('team_member_id', personId)
         .eq('report_date', date)
         .maybeSingle();
       if (error) return Response.json({ error: error.message }, { status: 500 });
@@ -59,7 +59,7 @@ export async function GET(request) {
       .select('*')
       .order('report_date', { ascending: false })
       .limit(limit);
-    if (memberId) q = q.eq('team_member_id', parseInt(memberId));
+    if (memberId) q = q.eq('team_member_id', memberId);
     const { data, error } = await q;
     if (error) return Response.json({ error: error.message }, { status: 500 });
     const withMembers = await attachTeamMembers(supabase, data || []);
@@ -89,7 +89,7 @@ export async function POST(request) {
       return Response.json({ error: 'team_member_id and report_date are required' }, { status: 400 });
     }
 
-    const memberId = parseInt(team_member_id);
+    const memberId = team_member_id;
 
     const safeMetrics = {};
     if (metrics && typeof metrics === 'object' && !Array.isArray(metrics)) {
