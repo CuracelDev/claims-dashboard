@@ -23,10 +23,9 @@ async function attachTaskMember(supabase, task) {
 export async function PATCH(request, context) {
   try {
     const supabase = getSupabase();
-    const { id: rawId } = await context.params;
-    const id = parseInt(rawId);
-    if (isNaN(id)) {
-      console.error('PATCH /api/tasks/[id] invalid ID:', rawId);
+    const { id } = await context.params;
+    if (!id || id === 'undefined') {
+      console.error('PATCH /api/tasks/[id] invalid ID:', id);
       return Response.json({ error: 'Invalid task ID' }, { status: 400 });
     }
     const body = await request.json();
@@ -98,7 +97,7 @@ export async function PATCH(request, context) {
         member_name: completed_by_name || 'App',
         action:      'task.update',
         entity_type: 'task',
-        entity_id:   parseInt(id),
+        entity_id:   id,
         details:     { status, title: enrichedTask.title },
         source:      'app',
       });
@@ -115,10 +114,9 @@ export async function PATCH(request, context) {
 export async function DELETE(request, context) {
   try {
     const supabase = getSupabase();
-    const { id: rawId } = await context.params;
-    const id = parseInt(rawId);
-    if (isNaN(id)) {
-      console.error('DELETE /api/tasks/[id] invalid ID:', rawId);
+    const { id } = await context.params;
+    if (!id || id === 'undefined') {
+      console.error('DELETE /api/tasks/[id] invalid ID:', id);
       return Response.json({ error: 'Invalid task ID' }, { status: 400 });
     }
 
@@ -139,7 +137,7 @@ export async function DELETE(request, context) {
         member_name: task?.assigned_by || 'Admin',
         action:      'task.delete',
         entity_type: 'task',
-        entity_id:   parseInt(id),
+        entity_id:   id,
         details:     { title: task?.title },
         source:      'app',
       });

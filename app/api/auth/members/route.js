@@ -21,9 +21,20 @@ export async function GET() {
     return Response.json({ error: error.message }, { status: 500 });
   }
 
+  // Unique members by name or id to avoid duplicates in UI
+  const uniqueMap = new Map();
+  data.forEach(m => {
+    const key = m.id || m.name;
+    if (!uniqueMap.has(key)) {
+      uniqueMap.set(key, m);
+    }
+  });
+
+  const uniqueData = Array.from(uniqueMap.values());
+
   return Response.json({
-    members: data.map((m) => ({
-      id: parseInt(m.id),
+    members: uniqueData.map((m) => ({
+      id: m.id, // Keep as string (text in DB)
       name: m.display_name || m.name,
       has_pin: !!m.report_pin,
       slack_user_id: m.slack_user_id || null,
