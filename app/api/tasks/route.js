@@ -1,12 +1,24 @@
-import { createClient } from "@supabase/supabase-js";
+import { getSupabase } from "../../../lib/supabase";
 
 export const dynamic = "force-dynamic";
 
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
+async function attachTaskMembers(supabase, tasks) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return tasks || [];
+
+  const memberIds = [...new Set(tasks.map((task) => task.assigned_to).filter(Boolean))];
+  if (memberIds.length === 0) return tasks;
+
+  const { data: members, error } = await supabase
+    .from("team_members")
+    .select("id, name, slack_user_id");
+
+  if (error) throw error;
+
+  const memberMap = new Map((members || []).map((member) => [String(member.id), member]));
+  return tasks.map((task) => ({
+    ...task,
+    team_members: memberMap.get(String(task.assigned_to)) || null,
+  }));
 }
 
 // GET /api/tasks?assigned_to=123 or GET /api/tasks (all tasks)
@@ -18,10 +30,7 @@ export async function GET(request) {
 
     let query = supabase
       .from("tasks")
-      .select(`
-        *,
-        team_members!tasks_assigned_to_fkey(id, name, slack_user_id)
-      `)
+      .select("*")
       .order("created_at", { ascending: false });
 
     if (assignedTo) {
@@ -31,7 +40,8 @@ export async function GET(request) {
     const { data, error } = await query;
     if (error) throw error;
 
-    return Response.json({ tasks: data });
+    const tasks = await attachTaskMembers(supabase, data || []);
+    return Response.json({ tasks });
   } catch (err) {
     console.error("GET /api/tasks error:", err);
     return Response.json({ error: err.message }, { status: 500 });
@@ -62,16 +72,23 @@ export async function POST(request) {
         category: category || "ad_hoc",
         status: "todo",
       })
-      .select(`
-        *,
-        team_members!tasks_assigned_to_fkey(id, name, slack_user_id)
-      `)
       .single();
 
     if (error) throw error;
 
+    const { data: member } = await supabase
+      .from("team_members")
+      .select("id, name, slack_user_id")
+      .eq("id", parseInt(assigned_to))
+      .maybeSingle();
+
+    const taskWithMember = {
+      ...task,
+      team_members: member || null,
+    };
+
     // Send Slack DM to assignee
-    const slackUserId = task.team_members?.slack_user_id;
+    const slackUserId = taskWithMember.team_members?.slack_user_id;
     if (slackUserId && process.env.SLACK_BOT_TOKEN) {
       try {
         const dueDateText = due_date
@@ -146,7 +163,7 @@ export async function POST(request) {
       });
     } catch {}
 
-    return Response.json({ task }, { status: 201 });
+    return Response.json({ task: taskWithMember }, { status: 201 });
   } catch (err) {
     console.error("POST /api/tasks error:", err);
     return Response.json({ error: err.message }, { status: 500 });

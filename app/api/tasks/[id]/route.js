@@ -1,19 +1,29 @@
 // app/api/tasks/[id]/route.js
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../../lib/supabase';
 export const dynamic = 'force-dynamic';
 
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
+async function attachTaskMember(supabase, task) {
+  if (!task?.assigned_to) return task;
+
+  const { data: member, error } = await supabase
+    .from('team_members')
+    .select('id, name, slack_user_id')
+    .eq('id', task.assigned_to)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return {
+    ...task,
+    team_members: member || null,
+  };
 }
 
 // PATCH /api/tasks/[id] — update status
-export async function PATCH(request, { params }) {
+export async function PATCH(request, context) {
   try {
     const supabase = getSupabase();
-    const { id } = params;
+    const { id } = await context.params;
     const body = await request.json();
     const { status, completed_by_name } = body;
 
@@ -33,18 +43,19 @@ export async function PATCH(request, { params }) {
       .from('tasks')
       .update(updatePayload)
       .eq('id', id)
-      .select(`*, team_members!tasks_assigned_to_fkey(id, name, slack_user_id)`)
+      .select('*')
       .single();
 
     if (error) throw error;
+    const enrichedTask = await attachTaskMember(supabase, task);
 
     // Slack DM if marked done
-    if (status === 'done' && task.assigned_by && process.env.SLACK_BOT_TOKEN) {
+    if (status === 'done' && enrichedTask.assigned_by && process.env.SLACK_BOT_TOKEN) {
       try {
         const { data: assigner } = await supabase
           .from('team_members')
           .select('slack_user_id, name')
-          .ilike('name', task.assigned_by)
+          .ilike('name', enrichedTask.assigned_by)
           .single();
 
         if (assigner?.slack_user_id) {
@@ -56,14 +67,14 @@ export async function PATCH(request, { params }) {
           const openData = await openRes.json();
 
           if (openData.ok) {
-            const completedBy = completed_by_name || task.team_members?.name || 'A team member';
+            const completedBy = completed_by_name || enrichedTask.team_members?.name || 'A team member';
             await fetch('https://slack.com/api/chat.postMessage', {
               method: 'POST',
               headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 channel: openData.channel.id,
                 blocks: [
-                  { type: 'section', text: { type: 'mrkdwn', text: `✅ *Task completed!*\n*${completedBy}* just completed: *${task.title}*` } },
+                  { type: 'section', text: { type: 'mrkdwn', text: `✅ *Task completed!*\n*${completedBy}* just completed: *${enrichedTask.title}*` } },
                   { type: 'context', elements: [{ type: 'mrkdwn', text: `Completed at ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} Lagos time` }] },
                 ],
               }),
@@ -83,12 +94,12 @@ export async function PATCH(request, { params }) {
         action:      'task.update',
         entity_type: 'task',
         entity_id:   parseInt(id),
-        details:     { status, title: task.title },
+        details:     { status, title: enrichedTask.title },
         source:      'app',
       });
     } catch {}
 
-    return Response.json({ task });
+    return Response.json({ task: enrichedTask });
   } catch (err) {
     console.error('PATCH /api/tasks/[id] error:', err);
     return Response.json({ error: err.message }, { status: 500 });
@@ -96,10 +107,10 @@ export async function PATCH(request, { params }) {
 }
 
 // DELETE /api/tasks/[id]
-export async function DELETE(request, { params }) {
+export async function DELETE(request, context) {
   try {
     const supabase = getSupabase();
-    const { id } = params;
+    const { id } = await context.params;
 
     // Fetch task title before deleting for audit context
     const { data: task } = await supabase
