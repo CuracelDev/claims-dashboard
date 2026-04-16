@@ -1,15 +1,12 @@
 // app/api/auth/members/route.js
 // Returns active team members for the login name-picker grid.
 // Never returns report_pin — PIN check is server-side only in /verify.
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
+  const supabase = getSupabase();
 
   const { data, error } = await supabase
     .from('team_members')
