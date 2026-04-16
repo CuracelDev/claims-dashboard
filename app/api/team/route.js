@@ -9,9 +9,21 @@ export async function GET() {
     const { data, error } = await supabase
       .from('team_members')
       .select('*')
+      .eq('active', true)
       .order('name');
     if (error) throw error;
-    return Response.json({ data });
+
+    // Deduplicate by name (keep first occurrence of each unique name)
+    const seen = new Set();
+    const unique = data.filter(member => {
+      if (seen.has(member.name.toLowerCase())) {
+        return false;
+      }
+      seen.add(member.name.toLowerCase());
+      return true;
+    });
+
+    return Response.json({ data: unique });
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });
   }
