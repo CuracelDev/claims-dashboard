@@ -28,7 +28,7 @@ export async function POST(request) {
   const { data: member, error: memberErr } = await supabase
     .from('team_members')
     .select('id, name, display_name, slack_user_id')
-    .eq('id', parseInt(member_id))
+    .eq('id', member_id)
     .single();
 
   if (memberErr || !member) {
@@ -44,7 +44,7 @@ export async function POST(request) {
   const { error: updateErr } = await supabase
     .from('team_members')
     .update({ report_pin: pin })
-    .eq('id', parseInt(member_id));
+    .eq('id', member_id);
 
   if (updateErr) {
     return Response.json({ error: 'Could not save PIN' }, { status: 500 });

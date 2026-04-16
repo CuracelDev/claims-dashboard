@@ -288,7 +288,7 @@ export default function LoginPage() {
             )}
 
             {/* PIN input — show once PIN sent */}
-            {(pinSent || (!sending && !selected.slack_user_id === false)) && !sending && selected.slack_user_id && (
+            {(pinSent || selected.has_pin) && !sending && selected.slack_user_id && (
               <>
                 <div style={{ marginBottom: 18 }}>
                   <div style={{
