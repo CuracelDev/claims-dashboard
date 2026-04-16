@@ -11,7 +11,19 @@ export async function GET() {
       .select('*')
       .order('name');
     if (error) throw error;
-    return Response.json({ data });
+
+    // Deduplicate by name
+    const uniqueMap = {};
+    const uniqueList = [];
+    (data || []).forEach(m => {
+      const lower = (m.name || '').toLowerCase().trim();
+      if (!uniqueMap[lower]) {
+        uniqueMap[lower] = true;
+        uniqueList.push(m);
+      }
+    });
+
+    return Response.json({ data: uniqueList });
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });
   }
