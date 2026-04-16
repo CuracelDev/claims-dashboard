@@ -20,10 +20,10 @@ async function attachTaskMember(supabase, task) {
 }
 
 // PATCH /api/tasks/[id] — update status
-export async function PATCH(request, { params }) {
+export async function PATCH(request, context) {
   try {
     const supabase = getSupabase();
-    const { id } = params;
+    const { id } = await context.params;
     const body = await request.json();
     const { status, completed_by_name } = body;
 
@@ -107,10 +107,10 @@ export async function PATCH(request, { params }) {
 }
 
 // DELETE /api/tasks/[id]
-export async function DELETE(request, { params }) {
+export async function DELETE(request, context) {
   try {
     const supabase = getSupabase();
-    const { id } = params;
+    const { id } = await context.params;
 
     // Fetch task title before deleting for audit context
     const { data: task } = await supabase
