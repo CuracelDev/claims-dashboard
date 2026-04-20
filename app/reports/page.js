@@ -43,7 +43,11 @@ const GROUP_COLORS = {
   quality_review: '#00E5A0',
 };
 
-const todayStr = () => new Date().toISOString().split('T')[0];
+const todayStr = () => {
+  const now = new Date();
+  const lagosTime = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Lagos' }));
+  return lagosTime.toISOString().split('T')[0];
+};
 
 function MetricGroup({ group, metrics, onChangeMetric }) {
   const { C } = useTheme();
