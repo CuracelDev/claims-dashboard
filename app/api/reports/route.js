@@ -2,6 +2,27 @@
 import { getSupabase } from '../../../lib/supabase';
 export const dynamic = 'force-dynamic';
 
+function normalizeReportDate(value) {
+  if (!value) return null;
+  const raw = String(value);
+  return raw.length >= 10 ? raw.slice(0, 10) : raw;
+}
+
+function dedupeLatestReports(reports) {
+  const out = [];
+  const seen = new Set();
+
+  for (const report of reports || []) {
+    const date = normalizeReportDate(report.report_date);
+    const key = `${String(report.team_member_id)}__${date}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(report);
+  }
+
+  return out;
+}
+
 async function attachTeamMembers(supabase, reports) {
   if (!Array.isArray(reports) || reports.length === 0) return reports || [];
 
@@ -37,9 +58,10 @@ export async function GET(request) {
         .select('*')
         .eq('team_member_id', personId)
         .eq('report_date', date)
-        .maybeSingle();
+        .order('created_at', { ascending: false })
+        .limit(1);
       if (error) return Response.json({ error: error.message }, { status: 500 });
-      return Response.json({ data });
+      return Response.json({ data: data?.[0] || null });
     }
 
     if (date) {
@@ -50,7 +72,8 @@ export async function GET(request) {
         .order('created_at', { ascending: false })
         .limit(limit);
       if (error) return Response.json({ error: error.message }, { status: 500 });
-      const withMembers = await attachTeamMembers(supabase, data || []);
+      const deduped = dedupeLatestReports(data || []);
+      const withMembers = await attachTeamMembers(supabase, deduped);
       return Response.json({ data: withMembers });
     }
 
