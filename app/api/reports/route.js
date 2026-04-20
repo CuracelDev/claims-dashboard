@@ -2,6 +2,25 @@
 import { getSupabase } from '../../../lib/supabase';
 export const dynamic = 'force-dynamic';
 
+const ALLOWED_METRIC_KEYS = new Set([
+  'claims_kenya',
+  'claims_tanzania',
+  'claims_uganda',
+  'claims_uap',
+  'claims_defmis',
+  'claims_hadiel',
+  'claims_axa',
+  'providers_mapped',
+  'care_items_mapped',
+  'care_items_grouped',
+  'resolved_cares',
+  'auto_pa_reviewed',
+  'flagged_care_items',
+  'icd10_adjusted',
+  'benefits_set_up',
+  'providers_assigned',
+]);
+
 function normalizeReportDate(value) {
   if (!value) return null;
   const raw = String(value);
@@ -117,6 +136,7 @@ export async function POST(request) {
     const safeMetrics = {};
     if (metrics && typeof metrics === 'object' && !Array.isArray(metrics)) {
       for (const [k, v] of Object.entries(metrics)) {
+        if (!ALLOWED_METRIC_KEYS.has(k)) continue;
         const num = parseInt(v);
         if (!isNaN(num)) safeMetrics[k] = num;
       }

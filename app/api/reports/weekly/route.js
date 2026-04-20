@@ -2,6 +2,25 @@ import { getSupabase } from '../../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
+const ALLOWED_METRIC_KEYS = new Set([
+  'claims_kenya',
+  'claims_tanzania',
+  'claims_uganda',
+  'claims_uap',
+  'claims_defmis',
+  'claims_hadiel',
+  'claims_axa',
+  'providers_mapped',
+  'care_items_mapped',
+  'care_items_grouped',
+  'resolved_cares',
+  'auto_pa_reviewed',
+  'flagged_care_items',
+  'icd10_adjusted',
+  'benefits_set_up',
+  'providers_assigned',
+]);
+
 function normalizeDate(value) {
   if (!value) return null;
 
@@ -137,6 +156,7 @@ export async function GET(request) {
 
       const metrics = report.metrics || {};
       for (const [key, val] of Object.entries(metrics)) {
+        if (!ALLOWED_METRIC_KEYS.has(key)) continue;
         const num = Number(val);
         if (Number.isFinite(num)) {
           byPerson[pid].totals[key] = (byPerson[pid].totals[key] || 0) + num;
