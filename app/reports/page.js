@@ -297,6 +297,8 @@ function DailySummary({ teamMembers, date }) {
   const [data, setData] = useState({ reports: [], leave: [] });
   const [loading, setLoading] = useState(true);
 
+  const normalizeName = (value) => String(value || '').trim().toLowerCase();
+
   useEffect(() => {
     if (!date) return;
     setLoading(true);
@@ -311,9 +313,21 @@ function DailySummary({ teamMembers, date }) {
 
   if (loading || !date) return null;
 
-  const submitted = data.reports.map(r => r.team_member_id);
+  const submittedIds = new Set(data.reports.map(r => String(r.team_member_id)));
+  const submittedNames = new Set(
+    data.reports
+      .map(r => normalizeName(r.team_members?.display_name || r.team_members?.name))
+      .filter(Boolean)
+  );
   const onLeave = data.leave.map(l => l.team_member_id);
-  const pending = teamMembers.filter(m => !submitted.includes(m.id) && !onLeave.includes(m.id));
+  const isSubmitted = (member) => {
+    const memberId = String(member.id);
+    const memberName = normalizeName(member.display_name || member.name);
+    return submittedIds.has(memberId) || (memberName && submittedNames.has(memberName));
+  };
+
+  const submittedCount = teamMembers.filter(isSubmitted).length;
+  const pending = teamMembers.filter(m => !isSubmitted(m) && !onLeave.includes(m.id));
 
   return (
     <div style={{ ...S.card, borderTop: `3px solid ${C.accent}`, marginBottom: 24 }}>
@@ -322,7 +336,7 @@ function DailySummary({ teamMembers, date }) {
       </div>
       <div style={{ display: 'flex', gap: 24, marginBottom: 16, flexWrap: 'wrap' }}>
         {[
-          { val: data.reports.length, label: 'Submitted', color: C.accent },
+          { val: submittedCount, label: 'Submitted', color: C.accent },
           { val: onLeave.length, label: 'On Leave', color: C.warn },
           { val: pending.length, label: 'Pending', color: C.muted },
         ].map(s => (
@@ -334,7 +348,7 @@ function DailySummary({ teamMembers, date }) {
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         {teamMembers.map(m => {
-          const done = submitted.includes(m.id);
+          const done = isSubmitted(m);
           const off = onLeave.includes(m.id);
           return (
             <span key={m.id} style={{

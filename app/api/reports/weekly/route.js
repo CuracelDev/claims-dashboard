@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
@@ -38,10 +38,7 @@ function sumMetricValues(metrics) {
 
 export async function GET(request) {
   try {
-    const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY
-    );
+    const supabase = getSupabase();
     const { searchParams } = new URL(request.url);
 
     const rawFrom = searchParams.get('from');
@@ -60,12 +57,15 @@ export async function GET(request) {
       );
     }
 
-    const { data: allMembers, error: membersError } = await supabase
+    const { data: allMembersRaw, error: membersError } = await supabase
       .from('team_members')
-      .select('id, name, display_name, is_active')
-      .eq('is_active', true);
+      .select('id, name, display_name, active, is_active');
 
     if (membersError) throw membersError;
+
+    const allMembers = (allMembersRaw || []).filter(
+      (m) => m.active !== false && m.is_active !== false
+    );
 
     const { data: rawReports, error: reportsError } = await supabase
       .from('daily_reports')
