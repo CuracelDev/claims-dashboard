@@ -34,7 +34,7 @@ export async function GET(request) {
       .order("created_at", { ascending: false });
 
     if (assignedTo) {
-      query = query.eq("assigned_to", parseInt(assignedTo));
+      query = query.eq("assigned_to", assignedTo);
     }
 
     const { data, error } = await query;
@@ -65,7 +65,7 @@ export async function POST(request) {
       .insert({
         title,
         description: description || null,
-        assigned_to: parseInt(assigned_to),
+        assigned_to: assigned_to,
         assigned_by: assigned_by || "Admin",
         due_date: due_date || null,
         priority: priority || "medium",
@@ -79,7 +79,7 @@ export async function POST(request) {
     const { data: member } = await supabase
       .from("team_members")
       .select("id, name, slack_user_id")
-      .eq("id", parseInt(assigned_to))
+      .eq("id", assigned_to)
       .maybeSingle();
 
     const taskWithMember = {
@@ -158,7 +158,7 @@ export async function POST(request) {
         action:      'task.create',
         entity_type: 'task',
         entity_id:   task.id || null,
-        details:     { title, assigned_to: parseInt(assigned_to), priority: priority || 'medium' },
+        details:     { title, assigned_to: assigned_to, priority: priority || 'medium' },
         source:      'app',
       });
     } catch {}

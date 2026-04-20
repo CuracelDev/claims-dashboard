@@ -24,6 +24,10 @@ export async function PATCH(request, context) {
   try {
     const supabase = getSupabase();
     const { id } = await context.params;
+    if (!id || id === 'undefined') {
+      console.error('PATCH /api/tasks/[id] invalid ID:', id);
+      return Response.json({ error: 'Invalid task ID' }, { status: 400 });
+    }
     const body = await request.json();
     const { status, completed_by_name } = body;
 
@@ -127,7 +131,7 @@ export async function PATCH(request, context) {
         member_name: completed_by_name || 'App',
         action:      'task.update',
         entity_type: 'task',
-        entity_id:   parseInt(id),
+        entity_id:   id,
         details:     { status, title: enrichedTask.title },
         source:      'app',
       });
@@ -145,6 +149,10 @@ export async function DELETE(request, context) {
   try {
     const supabase = getSupabase();
     const { id } = await context.params;
+    if (!id || id === 'undefined') {
+      console.error('DELETE /api/tasks/[id] invalid ID:', id);
+      return Response.json({ error: 'Invalid task ID' }, { status: 400 });
+    }
 
     // Fetch task title before deleting for audit context
     const { data: task } = await supabase
@@ -163,7 +171,7 @@ export async function DELETE(request, context) {
         member_name: task?.assigned_by || 'Admin',
         action:      'task.delete',
         entity_type: 'task',
-        entity_id:   parseInt(id),
+        entity_id:   id,
         details:     { title: task?.title },
         source:      'app',
       });

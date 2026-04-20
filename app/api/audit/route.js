@@ -2,15 +2,8 @@
 // Reads from audit_log table with filters: member_id, action, from, to
 // Supports pagination via limit + offset
 
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../lib/supabase';
 export const dynamic = 'force-dynamic';
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 export async function GET(request) {
   try {
@@ -30,7 +23,7 @@ export async function GET(request) {
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
-    if (memberId) query = query.eq('member_id', parseInt(memberId));
+    if (memberId) query = query.eq('member_id', memberId);
     if (action)   query = query.ilike('action', `%${action}%`);
     if (from)     query = query.gte('created_at', `${from}T00:00:00.000Z`);
     if (to)       query = query.lte('created_at', `${to}T23:59:59.999Z`);

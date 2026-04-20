@@ -383,7 +383,7 @@ export default function TasksPage() {
     try {
       const session = JSON.parse(localStorage.getItem("claims_intel_session") || "{}");
       if (session.member_id) {
-        const match = list.find(m => m.id === parseInt(session.member_id));
+        const match = list.find(m => String(m.id) === String(session.member_id));
         if (match) setSelectedMember(String(match.id));
       }
     } catch {}
@@ -422,7 +422,7 @@ export default function TasksPage() {
   // Filter tasks
   const visibleTasks = tasks.filter(t => {
     const memberMatch = viewMode === "my"
-      ? selectedMember && t.assigned_to === parseInt(selectedMember)
+      ? selectedMember && String(t.assigned_to) === String(selectedMember)
       : true;
     const statusMatch = filterStatus === "all" || t.status === filterStatus;
     return memberMatch && statusMatch;
@@ -434,7 +434,7 @@ export default function TasksPage() {
   }, {});
 
   // Stats for selected member
-  const myTasks = selectedMember ? tasks.filter(t => t.assigned_to === parseInt(selectedMember)) : [];
+  const myTasks = selectedMember ? tasks.filter(t => String(t.assigned_to) === String(selectedMember)) : [];
   const stats = {
     total: myTasks.length,
     todo: myTasks.filter(t => t.status === "todo").length,
@@ -443,7 +443,7 @@ export default function TasksPage() {
     overdue: myTasks.filter(t => isOverdue(t.due_date, t.status)).length,
   };
 
-  const currentMemberName = members.find(m => m.id === parseInt(selectedMember))?.name || "Admin";
+  const currentMemberName = members.find(m => String(m.id) === String(selectedMember))?.name || "Admin";
 
   if (loading) return (
     <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Sans', sans-serif" }}>

@@ -4,15 +4,12 @@
 // The token is the only thing the client can use to prove identity.
 // Tampering with member_id or member_name in localStorage does nothing
 // without a matching valid session_token in the sessions table.
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request) {
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
+  const supabase = getSupabase();
 
   let body;
   try {
@@ -31,7 +28,7 @@ export async function POST(request) {
   const { data: member, error: memberError } = await supabase
     .from('team_members')
     .select('id, name, display_name, report_pin, is_active')
-    .eq('id', parseInt(member_id))
+    .eq('id', member_id)
     .single();
 
   if (memberError || !member) {
@@ -53,7 +50,7 @@ export async function POST(request) {
   const { data: session, error: sessionError } = await supabase
     .from('sessions')
     .insert({
-      member_id: parseInt(member.id),
+      member_id: member.id,
       is_guest: false,
       expires_at: expiresAt,
     })
@@ -67,7 +64,7 @@ export async function POST(request) {
 
   // Write audit log
   await supabase.from('audit_log').insert({
-    member_id:   parseInt(member.id),
+    member_id:   member.id,
     member_name: member.display_name || member.name,
     action:      'auth.login',
     entity_type: 'session',
@@ -78,7 +75,7 @@ export async function POST(request) {
   return Response.json({
     valid: true,
     session_token: session.session_token,
-    member_id: parseInt(member.id),
+    member_id: member.id,
     member_name: member.display_name || member.name,
   });
 }
