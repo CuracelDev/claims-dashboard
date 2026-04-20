@@ -40,6 +40,7 @@ const METRIC_GROUPS = [
 ];
 
 const ALL_METRICS = METRIC_GROUPS.flatMap((g) => g.metrics);
+const KNOWN_METRIC_KEYS = new Set(ALL_METRICS.map((m) => m.key));
 
 function toLocalYMD(date) {
   const y = date.getFullYear();
@@ -529,7 +530,7 @@ export default function WeeklyPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: 14 }}>
               {members.map((p, i) => {
                 const top = Object.entries(p.totals)
-                  .filter(([, v]) => v > 0)
+                  .filter(([key, v]) => KNOWN_METRIC_KEYS.has(key) && v > 0)
                   .sort((a, b) => b[1] - a[1])
                   .slice(0, 4);
 
