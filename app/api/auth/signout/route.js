@@ -1,12 +1,9 @@
 // app/api/auth/signout/route.js
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../../lib/supabase';
 export const dynamic = 'force-dynamic';
 
 export async function POST(request) {
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
+  const supabase = getSupabase();
 
   let body;
   try { body = await request.json(); } catch { return Response.json({ ok: true }); }
@@ -17,15 +14,24 @@ export async function POST(request) {
     // Look up session before deleting so we can log who signed out
     const { data: session } = await supabase
       .from('sessions')
-      .select('member_id, team_members(name, display_name)')
+      .select('member_id')
       .eq('session_token', session_token)
       .maybeSingle();
+
+    let member = null;
+    if (session?.member_id) {
+      const { data } = await supabase
+        .from('team_members')
+        .select('name, display_name')
+        .eq('id', session.member_id)
+        .maybeSingle();
+      member = data;
+    }
 
     await supabase.from('sessions').delete().eq('session_token', session_token);
 
     // Audit log
     try {
-      const member = session?.team_members;
       await supabase.from('audit_log').insert({
         member_id:   session?.member_id ? parseInt(session.member_id) : null,
         member_name: member?.display_name || member?.name || 'Unknown',

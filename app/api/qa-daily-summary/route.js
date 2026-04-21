@@ -1,14 +1,7 @@
-import { createClient } from "@supabase/supabase-js";
+import { getSupabase } from "../../../lib/supabase";
 import { getSettings } from "../../lib/settings";
 
 export const dynamic = "force-dynamic";
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);

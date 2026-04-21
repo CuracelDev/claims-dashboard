@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "db:audit": "node scripts/db-schema-audit.mjs",
+    "db:fresh-migrate:adminer": "node scripts/fresh-migrate-prod-via-adminer.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

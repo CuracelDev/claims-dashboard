@@ -1,16 +1,9 @@
 // app/lib/settings.js
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../lib/supabase';
 
 let _cache = null;
 let _cacheTime = 0;
 const CACHE_TTL = 10_000;
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 export async function getSettings() {
   const now = Date.now();
