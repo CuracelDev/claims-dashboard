@@ -1,13 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
+import { getSupabase } from "../../../lib/supabase";
 
 export const dynamic = "force-dynamic";
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 // POST /api/qa-flags — called by n8n after each QA run
 // Accepts single object OR array of flag objects

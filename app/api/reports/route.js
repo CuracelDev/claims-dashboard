@@ -1,25 +1,11 @@
 // app/api/reports/route.js
 import { getSupabase } from '../../../lib/supabase';
+import {
+  DAILY_REPORT_METRIC_KEYS,
+  normalizeDailyReport,
+  normalizeDailyReports,
+} from '../../../lib/report-metrics';
 export const dynamic = 'force-dynamic';
-
-const ALLOWED_METRIC_KEYS = new Set([
-  'claims_kenya',
-  'claims_tanzania',
-  'claims_uganda',
-  'claims_uap',
-  'claims_defmis',
-  'claims_hadiel',
-  'claims_axa',
-  'providers_mapped',
-  'care_items_mapped',
-  'care_items_grouped',
-  'resolved_cares',
-  'auto_pa_reviewed',
-  'flagged_care_items',
-  'icd10_adjusted',
-  'benefits_set_up',
-  'providers_assigned',
-]);
 
 function normalizeReportDate(value) {
   if (!value) return null;
@@ -80,7 +66,7 @@ export async function GET(request) {
         .order('created_at', { ascending: false })
         .limit(1);
       if (error) return Response.json({ error: error.message }, { status: 500 });
-      return Response.json({ data: data?.[0] || null });
+      return Response.json({ data: normalizeDailyReport(data?.[0] || null) });
     }
 
     if (date) {
@@ -91,7 +77,7 @@ export async function GET(request) {
         .order('created_at', { ascending: false })
         .limit(limit);
       if (error) return Response.json({ error: error.message }, { status: 500 });
-      const deduped = dedupeLatestReports(data || []);
+      const deduped = dedupeLatestReports(normalizeDailyReports(data));
       const withMembers = await attachTeamMembers(supabase, deduped);
       return Response.json({ data: withMembers });
     }
@@ -104,7 +90,7 @@ export async function GET(request) {
     if (memberId) q = q.eq('team_member_id', memberId);
     const { data, error } = await q;
     if (error) return Response.json({ error: error.message }, { status: 500 });
-    const withMembers = await attachTeamMembers(supabase, data || []);
+    const withMembers = await attachTeamMembers(supabase, normalizeDailyReports(data));
     return Response.json({ data: withMembers });
 
   } catch (err) {
@@ -136,7 +122,7 @@ export async function POST(request) {
     const safeMetrics = {};
     if (metrics && typeof metrics === 'object' && !Array.isArray(metrics)) {
       for (const [k, v] of Object.entries(metrics)) {
-        if (!ALLOWED_METRIC_KEYS.has(k)) continue;
+        if (!DAILY_REPORT_METRIC_KEYS.has(k)) continue;
         const num = parseInt(v);
         if (!isNaN(num)) safeMetrics[k] = num;
       }
@@ -199,7 +185,7 @@ export async function POST(request) {
       });
     } catch {}
 
-    return Response.json({ data });
+    return Response.json({ data: normalizeDailyReport(data) });
 
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });

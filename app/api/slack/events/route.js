@@ -1,13 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
+import { getSupabase } from "../../../../lib/supabase";
 
 export const dynamic = "force-dynamic";
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 async function slackPost(method, body) {
   const res = await fetch(`https://slack.com/api/${method}`, {

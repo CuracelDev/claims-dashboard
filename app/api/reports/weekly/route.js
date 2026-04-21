@@ -1,25 +1,10 @@
 import { getSupabase } from '../../../../lib/supabase';
+import {
+  DAILY_REPORT_METRIC_KEYS,
+  normalizeDailyReports,
+} from '../../../../lib/report-metrics';
 
 export const dynamic = 'force-dynamic';
-
-const ALLOWED_METRIC_KEYS = new Set([
-  'claims_kenya',
-  'claims_tanzania',
-  'claims_uganda',
-  'claims_uap',
-  'claims_defmis',
-  'claims_hadiel',
-  'claims_axa',
-  'providers_mapped',
-  'care_items_mapped',
-  'care_items_grouped',
-  'resolved_cares',
-  'auto_pa_reviewed',
-  'flagged_care_items',
-  'icd10_adjusted',
-  'benefits_set_up',
-  'providers_assigned',
-]);
 
 function normalizeDate(value) {
   if (!value) return null;
@@ -55,6 +40,25 @@ function sumMetricValues(metrics) {
   }, 0);
 }
 
+function isFalseFlag(value) {
+  if (value === false || value === 0) return true;
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'false' || normalized === '0' || normalized === 'no';
+}
+
+function normalizeActiveMembers(members) {
+  const byId = new Map();
+
+  for (const member of members || []) {
+    if (isFalseFlag(member.active) || isFalseFlag(member.is_active)) continue;
+    const key = String(member.id);
+    if (!byId.has(key)) byId.set(key, member);
+  }
+
+  return Array.from(byId.values());
+}
+
 export async function GET(request) {
   try {
     const supabase = getSupabase();
@@ -82,9 +86,7 @@ export async function GET(request) {
 
     if (membersError) throw membersError;
 
-    const allMembers = (allMembersRaw || []).filter(
-      (m) => m.active !== false && m.is_active !== false
-    );
+    const allMembers = normalizeActiveMembers(allMembersRaw);
 
     const { data: rawReports, error: reportsError } = await supabase
       .from('daily_reports')
@@ -104,7 +106,7 @@ export async function GET(request) {
 
     const dedupeMap = new Map();
 
-    for (const report of rawReports || []) {
+    for (const report of normalizeDailyReports(rawReports)) {
       const normalizedReportDate = normalizeDate(report.report_date);
       if (!normalizedReportDate) continue;
       if (normalizedReportDate < from || normalizedReportDate > to) continue;
@@ -156,7 +158,7 @@ export async function GET(request) {
 
       const metrics = report.metrics || {};
       for (const [key, val] of Object.entries(metrics)) {
-        if (!ALLOWED_METRIC_KEYS.has(key)) continue;
+        if (!DAILY_REPORT_METRIC_KEYS.has(key)) continue;
         const num = Number(val);
         if (Number.isFinite(num)) {
           byPerson[pid].totals[key] = (byPerson[pid].totals[key] || 0) + num;

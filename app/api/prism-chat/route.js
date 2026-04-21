@@ -2,19 +2,12 @@
 // Note: Anthropic SDK kept for reference, now using Azure OpenAI
 // import Anthropic from '@anthropic-ai/sdk';
 import { chatCompletionJSON, MODELS } from '../../../lib/azure-openai';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
 const PRISM_ID = 'U0AF86M8TRS';
 const CHANNEL = 'C06DVSADD6J';
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 async function slackPost(body) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {

@@ -2,7 +2,7 @@
 // Note: Anthropic SDK kept for reference, now using Azure OpenAI
 // import Anthropic from '@anthropic-ai/sdk';
 import { chatCompletionJSON, MODELS } from '../../../lib/azure-openai';
-import { createClient } from '@supabase/supabase-js';
+import { getSupabase } from '../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,13 +16,6 @@ const USER_NAMES = {
   'U0AF86M8TRS': 'Prism',
   'U0AGVJNJ20M': 'Claims Dashboard',
 };
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-}
 
 function stripMentions(text) {
   return (text || '').replace(/<@[A-Z0-9]+>/g, '').replace(/\s+/g, ' ').trim();
