@@ -13,7 +13,7 @@ const pgPool = new Pool({
 const tables = [
   'audit_log', 'claim_errors', 'daily_reports', 'insurer_feedback_items',
   'leave_records', 'metric_definitions', 'okr_entries', 'platform_settings',
-  'prism_logs', 'qa_flags', 'sessions', 'slack_summaries', 'target_logs',
+  'prism_conversations', 'prism_logs', 'prism_messages', 'qa_flags', 'sessions', 'slack_summaries', 'target_logs',
   'tasks', 'team_leave', 'team_members', 'weekly_targets'
 ];
 

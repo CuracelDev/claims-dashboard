@@ -38,7 +38,10 @@ export default function PrismPage() {
   const [member, setMember] = useState('');
   const [logs, setLogs] = useState([]);
   const [logsLoading, setLogsLoading] = useState(false);
+  const [conversationId, setConversationId] = useState(null);
   const bottomRef = useRef(null);
+  const pollRef = useRef(null);
+  const messagesRef = useRef(messages);
 
   useEffect(() => {
     const session = getSession();
@@ -47,11 +50,16 @@ export default function PrismPage() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesRef.current = messages;
   }, [messages]);
 
   useEffect(() => {
     if (tab === 'log') fetchLogs();
   }, [tab]);
+
+  useEffect(() => () => {
+    if (pollRef.current) clearInterval(pollRef.current);
+  }, []);
 
   async function fetchLogs() {
     setLogsLoading(true);
@@ -63,9 +71,69 @@ export default function PrismPage() {
     setLogsLoading(false);
   }
 
+  function appendPrismMessages(remoteMessages = []) {
+    const existing = new Set(messagesRef.current.map(msg => msg.remoteKey).filter(Boolean));
+    const existingText = new Set(messagesRef.current.map(msg => `${msg.role}:${msg.text}`));
+    const additions = remoteMessages
+      .filter(msg => msg.direction === 'prism' && msg.body)
+      .filter(msg => {
+        const key = msg.slack_ts || msg.id || `${msg.created_at}:${msg.body}`;
+        if (existing.has(key)) return false;
+        if (existingText.has(`prism:${msg.body}`)) return false;
+        existing.add(key);
+        existingText.add(`prism:${msg.body}`);
+        return true;
+      })
+      .map(msg => ({
+        role: 'prism',
+        text: msg.body,
+        ts: msg.created_at || new Date().toISOString(),
+        remoteKey: msg.slack_ts || msg.id || `${msg.created_at}:${msg.body}`,
+      }));
+
+    if (additions.length) {
+      const nextMessages = [...messagesRef.current, ...additions];
+      messagesRef.current = nextMessages;
+      setMessages(nextMessages);
+    }
+    return additions.length > 0;
+  }
+
+  function pollConversation(nextConversationId) {
+    if (!nextConversationId) return;
+    if (pollRef.current) clearInterval(pollRef.current);
+
+    let attempts = 0;
+    pollRef.current = setInterval(async () => {
+      attempts += 1;
+      try {
+        const res = await fetch(`/api/prism-chat?conversation_id=${encodeURIComponent(nextConversationId)}`);
+        const data = await res.json();
+        const added = appendPrismMessages(data.messages || []);
+        if (added) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setLoading(false);
+        }
+      } catch {}
+
+      if (attempts >= 20) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+        setLoading(false);
+        setMessages(prev => [...prev, {
+          role: 'prism',
+          text: 'Message sent to Prism. I am still waiting for the Slack thread reply, so refresh shortly if it takes longer.',
+          ts: new Date().toISOString(),
+        }]);
+      }
+    }, 3000);
+  }
+
   async function sendMessage() {
     if (!input.trim() || loading) return;
-    const userMsg = { role: 'user', text: input.trim(), ts: new Date().toISOString() };
+    const messageText = input.trim();
+    const userMsg = { role: 'user', text: messageText, ts: new Date().toISOString() };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setLoading(true);
@@ -73,22 +141,36 @@ export default function PrismPage() {
       const res = await fetch('/api/prism-chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input.trim(), member_name: member }),
+        body: JSON.stringify({ message: messageText, member_name: member, conversation_id: conversationId }),
       });
       const data = await res.json();
-      setMessages(prev => [...prev, {
-        role: 'prism',
-        text: data.success
-          ? data.prism_reply
-            ? data.prism_reply
-            : `Message sent to Prism ✓ — reply will appear in the #test channel in Slack. Logged under Intelligence Log.`
-          : `Something went wrong: ${data.error}`,
-        ts: new Date().toISOString(),
-        category: data.category,
-      }]);
+      if (!data.success) {
+        setMessages(prev => [...prev, {
+          role: 'prism',
+          text: `Something went wrong: ${data.error}`,
+          ts: new Date().toISOString(),
+        }]);
+        setLoading(false);
+        return;
+      }
+
+      const nextConversationId = data.conversation_id || data.thread_ts;
+      if (nextConversationId) setConversationId(nextConversationId);
+
+      if (data.prism_reply) {
+        setMessages(prev => [...prev, {
+          role: 'prism',
+          text: data.prism_reply,
+          ts: new Date().toISOString(),
+          category: data.category,
+          remoteKey: `reply:${data.thread_ts}:${data.prism_reply}`,
+        }]);
+        setLoading(false);
+      } else {
+        pollConversation(nextConversationId);
+      }
     } catch {
       setMessages(prev => [...prev, { role: 'prism', text: 'Failed to reach Slack. Check your connection.', ts: new Date().toISOString() }]);
-    } finally {
       setLoading(false);
     }
   }
@@ -111,7 +193,7 @@ export default function PrismPage() {
         }}>✦</div>
         <div>
           <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>Prism</div>
-          <div style={{ fontSize: 11, color: C.muted }}>AI Agent · Responds in #healthops-alerts</div>
+          <div style={{ fontSize: 11, color: C.muted }}>AI Agent · Responds in the test Slack channel</div>
         </div>
         <div style={{
           marginLeft: 'auto', fontSize: 10, fontWeight: 600,

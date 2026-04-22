@@ -20,7 +20,9 @@ const TABLES = [
   'metric_definitions',
   'okr_entries',
   'platform_settings',
+  'prism_conversations',
   'prism_logs',
+  'prism_messages',
   'qa_flags',
   'sessions',
   'slack_summaries',
@@ -98,6 +100,14 @@ const TABLE_COLUMNS = {
     ['id', 'bigint'], ['sent_by', 'text'], ['message', 'text'], ['category', 'text'],
     ['summary', 'text'], ['slack_ts', 'text'], ['status', 'text'], ['created_at', 'timestamptz'],
     ['prism_reply', 'text'], ['flagged_user', 'text'],
+  ],
+  prism_conversations: [
+    ['id', 'text'], ['created_by', 'text'], ['slack_channel', 'text'], ['slack_thread_ts', 'text'],
+    ['status', 'text'], ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  prism_messages: [
+    ['id', 'text'], ['conversation_id', 'text'], ['direction', 'text'], ['body', 'text'],
+    ['slack_ts', 'text'], ['slack_user_id', 'text'], ['status', 'text'], ['created_at', 'timestamptz'],
   ],
   qa_flags: [
     ['id', 'text'], ['claim_id', 'text'], ['full_name', 'text'], ['insurance_number', 'text'],
@@ -279,6 +289,27 @@ const CREATE_TABLE_SQL = {
       created_at timestamptz DEFAULT now(),
       prism_reply text,
       flagged_user text
+    )`,
+  prism_conversations: `
+    CREATE TABLE prism_conversations (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      created_by text,
+      slack_channel text NOT NULL,
+      slack_thread_ts text NOT NULL UNIQUE,
+      status text DEFAULT 'open',
+      created_at timestamptz DEFAULT now(),
+      updated_at timestamptz DEFAULT now()
+    )`,
+  prism_messages: `
+    CREATE TABLE prism_messages (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      conversation_id text REFERENCES prism_conversations(id) ON DELETE CASCADE,
+      direction text NOT NULL,
+      body text NOT NULL,
+      slack_ts text,
+      slack_user_id text,
+      status text DEFAULT 'sent',
+      created_at timestamptz DEFAULT now()
     )`,
   qa_flags: `
     CREATE TABLE qa_flags (

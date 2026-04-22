@@ -1,4 +1,9 @@
 import { getSupabase } from "../../../../lib/supabase";
+import {
+  cleanSlackText,
+  getPrismConfig,
+  isPrismSlackMessage,
+} from "../../../../lib/prism-slack";
 
 export const dynamic = "force-dynamic";
 
@@ -84,6 +89,48 @@ async function saveClaimError({ channel_id, channel_name, message_ts, raw_messag
     refs:          parsed.refs,
   });
   if (error) console.error("[claim_errors] insert error:", error.message);
+}
+
+async function savePrismReply(event) {
+  const { channel } = getPrismConfig();
+  const threadTs = event.thread_ts;
+
+  if (!threadTs || event.ts === threadTs) return;
+  if (event.channel !== channel) return;
+  if (!isPrismSlackMessage(event)) return;
+
+  const reply = cleanSlackText(event.text);
+  if (!reply) return;
+
+  const supabase = getSupabase();
+  const { data: conversation, error: conversationError } = await supabase
+    .from("prism_conversations")
+    .select("id")
+    .eq("slack_thread_ts", threadTs)
+    .maybeSingle();
+
+  if (conversationError) {
+    console.warn("[prism_events] conversation lookup skipped:", conversationError.message);
+  }
+
+  if (conversation?.id) {
+    const { error: insertError } = await supabase.from("prism_messages").insert({
+      conversation_id: conversation.id,
+      direction: "prism",
+      body: reply,
+      slack_ts: event.ts,
+      slack_user_id: event.user || null,
+      status: "received",
+    });
+    if (insertError) console.warn("[prism_events] message insert skipped:", insertError.message);
+  }
+
+  const { error: logError } = await supabase
+    .from("prism_logs")
+    .update({ prism_reply: reply, status: "replied" })
+    .eq("slack_ts", threadTs);
+
+  if (logError) console.warn("[prism_events] log update skipped:", logError.message);
 }
 
 // ── Menu shown when bot is mentioned ─────────────────────────
@@ -176,6 +223,8 @@ export async function POST(request) {
 
       // ── Passive message listener — error tracking ──────────
       if (event.type === "message" && event.text) {
+        await savePrismReply(event);
+
         const parsed = parseErrorMessage(event.text);
         if (parsed) {
           // Use channel_name from payload (set by n8n) — no Slack API call needed
