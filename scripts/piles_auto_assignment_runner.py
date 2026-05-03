@@ -595,6 +595,31 @@ class CuracelPilesRunner:
                 continue
         return None
 
+    def _select_in_container(self, label_text: str) -> Any | None:
+        assert self.page
+        selectors = [
+            f"div:has-text('{label_text}') .p-select.p-component",
+            f"div:has-text('{label_text}') .p-multiselect.p-component",
+            f"div:has-text('{label_text}') [role='combobox']",
+        ]
+        visible: list[tuple[float, float, Any]] = []
+        for selector in selectors:
+            try:
+                locs = self.page.locator(selector)
+                for idx in range(locs.count()):
+                    loc = locs.nth(idx)
+                    if not loc.is_visible():
+                        continue
+                    box = loc.bounding_box()
+                    if box and box["y"] < 420:
+                        visible.append((box["y"], box["x"], loc))
+            except Exception:
+                continue
+        if not visible:
+            return None
+        visible.sort(key=lambda item: (item[0], item[1]))
+        return visible[0][2]
+
     def _choose_option_from_open_dropdown(self, desired_text: str) -> bool:
         assert self.page
         options = self.page.locator(".p-select-option, .p-select-list li, [role='option']")
@@ -639,10 +664,34 @@ class CuracelPilesRunner:
         except Exception:
             return ""
 
+    def _read_year_chip_text(self) -> str:
+        assert self.page
+        selectors = [
+            "div:has-text('Year')",
+            "label:has-text('Year')",
+        ]
+        for selector in selectors:
+            try:
+                locs = self.page.locator(selector)
+                for idx in range(locs.count()):
+                    loc = locs.nth(idx)
+                    if not loc.is_visible():
+                        continue
+                    box = loc.bounding_box()
+                    if not box or box["y"] > 420:
+                        continue
+                    text = norm(loc.inner_text())
+                    year_match = re.search(r"\b20\d{2}\b", text)
+                    if year_match:
+                        return year_match.group(0)
+            except Exception:
+                continue
+        return ""
+
     def apply_filters(self, month_label: str, year_label: str, status_label: str) -> None:
         assert self.page
-        month_select = self._select_by_label("Select Month")
-        year_select = self._select_by_label("Year")
+        month_select = self._select_in_container("Select Month") or self._select_by_label("Select Month")
+        year_select = None
         status_select = self._select_by_label("Filter by Vetting Status")
 
         selects = self._visible_selects()
@@ -650,18 +699,14 @@ class CuracelPilesRunner:
             month_select = selects[0]
         if status_select is None and len(selects) >= 2:
             status_select = selects[-1]
-        if year_select is None and len(selects) >= 3:
-            year_select = selects[1]
 
         self._set_select_value(month_select, month_label)
-        if year_select is not None:
-            self._set_select_value(year_select, year_label)
         self._set_select_value(status_select, status_label, required=True)
 
         print(
             "  Applied filter controls:"
             f" month='{self._read_select_text(month_select)}'"
-            f" year='{self._read_select_text(year_select)}'"
+            f" year='{self._read_year_chip_text() or year_label}'"
             f" status='{self._read_select_text(status_select)}'"
         )
 
