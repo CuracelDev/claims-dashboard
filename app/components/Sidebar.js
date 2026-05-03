@@ -43,6 +43,7 @@ const NAV = [
     section: 'TOOLS',
     items: [
       { href: '/tools',                  icon: '🔧', label: 'Operational Tools', sub: 'Utilities & batch ops', exact: true },
+      { href: '/tools/piles-auto-assignment', icon: '🧠', label: 'Piles Auto-Assignment', sub: 'Bot control & logs' },
       { href: '/tools/insurer-feedback', icon: '📋', label: 'Insurer Feedback',  sub: 'JBL & insurer review' },
     ],
   },

@@ -3,6 +3,7 @@ import { useRouter } from 'next/navigation';
 import { useTheme } from '../context/ThemeContext';
 
 const tools = [
+  { id: 'piles-auto-assignment', name: 'Piles Auto-Assignment',      description: 'Manage master insurer logins, bot credentials, speed metrics, assignment rules and assignment logs for automated pile distribution.',                    icon: '🧠', status: 'live',   tags: ['Bots', 'Piles', 'Claims', 'Automation'] },
   { id: 'batch-splitter',    name: 'Batch File Splitter',            description: 'Split large CSV or Excel files into operational batches for processing.',                                                                                icon: '⚡', status: 'live',   tags: ['CSV', 'Excel', 'Batch'] },
   { id: 'insurer-feedback',  name: 'Insurer Feedback Intelligence',  description: 'Analyze and categorize insurer feedback patterns automatically.',                                                                                       icon: '🔍', status: 'live',   tags: ['AI', 'Feedback', 'Analysis'] },
   { id: 'report-converter',  name: 'Health Ops Report Converter',    description: 'Convert weekly Health Ops Excel reports into the bulk import CSV format. Upload your file, select your name, download ready-to-import CSV.',           icon: '🔄', status: 'live',   tags: ['Excel', 'CSV', 'Import', 'Reports'] },

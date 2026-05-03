@@ -52,6 +52,7 @@ export const NAV = [
     section: 'TOOLS',
     items: [
       { label: 'Operational Tools', sub: 'Utilities & batch ops', route: '/tools',                  icon: '🔧' },
+      { label: 'Piles Auto-Assignment', sub: 'Bot control & logs', route: '/tools/piles-auto-assignment', icon: '🧠' },
       { label: 'Insurer Feedback',  sub: 'JBL & insurer review',  route: '/tools/insurer-feedback', icon: '💬' },
     ],
   },

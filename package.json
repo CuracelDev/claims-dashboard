@@ -8,6 +8,9 @@
     "start": "next start",
     "db:audit": "node scripts/db-schema-audit.mjs",
     "db:prism-chat": "node scripts/apply-prism-chat-schema.mjs",
+    "db:piles-auto-assignment": "node scripts/apply-piles-auto-assignment-schema.mjs",
+    "db:piles-auto-assignment:seed": "node scripts/seed-piles-auto-assignment-from-csv.mjs",
+    "db:piles-auto-assignment:repair-local": "node scripts/repair-local-piles-auto-assignment-defaults.mjs",
     "db:prism-chat:adminer": "node scripts/apply-prism-chat-schema-adminer.mjs",
     "db:fresh-migrate:adminer": "node scripts/fresh-migrate-prod-via-adminer.mjs"
   },
