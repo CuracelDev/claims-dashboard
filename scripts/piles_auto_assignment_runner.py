@@ -22,6 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -35,7 +36,6 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env.local")
 
-CURACEL_BASE_URL = "https://health.curacel.co"
 TARGET_STATUSES = [
     "Vetting Pending",
     "Vetting Ongoing",
@@ -59,12 +59,20 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def is_test_portal(url: str) -> bool:
+    lowered = norm(url).lower()
+    return "dev.claims.curacel.co" in lowered
+
+
 def norm(text: Any) -> str:
     return str(text or "").strip()
 
 
 def norm_key(text: Any) -> str:
     return "".join(ch.lower() for ch in norm(text) if ch.isalnum())
+
+
+CURACEL_BASE_URL = norm(os.getenv("CURACEL_PORTAL_BASE_URL")) or "https://health.curacel.co"
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -83,6 +91,17 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 def chunked(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def insurer_env_key(insurer_name: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", norm(insurer_name).upper()).strip("_")
+
+
+def override_master_credentials(insurer_name: str, email: str, password: str) -> tuple[str, str]:
+    key = insurer_env_key(insurer_name)
+    override_email = norm(os.getenv(f"CURACEL_OVERRIDE_{key}_EMAIL"))
+    override_password = norm(os.getenv(f"CURACEL_OVERRIDE_{key}_PASSWORD"))
+    return override_email or email, override_password or password
 
 
 _DECRYPT_CACHE: dict[str, str] = {}
@@ -263,19 +282,52 @@ class DataStore:
                 filters=[("insurer_name", "eq", insurer_name)],
             )
         if not rows:
+            override_email, override_password = override_master_credentials(insurer_name, "", "")
+            if override_email and override_password:
+                return MasterAccount(
+                    id=f"env-override-{insurer_env_key(insurer_name).lower()}",
+                    insurer_name=norm(insurer_name),
+                    login_email=override_email,
+                    login_password=override_password,
+                    is_active=True,
+                )
             raise RuntimeError(f"No master account found for insurer '{insurer_name}'.")
         row = rows[0]
+        login_email, login_password = override_master_credentials(
+            insurer_name,
+            decrypt_credential(row["login_email"]),
+            decrypt_credential(row.get("login_password")),
+        )
         return MasterAccount(
             id=str(row["id"]),
             insurer_name=norm(row["insurer_name"]),
-            login_email=decrypt_credential(row["login_email"]),
-            login_password=decrypt_credential(row.get("login_password")),
+            login_email=login_email,
+            login_password=login_password,
             is_active=bool(row.get("is_active", True)),
         )
 
     def get_bot_accounts(self, insurer_name: str) -> list[BotAccount]:
+        return self._rows_to_bot_accounts(self._fetch_bot_account_rows(insurer_name))
+
+    def get_all_bot_accounts(self) -> list[BotAccount]:
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
+                """
+                select *
+                from piles_auto_assignment_bot_accounts
+                order by insurer_name asc, priority_order asc, owner_name asc
+                """
+            )
+        else:
+            rows = self._fetchall_supabase(
+                "piles_auto_assignment_bot_accounts",
+                order="insurer_name.asc,priority_order.asc",
+            )
+        return self._rows_to_bot_accounts(rows)
+
+    def _fetch_bot_account_rows(self, insurer_name: str) -> list[dict[str, Any]]:
+        if self.mode == "postgres":
+            return self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_bot_accounts
@@ -285,11 +337,13 @@ class DataStore:
                 (insurer_name,),
             )
         else:
-            rows = self._fetchall_supabase(
+            return self._fetchall_supabase(
                 "piles_auto_assignment_bot_accounts",
                 filters=[("insurer_name", "eq", insurer_name)],
                 order="priority_order.asc",
             )
+
+    def _rows_to_bot_accounts(self, rows: list[dict[str, Any]]) -> list[BotAccount]:
         return [
             BotAccount(
                 id=str(row["id"]),
@@ -470,6 +524,7 @@ class CuracelPilesRunner:
     def __init__(self, visible: bool = True, slow_mo: int = 350) -> None:
         self.visible = visible
         self.slow_mo = slow_mo
+        self.allow_test_any_assignee = False
         self.playwright = None
         self.browser: Browser | None = None
         self.page: Page | None = None
@@ -620,17 +675,29 @@ class CuracelPilesRunner:
         visible.sort(key=lambda item: (item[0], item[1]))
         return visible[0][2]
 
-    def _choose_option_from_open_dropdown(self, desired_text: str) -> bool:
+    def _choose_option_from_open_dropdown(self, desired_text: str) -> str | None:
         assert self.page
         options = self.page.locator(".p-select-option, .p-select-list li, [role='option']")
+        option_texts: list[tuple[str, Any]] = []
         for idx in range(options.count()):
             option = options.nth(idx)
             text = norm(option.inner_text())
+            if text:
+                option_texts.append((text, option))
             if norm_key(text) == norm_key(desired_text) or norm_key(desired_text) in norm_key(text):
                 option.click()
                 time.sleep(0.8)
-                return True
-        return False
+                return text
+        if self.allow_test_any_assignee:
+            for text, option in option_texts:
+                lowered = text.lower()
+                if lowered in {"select user", "no results found", "all"}:
+                    continue
+                option.click()
+                time.sleep(0.8)
+                print(f"  Test fallback: selected available assignee '{text}' instead of requested '{desired_text}'.")
+                return text
+        return None
 
     def _set_select_value(self, select: Any | None, desired_text: str, required: bool = False) -> bool:
         assert self.page
@@ -641,8 +708,8 @@ class CuracelPilesRunner:
         try:
             select.click()
             time.sleep(0.5)
-            success = self._choose_option_from_open_dropdown(desired_text)
-            if not success:
+            selected_text = self._choose_option_from_open_dropdown(desired_text)
+            if not selected_text:
                 try:
                     self.page.keyboard.press("Escape")
                 except Exception:
@@ -929,27 +996,219 @@ class CuracelPilesRunner:
 
     def _open_assign_modal(self) -> None:
         assert self.page
-        self.page.locator("button:has-text('Actions')").first.click()
-        time.sleep(0.5)
-        self.page.locator("text=Assign to").first.click()
+        try:
+            self.page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+        actions_clicked = False
+        action_selectors = [
+            "button:has-text('Actions')",
+            ".actionDropdownBtn",
+            "[role='button']:has-text('Actions')",
+        ]
+        for selector in action_selectors:
+            try:
+                locs = self.page.locator(selector)
+                for idx in range(locs.count()):
+                    button = locs.nth(idx)
+                    if not button.is_visible():
+                        continue
+                    try:
+                        button.scroll_into_view_if_needed(timeout=2000)
+                    except Exception:
+                        pass
+                    button.click(force=True)
+                    actions_clicked = True
+                    break
+                if actions_clicked:
+                    break
+            except Exception:
+                continue
+        if not actions_clicked:
+            raise RuntimeError("Could not open the Actions menu on the piles page.")
+
+        time.sleep(0.8)
+        assign_clicked = False
+        try:
+            exact_nodes = self.page.locator("xpath=//*[normalize-space(text())='Assign to']")
+            for idx in range(exact_nodes.count()):
+                node = exact_nodes.nth(idx)
+                if not node.is_visible():
+                    continue
+                clicked = False
+                try:
+                    ancestor = node.locator(
+                        "xpath=ancestor::*[self::button or self::a or self::li or @role='menuitem' or contains(@class,'item') or contains(@class,'option')][1]"
+                    )
+                    if ancestor.count() and ancestor.first.is_visible():
+                        ancestor.first.click(force=True)
+                        clicked = True
+                except Exception:
+                    pass
+                if not clicked:
+                    try:
+                        node.click(force=True)
+                        clicked = True
+                    except Exception:
+                        pass
+                if clicked:
+                    assign_clicked = True
+                    break
+        except Exception:
+            pass
+        if not assign_clicked:
+            raise RuntimeError("Could not choose 'Assign to' from the Actions menu.")
         time.sleep(1)
+
+    def _visible_overlay_roots(self) -> list[Any]:
+        assert self.page
+        selectors = [
+            ".p-dialog:visible",
+            "[role='dialog']:visible",
+            ".p-sidebar:visible",
+            ".p-overlaypanel:visible",
+        ]
+        roots: list[tuple[float, Any]] = []
+        for selector in selectors:
+            try:
+                locs = self.page.locator(selector)
+                for idx in range(locs.count()):
+                    loc = locs.nth(idx)
+                    if not loc.is_visible():
+                        continue
+                    box = loc.bounding_box()
+                    if not box:
+                        continue
+                    roots.append((box["y"], loc))
+            except Exception:
+                continue
+        roots.sort(key=lambda item: item[0])
+        return [item[1] for item in roots]
+
+    def _find_assign_user_control(self) -> Any | None:
+        assert self.page
+        roots = self._visible_overlay_roots()
+        search_roots = roots[::-1] + [self.page.locator("body")]
+        selectors = [
+            ".p-select.p-component",
+            ".p-dropdown.p-component",
+            "[role='combobox']",
+            "button[aria-haspopup='listbox']",
+        ]
+        best: tuple[float, Any] | None = None
+        for root in search_roots:
+            for selector in selectors:
+                try:
+                    locs = root.locator(selector)
+                    for idx in range(locs.count()):
+                        loc = locs.nth(idx)
+                        if not loc.is_visible():
+                            continue
+                        text = norm(loc.inner_text())
+                        box = loc.bounding_box()
+                        if not box:
+                            continue
+                        score = box["y"]
+                        if "select user" in text.lower():
+                            score -= 500
+                        elif box["y"] < 250:
+                            # Bias away from top-level account selectors when a modal is open.
+                            score += 400
+                        if best is None or score < best[0]:
+                            best = (score, loc)
+                except Exception:
+                    continue
+        return best[1] if best else None
+
+    def _open_select_control(self, control: Any) -> bool:
+        assert self.page
+        click_targets = [
+            control,
+            control.locator(".p-select-dropdown").first,
+            control.locator(".p-dropdown-trigger").first,
+            control.locator("[aria-haspopup='listbox']").first,
+            control.locator("svg").first,
+        ]
+        for target in click_targets:
+            try:
+                if target.count() == 0 or not target.is_visible():
+                    continue
+                target.click(force=True)
+                time.sleep(0.4)
+                if self.page.locator(".p-select-option, .p-select-list li, [role='option']").count() > 0:
+                    return True
+            except Exception:
+                try:
+                    box = target.bounding_box()
+                    if box:
+                        self.page.mouse.click(box["x"] + (box["width"] / 2), box["y"] + (box["height"] / 2))
+                        time.sleep(0.4)
+                        if self.page.locator(".p-select-option, .p-select-list li, [role='option']").count() > 0:
+                            return True
+                except Exception:
+                    continue
+        try:
+            control.focus()
+            self.page.keyboard.press("ArrowDown")
+            time.sleep(0.4)
+            if self.page.locator(".p-select-option, .p-select-list li, [role='option']").count() > 0:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _apply_assignment_modal(self, assignment_type: str, assignee_name: str, execute: bool) -> None:
         assert self.page
         # Per current workflow, keep the assign modal on its default Vetting path.
         assignment_type = "Vetting"
-        dropdown = self.page.locator("text=Select User").first
-        dropdown.click()
-        time.sleep(0.4)
-        option = self.page.locator(f"text={assignee_name}").first
-        option.click()
+        time.sleep(0.8)
+        control = self._find_assign_user_control()
+        if control is None:
+            raise RuntimeError("Could not open the Select User control inside the assign modal.")
+        opened = self._open_select_control(control)
+        if not opened:
+            raise RuntimeError("Could not open the Select User control inside the assign modal.")
+        selected_assignee = self._choose_option_from_open_dropdown(assignee_name)
+        if not selected_assignee:
+            try:
+                search = self.page.locator("input[placeholder*='Search'], input[placeholder*='search']").last
+                if search.count() and search.is_visible():
+                    search.fill(assignee_name)
+                    time.sleep(0.4)
+                    selected_assignee = self._choose_option_from_open_dropdown(assignee_name)
+                    if not selected_assignee:
+                        raise RuntimeError(f"Could not choose assignee '{assignee_name}' from the assign modal.")
+            except Exception:
+                raise RuntimeError(f"Could not choose assignee '{assignee_name}' from the assign modal.")
+
         time.sleep(0.5)
         if execute:
-            self.page.locator("button:has-text('Assign Claims')").first.click()
+            clicked = False
+            for root in self._visible_overlay_roots()[::-1] + [self.page.locator("body")]:
+                for selector in [
+                    "button:has-text('Assign Claims')",
+                    "button:has-text('Assign')",
+                    "[role='button']:has-text('Assign Claims')",
+                    "[role='button']:has-text('Assign')",
+                ]:
+                    try:
+                        button = root.locator(selector).first
+                        if button.count() and button.is_visible():
+                            button.click(force=True)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if clicked:
+                    break
+            if not clicked:
+                raise RuntimeError("Could not click the final Assign Claims button inside the assign modal.")
             time.sleep(2)
             self._dismiss_popup()
         else:
-            print(f"  Dry run: would assign selected piles to {assignee_name} as {assignment_type}.")
+            print(f"  Dry run: would assign selected piles to {selected_assignee or assignee_name} as {assignment_type}.")
             try:
                 self.page.keyboard.press("Escape")
             except Exception:
@@ -963,6 +1222,7 @@ class CuracelPilesRunner:
             if not status_plans:
                 continue
             print(f"\nApplying assignments for status: {status_label}")
+            self.open_piles()
             self.apply_filters(month_label, year_label, status_label)
             self.try_set_page_size(100)
             page_number = 1
@@ -1075,6 +1335,13 @@ def main() -> None:
     month_label = args.month or datetime.now().strftime("%b")
     year_label = args.year or str(datetime.now().year)
     visible = args.visible or not env_bool("HEADLESS", True)
+    captured_at = datetime.now(timezone.utc).isoformat()
+
+    if args.execute and not is_test_portal(CURACEL_BASE_URL) and not env_bool("ALLOW_PRODUCTION_ASSIGNMENTS", False):
+        raise RuntimeError(
+            "Execute mode is blocked outside the test portal. "
+            "Use the dev portal, or set ALLOW_PRODUCTION_ASSIGNMENTS=true only when you intentionally want live assignments."
+        )
 
     store = DataStore()
     try:
@@ -1082,12 +1349,18 @@ def main() -> None:
         if not master.login_email or not master.login_password:
             raise RuntimeError(f"Master account for '{args.insurer}' is missing login email or password.")
         bots = store.get_bot_accounts(args.insurer)
+        fallback_pool_used = False
+        if not bots and is_test_portal(CURACEL_BASE_URL):
+            bots = store.get_all_bot_accounts()
+            fallback_pool_used = True
+            print("Using test-portal fallback assignee pool because this insurer has no configured bot rows.")
         metrics = store.get_bot_metrics([bot.id for bot in bots])
         rule = store.get_rule(args.insurer)
 
         print("=" * 72)
         print(f"Piles Auto-Assignment Runner")
         print(f"Insurer: {args.insurer}")
+        print(f"Portal: {CURACEL_BASE_URL}")
         print(f"Month/Year: {month_label} {year_label}")
         print(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
         if rule:
@@ -1095,6 +1368,7 @@ def main() -> None:
         print("=" * 72)
 
         with CuracelPilesRunner(visible=visible, slow_mo=args.slow_mo) as runner:
+            runner.allow_test_any_assignee = fallback_pool_used and is_test_portal(CURACEL_BASE_URL)
             print("\nLogging in...")
             runner.login(master.login_email, master.login_password)
             runner.select_account(args.insurer)
@@ -1123,6 +1397,7 @@ def main() -> None:
                 "month": month_label,
                 "year": year_label,
                 "mode": "execute" if args.execute else "dry-run",
+                "captured_at": captured_at,
                 "unassigned_count": len(unassigned),
                 "piles": [row.__dict__ for row in unassigned],
                 "plans": [plan.__dict__ for plan in plans],
@@ -1138,7 +1413,10 @@ def main() -> None:
                 pile_count=len(unassigned),
                 claim_count=sum(row.claims for row in unassigned),
                 details={
+                    "insurer_name": args.insurer,
                     "mode": "execute" if args.execute else "dry-run",
+                    "captured_at": captured_at,
+                    "fallback_pool_used": fallback_pool_used,
                     "month": month_label,
                     "year": year_label,
                     "statuses": TARGET_STATUSES,
@@ -1174,7 +1452,10 @@ def main() -> None:
             pile_count=len(plans),
             claim_count=sum(plan.claims for plan in plans),
             details={
+                "insurer_name": args.insurer,
                 "mode": "execute" if args.execute else "dry-run",
+                "captured_at": captured_at,
+                "fallback_pool_used": fallback_pool_used,
                 "results": results,
                 "summary": summary,
             },
