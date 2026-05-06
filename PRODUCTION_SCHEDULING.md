@@ -6,14 +6,14 @@ This repository now uses the deployed dashboard server itself for scheduled `Pil
 
 - Deploy application code to the production VM via `.github/workflows/deploy.yml`
 - Install the runner dependencies on that VM
-- Install an idempotent user cron entry that runs every 30 minutes
+- Install an idempotent user cron entry that runs every 1 hour
 - Let the website manual trigger call the same server-local Python runner in production
 
 That means:
 
 - scheduled runs and production manual runs use the same compute
 - local development manual runs still use your laptop
-- GitHub Actions is **not** the 30-minute scheduler
+- GitHub Actions is **not** the hourly scheduler
 
 ## Scheduler entrypoint
 
@@ -55,7 +55,7 @@ These values should exist in the production `.env` written by deploy:
 
 Optional:
 
-- `PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE=*/30 * * * *`
+- `PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE=0 * * * *`
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_MODE=all-active`
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_EXECUTE=true`
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_VISIBLE=false`
