@@ -3142,16 +3142,18 @@ def resolve_bots_to_portal_options(
         used_options.add(candidates[0][2])
 
     unmatched = [bot.portal_name for bot in eligible if bot.id not in resolved_names]
-    if unmatched:
+    resolved_bots = [
+        replace(bot, bot_name=resolved_names.get(bot.id, bot.bot_name))
+        for bot in bots
+        if bot.id in resolved_names or bot.id not in {eligible_bot.id for eligible_bot in eligible}
+    ]
+
+    if not any(bot.id in resolved_names for bot in eligible):
         raise RuntimeError(
             f"Configured bot names for insurer '{insurer_name}' did not match the real portal assignee dropdown. "
             f"Unmatched: {unmatched}. Visible portal users: {portal_option_names}"
         )
 
-    resolved_bots = [
-        replace(bot, bot_name=resolved_names.get(bot.id, bot.bot_name))
-        for bot in bots
-    ]
     return resolved_bots, resolved_names, unmatched
 
 
@@ -3193,6 +3195,7 @@ def run_for_insurer(
     portal_option_names: list[str] = []
     resolved_name_map: dict[str, str] = {}
     resolved_bots = bots[:]
+    portal_mapping_warnings: list[str] = []
     team_slack_map = store.get_team_slack_map() if args.execute else {}
     tracked_reconcile = {
         "tracked_count": 0,
@@ -3226,7 +3229,7 @@ def run_for_insurer(
         runner.allow_test_any_assignee = False
 
         def ensure_portal_mapping(sample_pile: PileRow) -> None:
-            nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots
+            nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots, portal_mapping_warnings
             if portal_option_names:
                 return
             portal_assignees = runner.discover_portal_assignees(sample_pile.filter_month, year_label, sample_pile)
@@ -3242,11 +3245,18 @@ def run_for_insurer(
                     f"No configured bot accounts found for insurer '{insurer_name}', and fallback assignment is blocked outside the test portal."
                 )
 
-            resolved_bots, resolved_name_map, _ = resolve_bots_to_portal_options(insurer_name, bots, portal_option_names)
+            resolved_bots, resolved_name_map, unmatched = resolve_bots_to_portal_options(insurer_name, bots, portal_option_names)
             print("Resolved configured bot names against the real portal dropdown:")
             for bot in resolved_bots:
                 if bot.id in resolved_name_map:
                     print(f"  - {bot.owner_name or bot.portal_name} -> {resolved_name_map[bot.id]}")
+            if unmatched:
+                warning = (
+                    f"Configured bot rows missing from the live portal dropdown were excluded for this run: {unmatched}. "
+                    f"Visible portal users: {portal_option_names}"
+                )
+                portal_mapping_warnings.append(warning)
+                print(f"  Warning: {warning}")
 
         print("\nLogging in...")
         runner.login(master.login_email, master.login_password)
@@ -3368,6 +3378,7 @@ def run_for_insurer(
                 "message": "No unassigned piles found. Nothing to assign.",
                 "portal_option_names": [],
                 "resolved_name_map": {},
+                "portal_mapping_warnings": [],
             }
             store.log_runner_event(
                 insurer_name=insurer_name,
@@ -3396,6 +3407,7 @@ def run_for_insurer(
                 "fallback_pool_used": False,
                 "portal_option_names": [],
                 "resolved_name_map": {},
+                "portal_mapping_warnings": [],
             }
 
         plans: list[PlannedAssignment] = []
@@ -3442,6 +3454,7 @@ def run_for_insurer(
             "summary": summary,
             "portal_option_names": portal_option_names,
             "resolved_name_map": resolved_name_map,
+            "portal_mapping_warnings": portal_mapping_warnings,
         }
         output_path.write_text(json.dumps(payload, indent=2))
 
@@ -3473,6 +3486,7 @@ def run_for_insurer(
                 "summary": summary,
                 "portal_option_names": portal_option_names,
                 "resolved_name_map": resolved_name_map,
+                "portal_mapping_warnings": portal_mapping_warnings,
             },
         )
 
@@ -3608,6 +3622,7 @@ def run_for_insurer(
             "summary": summary,
             "portal_option_names": portal_option_names,
             "resolved_name_map": resolved_name_map,
+            "portal_mapping_warnings": portal_mapping_warnings,
             "reassignment_assignments": [
                 {
                     "pile_key": item.plan.pile_key,
@@ -3652,6 +3667,7 @@ def run_for_insurer(
         "fallback_pool_used": fallback_pool_used,
         "portal_option_names": portal_option_names,
         "resolved_name_map": resolved_name_map,
+        "portal_mapping_warnings": portal_mapping_warnings,
     }
 
 
