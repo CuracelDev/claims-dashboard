@@ -35,6 +35,7 @@ These values should exist in the production `.env` written by deploy:
 
 - `DATABASE_URL`
 - `BOT_CREDENTIALS_ENCRYPTION_KEY`
+- `PILES_ASSIGNMENT_PYTHON_BIN=$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python`
 - `SLACK_PRISM_BOT_TOKEN`
 - `SLACK_ALERTS_CHANNEL_ID`
 - `CURACEL_PORTAL_BASE_URL_PRODUCTION`

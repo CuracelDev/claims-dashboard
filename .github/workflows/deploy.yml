@@ -74,6 +74,7 @@ jobs:
             CURACEL_PORTAL_BASE_URL_TEST="${{ vars.CURACEL_PORTAL_BASE_URL_TEST }}"
             CURACEL_PORTAL_ENVIRONMENT="${{ vars.CURACEL_PORTAL_ENVIRONMENT }}"
             PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND="${{ vars.PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND }}"
+            PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python"
             ALLOW_PRODUCTION_ASSIGNMENTS="${{ vars.ALLOW_PRODUCTION_ASSIGNMENTS }}"
             HEADLESS="${{ vars.HEADLESS }}"
             PYTHONUNBUFFERED="${{ vars.PYTHONUNBUFFERED }}"
@@ -82,10 +83,12 @@ jobs:
             EOF
             export PATH="$HOME/.local/bin:$PATH"
             sudo apt-get update
-            sudo apt-get install -y python3 python3-pip
+            sudo apt-get install -y python3 python3-pip python3-venv
             npm install --production
-            python3 -m pip install --user -r scripts/piles-auto-assignment-requirements.txt
-            python3 -m playwright install --with-deps chromium
+            python3 -m venv .venv-piles-auto-assignment
+            ./.venv-piles-auto-assignment/bin/python -m pip install --upgrade pip
+            ./.venv-piles-auto-assignment/bin/python -m pip install -r scripts/piles-auto-assignment-requirements.txt
+            ./.venv-piles-auto-assignment/bin/python -m playwright install --with-deps chromium
             npm run db:piles-auto-assignment
             chmod +x scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh
             ./scripts/install-piles-auto-assignment-cron.sh

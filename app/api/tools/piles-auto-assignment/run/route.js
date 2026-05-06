@@ -22,6 +22,7 @@ function resolvePythonBin() {
   const candidates = [
     process.env.PILES_ASSIGNMENT_PYTHON_BIN,
     process.env.PYTHON_BIN,
+    path.join(process.cwd(), '.venv-piles-auto-assignment', 'bin', 'python'),
     process.env.HOME ? path.join(process.env.HOME, 'anaconda3', 'bin', 'python3') : '',
     'python3',
   ].filter(Boolean);
