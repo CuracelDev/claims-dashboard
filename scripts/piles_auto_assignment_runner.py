@@ -37,6 +37,7 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / ".env.local")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(ROOT / ".playwright-browsers"))
 
 TARGET_STATUSES = [
     "Vetting Pending",
