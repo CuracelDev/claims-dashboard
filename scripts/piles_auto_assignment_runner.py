@@ -35,6 +35,7 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 
 
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / ".env.local")
 
 TARGET_STATUSES = [
@@ -358,13 +359,19 @@ def decrypt_credential(value: Any) -> str:
         return _DECRYPT_CACHE[raw]
 
     script = ROOT / "scripts" / "piles_auto_assignment_credential_cli.mjs"
-    result = subprocess.run(
-        ["node", str(script), "decrypt", raw],
-        capture_output=True,
-        text=True,
-        env=os.environ.copy(),
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            ["node", str(script), "decrypt", raw],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        stderr = norm(error.stderr)
+        stdout = norm(error.stdout)
+        detail = stderr or stdout or f"exit status {error.returncode}"
+        raise RuntimeError(f"Credential decrypt failed: {detail}") from error
     decrypted = result.stdout.strip()
     _DECRYPT_CACHE[raw] = decrypted
     return decrypted
