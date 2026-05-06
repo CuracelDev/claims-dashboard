@@ -13,6 +13,9 @@ const pgPool = new Pool({
 const tables = [
   'audit_log', 'claim_errors', 'daily_reports', 'insurer_feedback_items',
   'leave_records', 'metric_definitions', 'okr_entries', 'platform_settings',
+  'piles_auto_assignment_bot_accounts', 'piles_auto_assignment_bot_metrics',
+  'piles_auto_assignment_logs', 'piles_auto_assignment_master_accounts',
+  'piles_auto_assignment_rules',
   'prism_conversations', 'prism_logs', 'prism_messages', 'qa_flags', 'sessions', 'slack_summaries', 'target_logs',
   'tasks', 'team_leave', 'team_members', 'weekly_targets'
 ];
