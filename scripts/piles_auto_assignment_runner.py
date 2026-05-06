@@ -96,6 +96,10 @@ def norm_key(text: Any) -> str:
     return "".join(ch.lower() for ch in norm(text) if ch.isalnum())
 
 
+def label_key(text: Any) -> str:
+    return re.sub(r"\s+", " ", norm(text).lower()).strip()
+
+
 CURACEL_BASE_URL = norm(os.getenv("CURACEL_PORTAL_BASE_URL")) or "https://health.curacel.co"
 PORTAL_ENVIRONMENT = norm(os.getenv("CURACEL_PORTAL_ENVIRONMENT")) or "production"
 SLACK_PRISM_BOT_TOKEN = norm(os.getenv("SLACK_PRISM_BOT_TOKEN")) or norm(os.getenv("SLACK_BOT_TOKEN"))
@@ -1322,7 +1326,7 @@ class DataStore:
         event_type_override: str | None = None,
     ) -> None:
         planned_name = planned_assignee.portal_name if planned_assignee else ""
-        matched_planned = bool(planned_assignee and norm_key(actual_assignee_name) == norm_key(planned_name))
+        matched_planned = bool(planned_assignee and label_key(actual_assignee_name) == label_key(planned_name))
         event_type = event_type_override or ("assignment_planned" if not execute else "assignment")
         status = "planned" if not execute else "assigned"
         if event_type_override == "reassignment":
@@ -1769,7 +1773,7 @@ class CuracelPilesRunner:
             text = norm(option.inner_text())
             if text:
                 option_texts.append((text, option))
-            if norm_key(text) == norm_key(desired_text) or norm_key(desired_text) in norm_key(text):
+            if label_key(text) == label_key(desired_text):
                 option.click(force=True)
                 time.sleep(0.8)
                 return text
@@ -2185,17 +2189,11 @@ class CuracelPilesRunner:
         return bool(key_words and any(w in option_lower for w in key_words))
 
     def _assignee_matches_assigned_text(self, expected_name: str, observed_text: str) -> bool:
-        expected_key = norm_key(expected_name)
-        observed_key = norm_key(observed_text)
-        if not expected_key or not observed_key:
+        expected_label = label_key(expected_name)
+        observed_label = label_key(observed_text)
+        if not expected_label or not observed_label:
             return False
-        if expected_key == observed_key:
-            return True
-        if expected_key in observed_key or observed_key in expected_key:
-            return True
-        expected_words = [w for w in norm(expected_name).lower().split() if len(w) > 2]
-        observed_lower = norm(observed_text).lower()
-        return bool(expected_words and all(word in observed_lower for word in expected_words))
+        return expected_label == observed_label
 
     def _select_rows(self, pile_keys: list[str], current_rows: list[PileRow]) -> int:
         assert self.page
@@ -2515,16 +2513,11 @@ class CuracelPilesRunner:
             raise RuntimeError("Could not open the Select User control inside the assign modal.")
         selected_assignee = self._choose_option_from_open_dropdown(assignee_name)
         if not selected_assignee:
-            try:
-                search = self.page.locator("input[placeholder*='Search'], input[placeholder*='search']").last
-                if search.count() and search.is_visible():
-                    search.fill(assignee_name)
-                    self._wait_for_dropdown_options()
-                    selected_assignee = self._choose_option_from_open_dropdown(assignee_name)
-                    if not selected_assignee:
-                        raise RuntimeError(f"Could not choose assignee '{assignee_name}' from the assign modal.")
-            except Exception:
-                raise RuntimeError(f"Could not choose assignee '{assignee_name}' from the assign modal.")
+            available_options = self._visible_dropdown_option_texts()
+            raise RuntimeError(
+                f"Could not choose assignee '{assignee_name}' from the assign modal. "
+                f"Visible portal options were: {available_options}"
+            )
 
         time.sleep(0.5)
         if execute:
@@ -3049,22 +3042,25 @@ def build_assignment_plan_from_portal_options(
 
 
 def portal_option_match_score(bot: BotAccount, option_name: str) -> int:
-    option_key = norm_key(option_name)
+    option_label = label_key(option_name)
     option_lower = norm(option_name).lower()
-    candidates = [bot.portal_name, bot.owner_name, bot.bot_email]
+    candidates = [
+        ("bot_name", bot.bot_name),
+        ("owner_name", bot.owner_name),
+        ("bot_email", bot.bot_email),
+    ]
     best = 0
-    for rank, candidate in enumerate(candidates):
+    for rank, (candidate_type, candidate) in enumerate(candidates):
         candidate = norm(candidate)
         if not candidate:
             continue
-        candidate_key = norm_key(candidate)
+        candidate_label = label_key(candidate)
         candidate_lower = candidate.lower()
         bias = max(0, 4 - rank)
-        if candidate_key == option_key:
-            best = max(best, 100 + bias)
+        if candidate_label == option_label:
+            best = max(best, (1000 if candidate_type == "bot_name" else 400) + bias)
             continue
-        if candidate_key and (candidate_key in option_key or option_key in candidate_key):
-            best = max(best, 80 + bias)
+        if candidate_type == "bot_name":
             continue
         words = [word for word in candidate_lower.split() if len(word) > 2]
         if words and all(word in option_lower for word in words):
@@ -3084,18 +3080,66 @@ def resolve_bots_to_portal_options(
     resolved_names: dict[str, str] = {}
     used_options: set[str] = set()
     scored_pairs: list[tuple[int, int, str, BotAccount]] = []
+    options_by_label: dict[str, list[str]] = {}
+
+    for option_name in portal_option_names:
+        options_by_label.setdefault(label_key(option_name), []).append(option_name)
 
     for bot in eligible:
+        configured_bot_name = norm(bot.bot_name)
+        if not configured_bot_name:
+            continue
+        exact_matches = options_by_label.get(label_key(configured_bot_name), [])
+        if len(exact_matches) == 1:
+            resolved_names[bot.id] = exact_matches[0]
+            used_options.add(exact_matches[0])
+            continue
+        if len(exact_matches) > 1:
+            raise RuntimeError(
+                f"Configured bot name '{configured_bot_name}' for insurer '{insurer_name}' matched multiple visible portal users: {exact_matches}. "
+                "The runner will not guess between them."
+            )
+
+        ambiguous_matches = [
+            option_name
+            for option_name in portal_option_names
+            if norm_key(option_name) == norm_key(configured_bot_name)
+        ]
+        if len(ambiguous_matches) > 1:
+            raise RuntimeError(
+                f"Configured bot name '{configured_bot_name}' for insurer '{insurer_name}' did not exactly match a portal user, "
+                f"and multiple near-matches were visible: {ambiguous_matches}. "
+                "Update the bot name in the dashboard to exactly match the portal dropdown label."
+            )
+
+    for bot in eligible:
+        if bot.id in resolved_names:
+            continue
         for option_name in portal_option_names:
             score = portal_option_match_score(bot, option_name)
             if score > 0:
                 scored_pairs.append((score, -bot.priority_order, option_name, bot))
 
-    for _, _, option_name, bot in sorted(scored_pairs, key=lambda item: (-item[0], item[1], item[2].lower())):
-        if bot.id in resolved_names or option_name in used_options:
+    for bot in eligible:
+        if bot.id in resolved_names:
             continue
-        resolved_names[bot.id] = option_name
-        used_options.add(option_name)
+        candidates = [
+            (score, priority, option_name)
+            for score, priority, option_name, candidate_bot in scored_pairs
+            if candidate_bot.id == bot.id and option_name not in used_options
+        ]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
+        top_score = candidates[0][0]
+        top_candidates = [item[2] for item in candidates if item[0] == top_score]
+        if len(top_candidates) > 1:
+            raise RuntimeError(
+                f"Configured assignee '{bot.portal_name}' for insurer '{insurer_name}' matched multiple visible portal users with the same score: {top_candidates}. "
+                "The runner will not guess. Update the bot name in the dashboard to exactly match one portal dropdown label."
+            )
+        resolved_names[bot.id] = candidates[0][2]
+        used_options.add(candidates[0][2])
 
     unmatched = [bot.portal_name for bot in eligible if bot.id not in resolved_names]
     if unmatched:
