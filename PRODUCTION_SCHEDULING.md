@@ -29,6 +29,11 @@ The deploy workflow installs the cron entry through:
 ./scripts/install-piles-auto-assignment-cron.sh
 ```
 
+During deploy, the server also installs both Playwright browser packages into the same project-local browser directory used at runtime:
+
+- `chromium`
+- `chromium-headless-shell`
+
 ## Environment variables
 
 These values should exist in the production `.env` written by deploy:
