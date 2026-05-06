@@ -42,7 +42,7 @@ jobs:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: ".next,public,package.json,package-lock.json,next.config.js"
+          source: ".next,public,package.json,package-lock.json,next.config.js,scripts"
           target: "~/claims-dashboard"
 
       - name: Restart App via SSH
@@ -57,7 +57,11 @@ jobs:
             DATABASE_URL="${{ secrets.DATABASE_URL }}"
             NEXT_PUBLIC_SUPABASE_URL="${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}"
             SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}"
+            BOT_CREDENTIALS_ENCRYPTION_KEY="${{ secrets.BOT_CREDENTIALS_ENCRYPTION_KEY }}"
             SLACK_BOT_TOKEN="${{ secrets.SLACK_BOT_TOKEN }}"
+            SLACK_PRISM_BOT_TOKEN="${{ secrets.SLACK_PRISM_BOT_TOKEN }}"
+            SLACK_APP_TOKEN="${{ secrets.SLACK_APP_TOKEN }}"
+            SLACK_ALERTS_CHANNEL_ID="${{ secrets.SLACK_ALERTS_CHANNEL_ID }}"
             SLACK_WEBHOOK_HEALTHOPS="${{ secrets.SLACK_WEBHOOK_HEALTHOPS }}"
             ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}"
             AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}"
@@ -66,6 +70,23 @@ jobs:
             METABASE_URL="${{ secrets.METABASE_URL }}"
             METABASE_USERNAME="${{ secrets.METABASE_USERNAME }}"
             METABASE_PASSWORD="${{ secrets.METABASE_PASSWORD }}"
+            CURACEL_PORTAL_BASE_URL_PRODUCTION="${{ vars.CURACEL_PORTAL_BASE_URL_PRODUCTION }}"
+            CURACEL_PORTAL_BASE_URL_TEST="${{ vars.CURACEL_PORTAL_BASE_URL_TEST }}"
+            CURACEL_PORTAL_ENVIRONMENT="${{ vars.CURACEL_PORTAL_ENVIRONMENT }}"
+            PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND="${{ vars.PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND }}"
+            ALLOW_PRODUCTION_ASSIGNMENTS="${{ vars.ALLOW_PRODUCTION_ASSIGNMENTS }}"
+            HEADLESS="${{ vars.HEADLESS }}"
+            PYTHONUNBUFFERED="${{ vars.PYTHONUNBUFFERED }}"
+            SCREENSHOT_ON_ERROR="${{ vars.SCREENSHOT_ON_ERROR }}"
+            PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE="${{ vars.PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE }}"
             EOF
+            export PATH="$HOME/.local/bin:$PATH"
+            sudo apt-get update
+            sudo apt-get install -y python3 python3-pip
             npm install --production
+            python3 -m pip install --user -r scripts/piles-auto-assignment-requirements.txt
+            python3 -m playwright install --with-deps chromium
+            npm run db:piles-auto-assignment
+            chmod +x scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh
+            ./scripts/install-piles-auto-assignment-cron.sh
             pm2 restart claims-dashboard || pm2 start npm --name "claims-dashboard" -- start -- -p 3030

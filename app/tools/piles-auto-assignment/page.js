@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../../context/ThemeContext';
 import { getMemberName } from '../../lib/auth';
 
@@ -9,6 +9,39 @@ const ROLE_OPTIONS = [
   { value: 'support', label: 'Support' },
   { value: 'admin', label: 'Admin / All Insurers' },
 ];
+
+const DISTRIBUTION_MODE_OPTIONS = [
+  {
+    value: 'balanced_finish',
+    label: 'Balanced finish',
+    description: 'Spread new piles across eligible bots so everyone is projected to finish around the same time based on speed and current load.',
+  },
+  {
+    value: 'single_owner',
+    label: 'Single owner',
+    description: 'Keep new work with the primary owner for that insurer unless you manually move the ownership elsewhere.',
+  },
+  {
+    value: 'manual_override',
+    label: 'Manual override',
+    description: 'Use your manual owner/availability changes as the main guide and avoid automatic balancing decisions for that insurer.',
+  },
+];
+
+const DEFAULT_RULE_DRAFT = {
+  id: '',
+  master_account_id: '',
+  insurer_name: '',
+  minimum_claim_chunk: 25,
+  reassignment_threshold_minutes: 120,
+  stale_claim_threshold: 40,
+  target_completion_gap_minutes: 30,
+  distribution_mode: 'balanced_finish',
+  notes: '',
+};
+
+const MONTH_OPTIONS = ['All', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const OWNER_DISPLAY_ORDER = ['Muyiwa', 'Sophie', 'Morenike', 'Emmanuel', 'Daniel'];
 
 const cardStyle = (C) => ({
   background: C.card,
@@ -78,6 +111,87 @@ function sameDay(dateA, dateB) {
   );
 }
 
+function formatProjectedFinish(row) {
+  const explicitMinutes = Number(row?.projected_finish_minutes);
+  const minutes = Number.isFinite(explicitMinutes)
+    ? explicitMinutes
+    : Math.max(0, Math.ceil((Number(row?.projected_finish_hours) || 0) * 60));
+  return `${minutes} mins`;
+}
+
+function formatRunnerRunResult(run) {
+  if (!run) return 'No run output yet.';
+  const details = run.details || {};
+  const lines = [
+    `Run scope: ${run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}`,
+    `Portal: ${run.portal_environment || 'production'}`,
+    `Mode: ${run.mode === 'execute' ? 'Execute' : 'Preview'}`,
+    `Status: ${run.status || 'completed'}`,
+  ];
+  if (Array.isArray(run.months) && run.months.length) {
+    lines.push(`Month(s): ${run.months.sort(compareMonthLabels).join(', ')}`);
+  }
+  if (run.year) {
+    lines.push(`Year: ${run.year}`);
+  }
+  if (run.finished_at || run.started_at) {
+    lines.push(`Finished: ${new Date(run.finished_at || run.started_at).toLocaleString('en-GB')}`);
+  }
+  if (details?.error) {
+    lines.push(`Error: ${details.error}`);
+  }
+  if (run.stdout) return run.stdout;
+  if (run.stderr) return run.stderr;
+  return lines.join('\n');
+}
+
+function buildRunnerOutputFallback(logs) {
+  const latest = (logs || []).find((log) => log.event_type === 'runner_complete');
+  if (!latest) return '';
+  const details = latest.details || {};
+  const capturedAt = details.finished_at || details.captured_at || latest.created_at;
+  const insurer = details.insurer_name || latest.insurer_name || 'Unknown insurer';
+  const mode = details.mode === 'execute' ? 'EXECUTE' : 'DRY RUN';
+  const months = Array.isArray(details.months) ? details.months.join(', ') : details.month || '—';
+  const lines = [
+    'Last recorded runner completion',
+    `Insurer: ${insurer}`,
+    `Mode: ${mode}`,
+    `Month(s): ${months}`,
+    `Time: ${capturedAt ? new Date(capturedAt).toLocaleString('en-GB') : '—'}`,
+  ];
+  if (details.no_work) {
+    lines.push('Result: No unassigned piles found. Nothing to assign.');
+  } else if (details.summary && typeof details.summary === 'object') {
+    const summaryRows = Object.values(details.summary);
+    const totalPiles = summaryRows.reduce((sum, row) => sum + Number(row?.assigned_piles || 0), 0);
+    const totalClaims = summaryRows.reduce((sum, row) => sum + Number(row?.assigned_claims || 0), 0);
+    lines.push(`Result: ${totalPiles} pile(s), ${totalClaims} claim(s) in the latest plan.`);
+  }
+  return lines.join('\n');
+}
+
+function normKeyClient(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function ownerDisplayRank(name) {
+  const index = OWNER_DISPLAY_ORDER.indexOf(String(name || '').trim());
+  return index === -1 ? OWNER_DISPLAY_ORDER.length + 1 : index;
+}
+
+function compareBotRows(a, b) {
+  const insurerCompare = String(a?.insurer_name || '').localeCompare(String(b?.insurer_name || ''));
+  if (insurerCompare !== 0) return insurerCompare;
+  const ownerRank = ownerDisplayRank(a?.owner_name) - ownerDisplayRank(b?.owner_name);
+  if (ownerRank !== 0) return ownerRank;
+  return String(a?.owner_name || '').localeCompare(String(b?.owner_name || ''));
+}
+
+function compareMonthLabels(a, b) {
+  return MONTH_OPTIONS.indexOf(a) - MONTH_OPTIONS.indexOf(b);
+}
+
 function SaveBanner({ C, notice }) {
   if (!notice) return null;
   return (
@@ -87,9 +201,376 @@ function SaveBanner({ C, notice }) {
   );
 }
 
+function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, setNotice, runnerState, setRunnerState, runnerOutputFallback }) {
+  const [running, setRunning] = useState(false);
+  const [monthPickerOpen, setMonthPickerOpen] = useState(false);
+  const monthPickerRef = useRef(null);
+  const currentMonthLabel = new Date().toLocaleString('en-US', { month: 'short' });
+  const [draft, setDraft] = useState({
+    portal_environment: 'production',
+    target: 'single',
+    insurer_name: masterAccounts[0]?.insurer_name || '',
+    months: [currentMonthLabel],
+    year: String(new Date().getFullYear()),
+    finalize_assignments: false,
+    visible_browser: false,
+  });
+
+  useEffect(() => {
+    if (draft.target === 'single' && !draft.insurer_name && masterAccounts.length) {
+      setDraft((prev) => ({ ...prev, insurer_name: masterAccounts[0].insurer_name }));
+    }
+  }, [draft.target, draft.insurer_name, masterAccounts]);
+
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (monthPickerRef.current && !monthPickerRef.current.contains(event.target)) {
+        setMonthPickerOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  async function runFlow() {
+    if (draft.target === 'single' && !draft.insurer_name) {
+      setNotice({ type: 'error', text: 'Choose an insurer before starting the runner.' });
+      return;
+    }
+    setRunning(true);
+    setRunnerState({ runOutput: '', runMeta: null });
+    try {
+      const payload = {
+        portal_environment: draft.portal_environment,
+        run_all: draft.target === 'all',
+        insurer_name: draft.target === 'single' ? draft.insurer_name : '',
+        months: draft.months,
+        year: draft.year,
+        finalize_assignments: draft.finalize_assignments,
+        visible_browser: draft.visible_browser,
+      };
+      const res = await fetch('/api/tools/piles-auto-assignment/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      const combinedOutput = [json.stdout, json.stderr].filter(Boolean).join('\n').trim();
+      setRunnerState({
+        runMeta: json,
+        runOutput: combinedOutput || `Run finished with status: ${json.success ? 'Completed' : 'Failed'}`,
+      });
+      if (!json.success) throw new Error(json.error || json.stderr || 'Runner failed.');
+      setNotice({
+        type: 'success',
+        text: draft.finalize_assignments
+          ? `Runner completed on the ${draft.portal_environment} portal with final assignment enabled.`
+          : `Runner completed on the ${draft.portal_environment} portal in preview mode, so it stopped before the final Assign Claims click.`,
+      });
+      onRefresh();
+      onRunnerFinished?.();
+    } catch (error) {
+      setNotice({ type: 'error', text: error.message });
+      onRunnerFinished?.();
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  function updateMonths(selection) {
+    const values = selection.length ? [...selection].sort(compareMonthLabels) : ['All'];
+    if (values.includes('All')) {
+      setDraft((prev) => ({ ...prev, months: ['All'] }));
+      return;
+    }
+    setDraft((prev) => ({ ...prev, months: values }));
+  }
+
+  function toggleMonth(month) {
+    if (month === 'All') {
+      updateMonths(['All']);
+      return;
+    }
+    const current = draft.months.includes('All') ? [] : draft.months;
+    const next = current.includes(month)
+      ? current.filter((item) => item !== month)
+      : [...current, month];
+    updateMonths(next);
+  }
+
+  const selectedMonthsLabel = draft.months.join(', ');
+
+  return (
+    <div style={cardStyle(C)}>
+      <SectionHeader
+        C={C}
+        icon="▶️"
+        title="Runner Control"
+        text="Manually trigger one insurer or the full active-insurer loop. Safe mode goes through login, scan, planning, modal opening, and user selection, but stops before the final Assign Claims click."
+      />
+      <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 0.9fr 1.2fr 1fr 0.8fr', gap: 12, marginBottom: 12 }}>
+        <select value={draft.portal_environment} onChange={(e) => setDraft((prev) => ({ ...prev, portal_environment: e.target.value }))} style={inputStyle(C)}>
+          <option value="production">Production portal</option>
+          <option value="test">Test portal</option>
+        </select>
+        <select value={draft.target} onChange={(e) => setDraft((prev) => ({ ...prev, target: e.target.value }))} style={inputStyle(C)}>
+          <option value="single">One insurer</option>
+          <option value="all">All active insurers</option>
+        </select>
+        <select value={draft.insurer_name} onChange={(e) => setDraft((prev) => ({ ...prev, insurer_name: e.target.value }))} style={inputStyle(C)} disabled={draft.target !== 'single'}>
+          <option value="">Select insurer</option>
+          {masterAccounts.map((account) => (
+            <option key={account.id} value={account.insurer_name}>{account.insurer_name}</option>
+          ))}
+        </select>
+        <div ref={monthPickerRef} style={{ position: 'relative' }}>
+          <button
+            type="button"
+            onClick={() => setMonthPickerOpen((prev) => !prev)}
+            style={{
+              ...inputStyle(C),
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              cursor: 'pointer',
+              textAlign: 'left',
+            }}
+          >
+            <span style={{ color: selectedMonthsLabel ? C.text : C.sub, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {selectedMonthsLabel || 'Select month(s)'}
+            </span>
+            <span style={{ color: C.sub, marginLeft: 12, flexShrink: 0 }}>{monthPickerOpen ? '▴' : '▾'}</span>
+          </button>
+          {monthPickerOpen && (
+            <div style={{
+              position: 'absolute',
+              top: 'calc(100% + 8px)',
+              left: 0,
+              right: 0,
+              background: C.card,
+              border: `1px solid ${C.border}`,
+              borderRadius: 12,
+              padding: 8,
+              boxShadow: '0 12px 30px rgba(0,0,0,0.22)',
+              zIndex: 20,
+              maxHeight: 260,
+              overflowY: 'auto',
+            }}>
+              {MONTH_OPTIONS.map((month) => {
+                const checked = draft.months.includes(month);
+                return (
+                  <label
+                    key={month}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      padding: '9px 10px',
+                      borderRadius: 8,
+                      cursor: 'pointer',
+                      color: C.text,
+                      fontSize: 13,
+                      background: checked ? C.elevated : 'transparent',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleMonth(month)}
+                    />
+                    <span>{month}</span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <input value={draft.year} onChange={(e) => setDraft((prev) => ({ ...prev, year: e.target.value }))} placeholder="Year" style={inputStyle(C)} />
+      </div>
+      <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.sub, fontSize: 12, marginBottom: 16 }}>
+        Months selected: <span style={{ color: C.text, fontWeight: 700 }}>{selectedMonthsLabel}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 16 }}>
+        <label style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input
+            type="checkbox"
+            checked={draft.finalize_assignments}
+            onChange={(e) => setDraft((prev) => ({ ...prev, finalize_assignments: e.target.checked }))}
+          />
+          Finalize assignments
+        </label>
+        <label style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input
+            type="checkbox"
+            checked={draft.visible_browser}
+            onChange={(e) => setDraft((prev) => ({ ...prev, visible_browser: e.target.checked }))}
+          />
+          Visible browser
+        </label>
+        <button
+          onClick={runFlow}
+          disabled={running}
+          style={{ background: running ? C.muted : C.accent, color: running ? C.sub : '#0B0F1A', border: 'none', borderRadius: 10, fontWeight: 700, cursor: running ? 'not-allowed' : 'pointer' }}
+        >
+          {running ? 'Running...' : 'Start Runner'}
+        </button>
+      </div>
+      <div style={{ background: draft.finalize_assignments ? '#FFB84D14' : '#00E5A012', border: `1px solid ${draft.finalize_assignments ? '#FFB84D44' : '#00E5A040'}`, borderRadius: 10, padding: '12px 14px', color: draft.finalize_assignments ? C.warn : C.accent, fontSize: 12, marginBottom: 16, lineHeight: 1.6 }}>
+        {draft.finalize_assignments
+          ? draft.portal_environment === 'production'
+            ? 'Final assignment is enabled on the production portal. This still depends on the runner safety gate and should only be used intentionally.'
+            : 'Final assignment is enabled on the test portal.'
+          : `Preview mode is active on the ${draft.portal_environment} portal. The runner will stop before the final Assign Claims click.`}
+      </div>
+      {runnerState.runMeta && (
+        <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 12, color: C.sub, fontSize: 12 }}>
+          <div>Duration: <span style={{ color: C.text }}>{Math.round((runnerState.runMeta.duration_ms || 0) / 1000)}s</span></div>
+          <div>Status: <span style={{ color: runnerState.runMeta.success ? C.accent : C.danger }}>{runnerState.runMeta.success ? 'Completed' : 'Failed'}</span></div>
+          <div>Backend: <span style={{ color: C.text }}>{runnerState.runMeta.backend || 'local'}</span></div>
+        </div>
+      )}
+      <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
+        <div style={{ color: C.sub, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Runner Output</div>
+        <pre style={{ margin: 0, color: C.text, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+          {runnerState.runOutput || runnerOutputFallback || 'No run output yet.'}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+function RunnerHistorySection({ C, refreshToken }) {
+  const [loading, setLoading] = useState(true);
+  const [scope, setScope] = useState('today');
+  const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
+  const [runs, setRuns] = useState([]);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    async function loadRuns() {
+      setLoading(true);
+      setError('');
+      try {
+        const res = await fetch('/api/tools/piles-auto-assignment/runner-runs?limit=150', { cache: 'no-store' });
+        const json = await res.json();
+        if (!json.success) throw new Error(json.error || 'Failed to load runner history.');
+        if (!active) return;
+        setRuns(json.runs || []);
+      } catch (loadError) {
+        if (!active) return;
+        setError(loadError.message);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    loadRuns();
+    return () => {
+      active = false;
+    };
+  }, [refreshToken]);
+
+  const filteredRuns = useMemo(() => {
+    const sorted = [...runs].sort((a, b) => new Date(b.finished_at || b.started_at || 0).getTime() - new Date(a.finished_at || a.started_at || 0).getTime());
+    if (scope === 'all') return sorted;
+    const baseDate = scope === 'today'
+      ? new Date()
+      : scope === 'yesterday'
+        ? new Date(Date.now() - (24 * 60 * 60 * 1000))
+        : new Date(selectedDay);
+    return sorted.filter((run) => sameDay(new Date(run.finished_at || run.started_at), baseDate));
+  }, [runs, scope, selectedDay]);
+
+  return (
+    <div style={cardStyle(C)}>
+      <SectionHeader
+        C={C}
+        icon="📜"
+        title="Runner History"
+        text="Full runner history for manual and scheduled executions. Use this to inspect the exact output, timing, and outcome of previous runs."
+      />
+      <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 1fr', gap: 12, marginBottom: 16 }}>
+        <select value={scope} onChange={(e) => setScope(e.target.value)} style={inputStyle(C)}>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="custom">Pick a day</option>
+          <option value="all">All time</option>
+        </select>
+        {scope === 'custom' ? (
+          <input type="date" value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)} style={inputStyle(C)} />
+        ) : (
+          <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
+            {scope === 'all' ? 'Showing all recorded runner executions.' : 'Showing the latest runner executions for the selected day.'}
+          </div>
+        )}
+      </div>
+      {loading ? (
+        <div style={{ color: C.sub, fontSize: 13 }}>Loading runner history…</div>
+      ) : error ? (
+        <div style={{ color: C.danger, fontSize: 13 }}>{error}</div>
+      ) : !filteredRuns.length ? (
+        <EmptyState C={C} title="No runner executions for this filter" text="Once manual or scheduled runs happen, their full output will be available here for the selected day." />
+      ) : (
+        <div style={{ maxHeight: 540, overflowY: 'auto', display: 'grid', gap: 12 }}>
+          {filteredRuns.map((run) => {
+            const eventTime = run.finished_at || run.started_at;
+            const months = Array.isArray(run.months) ? [...run.months].sort(compareMonthLabels).join(', ') : (run.months || '—');
+            const stdout = String(run.stdout || '').trim();
+            const stderr = String(run.stderr || '').trim();
+            const fallbackText = formatRunnerRunResult(run);
+            return (
+              <details key={run.id} style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
+                <summary style={{ cursor: 'pointer', listStyle: 'none' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 0.9fr 0.9fr 0.8fr 1fr', gap: 12, alignItems: 'center' }}>
+                    <div>
+                      <div style={{ color: C.text, fontSize: 14, fontWeight: 700 }}>
+                        {run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}
+                      </div>
+                      <div style={{ color: C.sub, fontSize: 12 }}>
+                        {run.portal_environment || 'production'} portal · {run.run_source || 'manual'} · {run.backend || 'local'}
+                      </div>
+                    </div>
+                    <div style={{ color: C.text, fontSize: 13 }}>{run.mode === 'execute' ? 'Execute' : 'Preview'}</div>
+                    <div style={{ color: run.status === 'failed' ? C.danger : C.accent, fontSize: 13, fontWeight: 700 }}>{run.status}</div>
+                    <div style={{ color: C.text, fontSize: 13 }}>{Math.round((run.duration_ms || 0) / 1000)}s</div>
+                    <div style={{ color: C.muted, fontSize: 12 }}>{eventTime ? new Date(eventTime).toLocaleString('en-GB') : '—'}</div>
+                  </div>
+                </summary>
+                <div style={{ marginTop: 14, display: 'grid', gap: 12 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 12 }}>
+                    <div style={{ color: C.sub, fontSize: 12 }}>Month(s): <span style={{ color: C.text, fontWeight: 700 }}>{months}</span></div>
+                    <div style={{ color: C.sub, fontSize: 12 }}>Year: <span style={{ color: C.text, fontWeight: 700 }}>{run.year || '—'}</span></div>
+                    <div style={{ color: C.sub, fontSize: 12 }}>Started: <span style={{ color: C.text, fontWeight: 700 }}>{run.started_at ? new Date(run.started_at).toLocaleString('en-GB') : '—'}</span></div>
+                    <div style={{ color: C.sub, fontSize: 12 }}>Finished: <span style={{ color: C.text, fontWeight: 700 }}>{run.finished_at ? new Date(run.finished_at).toLocaleString('en-GB') : '—'}</span></div>
+                  </div>
+                  <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px' }}>
+                    <div style={{ color: C.sub, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Run Output</div>
+                    <pre style={{ margin: 0, color: C.text, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 280, overflowY: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                      {stdout || stderr || fallbackText}
+                    </pre>
+                  </div>
+                  {stderr && stdout && (
+                    <div style={{ background: '#EF444412', border: '1px solid #EF444444', borderRadius: 10, padding: '12px 14px' }}>
+                      <div style={{ color: C.danger, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>stderr</div>
+                      <pre style={{ margin: 0, color: C.text, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 180, overflowY: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                        {stderr}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              </details>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TeamSlackSection({ C, members, onRefresh, setNotice }) {
   const [saving, setSaving] = useState(false);
   const [updatingId, setUpdatingId] = useState(null);
+  const [editingId, setEditingId] = useState(null);
   const [draft, setDraft] = useState({ name: '', role: 'Claims Ops', slack_user_id: '' });
   const [edits, setEdits] = useState({});
 
@@ -136,12 +617,34 @@ function TeamSlackSection({ C, members, onRefresh, setNotice }) {
         delete next[member.id];
         return next;
       });
+      setEditingId(null);
       onRefresh();
     } catch (error) {
       setNotice({ type: 'error', text: error.message });
     } finally {
       setUpdatingId(null);
     }
+  }
+
+  function startEditing(member) {
+    setEditingId(member.id);
+    setEdits((prev) => ({
+      ...prev,
+      [member.id]: prev[member.id] || {
+        name: member.name || '',
+        role: member.role || '',
+        slack_user_id: member.slack_user_id || '',
+      },
+    }));
+  }
+
+  function cancelEditing(memberId) {
+    setEditingId((current) => (current === memberId ? null : current));
+    setEdits((prev) => {
+      const next = { ...prev };
+      delete next[memberId];
+      return next;
+    });
   }
 
   const missingSlack = members.filter((member) => !member.slack_user_id);
@@ -181,6 +684,7 @@ function TeamSlackSection({ C, members, onRefresh, setNotice }) {
             </thead>
             <tbody>
               {members.map((member) => {
+                const isEditing = editingId === member.id;
                 const edit = edits[member.id] || {
                   name: member.name || '',
                   role: member.role || '',
@@ -189,23 +693,46 @@ function TeamSlackSection({ C, members, onRefresh, setNotice }) {
                 return (
                   <tr key={member.id}>
                     <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
-                      <input value={edit.name} onChange={(e) => setEdits((prev) => ({ ...prev, [member.id]: { ...edit, name: e.target.value } }))} style={inputStyle(C)} />
+                      {isEditing ? (
+                        <input value={edit.name} onChange={(e) => setEdits((prev) => ({ ...prev, [member.id]: { ...edit, name: e.target.value } }))} style={inputStyle(C)} />
+                      ) : (
+                        <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>{member.name || '—'}</div>
+                      )}
                     </td>
                     <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
-                      <input value={edit.role} onChange={(e) => setEdits((prev) => ({ ...prev, [member.id]: { ...edit, role: e.target.value } }))} style={inputStyle(C)} />
+                      {isEditing ? (
+                        <input value={edit.role} onChange={(e) => setEdits((prev) => ({ ...prev, [member.id]: { ...edit, role: e.target.value } }))} style={inputStyle(C)} />
+                      ) : (
+                        <div style={{ color: C.text, fontSize: 13 }}>{member.role || '—'}</div>
+                      )}
                     </td>
                     <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
-                      <input value={edit.slack_user_id} onChange={(e) => setEdits((prev) => ({ ...prev, [member.id]: { ...edit, slack_user_id: e.target.value } }))} style={inputStyle(C)} />
+                      {isEditing ? (
+                        <input value={edit.slack_user_id} onChange={(e) => setEdits((prev) => ({ ...prev, [member.id]: { ...edit, slack_user_id: e.target.value } }))} style={inputStyle(C)} />
+                      ) : (
+                        <div style={{ color: member.slack_user_id ? C.text : C.sub, fontSize: 13 }}>{member.slack_user_id || 'Missing'}</div>
+                      )}
                     </td>
                     <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
                       <span style={{ fontSize: 11, fontWeight: 700, color: edit.slack_user_id ? C.accent : C.warn }}>
-                        {edit.slack_user_id ? 'Ready for tagging' : 'Missing Slack ID'}
+                        {(isEditing ? edit.slack_user_id : member.slack_user_id) ? 'Ready for tagging' : 'Missing Slack ID'}
                       </span>
                     </td>
-                    <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
-                      <button onClick={() => saveMember(member)} disabled={updatingId === member.id} style={{ background: updatingId === member.id ? C.muted : C.elevated, color: updatingId === member.id ? C.sub : C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: updatingId === member.id ? 'not-allowed' : 'pointer' }}>
-                        {updatingId === member.id ? 'Saving...' : 'Save'}
-                      </button>
+                    <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>
+                      {isEditing ? (
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button onClick={() => saveMember(member)} disabled={updatingId === member.id} style={{ background: updatingId === member.id ? C.muted : C.accent, color: updatingId === member.id ? C.sub : '#0B0F1A', border: 'none', borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: updatingId === member.id ? 'not-allowed' : 'pointer' }}>
+                            {updatingId === member.id ? 'Saving...' : 'Save'}
+                          </button>
+                          <button onClick={() => cancelEditing(member.id)} disabled={updatingId === member.id} style={{ background: C.elevated, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: updatingId === member.id ? 'not-allowed' : 'pointer' }}>
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button onClick={() => startEditing(member)} style={{ background: C.elevated, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
+                          Edit
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );
@@ -314,6 +841,7 @@ function MasterAccountsSection({ C, accounts, onRefresh, setNotice }) {
 function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRefresh, setNotice }) {
   const [saving, setSaving] = useState(false);
   const [editingId, setEditingId] = useState('');
+  const formRef = useRef(null);
   const [draft, setDraft] = useState({
     master_account_id: '',
     insurer_name: '',
@@ -373,6 +901,9 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       is_active: account.is_active !== false,
       is_available: account.is_available !== false,
     });
+    setTimeout(() => {
+      formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 50);
   }
 
   async function submit() {
@@ -406,13 +937,16 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       if (!grouped.has(key)) grouped.set(key, []);
       grouped.get(key).push(account);
     }
+    for (const [key, insurerAccounts] of grouped.entries()) {
+      grouped.set(key, [...insurerAccounts].sort(compareBotRows));
+    }
     return Array.from(grouped.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   }, [accounts]);
 
   return (
     <div style={cardStyle(C)}>
       <SectionHeader C={C} icon="🤖" title="Bot Accounts" text="Each sub-bot represents one person who can receive piles. Claims-per-hour metrics will later drive proration across these rows." />
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+      <div ref={formRef} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
         <select value={draft.master_account_id} onChange={(e) => onMasterChange(e.target.value)} style={inputStyle(C)}>
           <option value="">Select master insurer</option>
           {masterAccounts.map((account) => <option key={account.id} value={account.id}>{account.insurer_name}</option>)}
@@ -443,7 +977,10 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       </div>
       <textarea value={draft.notes} onChange={(e) => setDraft((prev) => ({ ...prev, notes: e.target.value }))} placeholder="Notes for shift ownership, fallback usage, or password caveats" style={{ ...inputStyle(C), minHeight: 72, marginBottom: 18, resize: 'vertical' }} />
       {editingId && (
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16, padding: '12px 14px', borderRadius: 10, border: `1px solid ${C.border}`, background: C.elevated }}>
+          <div style={{ color: C.text, fontSize: 13, fontWeight: 700 }}>
+            Editing: {draft.owner_name || 'Selected bot row'} {draft.bot_name ? `· ${draft.bot_name}` : ''}
+          </div>
           <button onClick={resetDraft} style={{ background: 'transparent', color: C.sub, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
             Cancel Edit
           </button>
@@ -472,17 +1009,17 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
-                    <tr>{['Owner', 'Role', 'Weight', 'Bot Login', 'Claims/Hr', 'Current Load', 'Availability', 'Action'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
+                    <tr>{['Owner', 'Role', 'Weight', 'Bot Name', 'Claims/Hr', 'Current Load', 'Availability', 'Action'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
                   </thead>
                   <tbody>
                     {insurerAccounts.map((account) => {
                       const metric = metricsByBotId[account.id];
                       return (
-                        <tr key={account.id}>
+                        <tr key={account.id} style={editingId === account.id ? { background: C.card } : undefined}>
                           <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.owner_name}</td>
                           <td style={{ color: account.assignment_role === 'support' ? C.warn : C.accent, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.assignment_role || 'primary'}</td>
                           <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.support_capacity_ratio ?? 1}</td>
-                          <td style={{ color: C.sub, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.bot_email || account.bot_name || '—'}</td>
+                          <td style={{ color: C.sub, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.bot_name || '—'}</td>
                           <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric?.claims_per_hour ?? '—'}</td>
                           <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric?.active_claim_load ?? account.current_claim_load ?? 0}</td>
                           <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
@@ -491,8 +1028,8 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
                             </span>
                           </td>
                           <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
-                            <button onClick={() => startEdit(account)} style={{ background: C.card, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
-                              Edit
+                            <button onClick={() => startEdit(account)} style={{ background: editingId === account.id ? C.accent : C.card, color: editingId === account.id ? '#0B0F1A' : C.text, border: `1px solid ${editingId === account.id ? C.accent : C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
+                              {editingId === account.id ? 'Editing' : 'Edit'}
                             </button>
                           </td>
                         </tr>
@@ -510,6 +1047,7 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
 }
 
 function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
+  const orderedAccounts = useMemo(() => [...accounts].sort(compareBotRows), [accounts]);
   const [selectedId, setSelectedId] = useState('');
   const [saving, setSaving] = useState(false);
   const selected = accounts.find((item) => item.id === selectedId) || null;
@@ -567,7 +1105,7 @@ function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
         <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)} style={inputStyle(C)}>
           <option value="">Select insurer/person row</option>
-          {accounts.map((account) => (
+          {orderedAccounts.map((account) => (
             <option key={account.id} value={account.id}>{account.insurer_name} · {account.owner_name}</option>
           ))}
         </select>
@@ -596,11 +1134,49 @@ function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
 
 function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
   const [saving, setSaving] = useState(false);
-  const [draft, setDraft] = useState({ master_account_id: '', insurer_name: '', minimum_claim_chunk: 25, reassignment_threshold_minutes: 120, stale_claim_threshold: 40, target_completion_gap_minutes: 30, distribution_mode: 'balanced_finish', notes: '' });
+  const [draft, setDraft] = useState(DEFAULT_RULE_DRAFT);
+  const sectionRef = useRef(null);
+  const selectedMode = DISTRIBUTION_MODE_OPTIONS.find((option) => option.value === draft.distribution_mode) || DISTRIBUTION_MODE_OPTIONS[0];
 
   function onMasterChange(id) {
     const account = masterAccounts.find((item) => item.id === id);
-    setDraft((prev) => ({ ...prev, master_account_id: id, insurer_name: account?.insurer_name || prev.insurer_name }));
+    const existingRule = rules.find((rule) => rule.master_account_id === id || rule.insurer_name === account?.insurer_name);
+    if (existingRule) {
+      setDraft({
+        id: existingRule.id,
+        master_account_id: existingRule.master_account_id || id,
+        insurer_name: existingRule.insurer_name || account?.insurer_name || '',
+        minimum_claim_chunk: existingRule.minimum_claim_chunk ?? 25,
+        reassignment_threshold_minutes: existingRule.reassignment_threshold_minutes ?? 120,
+        stale_claim_threshold: existingRule.stale_claim_threshold ?? 40,
+        target_completion_gap_minutes: existingRule.target_completion_gap_minutes ?? 30,
+        distribution_mode: existingRule.distribution_mode || 'balanced_finish',
+        notes: existingRule.notes || '',
+      });
+      return;
+    }
+    setDraft((prev) => ({ ...DEFAULT_RULE_DRAFT, master_account_id: id, insurer_name: account?.insurer_name || prev.insurer_name }));
+  }
+
+  function editRule(rule) {
+    setDraft({
+      id: rule.id,
+      master_account_id: rule.master_account_id || '',
+      insurer_name: rule.insurer_name || '',
+      minimum_claim_chunk: rule.minimum_claim_chunk ?? 25,
+      reassignment_threshold_minutes: rule.reassignment_threshold_minutes ?? 120,
+      stale_claim_threshold: rule.stale_claim_threshold ?? 40,
+      target_completion_gap_minutes: rule.target_completion_gap_minutes ?? 30,
+      distribution_mode: rule.distribution_mode || 'balanced_finish',
+      notes: rule.notes || '',
+    });
+    requestAnimationFrame(() => {
+      sectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+
+  function resetDraft() {
+    setDraft(DEFAULT_RULE_DRAFT);
   }
 
   async function submit() {
@@ -610,15 +1186,16 @@ function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
     }
     setSaving(true);
     try {
+      const method = draft.id ? 'PATCH' : 'POST';
       const res = await fetch('/api/tools/piles-auto-assignment/assignment-rules', {
-        method: 'POST',
+        method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(draft),
       });
       const data = await res.json();
       if (!data.success) throw new Error(data.error || 'Failed to save rule.');
-      setDraft({ master_account_id: '', insurer_name: '', minimum_claim_chunk: 25, reassignment_threshold_minutes: 120, stale_claim_threshold: 40, target_completion_gap_minutes: 30, distribution_mode: 'balanced_finish', notes: '' });
-      setNotice({ type: 'success', text: `Rule saved for ${data.item.insurer_name}.` });
+      resetDraft();
+      setNotice({ type: 'success', text: `${draft.id ? 'Rule updated' : 'Rule saved'} for ${data.item.insurer_name}.` });
       onRefresh();
     } catch (error) {
       setNotice({ type: 'error', text: error.message });
@@ -628,8 +1205,22 @@ function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
   }
 
   return (
-    <div style={cardStyle(C)}>
-      <SectionHeader C={C} icon="⚖️" title="Assignment Rules" text="This is where the proration logic will be configured. For now the dashboard stores insurer-level thresholds and finish-time balancing defaults." />
+    <div ref={sectionRef} style={cardStyle(C)}>
+      <SectionHeader C={C} icon="⚖️" title="Assignment Rules" text="These are insurer-level guardrails for how piles should be distributed. The main live assignment inputs still come from Bot Accounts, role/availability, and claims-per-hour." />
+      <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px', marginBottom: 14 }}>
+        <div style={{ color: C.text, fontSize: 13, fontWeight: 700, marginBottom: 8 }}>What this section does</div>
+        <div style={{ color: C.sub, fontSize: 12, lineHeight: 1.7, marginBottom: 10 }}>
+          Use this when an insurer needs extra assignment behavior on top of the normal bot setup. If you leave it alone, the runner will still use the insurer&apos;s bot roles, availability, and speed metrics.
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10 }}>
+          {DISTRIBUTION_MODE_OPTIONS.map((option) => (
+            <div key={option.value} style={{ border: `1px solid ${option.value === selectedMode.value ? C.accent : C.border}`, borderRadius: 10, padding: '10px 12px', background: option.value === selectedMode.value ? '#00E5A010' : 'transparent' }}>
+              <div style={{ color: C.text, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>{option.label}</div>
+              <div style={{ color: C.sub, fontSize: 11, lineHeight: 1.6 }}>{option.description}</div>
+            </div>
+          ))}
+        </div>
+      </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
         <select value={draft.master_account_id} onChange={(e) => onMasterChange(e.target.value)} style={inputStyle(C)}>
           <option value="">Select master insurer</option>
@@ -637,17 +1228,27 @@ function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
         </select>
         <input value={draft.insurer_name} onChange={(e) => setDraft((prev) => ({ ...prev, insurer_name: e.target.value }))} placeholder="Insurer name" style={inputStyle(C)} />
         <select value={draft.distribution_mode} onChange={(e) => setDraft((prev) => ({ ...prev, distribution_mode: e.target.value }))} style={inputStyle(C)}>
-          <option value="balanced_finish">Balanced finish</option>
-          <option value="manual_override">Manual override</option>
-          <option value="single_owner">Single owner</option>
+          {DISTRIBUTION_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
-        <button onClick={submit} disabled={saving} style={{ background: saving ? C.muted : C.accent, color: saving ? C.sub : '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>{saving ? 'Saving...' : 'Add Rule'}</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={submit} disabled={saving} style={{ flex: 1, background: saving ? C.muted : C.accent, color: saving ? C.sub : '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>
+            {saving ? 'Saving...' : draft.id ? 'Update Rule' : 'Save Rule'}
+          </button>
+          {draft.id ? (
+            <button onClick={resetDraft} disabled={saving} style={{ background: C.elevated, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '0 12px', fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>
+              Cancel
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div style={{ background: '#00E5A010', border: '1px solid #00E5A040', borderRadius: 10, padding: '10px 12px', color: C.sub, fontSize: 12, lineHeight: 1.6, marginBottom: 12 }}>
+        <span style={{ color: C.text, fontWeight: 700 }}>{selectedMode.label}:</span> {selectedMode.description}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
-        <input type="number" value={draft.minimum_claim_chunk} onChange={(e) => setDraft((prev) => ({ ...prev, minimum_claim_chunk: e.target.value }))} placeholder="Minimum claim chunk" style={inputStyle(C)} />
-        <input type="number" value={draft.reassignment_threshold_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, reassignment_threshold_minutes: e.target.value }))} placeholder="Reassign after (mins)" style={inputStyle(C)} />
-        <input type="number" value={draft.stale_claim_threshold} onChange={(e) => setDraft((prev) => ({ ...prev, stale_claim_threshold: e.target.value }))} placeholder="Stale claim threshold" style={inputStyle(C)} />
-        <input type="number" value={draft.target_completion_gap_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, target_completion_gap_minutes: e.target.value }))} placeholder="Finish gap target" style={inputStyle(C)} />
+        <input type="number" value={draft.minimum_claim_chunk} onChange={(e) => setDraft((prev) => ({ ...prev, minimum_claim_chunk: e.target.value }))} placeholder="Minimum claims per batch" style={inputStyle(C)} />
+        <input type="number" value={draft.reassignment_threshold_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, reassignment_threshold_minutes: e.target.value }))} placeholder="Reassign after idle mins" style={inputStyle(C)} />
+        <input type="number" value={draft.stale_claim_threshold} onChange={(e) => setDraft((prev) => ({ ...prev, stale_claim_threshold: e.target.value }))} placeholder="Stale claims threshold" style={inputStyle(C)} />
+        <input type="number" value={draft.target_completion_gap_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, target_completion_gap_minutes: e.target.value }))} placeholder="Target finish gap mins" style={inputStyle(C)} />
       </div>
       <textarea value={draft.notes} onChange={(e) => setDraft((prev) => ({ ...prev, notes: e.target.value }))} placeholder="Any insurer-specific notes around load balancing or overrides" style={{ ...inputStyle(C), minHeight: 72, marginBottom: 18, resize: 'vertical' }} />
       {!rules.length ? (
@@ -662,10 +1263,15 @@ function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
               {rules.map((rule) => (
                 <tr key={rule.id}>
                   <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{rule.insurer_name}</td>
-                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{rule.distribution_mode}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{DISTRIBUTION_MODE_OPTIONS.find((option) => option.value === rule.distribution_mode)?.label || rule.distribution_mode}</td>
                   <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{rule.minimum_claim_chunk}</td>
                   <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{rule.reassignment_threshold_minutes} min</td>
                   <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{rule.stale_claim_threshold} claims</td>
+                  <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
+                    <button onClick={() => editRule(rule)} style={{ background: C.elevated, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
+                      Edit
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -699,7 +1305,9 @@ function MetricsSection({ C, metrics, botAccounts, onRefresh, setNotice }) {
   }, [metrics, botAccounts, selectedInsurer]);
 
   const filteredBots = useMemo(() => {
-    return botAccounts.filter((account) => selectedInsurer ? account.insurer_name === selectedInsurer : true);
+    return botAccounts
+      .filter((account) => selectedInsurer ? account.insurer_name === selectedInsurer : true)
+      .sort(compareBotRows);
   }, [botAccounts, selectedInsurer]);
 
   async function submit() {
@@ -778,7 +1386,7 @@ function MetricsSection({ C, metrics, botAccounts, onRefresh, setNotice }) {
   );
 }
 
-function LiveAssignmentScoreboard({ C, logs }) {
+function LiveAssignmentScoreboard({ C, logs, botAccounts }) {
   const [scope, setScope] = useState('today');
   const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
 
@@ -786,38 +1394,74 @@ function LiveAssignmentScoreboard({ C, logs }) {
     return logs
       .filter((log) => {
         const summary = log?.details?.summary;
+        const noWork = Boolean(log?.details?.no_work);
         return (
-          summary
-          && typeof summary === 'object'
-          && Object.keys(summary).length > 0
-          && (log.event_type === 'runner_complete' || log.event_type === 'runner_scan')
+          (
+            (summary && typeof summary === 'object' && Object.keys(summary).length > 0)
+            || noWork
+          )
+          && log.event_type === 'runner_complete'
         );
       })
       .flatMap((log) => {
         const summary = Object.values(log.details.summary || {});
-        const eventTime = log?.details?.captured_at || log?.created_at || null;
+        const eventTime = log?.details?.finished_at || log?.created_at || log?.details?.captured_at || null;
         const insurerName = log?.details?.insurer_name || log?.insurer_name || '—';
         const mode = log?.details?.mode || log?.status || 'runner';
-        const timeLabel = log.event_type === 'runner_complete'
-          ? (mode === 'execute' ? 'Assigned At' : 'Planned At')
-          : 'Scanned At';
+        const timeLabel = mode === 'execute' ? 'Assigned At' : 'Planned At';
 
-        return summary.map((row, index) => ({
-          id: `${log.id}-${row.assignee_name || 'assignee'}-${index}`,
-          insurer_name: row.insurer_name || insurerName,
-          assignee_name: row.assignee_name,
-          assignment_role: row.assignment_role,
-          effective_speed: row.effective_speed,
-          starting_load: row.starting_load,
-          assigned_claims: row.assigned_claims,
-          projected_finish_hours: row.projected_finish_hours,
-          event_time: eventTime,
-          time_label: timeLabel,
-          event_type: log.event_type,
-        }));
+        if (!summary.length && log?.details?.no_work) {
+          return [{
+            id: `${log.id}-no-work`,
+            insurer_name: insurerName,
+            assignee_name: 'No unassigned piles',
+            owner_name: '—',
+            assignment_role: '—',
+            effective_speed: '—',
+            starting_claim_load: 0,
+            starting_load: 0,
+            assigned_piles: 0,
+            assigned_claims: 0,
+            projected_finish_hours: 0,
+            projected_finish_minutes: 0,
+            event_time: eventTime,
+            time_label: timeLabel,
+            event_type: log.event_type,
+          }];
+        }
+
+        return summary.map((row, index) => {
+          const resolvedInsurer = row.insurer_name || insurerName;
+          const assigneeKey = normKeyClient(row.assignee_name);
+          const matchedBot = botAccounts.find((bot) => (
+            bot.insurer_name === resolvedInsurer
+            && (
+              normKeyClient(bot.bot_name) === assigneeKey
+              || normKeyClient(bot.owner_name) === assigneeKey
+            )
+          ));
+
+          return {
+            id: `${log.id}-${row.assignee_name || 'assignee'}-${index}`,
+            insurer_name: resolvedInsurer,
+            assignee_name: row.assignee_name,
+            owner_name: matchedBot?.owner_name || '—',
+            assignment_role: row.assignment_role,
+            effective_speed: row.effective_speed,
+            starting_claim_load: row.starting_claim_load ?? row.starting_load ?? 0,
+            starting_load: row.starting_claim_load ?? row.starting_load ?? 0,
+            assigned_piles: row.assigned_piles ?? 0,
+            assigned_claims: row.assigned_claims,
+            projected_finish_hours: row.projected_finish_hours,
+            projected_finish_minutes: row.projected_finish_minutes,
+            event_time: eventTime,
+            time_label: timeLabel,
+            event_type: log.event_type,
+          };
+        });
       })
       .sort((a, b) => new Date(b.event_time || 0).getTime() - new Date(a.event_time || 0).getTime());
-  }, [logs]);
+  }, [logs, botAccounts]);
 
   const filteredRows = useMemo(() => {
     if (scope === 'all') return flattenedRows;
@@ -839,9 +1483,9 @@ function LiveAssignmentScoreboard({ C, logs }) {
     <div style={cardStyle(C)}>
       <SectionHeader
         C={C}
-        icon="⚡"
-        title="Live Assignment Scoreboard"
-        text="This shows recent runner assignment snapshots for the selected day, including insurer, assignee, speed, load, and the time the plan or assignment was captured."
+        icon="🧾"
+        title="Recent Assignment Activity"
+        text="This combines the latest runner assignment snapshots into one scrollable activity view, including insurer, bot owner, assignee, speed, load, and when the plan or assignment was captured."
       />
       <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 1fr', gap: 12, marginBottom: 16 }}>
         <select value={scope} onChange={(e) => setScope(e.target.value)} style={inputStyle(C)}>
@@ -869,7 +1513,7 @@ function LiveAssignmentScoreboard({ C, logs }) {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead style={{ position: 'sticky', top: 0, background: C.card, zIndex: 1 }}>
               <tr>
-                {['Insurer', 'Assignee', 'Role', 'Effective Speed', 'Starting Load', 'Assigned Claims', 'Projected Finish', latestVisibleTimeLabel].map((label) => (
+                {['Insurer', 'Bot Owner', 'Assignee', 'Role', 'Effective Speed', 'Starting Claims', 'Assigned Piles', 'Assigned Claims', 'Projected Finish', latestVisibleTimeLabel].map((label) => (
                   <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
                     {label}
                   </th>
@@ -880,21 +1524,23 @@ function LiveAssignmentScoreboard({ C, logs }) {
               {filteredRows.map((row) => (
                   <tr key={row.id}>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.insurer_name}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.owner_name}</td>
                     <td style={{ color: C.text, fontSize: 13, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assignee_name}</td>
-                    <td style={{ color: row.assignment_role === 'support' ? C.warn : C.accent, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assignment_role}</td>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.effective_speed}/hr</td>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.starting_load}</td>
+                    <td style={{ color: row.assignment_role === '—' ? C.sub : row.assignment_role === 'support' ? C.warn : C.accent, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assignment_role}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.effective_speed === '—' ? '—' : `${row.effective_speed}/hr`}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.starting_claim_load}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assigned_piles}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assigned_claims}</td>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.projected_finish_hours}h</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assignment_role === '—' ? '—' : formatProjectedFinish(row)}</td>
                     <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.event_time ? new Date(row.event_time).toLocaleString('en-GB') : '—'}</td>
                   </tr>
               ))}
             </tbody>
           </table>
-          <div style={{ color: C.muted, fontSize: 11, marginTop: 10, padding: '10px 12px' }}>
-            {latestVisibleSource ? `Latest visible source: ${latestVisibleSource}` : 'No visible runner source for this filter.'}
-          </div>
+        <div style={{ color: C.muted, fontSize: 11, marginTop: 10, padding: '10px 12px' }}>
+          {latestVisibleSource ? `Latest visible source: ${latestVisibleSource}` : 'No visible runner source for this filter.'}
         </div>
+      </div>
       )}
     </div>
   );
@@ -966,9 +1612,9 @@ function LogsSection({ C, logs, botAccounts, onRefresh, setNotice }) {
       {!logs.length ? (
         <EmptyState C={C} title="No assignment events yet" text="Once the runner starts assigning piles, this timeline will show who got work, when it was assigned, and how much moved." />
       ) : (
-        <div style={{ overflowX: 'auto' }}>
+        <div style={{ overflowX: 'auto', maxHeight: 430, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
+            <thead style={{ position: 'sticky', top: 0, background: C.card, zIndex: 1 }}>
               <tr>{['Time', 'Insurer', 'Event', 'Assigned To', 'Piles / Context', 'Claims', 'By'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
             </thead>
             <tbody>
@@ -1000,6 +1646,8 @@ export default function PilesAutoAssignmentPage() {
   const [notice, setNotice] = useState(null);
   const [data, setData] = useState({ overview: null, masterAccounts: [], botAccounts: [], rules: [], botMetrics: [], recentLogs: [] });
   const [teamMembers, setTeamMembers] = useState([]);
+  const [runnerState, setRunnerState] = useState({ runOutput: '', runMeta: null });
+  const [runnerHistoryRefreshToken, setRunnerHistoryRefreshToken] = useState(0);
 
   async function load() {
     setLoading(true);
@@ -1032,6 +1680,7 @@ export default function PilesAutoAssignmentPage() {
   }, []);
 
   const metricsByBotId = useMemo(() => Object.fromEntries((data.botMetrics || []).map((metric) => [metric.bot_account_id, metric])), [data.botMetrics]);
+  const runnerOutputFallback = useMemo(() => buildRunnerOutputFallback(data.recentLogs), [data.recentLogs]);
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, padding: '28px 32px 48px', fontFamily: 'system-ui, sans-serif' }}>
@@ -1071,8 +1720,18 @@ export default function PilesAutoAssignmentPage() {
         </div>
       ) : (
         <div style={{ display: 'grid', gap: 20 }}>
-          <LiveAssignmentScoreboard C={C} logs={data.recentLogs} />
-          <LogsSection C={C} logs={data.recentLogs} botAccounts={data.botAccounts} onRefresh={load} setNotice={setNotice} />
+          <RunnerControlSection
+            C={C}
+            masterAccounts={data.masterAccounts}
+            onRefresh={load}
+            onRunnerFinished={() => setRunnerHistoryRefreshToken((value) => value + 1)}
+            setNotice={setNotice}
+            runnerState={runnerState}
+            setRunnerState={setRunnerState}
+            runnerOutputFallback={runnerOutputFallback}
+          />
+          <RunnerHistorySection C={C} refreshToken={runnerHistoryRefreshToken} />
+          <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} />
           <MasterAccountsSection C={C} accounts={data.masterAccounts} onRefresh={load} setNotice={setNotice} />
           <BotAccountsSection C={C} accounts={data.botAccounts} masterAccounts={data.masterAccounts} metricsByBotId={metricsByBotId} onRefresh={load} setNotice={setNotice} />
           <BotRoleEditorSection C={C} accounts={data.botAccounts} onRefresh={load} setNotice={setNotice} />

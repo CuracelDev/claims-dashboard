@@ -1,0 +1,21 @@
+FROM mcr.microsoft.com/playwright/python:v1.54.0-jammy
+
+WORKDIR /app
+
+COPY scripts/piles-auto-assignment-requirements.txt /tmp/piles-auto-assignment-requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+  && pip install --no-cache-dir -r /tmp/piles-auto-assignment-requirements.txt
+
+COPY . /app
+
+ENV PYTHONUNBUFFERED=1
+ENV HEADLESS=true
+ENV SCREENSHOT_ON_ERROR=false
+ENV PILES_AUTO_ASSIGNMENT_SCHEDULE_MODE=all-active
+ENV PILES_AUTO_ASSIGNMENT_SCHEDULE_EXECUTE=true
+ENV PILES_AUTO_ASSIGNMENT_SCHEDULE_VISIBLE=false
+ENV PILES_AUTO_ASSIGNMENT_SCHEDULE_PORTAL_ENVIRONMENT=production
+
+RUN chmod +x /app/scripts/run-piles-auto-assignment.sh
+
+CMD ["/app/scripts/run-piles-auto-assignment.sh"]
