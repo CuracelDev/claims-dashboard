@@ -90,7 +90,7 @@ jobs:
             python3 -m venv .venv-piles-auto-assignment
             ./.venv-piles-auto-assignment/bin/python -m pip install --upgrade pip
             ./.venv-piles-auto-assignment/bin/python -m pip install -r scripts/piles-auto-assignment-requirements.txt
-            ./.venv-piles-auto-assignment/bin/python -m playwright install --with-deps chromium
+            ./.venv-piles-auto-assignment/bin/python -m playwright install --with-deps chromium chromium-headless-shell
             npm run db:piles-auto-assignment
             chmod +x scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh
             ./scripts/install-piles-auto-assignment-cron.sh
