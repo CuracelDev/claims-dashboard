@@ -75,6 +75,7 @@ jobs:
             CURACEL_PORTAL_ENVIRONMENT="${{ vars.CURACEL_PORTAL_ENVIRONMENT }}"
             PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND="${{ vars.PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND }}"
             PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python"
+            PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
             ALLOW_PRODUCTION_ASSIGNMENTS="${{ vars.ALLOW_PRODUCTION_ASSIGNMENTS }}"
             HEADLESS="${{ vars.HEADLESS }}"
             PYTHONUNBUFFERED="${{ vars.PYTHONUNBUFFERED }}"
@@ -82,6 +83,7 @@ jobs:
             PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE="${{ vars.PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE }}"
             EOF
             export PATH="$HOME/.local/bin:$PATH"
+            export PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
             sudo apt-get update
             sudo apt-get install -y python3 python3-pip python3-venv
             npm install --production
