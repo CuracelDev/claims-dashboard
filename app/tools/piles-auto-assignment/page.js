@@ -119,14 +119,29 @@ function formatProjectedFinish(row) {
   return `${minutes} mins`;
 }
 
+function formatDateTime(dateValue) {
+  if (!dateValue) return '—';
+  const parsed = new Date(dateValue);
+  if (Number.isNaN(parsed.getTime())) return '—';
+  return parsed.toLocaleString('en-GB');
+}
+
+function formatTrackedState(row) {
+  if (!row) return 'unknown';
+  if (row.completed_at || row.is_active === false) return 'completed';
+  if (row.is_stale) return 'stale';
+  return 'active';
+}
+
 function formatRunnerRunResult(run) {
   if (!run) return 'No run output yet.';
   const details = run.details || {};
+  const isRunning = run.status === 'started' && !run.finished_at;
   const lines = [
     `Run scope: ${run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}`,
     `Portal: ${run.portal_environment || 'production'}`,
     `Mode: ${run.mode === 'execute' ? 'Execute' : 'Preview'}`,
-    `Status: ${run.status || 'completed'}`,
+    `Status: ${isRunning ? 'in progress' : (run.status || 'completed')}`,
   ];
   if (Array.isArray(run.months) && run.months.length) {
     lines.push(`Month(s): ${run.months.sort(compareMonthLabels).join(', ')}`);
@@ -134,8 +149,11 @@ function formatRunnerRunResult(run) {
   if (run.year) {
     lines.push(`Year: ${run.year}`);
   }
-  if (run.finished_at || run.started_at) {
-    lines.push(`Finished: ${new Date(run.finished_at || run.started_at).toLocaleString('en-GB')}`);
+  if (run.started_at) {
+    lines.push(`Started: ${new Date(run.started_at).toLocaleString('en-GB')}`);
+  }
+  if (run.finished_at) {
+    lines.push(`Finished: ${new Date(run.finished_at).toLocaleString('en-GB')}`);
   }
   if (details?.error) {
     lines.push(`Error: ${details.error}`);
@@ -169,6 +187,26 @@ function buildRunnerOutputFallback(logs) {
     lines.push(`Result: ${totalPiles} pile(s), ${totalClaims} claim(s) in the latest plan.`);
   }
   return lines.join('\n');
+}
+
+function formatRunnerStatus(run) {
+  const isRunning = run?.status === 'started' && !run?.finished_at;
+  if (isRunning) return 'in progress';
+  return run?.status || 'completed';
+}
+
+function formatRunnerDuration(run, nowTs = Date.now()) {
+  if (!run) return '—';
+  if (run.finished_at && Number(run.duration_ms) > 0) {
+    return `${Math.max(1, Math.round(Number(run.duration_ms) / 1000))}s`;
+  }
+  if (run.status === 'started' && run.started_at) {
+    const elapsedMs = Math.max(0, nowTs - new Date(run.started_at).getTime());
+    const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
+    return `${elapsedSec}s live`;
+  }
+  if (Number(run.duration_ms) === 0) return '0s';
+  return '—';
 }
 
 function normKeyClient(value) {
@@ -445,6 +483,7 @@ function RunnerHistorySection({ C, refreshToken }) {
   const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
   const [runs, setRuns] = useState([]);
   const [error, setError] = useState('');
+  const [nowTs, setNowTs] = useState(Date.now());
 
   useEffect(() => {
     let active = true;
@@ -469,6 +508,19 @@ function RunnerHistorySection({ C, refreshToken }) {
       active = false;
     };
   }, [refreshToken]);
+
+  const hasActiveRun = useMemo(
+    () => runs.some((run) => run.status === 'started' && !run.finished_at),
+    [runs],
+  );
+
+  useEffect(() => {
+    if (!hasActiveRun) return undefined;
+    const interval = window.setInterval(() => {
+      setNowTs(Date.now());
+    }, 5000);
+    return () => window.clearInterval(interval);
+  }, [hasActiveRun]);
 
   const filteredRuns = useMemo(() => {
     const sorted = [...runs].sort((a, b) => new Date(b.finished_at || b.started_at || 0).getTime() - new Date(a.finished_at || a.started_at || 0).getTime());
@@ -518,8 +570,11 @@ function RunnerHistorySection({ C, refreshToken }) {
             const stdout = String(run.stdout || '').trim();
             const stderr = String(run.stderr || '').trim();
             const fallbackText = formatRunnerRunResult(run);
+            const isRunning = run.status === 'started' && !run.finished_at;
+            const statusText = formatRunnerStatus(run);
+            const durationText = formatRunnerDuration(run, nowTs);
             return (
-              <details key={run.id} style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
+              <details key={run.id} open={isRunning} style={{ background: C.elevated, border: `1px solid ${isRunning ? C.accent : C.border}`, boxShadow: isRunning ? `0 0 0 1px ${C.accent}33 inset` : 'none', borderRadius: 12, padding: '14px 16px' }}>
                 <summary style={{ cursor: 'pointer', listStyle: 'none' }}>
                   <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 0.9fr 0.9fr 0.8fr 1fr', gap: 12, alignItems: 'center' }}>
                     <div>
@@ -531,17 +586,22 @@ function RunnerHistorySection({ C, refreshToken }) {
                       </div>
                     </div>
                     <div style={{ color: C.text, fontSize: 13 }}>{run.mode === 'execute' ? 'Execute' : 'Preview'}</div>
-                    <div style={{ color: run.status === 'failed' ? C.danger : C.accent, fontSize: 13, fontWeight: 700 }}>{run.status}</div>
-                    <div style={{ color: C.text, fontSize: 13 }}>{Math.round((run.duration_ms || 0) / 1000)}s</div>
+                    <div style={{ color: run.status === 'failed' ? C.danger : C.accent, fontSize: 13, fontWeight: 700 }}>{statusText}</div>
+                    <div style={{ color: C.text, fontSize: 13 }}>{durationText}</div>
                     <div style={{ color: C.muted, fontSize: 12 }}>{eventTime ? new Date(eventTime).toLocaleString('en-GB') : '—'}</div>
                   </div>
                 </summary>
                 <div style={{ marginTop: 14, display: 'grid', gap: 12 }}>
+                  {isRunning && (
+                    <div style={{ background: '#14B8A61A', border: '1px solid #14B8A644', borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 12 }}>
+                      This run is still active. Duration and output will update after it finalizes.
+                    </div>
+                  )}
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 12 }}>
                     <div style={{ color: C.sub, fontSize: 12 }}>Month(s): <span style={{ color: C.text, fontWeight: 700 }}>{months}</span></div>
                     <div style={{ color: C.sub, fontSize: 12 }}>Year: <span style={{ color: C.text, fontWeight: 700 }}>{run.year || '—'}</span></div>
                     <div style={{ color: C.sub, fontSize: 12 }}>Started: <span style={{ color: C.text, fontWeight: 700 }}>{run.started_at ? new Date(run.started_at).toLocaleString('en-GB') : '—'}</span></div>
-                    <div style={{ color: C.sub, fontSize: 12 }}>Finished: <span style={{ color: C.text, fontWeight: 700 }}>{run.finished_at ? new Date(run.finished_at).toLocaleString('en-GB') : '—'}</span></div>
+                    <div style={{ color: C.sub, fontSize: 12 }}>{isRunning ? 'Elapsed' : 'Finished'}: <span style={{ color: C.text, fontWeight: 700 }}>{isRunning ? durationText : (run.finished_at ? new Date(run.finished_at).toLocaleString('en-GB') : '—')}</span></div>
                   </div>
                   <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px' }}>
                     <div style={{ color: C.sub, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Run Output</div>
@@ -1386,6 +1446,123 @@ function MetricsSection({ C, metrics, botAccounts, onRefresh, setNotice }) {
   );
 }
 
+function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
+  const [stateFilter, setStateFilter] = useState('active');
+  const [insurerFilter, setInsurerFilter] = useState('all');
+
+  const insurerOptions = useMemo(
+    () => Array.from(new Set((trackedPiles || []).map((pile) => pile.insurer_name).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [trackedPiles],
+  );
+
+  const counts = useMemo(() => {
+    const active = trackedPiles.filter((pile) => formatTrackedState(pile) === 'active').length;
+    const stale = trackedPiles.filter((pile) => formatTrackedState(pile) === 'stale').length;
+    const completed = trackedPiles.filter((pile) => formatTrackedState(pile) === 'completed').length;
+    return { active, stale, completed };
+  }, [trackedPiles]);
+
+  const filteredRows = useMemo(() => {
+    return [...trackedPiles]
+      .filter((pile) => (insurerFilter === 'all' ? true : pile.insurer_name === insurerFilter))
+      .filter((pile) => (stateFilter === 'all' ? true : formatTrackedState(pile) === stateFilter))
+      .sort((a, b) => new Date(b.updated_at || b.last_seen_at || 0).getTime() - new Date(a.updated_at || a.last_seen_at || 0).getTime());
+  }, [trackedPiles, insurerFilter, stateFilter]);
+
+  return (
+    <div style={cardStyle(C)}>
+      <SectionHeader
+        C={C}
+        icon="🛰️"
+        title="Tracked Pile Progress"
+        text="This shows only the piles the runner has actually assigned and is now watching for progress, completion, staleness, and possible reassignment."
+      />
+      <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 1fr 1fr', gap: 12, marginBottom: 14 }}>
+        <select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)} style={inputStyle(C)}>
+          <option value="active">Active tracked piles</option>
+          <option value="stale">Stale / reassignment candidates</option>
+          <option value="completed">Completed tracked piles</option>
+          <option value="all">All tracked piles</option>
+        </select>
+        <select value={insurerFilter} onChange={(e) => setInsurerFilter(e.target.value)} style={inputStyle(C)}>
+          <option value="all">All insurers</option>
+          {insurerOptions.map((insurer) => <option key={insurer} value={insurer}>{insurer}</option>)}
+        </select>
+        <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
+          Active: <span style={{ color: C.text, fontWeight: 700, margin: '0 10px 0 6px' }}>{counts.active}</span>
+          Stale: <span style={{ color: C.warn, fontWeight: 700, margin: '0 10px 0 6px' }}>{counts.stale}</span>
+          Completed: <span style={{ color: C.accent, fontWeight: 700, marginLeft: 6 }}>{counts.completed}</span>
+        </div>
+      </div>
+      {!filteredRows.length ? (
+        <EmptyState
+          C={C}
+          title="No tracked piles for this filter"
+          text="Once the runner completes real execute-mode assignments, those piles will appear here and start showing progress or stale signals over time."
+        />
+      ) : (
+        <div style={{ overflowX: 'auto', maxHeight: 430, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead style={{ position: 'sticky', top: 0, background: C.card, zIndex: 1 }}>
+              <tr>
+                {['Insurer', 'Bot Owner', 'Portal Assignee', 'Provider', 'Status', 'Claims', 'Remaining', 'Progress', 'Last Progress', 'State'].map((label) => (
+                  <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
+                    {label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filteredRows.map((row) => {
+                const bot = botAccounts.find((item) => item.id === row.bot_account_id);
+                const state = formatTrackedState(row);
+                const claimsTotal = Number(row.claims_total || 0);
+                const remainingClaims = Number(row.remaining_claims || 0);
+                const completedClaims = Math.max(0, claimsTotal - remainingClaims);
+                return (
+                  <tr key={row.id}>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>
+                      <div>{row.insurer_name}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{row.filter_month || row.claim_month || '—'}</div>
+                    </td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>{bot?.owner_name || '—'}</td>
+                    <td style={{ color: C.text, fontSize: 13, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>{row.current_assigned || bot?.bot_name || '—'}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>{row.provider || '—'}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>
+                      <div>{row.current_status_bucket || row.current_status || '—'}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{row.assignment_type || '—'}</div>
+                    </td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>{claimsTotal}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>{remainingClaims}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>
+                      <div>{completedClaims} done</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{`${completedClaims}/${claimsTotal}`}</div>
+                    </td>
+                    <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>
+                      <div>{formatDateTime(row.completed_at || row.last_progress_at || row.last_seen_at)}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>
+                        Assigned {formatDateTime(row.assigned_at)}
+                      </div>
+                    </td>
+                    <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>
+                      <div style={{ color: state === 'stale' ? C.warn : state === 'completed' ? C.accent : C.text, fontSize: 12, fontWeight: 700, textTransform: 'capitalize' }}>
+                        {state}
+                      </div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
+                        {row.stale_reason || (state === 'completed' ? 'Finished and closed from active tracking.' : 'Still being monitored by the runner.')}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LiveAssignmentScoreboard({ C, logs, botAccounts }) {
   const [scope, setScope] = useState('today');
   const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
@@ -1644,7 +1821,7 @@ export default function PilesAutoAssignmentPage() {
   const { C } = useTheme();
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState(null);
-  const [data, setData] = useState({ overview: null, masterAccounts: [], botAccounts: [], rules: [], botMetrics: [], recentLogs: [] });
+  const [data, setData] = useState({ overview: null, masterAccounts: [], botAccounts: [], rules: [], botMetrics: [], recentLogs: [], trackedPiles: [] });
   const [teamMembers, setTeamMembers] = useState([]);
   const [runnerState, setRunnerState] = useState({ runOutput: '', runMeta: null });
   const [runnerHistoryRefreshToken, setRunnerHistoryRefreshToken] = useState(0);
@@ -1666,6 +1843,7 @@ export default function PilesAutoAssignmentPage() {
         rules: json.rules || [],
         botMetrics: json.botMetrics || [],
         recentLogs: json.recentLogs || [],
+        trackedPiles: json.trackedPiles || [],
       });
       setTeamMembers(teamJson.data || []);
     } catch (error) {
@@ -1712,6 +1890,8 @@ export default function PilesAutoAssignmentPage() {
         <StatCard C={C} label="Support Rows" value={data.overview?.supportBots ?? '—'} hint="Reduced-share helpers" />
         <StatCard C={C} label="Average Claims/Hr" value={data.overview?.averageClaimsPerHour ?? '—'} hint="Across saved bot metrics" />
         <StatCard C={C} label="Active Claim Load" value={data.overview?.activeClaimLoad ?? '—'} hint="Current open claims assigned" />
+        <StatCard C={C} label="Tracked Piles" value={data.overview?.activeTrackedPiles ?? '—'} hint="Runner-managed active assignments" />
+        <StatCard C={C} label="Stale Tracked" value={data.overview?.staleTrackedPiles ?? '—'} hint="Candidates for reassignment" />
       </div>
 
       {loading ? (
@@ -1732,6 +1912,7 @@ export default function PilesAutoAssignmentPage() {
           />
           <RunnerHistorySection C={C} refreshToken={runnerHistoryRefreshToken} />
           <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} />
+          <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
           <MasterAccountsSection C={C} accounts={data.masterAccounts} onRefresh={load} setNotice={setNotice} />
           <BotAccountsSection C={C} accounts={data.botAccounts} masterAccounts={data.masterAccounts} metricsByBotId={metricsByBotId} onRefresh={load} setNotice={setNotice} />
           <BotRoleEditorSection C={C} accounts={data.botAccounts} onRefresh={load} setNotice={setNotice} />
