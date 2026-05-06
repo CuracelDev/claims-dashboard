@@ -1562,9 +1562,25 @@ class CuracelPilesRunner:
         self.browser: Browser | None = None
         self.page: Page | None = None
 
+    def _ensure_playwright_browsers(self) -> None:
+        print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
+        env = os.environ.copy()
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
+            env=env,
+            check=True,
+        )
+
     def __enter__(self) -> "CuracelPilesRunner":
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
+        try:
+            self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
+        except Exception as error:
+            message = str(error)
+            if "Executable doesn't exist" not in message:
+                raise
+            self._ensure_playwright_browsers()
+            self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
         self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
         return self
 
