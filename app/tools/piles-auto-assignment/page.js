@@ -209,6 +209,11 @@ function formatRunnerDuration(run, nowTs = Date.now()) {
   return '—';
 }
 
+function formatBackendLabel(backend) {
+  if (backend === 'remote') return 'remote worker';
+  return 'server';
+}
+
 function normKeyClient(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -464,7 +469,7 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
         <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 12, color: C.sub, fontSize: 12 }}>
           <div>Duration: <span style={{ color: C.text }}>{Math.round((runnerState.runMeta.duration_ms || 0) / 1000)}s</span></div>
           <div>Status: <span style={{ color: runnerState.runMeta.success ? C.accent : C.danger }}>{runnerState.runMeta.success ? 'Completed' : 'Failed'}</span></div>
-          <div>Backend: <span style={{ color: C.text }}>{runnerState.runMeta.backend || 'local'}</span></div>
+          <div>Backend: <span style={{ color: C.text }}>{formatBackendLabel(runnerState.runMeta.backend)}</span></div>
         </div>
       )}
       <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
@@ -582,7 +587,7 @@ function RunnerHistorySection({ C, refreshToken }) {
                         {run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}
                       </div>
                       <div style={{ color: C.sub, fontSize: 12 }}>
-                        {run.portal_environment || 'production'} portal · {run.run_source || 'manual'} · {run.backend || 'local'}
+                        {run.portal_environment || 'production'} portal · {run.run_source || 'manual'} · {formatBackendLabel(run.backend)}
                       </div>
                     </div>
                     <div style={{ color: C.text, fontSize: 13 }}>{run.mode === 'execute' ? 'Execute' : 'Preview'}</div>
