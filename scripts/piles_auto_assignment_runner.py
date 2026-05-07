@@ -2328,8 +2328,26 @@ class CuracelPilesRunner:
             claims = safe_int(texts[2] if len(texts) > 2 else "0", 0)
             month = texts[3] if len(texts) > 3 else ""
             submitted = texts[6] if len(texts) > 6 else ""
-            matched = next((p for p in current_rows if p.provider == provider and p.claims == claims and p.month == month and p.submitted_date == submitted), None)
-            if not matched or matched.key not in pile_keys:
+            matched_keys: list[str] = []
+            if idx < len(current_rows):
+                indexed_row = current_rows[idx]
+                if (
+                    indexed_row.provider == provider
+                    and indexed_row.claims == claims
+                    and indexed_row.month == month
+                    and indexed_row.submitted_date == submitted
+                ):
+                    matched_keys.append(indexed_row.key)
+            if not matched_keys:
+                matched_keys = [
+                    pile.key
+                    for pile in current_rows
+                    if pile.provider == provider
+                    and pile.claims == claims
+                    and pile.month == month
+                    and pile.submitted_date == submitted
+                ]
+            if not any(key in pile_keys for key in matched_keys):
                 continue
             try:
                 checkbox = row.locator("input[type='checkbox']").first
