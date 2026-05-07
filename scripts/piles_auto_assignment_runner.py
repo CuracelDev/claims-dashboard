@@ -198,25 +198,34 @@ def slack_post_message(
 
 
 def create_assignment_thread(
-    insurer_name: str,
+    scope_label: str,
     portal_environment: str,
     assigned_piles: int,
     assigned_claims: int,
     reassigned_piles: int,
     reassigned_claims: int,
+    insurer_names: list[str] | None = None,
 ) -> str | None:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return None
 
     total_piles = assigned_piles + reassigned_piles
     total_claims = assigned_claims + reassigned_claims
+    insurer_names = [name for name in (insurer_names or []) if norm(name)]
+    insurer_count = len({name.lower(): name for name in insurer_names})
+    insurer_summary = (
+        f"*{insurer_count} insurer(s)* touched"
+        if insurer_count
+        else "*0 insurer(s)* touched"
+    )
     header_lines = [
         f"🤖 *Piles Auto-Assignment Update*",
-        f"*{insurer_name}* on the *{portal_environment}* portal",
+        f"*{scope_label}* on the *{portal_environment}* portal",
         f"*{total_piles} pile(s)* • *{total_claims} claims* processed",
+        insurer_summary,
         f"New assignments: *{assigned_piles}* pile(s) / *{assigned_claims}* claims",
         f"Reassignments: *{reassigned_piles}* pile(s) / *{reassigned_claims}* claims",
-        "_See thread below for each pile update._",
+        "_See thread below for each owner summary._",
     ]
     blocks = [
         {
@@ -240,51 +249,105 @@ def create_assignment_thread(
         result = slack_post_message(
             SLACK_PRISM_BOT_TOKEN,
             SLACK_ALERTS_CHANNEL_ID,
-            text=f"Piles Auto-Assignment Update: {insurer_name} • {total_piles} pile(s)",
+            text=f"Piles Auto-Assignment Update: {scope_label} • {total_piles} pile(s)",
             blocks=blocks,
         )
         return str(result.get("ts") or "")
     except Exception as exc:
-        print(f"\n⚠️ Slack thread creation failed for {insurer_name}: {exc}")
+        print(f"\n⚠️ Slack thread creation failed for {scope_label}: {exc}")
         return None
 
 
-def send_assignment_reply(item: NotificationItem, insurer_name: str, thread_ts: str) -> bool:
+def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts: str) -> bool:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID and thread_ts):
         return False
+    if not owner_items:
+        return False
 
-    is_reassignment = item.kind == "reassignment"
-    owner_mention = slack_mention(item.owner_slack_user_id, item.owner_name or item.actual_assignee_name)
-    if is_reassignment:
-        previous_mention = slack_mention(item.previous_owner_slack_user_id, item.previous_owner_name or item.previous_assignee_name)
-        title = f"♻️ *Pile reassigned* — {previous_mention} → {owner_mention}"
-    else:
-        title = f"🆕 *New pile assigned* — {owner_mention}"
+    owner_name = owner_items[0].owner_name or owner_items[0].actual_assignee_name or "Team"
+    owner_slack_user_id = owner_items[0].owner_slack_user_id
+    owner_mention = slack_mention(owner_slack_user_id, owner_name)
 
-    line_two = (
-        f"*Bot:* {item.bot_name or item.actual_assignee_name}  •  "
-        f"*Claims:* {item.plan.claims}  •  *Month:* {item.plan.claim_month or item.plan.filter_month}"
-    )
-    line_three = (
-        f"*Provider:* {item.plan.provider or 'Unknown'}\n"
-        f"*Submitted:* {item.plan.submitted_date or 'Unknown'}  •  *Status:* {item.plan.status_bucket}"
-    )
-    if is_reassignment:
-        line_four = (
-            f"*Remaining claims moved:* {max(item.plan.remaining_claims, 0)}"
-            f"{f'  •  *Previous assignee:* {item.previous_assignee_name}' if item.previous_assignee_name else ''}"
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in owner_items:
+        insurer_name = item.plan.insurer_name or "Unknown insurer"
+        insurer_group = grouped.setdefault(
+            insurer_name,
+            {
+                "assigned_piles": 0,
+                "assigned_claims": 0,
+                "reassigned_piles": 0,
+                "reassigned_claims": 0,
+                "bots": set(),
+                "months": set(),
+                "providers": set(),
+                "statuses": set(),
+                "previous_owners": set(),
+            },
         )
-    else:
-        line_four = (
-            f"*Tracking key:* `{item.plan.tracking_key}`"
-        )
+        insurer_group["bots"].add(item.bot_name or item.actual_assignee_name)
+        insurer_group["months"].add(item.plan.claim_month or item.plan.filter_month or "Unknown")
+        if norm(item.plan.provider):
+            insurer_group["providers"].add(item.plan.provider)
+        if norm(item.plan.status_bucket):
+            insurer_group["statuses"].add(item.plan.status_bucket)
+        if item.kind == "reassignment":
+            insurer_group["reassigned_piles"] += 1
+            insurer_group["reassigned_claims"] += item.plan.claims
+            if norm(item.previous_owner_name):
+                insurer_group["previous_owners"].add(item.previous_owner_name)
+        else:
+            insurer_group["assigned_piles"] += 1
+            insurer_group["assigned_claims"] += item.plan.claims
+
+    total_assigned_piles = sum(group["assigned_piles"] for group in grouped.values())
+    total_assigned_claims = sum(group["assigned_claims"] for group in grouped.values())
+    total_reassigned_piles = sum(group["reassigned_piles"] for group in grouped.values())
+    total_reassigned_claims = sum(group["reassigned_claims"] for group in grouped.values())
+
+    header_lines = [
+        f"👤 *{owner_mention}*",
+        f"New assignments: *{total_assigned_piles}* pile(s) / *{total_assigned_claims}* claims",
+        f"Reassignments: *{total_reassigned_piles}* pile(s) / *{total_reassigned_claims}* claims",
+    ]
+
+    detail_lines: list[str] = []
+    for insurer_name in sorted(grouped.keys()):
+        group = grouped[insurer_name]
+        insurer_bits = [
+            f"• *{insurer_name}*",
+            f"{group['assigned_piles']} new pile(s) / {group['assigned_claims']} claims",
+        ]
+        if group["reassigned_piles"]:
+            insurer_bits.append(
+                f"{group['reassigned_piles']} reassigned pile(s) / {group['reassigned_claims']} claims"
+            )
+        detail_lines.append("  " + " • ".join(insurer_bits))
+
+        meta_parts = []
+        if group["bots"]:
+            meta_parts.append("Bot(s): " + ", ".join(sorted(group["bots"])))
+        if group["months"]:
+            meta_parts.append("Month(s): " + ", ".join(sorted(group["months"])))
+        if group["statuses"]:
+            meta_parts.append("Status: " + ", ".join(sorted(group["statuses"])))
+        if group["providers"]:
+            provider_preview = sorted(group["providers"])
+            shown = ", ".join(provider_preview[:3])
+            if len(provider_preview) > 3:
+                shown += f" +{len(provider_preview) - 3} more"
+            meta_parts.append("Providers: " + shown)
+        if group["previous_owners"]:
+            meta_parts.append("Moved from: " + ", ".join(sorted(group["previous_owners"])))
+        if meta_parts:
+            detail_lines.append("    " + "  •  ".join(meta_parts))
 
     blocks = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"{title}\n{line_two}\n{line_three}\n{line_four}",
+                "text": "\n".join(header_lines + [""] + detail_lines),
             },
         }
     ]
@@ -292,13 +355,16 @@ def send_assignment_reply(item: NotificationItem, insurer_name: str, thread_ts: 
         slack_post_message(
             SLACK_PRISM_BOT_TOKEN,
             SLACK_ALERTS_CHANNEL_ID,
-            text=f"{insurer_name}: {'Pile reassigned' if is_reassignment else 'New pile assigned'} to {item.owner_name or item.actual_assignee_name}",
+            text=(
+                f"Piles Auto-Assignment owner summary: {owner_name} • "
+                f"{total_assigned_piles + total_reassigned_piles} pile(s)"
+            ),
             blocks=blocks,
             thread_ts=thread_ts,
         )
         return True
     except Exception as exc:
-        print(f"   ⚠️ Slack reply failed for {insurer_name} / {item.plan.provider}: {exc}")
+        print(f"   ⚠️ Slack owner summary failed for {owner_name}: {exc}")
         return False
 
 
@@ -527,6 +593,27 @@ class NotificationItem:
     previous_owner_name: str = ""
     previous_owner_slack_user_id: str = ""
     previous_assignee_name: str = ""
+
+
+def group_notification_items_by_owner(items: list[NotificationItem]) -> list[list[NotificationItem]]:
+    grouped: dict[str, list[NotificationItem]] = {}
+    for item in items:
+        owner_key = (
+            norm(item.owner_slack_user_id).lower()
+            or norm(item.owner_name).lower()
+            or norm(item.actual_assignee_name).lower()
+            or "unassigned"
+        )
+        grouped.setdefault(owner_key, []).append(item)
+
+    ordered_groups = sorted(
+        grouped.values(),
+        key=lambda owner_items: (
+            (owner_items[0].owner_name or owner_items[0].actual_assignee_name or "").lower(),
+            owner_items[0].owner_slack_user_id.lower(),
+        ),
+    )
+    return ordered_groups
 
 
 class DataStore:
@@ -3567,22 +3654,6 @@ def run_for_insurer(
                 previous_assignee_name=previous_bot.portal_name if previous_bot else "",
             ))
 
-    if args.execute and notification_items:
-        assigned_items = [item for item in notification_items if item.kind == "assignment"]
-        reassigned_items = [item for item in notification_items if item.kind == "reassignment"]
-        slack_thread_ts = create_assignment_thread(
-            insurer_name=insurer_name,
-            portal_environment=PORTAL_ENVIRONMENT,
-            assigned_piles=len(assigned_items),
-            assigned_claims=sum(item.plan.claims for item in assigned_items),
-            reassigned_piles=len(reassigned_items),
-            reassigned_claims=sum(item.plan.claims for item in reassigned_items),
-        ) or ""
-        if slack_thread_ts:
-            for notification in notification_items:
-                if send_assignment_reply(notification, insurer_name, slack_thread_ts):
-                    slack_replies_sent += 1
-
     finished_at = datetime.now(timezone.utc).isoformat()
     total_planned = len(reassignment_plans) + len(plans)
     total_claims = sum(plan.claims for plan in reassignment_plans) + sum(plan.claims for plan in plans)
@@ -3668,6 +3739,7 @@ def run_for_insurer(
         "portal_option_names": portal_option_names,
         "resolved_name_map": resolved_name_map,
         "portal_mapping_warnings": portal_mapping_warnings,
+        "notification_items": notification_items,
     }
 
 
@@ -3687,6 +3759,9 @@ def main() -> None:
     failures: list[tuple[str, str]] = []
     final_error: Exception | None = None
     args: argparse.Namespace | None = None
+    all_notification_items: list[NotificationItem] = []
+    slack_thread_ts = ""
+    slack_replies_sent = 0
     try:
         args = parse_args()
         configure_portal_environment(args.portal_environment)
@@ -3730,7 +3805,8 @@ def main() -> None:
             if args.all_active:
                 print(f"\n\n===== Running insurer {index}/{len(insurers)}: {insurer_name} =====")
             try:
-                run_for_insurer(store, args, insurer_name, month_labels, year_label, visible)
+                insurer_result = run_for_insurer(store, args, insurer_name, month_labels, year_label, visible)
+                all_notification_items.extend(insurer_result.get("notification_items", []))
             except Exception as exc:
                 failures.append((insurer_name, str(exc)))
                 store.log_runner_event(
@@ -3748,6 +3824,24 @@ def main() -> None:
                 if not args.all_active:
                     raise
 
+        if args and args.execute and all_notification_items:
+            assigned_items = [item for item in all_notification_items if item.kind == "assignment"]
+            reassigned_items = [item for item in all_notification_items if item.kind == "reassignment"]
+            scope_label = args.insurer or "All active insurers"
+            slack_thread_ts = create_assignment_thread(
+                scope_label=scope_label,
+                portal_environment=PORTAL_ENVIRONMENT,
+                assigned_piles=len(assigned_items),
+                assigned_claims=sum(item.plan.claims for item in assigned_items),
+                reassigned_piles=len(reassigned_items),
+                reassigned_claims=sum(item.plan.claims for item in reassigned_items),
+                insurer_names=[item.plan.insurer_name for item in all_notification_items],
+            ) or ""
+            if slack_thread_ts:
+                for owner_items in group_notification_items_by_owner(all_notification_items):
+                    if send_assignment_owner_reply(owner_items, slack_thread_ts):
+                        slack_replies_sent += 1
+
         if failures:
             raise RuntimeError(
                 "One or more insurers failed: "
@@ -3764,6 +3858,9 @@ def main() -> None:
                 "insurers": insurers,
                 "failure_count": len(failures),
                 "failures": [{"insurer_name": insurer, "error": error} for insurer, error in failures],
+                "slack_thread_ts": slack_thread_ts or None,
+                "slack_replies_sent": slack_replies_sent,
+                "slack_notification_owner_count": len(group_notification_items_by_owner(all_notification_items)),
             }
             if final_error:
                 final_details["error"] = str(final_error)
