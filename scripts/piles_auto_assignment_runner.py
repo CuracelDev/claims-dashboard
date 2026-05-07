@@ -1703,9 +1703,40 @@ class CuracelPilesRunner:
                 except Exception:
                     pass
 
+    def _goto_with_soft_readiness(self, url: str, timeout_ms: int = 45000) -> None:
+        assert self.page
+        self.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            # Some production pages keep background requests open; that should not block the runner.
+            pass
+
+    def _wait_for_piles_page_ready(self, timeout_ms: int = 20000) -> None:
+        assert self.page
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            try:
+                if "/hmo/piles" not in self.page.url:
+                    time.sleep(0.25)
+                    continue
+
+                visible_selects = self._visible_selects()
+                has_table = self.page.locator("table").count() > 0
+                has_no_data = self.page.locator("text=No data found").count() > 0
+                has_filter_button = (
+                    self.page.locator("button:has-text('Filters'), button:has-text('Filter')").count() > 0
+                )
+                if visible_selects or has_table or has_no_data or has_filter_button:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.4)
+        raise RuntimeError("Piles page loaded too slowly; the filter controls/table never became ready.")
+
     def login(self, username: str, password: str) -> None:
         assert self.page
-        self.page.goto(CURACEL_BASE_URL, wait_until="networkidle")
+        self._goto_with_soft_readiness(CURACEL_BASE_URL)
         self.page.locator('input[name="loginId"]').fill(username)
         self.page.locator('input[name="password"]').fill(password)
         self.page.locator('input[type="Submit"]').click()
@@ -1749,8 +1780,9 @@ class CuracelPilesRunner:
 
     def open_piles(self) -> None:
         assert self.page
-        self.page.goto(f"{CURACEL_BASE_URL}/hmo/piles", wait_until="networkidle")
-        time.sleep(2)
+        self._goto_with_soft_readiness(f"{CURACEL_BASE_URL}/hmo/piles")
+        self._wait_for_piles_page_ready()
+        time.sleep(1)
         self._dismiss_popup()
 
     def _visible_selects(self) -> list[Any]:
