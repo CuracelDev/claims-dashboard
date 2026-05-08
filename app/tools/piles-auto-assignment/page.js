@@ -111,6 +111,20 @@ function sameDay(dateA, dateB) {
   );
 }
 
+function buildActivityRange(scope, selectedDay) {
+  if (scope === 'all') return null;
+  const baseDate = scope === 'today'
+    ? new Date()
+    : scope === 'yesterday'
+      ? new Date(Date.now() - (24 * 60 * 60 * 1000))
+      : new Date(selectedDay);
+  if (Number.isNaN(baseDate.getTime())) return null;
+  const start = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { from: start.toISOString(), to: end.toISOString() };
+}
+
 function formatProjectedFinish(row) {
   const explicitMinutes = Number(row?.projected_finish_minutes);
   const minutes = Number.isFinite(explicitMinutes)
@@ -1568,12 +1582,45 @@ function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
   );
 }
 
-function LiveAssignmentScoreboard({ C, logs, botAccounts }) {
+function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
   const [scope, setScope] = useState('today');
   const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
+  const [activityLogs, setActivityLogs] = useState(logs || []);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadActivityLogs() {
+      setLoading(true);
+      setLoadError('');
+      try {
+        const params = new URLSearchParams();
+        const range = buildActivityRange(scope, selectedDay);
+        if (range?.from) params.set('from', range.from);
+        if (range?.to) params.set('to', range.to);
+        params.set('limit', scope === 'all' ? '1000' : '500');
+        const res = await fetch(`/api/tools/piles-auto-assignment/assignment-logs?${params.toString()}`, { cache: 'no-store' });
+        const json = await res.json();
+        if (!res.ok || !json.success) throw new Error(json.error || 'Failed to load assignment activity.');
+        if (!cancelled) setActivityLogs(json.items || []);
+      } catch (error) {
+        if (!cancelled) {
+          setLoadError(error.message || 'Failed to load assignment activity.');
+          setActivityLogs([]);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    loadActivityLogs();
+    return () => {
+      cancelled = true;
+    };
+  }, [scope, selectedDay, refreshToken]);
 
   const flattenedRows = useMemo(() => {
-    return logs
+    return activityLogs
       .filter((log) => {
         const summary = log?.details?.summary;
         const noWork = Boolean(log?.details?.no_work);
@@ -1643,18 +1690,9 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts }) {
         });
       })
       .sort((a, b) => new Date(b.event_time || 0).getTime() - new Date(a.event_time || 0).getTime());
-  }, [logs, botAccounts]);
+  }, [activityLogs, botAccounts]);
 
-  const filteredRows = useMemo(() => {
-    if (scope === 'all') return flattenedRows;
-    const baseDate = scope === 'today'
-      ? new Date()
-      : scope === 'yesterday'
-        ? new Date(Date.now() - (24 * 60 * 60 * 1000))
-        : new Date(selectedDay);
-
-    return flattenedRows.filter((row) => sameDay(new Date(row.event_time), baseDate));
-  }, [flattenedRows, scope, selectedDay]);
+  const filteredRows = flattenedRows;
 
   const latestVisibleTimeLabel = filteredRows[0]?.time_label || 'Assigned At';
   const latestVisibleSource = filteredRows[0]
@@ -1680,15 +1718,24 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts }) {
           <input type="date" value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)} style={inputStyle(C)} />
         ) : (
           <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
-            {scope === 'all' ? 'Showing all recorded assignment snapshots.' : 'Showing the latest assignment snapshots for the selected day.'}
+            {loading
+              ? 'Loading assignment history...'
+              : scope === 'all'
+                ? 'Showing stored assignment history across all recorded time.'
+                : 'Showing stored assignment history for the selected day.'}
           </div>
         )}
       </div>
+      {loadError && (
+        <div style={{ background: '#FF5A6F15', border: '1px solid #FF5A6F44', borderRadius: 10, padding: '10px 12px', color: C.danger, fontSize: 12, marginBottom: 14 }}>
+          {loadError}
+        </div>
+      )}
       {!filteredRows.length ? (
         <EmptyState
           C={C}
           title="No assignment snapshots for this filter"
-          text="Run a dry mode or live assignment cycle for this day, or switch the filter to another day or all time."
+          text="No stored assignment history matched this filter. If that is unexpected, the logs may exist outside the previous recent slice and should now appear once fetched for that day."
         />
       ) : (
         <div style={{ overflowX: 'auto', maxHeight: 430, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
@@ -1916,7 +1963,7 @@ export default function PilesAutoAssignmentPage() {
             runnerOutputFallback={runnerOutputFallback}
           />
           <RunnerHistorySection C={C} refreshToken={runnerHistoryRefreshToken} />
-          <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} />
+          <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={refreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
           <MasterAccountsSection C={C} accounts={data.masterAccounts} onRefresh={load} setNotice={setNotice} />
           <BotAccountsSection C={C} accounts={data.botAccounts} masterAccounts={data.masterAccounts} metricsByBotId={metricsByBotId} onRefresh={load} setNotice={setNotice} />
