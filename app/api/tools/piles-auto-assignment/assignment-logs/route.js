@@ -13,14 +13,19 @@ export async function GET(request) {
     const supabase = getSupabase();
     const { searchParams } = new URL(request.url);
     const insurer = searchParams.get('insurer');
+    const from = searchParams.get('from');
+    const to = searchParams.get('to');
+    const limit = Math.min(toInt(searchParams.get('limit'), 250), 1000);
 
     let query = supabase
       .from('piles_auto_assignment_logs')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(50);
+      .limit(limit);
 
     if (insurer) query = query.eq('insurer_name', insurer);
+    if (from) query = query.gte('created_at', from);
+    if (to) query = query.lt('created_at', to);
 
     const { data, error } = await query;
     if (error) throw error;
