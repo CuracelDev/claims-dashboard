@@ -1712,7 +1712,7 @@ class CuracelPilesRunner:
             # Some production pages keep background requests open; that should not block the runner.
             pass
 
-    def _wait_for_piles_page_ready(self, timeout_ms: int = 20000) -> None:
+    def _wait_for_piles_page_ready(self, timeout_ms: int = 30000) -> None:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
@@ -1721,13 +1721,26 @@ class CuracelPilesRunner:
                     time.sleep(0.25)
                     continue
 
+                try:
+                    self._dismiss_popup()
+                except Exception:
+                    pass
+
                 visible_selects = self._visible_selects()
+                any_select = self.page.locator(".p-select.p-component, [role='combobox']").count() > 0
                 has_table = self.page.locator("table").count() > 0
                 has_no_data = self.page.locator("text=No data found").count() > 0
                 has_filter_button = (
                     self.page.locator("button:has-text('Filters'), button:has-text('Filter')").count() > 0
                 )
-                if visible_selects or has_table or has_no_data or has_filter_button:
+                has_filter_labels = (
+                    self.page.locator("text=Filter by Vetting Status, text=Select Month, text=Month, text=Year").count() > 0
+                )
+                ready_state = self.page.evaluate("document.readyState")
+
+                if visible_selects or any_select or has_table or has_no_data or has_filter_button or has_filter_labels:
+                    return
+                if ready_state == "complete":
                     return
             except Exception:
                 pass
