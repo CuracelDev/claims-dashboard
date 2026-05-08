@@ -19,13 +19,15 @@ export async function GET(request) {
 
     let query = supabase
       .from('piles_auto_assignment_logs')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(limit);
+      .select('*');
 
     if (insurer) query = query.eq('insurer_name', insurer);
     if (from) query = query.gte('created_at', from);
     if (to) query = query.lt('created_at', to);
+
+    query = query
+      .order('created_at', { ascending: false })
+      .limit(limit);
 
     const { data, error } = await query;
     if (error) throw error;

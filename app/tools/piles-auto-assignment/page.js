@@ -1963,7 +1963,7 @@ export default function PilesAutoAssignmentPage() {
             runnerOutputFallback={runnerOutputFallback}
           />
           <RunnerHistorySection C={C} refreshToken={runnerHistoryRefreshToken} />
-          <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={refreshToken} />
+          <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={runnerHistoryRefreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
           <MasterAccountsSection C={C} accounts={data.masterAccounts} onRefresh={load} setNotice={setNotice} />
           <BotAccountsSection C={C} accounts={data.botAccounts} masterAccounts={data.masterAccounts} metricsByBotId={metricsByBotId} onRefresh={load} setNotice={setNotice} />
