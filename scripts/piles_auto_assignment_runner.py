@@ -1793,10 +1793,21 @@ class CuracelPilesRunner:
 
     def open_piles(self) -> None:
         assert self.page
-        self._goto_with_soft_readiness(f"{CURACEL_BASE_URL}/hmo/piles")
-        self._wait_for_piles_page_ready()
-        time.sleep(1)
-        self._dismiss_popup()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                self._goto_with_soft_readiness(f"{CURACEL_BASE_URL}/hmo/piles")
+                self._wait_for_piles_page_ready()
+                time.sleep(1)
+                self._dismiss_popup()
+                return
+            except Exception as error:
+                last_error = error
+                if attempt == 0:
+                    print("  Piles page was slow to get ready. Retrying the page open once...")
+                    time.sleep(2)
+                    continue
+                raise last_error
 
     def _visible_selects(self) -> list[Any]:
         assert self.page
@@ -2728,8 +2739,24 @@ class CuracelPilesRunner:
 
     def discover_portal_assignees(self, month_label: str, year_label: str, sample_pile: PileRow) -> list[PortalAssignee]:
         active_month = sample_pile.filter_month or month_label
-        current_rows = self.reset_to_filtered_page(active_month, year_label, sample_pile.status_bucket, sample_pile.page_number)
-        selected = self._select_rows([sample_pile.key], current_rows)
+        selected = 0
+        current_rows: list[PileRow] = []
+        for attempt in range(3):
+            current_rows = self.reset_to_filtered_page(active_month, year_label, sample_pile.status_bucket, sample_pile.page_number)
+            candidate_keys = [sample_pile.key]
+            candidate_keys.extend([
+                row.key for row in current_rows[:6]
+                if row.key not in candidate_keys
+            ])
+            for candidate_key in candidate_keys:
+                selected = self._select_rows([candidate_key], current_rows)
+                if selected:
+                    break
+            if selected:
+                break
+            if attempt < 2:
+                print("  Sample row could not be selected on the first try. Refreshing the filtered page and retrying...")
+                time.sleep(1)
         if not selected:
             raise RuntimeError("Could not select a sample pile row to inspect the portal assignee dropdown.")
         self._open_assign_modal()
