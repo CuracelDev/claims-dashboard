@@ -164,6 +164,38 @@ CREATE INDEX IF NOT EXISTS piles_auto_assignment_pile_snapshots_tracked_idx
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_pile_snapshots_bot_idx
   ON piles_auto_assignment_pile_snapshots (bot_account_id, observed_at DESC);
 
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_external_assignments (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  master_account_id text REFERENCES piles_auto_assignment_master_accounts(id) ON DELETE SET NULL,
+  bot_account_id text REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE SET NULL,
+  insurer_name text NOT NULL,
+  tracking_key text NOT NULL,
+  last_pile_key text,
+  provider text,
+  claim_month text,
+  submitted_date text,
+  claims_total integer DEFAULT 0,
+  synced_claims integer DEFAULT 0,
+  remaining_claims integer DEFAULT 0,
+  assignment_type text DEFAULT 'Vetting',
+  current_status text,
+  current_status_bucket text,
+  current_assigned text,
+  owner_name text,
+  first_detected_at timestamptz DEFAULT now(),
+  last_seen_at timestamptz DEFAULT now(),
+  notification_sent_at timestamptz,
+  cleared_at timestamptz,
+  is_active boolean DEFAULT true,
+  details jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE (insurer_name, tracking_key)
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_external_assignments_insurer_active_idx
+  ON piles_auto_assignment_external_assignments (insurer_name, is_active, last_seen_at DESC);
+
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_runner_runs (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
   insurer_name text,
