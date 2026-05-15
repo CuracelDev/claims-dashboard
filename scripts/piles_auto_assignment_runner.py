@@ -23,10 +23,12 @@ import traceback
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import requests
@@ -38,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / ".env.local")
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(ROOT / ".playwright-browsers"))
+RUNNER_TIMEZONE = ZoneInfo((os.getenv("PILES_ASSIGNMENT_TIMEZONE") or "Africa/Lagos").strip() or "Africa/Lagos")
 
 TARGET_STATUSES = [
     "Vetting Pending",
@@ -187,6 +190,29 @@ def parse_iso_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def parse_clock_minutes(value: Any) -> int | None:
+    text = norm(value)
+    if not text:
+        return None
+    match = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if not match:
+        return None
+    hour = safe_int(match.group(1), -1)
+    minute = safe_int(match.group(2), -1)
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return (hour * 60) + minute
+
+
+def format_clock_label(value: Any) -> str:
+    minutes = parse_clock_minutes(value)
+    if minutes is None:
+        return norm(value) or "—"
+    hour = minutes // 60
+    minute = minutes % 60
+    return f"{hour:02d}:{minute:02d}"
 
 
 def parse_month_labels(raw_value: str | None) -> list[str]:
@@ -569,6 +595,9 @@ class BotAccount:
     support_capacity_ratio: float
     availability_status: str
     availability_note: str
+    active_from_time: str
+    active_to_time: str
+    shift_grace_minutes: int
     is_active: bool
     is_available: bool
     current_claim_load: int
@@ -944,6 +973,9 @@ class DataStore:
                 support_capacity_ratio=float(row.get("support_capacity_ratio") or 1),
                 availability_status=norm(row.get("availability_status") or "available").lower(),
                 availability_note=norm(row.get("availability_note")),
+                active_from_time=norm(row.get("active_from_time") or "09:00"),
+                active_to_time=norm(row.get("active_to_time")),
+                shift_grace_minutes=safe_int(row.get("shift_grace_minutes"), 120),
                 is_active=bool(row.get("is_active", True)),
                 is_available=bool(row.get("is_available", True)),
                 current_claim_load=safe_int(row.get("current_claim_load"), 0),
@@ -3262,18 +3294,64 @@ def match_bot_to_portal_name(bots: list[BotAccount], portal_name: str) -> BotAcc
     return scored[0][2]
 
 
+def shift_reassignment_hold(bot: BotAccount, now_utc: datetime) -> tuple[bool, str]:
+    start_minutes = parse_clock_minutes(bot.active_from_time)
+    if start_minutes is None:
+        return False, ""
+
+    grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
+    local_now = now_utc.astimezone(RUNNER_TIMEZONE)
+    now_minutes = (local_now.hour * 60) + local_now.minute
+    end_minutes = parse_clock_minutes(bot.active_to_time)
+    crosses_midnight = end_minutes is not None and end_minutes <= start_minutes
+
+    if crosses_midnight and end_minutes is not None and now_minutes < end_minutes:
+        shift_start_local = (local_now - timedelta(days=1)).replace(
+            hour=start_minutes // 60,
+            minute=start_minutes % 60,
+            second=0,
+            microsecond=0,
+        )
+    else:
+        shift_start_local = local_now.replace(
+            hour=start_minutes // 60,
+            minute=start_minutes % 60,
+            second=0,
+            microsecond=0,
+        )
+
+    grace_ends_local = shift_start_local + timedelta(minutes=grace_minutes)
+    if local_now < grace_ends_local:
+        return True, (
+            f"{bot.owner_name or bot.portal_name} is within shift grace until "
+            f"{grace_ends_local.strftime('%H:%M')} {RUNNER_TIMEZONE.key} "
+            f"(starts {format_clock_label(bot.active_from_time)}, grace {grace_minutes} mins)."
+        )
+    return False, ""
+
+
+def is_shift_ready_for_reassignment(bot: BotAccount, now_utc: datetime) -> bool:
+    hold, _ = shift_reassignment_hold(bot, now_utc)
+    return not hold
+
+
 def choose_best_bot_for_pile(
     pile_claims: int,
     bots: list[BotAccount],
     metrics: dict[str, BotMetric],
     exclude_bot_ids: set[str] | None = None,
+    require_shift_ready: bool = False,
+    now_utc: datetime | None = None,
 ) -> BotAccount | None:
     exclude_bot_ids = exclude_bot_ids or set()
+    now_utc = now_utc or datetime.now(timezone.utc)
     eligible: list[tuple[float, float, int, int, BotAccount]] = []
     for bot in bots:
         if bot.id in exclude_bot_ids:
             continue
         if not bot.is_active or not bot.is_available or bot.availability_status not in {"available", ""}:
+            continue
+        if require_shift_ready and not is_shift_ready_for_reassignment(bot, now_utc):
             continue
         metric = metrics.get(bot.id)
         observed_speed = metric.claims_per_hour if metric and metric.claims_per_hour > 0 else 0
@@ -3337,6 +3415,7 @@ def reconcile_tracked_assignments(
             row_map[row.tracking_key] = row
 
     now = datetime.now(timezone.utc)
+    bots_by_id = {bot.id: bot for bot in bots}
     stale_candidates: list[tuple[TrackedPile, PileRow, BotAccount]] = []
     completed_count = 0
     refreshed_tracked: list[TrackedPile] = []
@@ -3345,6 +3424,7 @@ def reconcile_tracked_assignments(
         previous_completed = max(tracked_pile.synced_claims, tracked_pile.claims_total - tracked_pile.remaining_claims)
         matched_bot = match_bot_to_portal_name(bots, observed.assigned if observed else tracked_pile.current_assigned) if (observed or tracked_pile.current_assigned) else None
         active_bot_id = matched_bot.id if matched_bot else tracked_pile.bot_account_id
+        current_assignee_bot = matched_bot or bots_by_id.get(tracked_pile.bot_account_id)
         progress_claims = 0
         completed = False
         stale_reason = None
@@ -3361,7 +3441,14 @@ def reconcile_tracked_assignments(
                 and observed.remaining_claims >= rule.stale_claim_threshold
                 and idle_minutes >= rule.reassignment_threshold_minutes
             ):
-                stale_reason = f"No meaningful progress for {idle_minutes} mins with {observed.remaining_claims} claims still open."
+                hold_reassignment = False
+                hold_reason = ""
+                if current_assignee_bot is not None:
+                    hold_reassignment, hold_reason = shift_reassignment_hold(current_assignee_bot, now)
+                if hold_reassignment:
+                    stale_reason = None
+                else:
+                    stale_reason = f"No meaningful progress for {idle_minutes} mins with {observed.remaining_claims} claims still open."
         else:
             progress_claims = max(tracked_pile.remaining_claims, 0)
             completed = True
@@ -3479,6 +3566,7 @@ def build_stale_reassignment_plans(
     if not stale_candidates or not rule or rule.distribution_mode != "balanced_finish":
         return [], {}
 
+    now_utc = datetime.now(timezone.utc)
     plans: list[PlannedAssignment] = []
     summary: dict[str, dict[str, Any]] = {}
     for tracked_pile, observed_row, current_bot in stale_candidates:
@@ -3487,7 +3575,18 @@ def build_stale_reassignment_plans(
             bots,
             metrics,
             exclude_bot_ids={current_bot.id},
+            require_shift_ready=True,
+            now_utc=now_utc,
         )
+        if target is None:
+            target = choose_best_bot_for_pile(
+                max(observed_row.remaining_claims, 1),
+                bots,
+                metrics,
+                exclude_bot_ids={current_bot.id},
+                require_shift_ready=False,
+                now_utc=now_utc,
+            )
         if target is None:
             continue
 

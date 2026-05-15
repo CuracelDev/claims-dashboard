@@ -20,6 +20,20 @@ function toNum(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function toClock(value) {
+  if (value === undefined) return undefined;
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const match = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number.parseInt(match[1], 10);
+  const minute = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
 export async function GET() {
   try {
     const supabase = getSupabase();
@@ -54,6 +68,9 @@ export async function POST(request) {
       support_capacity_ratio: toNum(body.support_capacity_ratio, 1),
       availability_status: body.availability_status?.trim() || 'available',
       availability_note: body.availability_note?.trim() || null,
+      active_from_time: toClock(body.active_from_time ?? '09:00'),
+      active_to_time: toClock(body.active_to_time),
+      shift_grace_minutes: toInt(body.shift_grace_minutes, 120),
       notes: body.notes?.trim() || null,
       is_active: toBool(body.is_active, true),
       is_available: toBool(body.is_available, true),
@@ -98,6 +115,9 @@ export async function PATCH(request) {
     if (body.is_active !== undefined) updates.is_active = toBool(body.is_active, true);
     if (body.is_available !== undefined) updates.is_available = toBool(body.is_available, true);
     if (body.support_capacity_ratio !== undefined) updates.support_capacity_ratio = toNum(body.support_capacity_ratio, 1);
+    if (body.active_from_time !== undefined) updates.active_from_time = toClock(body.active_from_time || '09:00');
+    if (body.active_to_time !== undefined) updates.active_to_time = toClock(body.active_to_time);
+    if (body.shift_grace_minutes !== undefined) updates.shift_grace_minutes = toInt(body.shift_grace_minutes, 120);
     if (body.priority_order !== undefined) updates.priority_order = toInt(body.priority_order, 100);
     if (body.current_claim_load !== undefined) updates.current_claim_load = toInt(body.current_claim_load, 0);
     if (body.last_assigned_at !== undefined) updates.last_assigned_at = body.last_assigned_at || null;
