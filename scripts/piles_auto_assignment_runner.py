@@ -408,6 +408,66 @@ def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts
         return False
 
 
+def send_external_assignment_alert(
+    items: list["ExternalNotificationItem"],
+    portal_environment: str,
+    run_source: str,
+) -> bool:
+    if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
+        return False
+    if not items:
+        return False
+
+    insurer_count = len({norm(item.insurer_name).lower() for item in items if norm(item.insurer_name)})
+    header_lines = [
+        "⚠️ *Externally Assigned Piles Detected*",
+        f"*{len(items)} pile(s)* were already assigned when scanned on the *{portal_environment}* portal.",
+        f"Detected during a *{run_source or 'manual'}* run across *{insurer_count} insurer(s)*.",
+        "_These piles were not assigned by the runner, so they are being logged separately for review._",
+        "",
+    ]
+    detail_lines: list[str] = []
+    for item in items:
+        owner_text = slack_mention(item.owner_slack_user_id, item.owner_name) if norm(item.owner_name) else "Unmapped owner"
+        line = (
+            f"• *{item.insurer_name}* — {owner_text} — *{item.current_assigned or 'Unknown assignee'}* — "
+            f"{item.claims} claims"
+        )
+        meta_parts = []
+        if norm(item.provider):
+            meta_parts.append(f"Provider: {item.provider}")
+        if norm(item.claim_month):
+            meta_parts.append(f"Month: {item.claim_month}")
+        if norm(item.status_bucket):
+            meta_parts.append(f"Status: {item.status_bucket}")
+        if item.remaining_claims > 0:
+            meta_parts.append(f"Remaining: {item.remaining_claims}")
+        detail_lines.append(line)
+        if meta_parts:
+            detail_lines.append("  " + " • ".join(meta_parts))
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "\n".join(header_lines + detail_lines),
+            },
+        }
+    ]
+    try:
+        slack_post_message(
+            SLACK_PRISM_BOT_TOKEN,
+            SLACK_ALERTS_CHANNEL_ID,
+            text=f"Externally assigned piles detected: {len(items)} pile(s)",
+            blocks=blocks,
+        )
+        return True
+    except Exception as exc:
+        print(f"\n⚠️ Slack external-assignment alert failed: {exc}")
+        return False
+
+
 def insurer_env_key(insurer_name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", norm(insurer_name).upper()).strip("_")
 
@@ -623,6 +683,33 @@ class TrackedPile:
 
 
 @dataclass
+class ExternalAssignment:
+    id: str
+    master_account_id: str
+    bot_account_id: str
+    insurer_name: str
+    tracking_key: str
+    last_pile_key: str
+    provider: str
+    claim_month: str
+    submitted_date: str
+    claims_total: int
+    synced_claims: int
+    remaining_claims: int
+    assignment_type: str
+    current_status: str
+    current_status_bucket: str
+    current_assigned: str
+    owner_name: str
+    first_detected_at: str
+    last_seen_at: str
+    notification_sent_at: str
+    cleared_at: str
+    is_active: bool
+    details: dict[str, Any]
+
+
+@dataclass
 class NotificationItem:
     kind: str
     plan: PlannedAssignment
@@ -633,6 +720,19 @@ class NotificationItem:
     previous_owner_name: str = ""
     previous_owner_slack_user_id: str = ""
     previous_assignee_name: str = ""
+
+
+@dataclass
+class ExternalNotificationItem:
+    insurer_name: str
+    provider: str
+    claims: int
+    remaining_claims: int
+    claim_month: str
+    status_bucket: str
+    current_assigned: str
+    owner_name: str
+    owner_slack_user_id: str
 
 
 def group_notification_items_by_owner(items: list[NotificationItem]) -> list[list[NotificationItem]]:
@@ -950,6 +1050,23 @@ class DataStore:
                 order="assigned_at.asc",
             )
         return self._rows_to_tracked_piles(rows)
+
+    def get_all_tracked_tracking_keys(self, insurer_name: str) -> set[str]:
+        if self.mode == "postgres":
+            rows = self._fetchall_postgres(
+                """
+                select tracking_key
+                from piles_auto_assignment_tracked_piles
+                where lower(insurer_name) = lower(%s)
+                """,
+                (insurer_name,),
+            )
+        else:
+            rows = self._fetchall_supabase(
+                "piles_auto_assignment_tracked_piles",
+                filters=[("insurer_name", "eq", insurer_name)],
+            )
+        return {norm(row.get("tracking_key")) for row in rows if norm(row.get("tracking_key"))}
 
     def _rows_to_tracked_piles(self, rows: list[dict[str, Any]]) -> list[TrackedPile]:
         tracked: list[TrackedPile] = []
@@ -1297,6 +1414,231 @@ class DataStore:
             )
         else:
             self._insert_supabase("piles_auto_assignment_pile_snapshots", payload)
+
+    def _rows_to_external_assignments(self, rows: list[dict[str, Any]]) -> list[ExternalAssignment]:
+        assignments: list[ExternalAssignment] = []
+        for row in rows:
+            details = row.get("details") or {}
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except Exception:
+                    details = {}
+            assignments.append(ExternalAssignment(
+                id=str(row["id"]),
+                master_account_id=norm(row.get("master_account_id")),
+                bot_account_id=norm(row.get("bot_account_id")),
+                insurer_name=norm(row.get("insurer_name")),
+                tracking_key=norm(row.get("tracking_key")),
+                last_pile_key=norm(row.get("last_pile_key")),
+                provider=norm(row.get("provider")),
+                claim_month=norm(row.get("claim_month")),
+                submitted_date=norm(row.get("submitted_date")),
+                claims_total=safe_int(row.get("claims_total"), 0),
+                synced_claims=safe_int(row.get("synced_claims"), 0),
+                remaining_claims=safe_int(row.get("remaining_claims"), 0),
+                assignment_type=norm(row.get("assignment_type") or "Vetting"),
+                current_status=norm(row.get("current_status")),
+                current_status_bucket=norm(row.get("current_status_bucket")),
+                current_assigned=norm(row.get("current_assigned")),
+                owner_name=norm(row.get("owner_name")),
+                first_detected_at=norm(row.get("first_detected_at")),
+                last_seen_at=norm(row.get("last_seen_at")),
+                notification_sent_at=norm(row.get("notification_sent_at")),
+                cleared_at=norm(row.get("cleared_at")),
+                is_active=bool(row.get("is_active", True)),
+                details=details if isinstance(details, dict) else {},
+            ))
+        return assignments
+
+    def save_external_assignment(
+        self,
+        master_account_id: str,
+        insurer_name: str,
+        row: PileRow,
+        matched_bot: BotAccount | None = None,
+    ) -> tuple[ExternalAssignment, bool]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if self.mode == "postgres":
+            rows = self._fetchall_postgres(
+                """
+                select *
+                from piles_auto_assignment_external_assignments
+                where lower(insurer_name) = lower(%s)
+                  and tracking_key = %s
+                limit 1
+                """,
+                (insurer_name, row.tracking_key),
+            )
+        else:
+            rows = self._fetchall_supabase(
+                "piles_auto_assignment_external_assignments",
+                filters=[("insurer_name", "eq", insurer_name), ("tracking_key", "eq", row.tracking_key)],
+            )
+        existing = self._rows_to_external_assignments(rows)[0] if rows else None
+        details = {
+            "source": "runner_detected_external_assignment",
+            "assigned_name": row.assigned,
+            "status_bucket": row.status_bucket,
+            "owner_name": matched_bot.owner_name if matched_bot else "",
+        }
+        payload = {
+            "master_account_id": master_account_id or None,
+            "bot_account_id": matched_bot.id if matched_bot else None,
+            "insurer_name": insurer_name,
+            "tracking_key": row.tracking_key,
+            "last_pile_key": row.key,
+            "provider": row.provider,
+            "claim_month": row.month,
+            "submitted_date": row.submitted_date,
+            "claims_total": row.claims,
+            "synced_claims": row.synced_claims,
+            "remaining_claims": row.remaining_claims,
+            "assignment_type": row.assignment_type,
+            "current_status": row.status,
+            "current_status_bucket": row.status_bucket,
+            "current_assigned": row.assigned,
+            "owner_name": matched_bot.owner_name if matched_bot else "",
+            "last_seen_at": now_iso,
+            "notification_sent_at": existing.notification_sent_at if existing else now_iso,
+            "cleared_at": None,
+            "is_active": True,
+            "details": details,
+            "updated_at": now_iso,
+        }
+        if existing:
+            if self.mode == "postgres":
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_external_assignments
+                    set master_account_id = %s,
+                        bot_account_id = %s,
+                        last_pile_key = %s,
+                        provider = %s,
+                        claim_month = %s,
+                        submitted_date = %s,
+                        claims_total = %s,
+                        synced_claims = %s,
+                        remaining_claims = %s,
+                        assignment_type = %s,
+                        current_status = %s,
+                        current_status_bucket = %s,
+                        current_assigned = %s,
+                        owner_name = %s,
+                        last_seen_at = %s,
+                        cleared_at = null,
+                        is_active = true,
+                        details = %s::jsonb,
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (
+                        payload["master_account_id"],
+                        payload["bot_account_id"],
+                        payload["last_pile_key"],
+                        payload["provider"],
+                        payload["claim_month"],
+                        payload["submitted_date"],
+                        payload["claims_total"],
+                        payload["synced_claims"],
+                        payload["remaining_claims"],
+                        payload["assignment_type"],
+                        payload["current_status"],
+                        payload["current_status_bucket"],
+                        payload["current_assigned"],
+                        payload["owner_name"],
+                        payload["last_seen_at"],
+                        json.dumps(payload["details"]),
+                        existing.id,
+                    ),
+                )
+            else:
+                self._update_supabase("piles_auto_assignment_external_assignments", "id", existing.id, payload)
+            tracked_id = existing.id
+            is_new = False
+        else:
+            record_id = str(uuid.uuid4())
+            payload = {
+                "id": record_id,
+                **payload,
+                "first_detected_at": now_iso,
+            }
+            if self.mode == "postgres":
+                self._execute_postgres(
+                    """
+                    insert into piles_auto_assignment_external_assignments
+                    (id, master_account_id, bot_account_id, insurer_name, tracking_key, last_pile_key, provider, claim_month, submitted_date, claims_total, synced_claims, remaining_claims, assignment_type, current_status, current_status_bucket, current_assigned, owner_name, first_detected_at, last_seen_at, notification_sent_at, cleared_at, is_active, details)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        payload["id"], payload["master_account_id"], payload["bot_account_id"], payload["insurer_name"],
+                        payload["tracking_key"], payload["last_pile_key"], payload["provider"], payload["claim_month"],
+                        payload["submitted_date"], payload["claims_total"], payload["synced_claims"], payload["remaining_claims"],
+                        payload["assignment_type"], payload["current_status"], payload["current_status_bucket"], payload["current_assigned"],
+                        payload["owner_name"], payload["first_detected_at"], payload["last_seen_at"], payload["notification_sent_at"],
+                        payload["cleared_at"], payload["is_active"], json.dumps(payload["details"]),
+                    ),
+                )
+            else:
+                self._insert_supabase("piles_auto_assignment_external_assignments", payload)
+            tracked_id = record_id
+            is_new = True
+
+        if self.mode == "postgres":
+            final_rows = self._fetchall_postgres(
+                "select * from piles_auto_assignment_external_assignments where id = %s limit 1",
+                (tracked_id,),
+            )
+        else:
+            final_rows = self._fetchall_supabase(
+                "piles_auto_assignment_external_assignments",
+                filters=[("id", "eq", tracked_id)],
+            )
+        return self._rows_to_external_assignments(final_rows)[0], is_new
+
+    def sync_external_assignments_for_insurer(self, insurer_name: str, active_tracking_keys: set[str]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if self.mode == "postgres":
+            rows = self._fetchall_postgres(
+                """
+                select id, tracking_key
+                from piles_auto_assignment_external_assignments
+                where lower(insurer_name) = lower(%s)
+                  and coalesce(is_active, true) = true
+                """,
+                (insurer_name,),
+            )
+        else:
+            rows = self._fetchall_supabase(
+                "piles_auto_assignment_external_assignments",
+                filters=[("insurer_name", "eq", insurer_name), ("is_active", "eq", "true")],
+            )
+        for row in rows:
+            tracking_key = norm(row.get("tracking_key"))
+            if tracking_key in active_tracking_keys:
+                continue
+            if self.mode == "postgres":
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_external_assignments
+                    set is_active = false,
+                        cleared_at = coalesce(cleared_at, %s),
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (now_iso, row["id"]),
+                )
+            else:
+                self._update_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    "id",
+                    str(row["id"]),
+                    {
+                        "is_active": False,
+                        "cleared_at": now_iso,
+                        "updated_at": now_iso,
+                    },
+                )
 
     def refresh_bot_metrics_from_tracking(
         self,
@@ -3056,6 +3398,77 @@ def reconcile_tracked_assignments(
     }
 
 
+def detect_external_assignments(
+    store: DataStore,
+    master_account_id: str,
+    insurer_name: str,
+    rows: list[PileRow],
+    bots: list[BotAccount],
+    tracked_keys: set[str],
+    team_slack_map: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    assigned_rows_by_tracking: dict[str, PileRow] = {}
+    for row in rows:
+        if not norm(row.assigned):
+            continue
+        if norm(row.tracking_key) in tracked_keys:
+            continue
+        existing = assigned_rows_by_tracking.get(row.tracking_key)
+        if existing is None or (not norm(existing.assigned) and norm(row.assigned)):
+            assigned_rows_by_tracking[row.tracking_key] = row
+
+    notifications: list[ExternalNotificationItem] = []
+    active_tracking_keys = set(assigned_rows_by_tracking.keys())
+    new_detection_count = 0
+
+    for row in assigned_rows_by_tracking.values():
+        matched_bot = match_bot_to_portal_name(bots, row.assigned) if bots else None
+        record, is_new = store.save_external_assignment(master_account_id, insurer_name, row, matched_bot)
+        if not is_new:
+            continue
+        new_detection_count += 1
+        owner_info = team_slack_map.get(norm(matched_bot.owner_name).lower(), {}) if matched_bot else {}
+        notifications.append(ExternalNotificationItem(
+            insurer_name=insurer_name,
+            provider=row.provider,
+            claims=row.claims,
+            remaining_claims=row.remaining_claims,
+            claim_month=row.month or row.filter_month,
+            status_bucket=row.status_bucket,
+            current_assigned=row.assigned,
+            owner_name=matched_bot.owner_name if matched_bot else record.owner_name,
+            owner_slack_user_id=norm(owner_info.get("slack_user_id")),
+        ))
+        store.log_runner_event(
+            insurer_name=insurer_name,
+            event_type="external_assignment_detected",
+            status="detected",
+            pile_count=1,
+            claim_count=row.claims,
+            details={
+                "tracking_key": row.tracking_key,
+                "pile_key": row.key,
+                "provider": row.provider,
+                "claim_month": row.month,
+                "submitted_date": row.submitted_date,
+                "claims_total": row.claims,
+                "remaining_claims": row.remaining_claims,
+                "status_bucket": row.status_bucket,
+                "current_assigned": row.assigned,
+                "owner_name": matched_bot.owner_name if matched_bot else "",
+                "bot_name": matched_bot.bot_name if matched_bot else "",
+                "bot_account_id": matched_bot.id if matched_bot else None,
+            },
+        )
+
+    store.sync_external_assignments_for_insurer(insurer_name, active_tracking_keys)
+    return {
+        "active_count": len(active_tracking_keys),
+        "new_detection_count": new_detection_count,
+        "notifications": notifications,
+    }
+
+
 def build_stale_reassignment_plans(
     insurer_name: str,
     stale_candidates: list[tuple[TrackedPile, PileRow, BotAccount]],
@@ -3447,7 +3860,7 @@ def run_for_insurer(
     resolved_name_map: dict[str, str] = {}
     resolved_bots = bots[:]
     portal_mapping_warnings: list[str] = []
-    team_slack_map = store.get_team_slack_map() if args.execute else {}
+    team_slack_map = store.get_team_slack_map()
     tracked_reconcile = {
         "tracked_count": 0,
         "completed_count": 0,
@@ -3456,6 +3869,11 @@ def run_for_insurer(
         "stale_candidates": [],
         "metrics": metrics,
         "tracked": [],
+    }
+    external_detection = {
+        "active_count": 0,
+        "new_detection_count": 0,
+        "notifications": [],
     }
     reassignment_plans: list[PlannedAssignment] = []
     reassignment_summary: dict[str, dict[str, Any]] = {}
@@ -3603,7 +4021,34 @@ def run_for_insurer(
                         metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
 
         print("\nScanning pages...")
-        unassigned = runner.scan_all_unassigned(month_labels, year_label)
+        scanned_rows = runner.scan_all_rows(month_labels, year_label)
+        tracked_keys = store.get_all_tracked_tracking_keys(insurer_name)
+        external_detection = detect_external_assignments(
+            store,
+            master.id,
+            insurer_name,
+            scanned_rows,
+            bots,
+            tracked_keys,
+            team_slack_map,
+        )
+        if external_detection["new_detection_count"]:
+            print("\nDetected externally assigned piles the runner is not tracking:")
+            for item in external_detection["notifications"]:
+                owner_label = item.owner_name or "Unmapped owner"
+                print(
+                    f"  - {item.insurer_name}: {item.current_assigned or 'Unknown assignee'} "
+                    f"({owner_label}) • {item.claims} claims • {item.status_bucket or 'Unknown status'}"
+                )
+        unassigned = []
+        seen_unassigned = set()
+        for row in scanned_rows:
+            if norm(row.assigned):
+                continue
+            if row.key in seen_unassigned:
+                continue
+            seen_unassigned.add(row.key)
+            unassigned.append(row)
         print(f"\nTotal unassigned piles found: {len(unassigned)}")
         if not unassigned and not reassignment_plans:
             print("No unassigned piles found. Nothing to assign.")
@@ -3624,6 +4069,10 @@ def run_for_insurer(
                     "completed_count": tracked_reconcile["completed_count"],
                     "stale_count": tracked_reconcile["stale_count"],
                     "active_count": tracked_reconcile["active_count"],
+                },
+                "external_detection": {
+                    "active_count": external_detection["active_count"],
+                    "new_detection_count": external_detection["new_detection_count"],
                 },
                 "no_work": True,
                 "message": "No unassigned piles found. Nothing to assign.",
@@ -3659,6 +4108,7 @@ def run_for_insurer(
                 "portal_option_names": [],
                 "resolved_name_map": {},
                 "portal_mapping_warnings": [],
+                "external_notification_items": external_detection["notifications"],
             }
 
         plans: list[PlannedAssignment] = []
@@ -3700,6 +4150,10 @@ def run_for_insurer(
                 "completed_count": tracked_reconcile["completed_count"],
                 "stale_count": tracked_reconcile["stale_count"],
                 "active_count": tracked_reconcile["active_count"],
+            },
+            "external_detection": {
+                "active_count": external_detection["active_count"],
+                "new_detection_count": external_detection["new_detection_count"],
             },
             "reassignment_summary": reassignment_summary,
             "summary": summary,
@@ -3843,16 +4297,20 @@ def run_for_insurer(
             "finished_at": finished_at,
             "fallback_pool_used": fallback_pool_used,
             "months": month_labels,
-            "tracked_reconcile": {
-                "tracked_count": tracked_reconcile["tracked_count"],
-                "completed_count": tracked_reconcile["completed_count"],
-                "stale_count": tracked_reconcile["stale_count"],
-                "active_count": tracked_reconcile["active_count"],
-            },
-            "slack_thread_ts": slack_thread_ts or None,
-            "slack_replies_sent": slack_replies_sent,
-            "reassignment_results": reassignment_results,
-            "reassignment_summary": reassignment_summary,
+                "tracked_reconcile": {
+                    "tracked_count": tracked_reconcile["tracked_count"],
+                    "completed_count": tracked_reconcile["completed_count"],
+                    "stale_count": tracked_reconcile["stale_count"],
+                    "active_count": tracked_reconcile["active_count"],
+                },
+                "external_detection": {
+                    "active_count": external_detection["active_count"],
+                    "new_detection_count": external_detection["new_detection_count"],
+                },
+                "slack_thread_ts": slack_thread_ts or None,
+                "slack_replies_sent": slack_replies_sent,
+                "reassignment_results": reassignment_results,
+                "reassignment_summary": reassignment_summary,
             "results": results,
             "summary": summary,
             "portal_option_names": portal_option_names,
@@ -3904,6 +4362,7 @@ def run_for_insurer(
         "resolved_name_map": resolved_name_map,
         "portal_mapping_warnings": portal_mapping_warnings,
         "notification_items": notification_items,
+        "external_notification_items": external_detection["notifications"],
     }
 
 
@@ -3924,6 +4383,7 @@ def main() -> None:
     final_error: Exception | None = None
     args: argparse.Namespace | None = None
     all_notification_items: list[NotificationItem] = []
+    all_external_notification_items: list[ExternalNotificationItem] = []
     slack_thread_ts = ""
     slack_replies_sent = 0
     try:
@@ -3971,6 +4431,7 @@ def main() -> None:
             try:
                 insurer_result = run_for_insurer(store, args, insurer_name, month_labels, year_label, visible)
                 all_notification_items.extend(insurer_result.get("notification_items", []))
+                all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
             except Exception as exc:
                 failures.append((insurer_name, str(exc)))
                 store.log_runner_event(
@@ -3987,6 +4448,13 @@ def main() -> None:
                 print(f"\nERROR for {insurer_name}: {exc}")
                 if not args.all_active:
                     raise
+
+        if args and all_external_notification_items:
+            send_external_assignment_alert(
+                all_external_notification_items,
+                portal_environment=PORTAL_ENVIRONMENT,
+                run_source=norm(args.run_source) or "manual",
+            )
 
         if args and args.execute and all_notification_items:
             assigned_items = [item for item in all_notification_items if item.kind == "assignment"]
@@ -4025,6 +4493,7 @@ def main() -> None:
                 "slack_thread_ts": slack_thread_ts or None,
                 "slack_replies_sent": slack_replies_sent,
                 "slack_notification_owner_count": len(group_notification_items_by_owner(all_notification_items)),
+                "external_assignment_alert_count": len(all_external_notification_items),
             }
             if final_error:
                 final_details["error"] = str(final_error)
