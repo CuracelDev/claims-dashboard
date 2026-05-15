@@ -113,7 +113,7 @@ const TABLE_COLUMNS = {
   piles_auto_assignment_bot_accounts: [
     ['id', 'text'], ['master_account_id', 'text'], ['insurer_name', 'text'], ['owner_name', 'text'],
     ['bot_name', 'text'], ['bot_email', 'text'], ['bot_password', 'text'], ['assignment_role', 'text'],
-    ['support_capacity_ratio', 'numeric'], ['availability_status', 'text'], ['availability_note', 'text'], ['notes', 'text'],
+    ['support_capacity_ratio', 'numeric'], ['availability_status', 'text'], ['availability_note', 'text'], ['active_from_time', 'text'], ['active_to_time', 'text'], ['shift_grace_minutes', 'integer'], ['notes', 'text'],
     ['is_active', 'boolean'], ['is_available', 'boolean'], ['priority_order', 'integer'],
     ['current_claim_load', 'integer'], ['last_assigned_at', 'timestamptz'], ['last_completed_at', 'timestamptz'],
     ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
@@ -372,6 +372,9 @@ const CREATE_TABLE_SQL = {
       support_capacity_ratio numeric DEFAULT 1,
       availability_status text DEFAULT 'available',
       availability_note text,
+      active_from_time text DEFAULT '09:00',
+      active_to_time text,
+      shift_grace_minutes integer DEFAULT 120,
       notes text,
       is_active boolean DEFAULT true,
       is_available boolean DEFAULT true,

@@ -47,7 +47,7 @@ const TABLES = [
   },
   {
     name: 'piles_auto_assignment_bot_accounts',
-    columns: ['id', 'master_account_id', 'insurer_name', 'owner_name', 'bot_name', 'bot_email', 'bot_password', 'assignment_role', 'support_capacity_ratio', 'availability_status', 'availability_note', 'notes', 'is_active', 'is_available', 'priority_order', 'current_claim_load', 'last_assigned_at', 'last_completed_at', 'created_at', 'updated_at'],
+    columns: ['id', 'master_account_id', 'insurer_name', 'owner_name', 'bot_name', 'bot_email', 'bot_password', 'assignment_role', 'support_capacity_ratio', 'availability_status', 'availability_note', 'active_from_time', 'active_to_time', 'shift_grace_minutes', 'notes', 'is_active', 'is_available', 'priority_order', 'current_claim_load', 'last_assigned_at', 'last_completed_at', 'created_at', 'updated_at'],
   },
   {
     name: 'piles_auto_assignment_rules',

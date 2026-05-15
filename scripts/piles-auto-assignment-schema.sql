@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_bot_accounts (
   support_capacity_ratio numeric DEFAULT 1,
   availability_status text DEFAULT 'available',
   availability_note text,
+  active_from_time text DEFAULT '09:00',
+  active_to_time text,
+  shift_grace_minutes integer DEFAULT 120,
   notes text,
   is_active boolean DEFAULT true,
   is_available boolean DEFAULT true,
@@ -50,6 +53,22 @@ ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
 
 ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
   ADD COLUMN IF NOT EXISTS availability_note text;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
+  ADD COLUMN IF NOT EXISTS active_from_time text;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
+  ADD COLUMN IF NOT EXISTS active_to_time text;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
+  ADD COLUMN IF NOT EXISTS shift_grace_minutes integer DEFAULT 120;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
+  ALTER COLUMN active_from_time SET DEFAULT '09:00';
+
+UPDATE piles_auto_assignment_bot_accounts
+SET active_from_time = '09:00'
+WHERE active_from_time IS NULL OR btrim(active_from_time) = '';
 
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_rules (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
