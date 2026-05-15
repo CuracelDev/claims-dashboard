@@ -232,13 +232,25 @@ function normKeyClient(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+function canonicalInsurerKeyClient(value) {
+  const label = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (label === 'uapom' || label === 'old mutual') return 'old mutual';
+  return label;
+}
+
+function displayInsurerName(value) {
+  if (!String(value || '').trim()) return '—';
+  if (canonicalInsurerKeyClient(value) === 'old mutual') return 'OLD MUTUAL';
+  return String(value || '').trim();
+}
+
 function ownerDisplayRank(name) {
   const index = OWNER_DISPLAY_ORDER.indexOf(String(name || '').trim());
   return index === -1 ? OWNER_DISPLAY_ORDER.length + 1 : index;
 }
 
 function compareBotRows(a, b) {
-  const insurerCompare = String(a?.insurer_name || '').localeCompare(String(b?.insurer_name || ''));
+  const insurerCompare = displayInsurerName(a?.insurer_name).localeCompare(displayInsurerName(b?.insurer_name));
   if (insurerCompare !== 0) return insurerCompare;
   const ownerRank = ownerDisplayRank(a?.owner_name) - ownerDisplayRank(b?.owner_name);
   if (ownerRank !== 0) return ownerRank;
@@ -1397,26 +1409,36 @@ function MetricsSection({ C, metrics, botAccounts, onRefresh, setNotice }) {
   const [selectedInsurer, setSelectedInsurer] = useState('');
   const [draft, setDraft] = useState({ bot_account_id: '', claims_completed: 0, hours_logged: 0, claims_per_hour: 0, active_claim_load: 0 });
 
-  const insurers = useMemo(() => Array.from(new Set(botAccounts.map((account) => account.insurer_name).filter(Boolean))).sort((a, b) => a.localeCompare(b)), [botAccounts]);
+  const insurers = useMemo(() => {
+    const deduped = new Map();
+    botAccounts.forEach((account) => {
+      if (!account?.insurer_name) return;
+      const key = canonicalInsurerKeyClient(account.insurer_name);
+      if (!deduped.has(key)) deduped.set(key, displayInsurerName(account.insurer_name));
+    });
+    return [...deduped.entries()]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([value, label]) => ({ value, label }));
+  }, [botAccounts]);
 
   useEffect(() => {
     if (!selectedInsurer && insurers.length) {
-      setSelectedInsurer(insurers[0]);
-    } else if (selectedInsurer && !insurers.includes(selectedInsurer)) {
-      setSelectedInsurer(insurers[0] || '');
+      setSelectedInsurer(insurers[0].value);
+    } else if (selectedInsurer && !insurers.some((insurer) => insurer.value === selectedInsurer)) {
+      setSelectedInsurer(insurers[0]?.value || '');
     }
   }, [insurers, selectedInsurer]);
 
   const filteredMetrics = useMemo(() => {
     return metrics.filter((metric) => {
       const bot = botAccounts.find((item) => item.id === metric.bot_account_id);
-      return selectedInsurer ? bot?.insurer_name === selectedInsurer : true;
+      return selectedInsurer ? canonicalInsurerKeyClient(bot?.insurer_name) === selectedInsurer : true;
     });
   }, [metrics, botAccounts, selectedInsurer]);
 
   const filteredBots = useMemo(() => {
-    return botAccounts
-      .filter((account) => selectedInsurer ? account.insurer_name === selectedInsurer : true)
+      return botAccounts
+      .filter((account) => selectedInsurer ? canonicalInsurerKeyClient(account.insurer_name) === selectedInsurer : true)
       .sort(compareBotRows);
   }, [botAccounts, selectedInsurer]);
 
@@ -1449,16 +1471,16 @@ function MetricsSection({ C, metrics, botAccounts, onRefresh, setNotice }) {
       <SectionHeader C={C} icon="📈" title="Bot Speed Metrics" text="These rows drive proration and completion balancing. View one insurer at a time so it is easier to compare who is moving faster inside that pool." />
       <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 12, marginBottom: 12 }}>
         <select value={selectedInsurer} onChange={(e) => setSelectedInsurer(e.target.value)} style={inputStyle(C)}>
-          {insurers.map((insurer) => <option key={insurer} value={insurer}>{insurer}</option>)}
+          {insurers.map((insurer) => <option key={insurer.value} value={insurer.value}>{insurer.label}</option>)}
         </select>
         <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
-          {selectedInsurer ? `Showing speed and completion rows for ${selectedInsurer}.` : 'Add bot rows first to view insurer metrics.'}
+          {selectedInsurer ? `Showing speed and completion rows for ${displayInsurerName(selectedInsurer)}.` : 'Add bot rows first to view insurer metrics.'}
         </div>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1.2fr repeat(4, 1fr) 0.9fr', gap: 12, marginBottom: 18 }}>
         <select value={draft.bot_account_id} onChange={(e) => setDraft((prev) => ({ ...prev, bot_account_id: e.target.value }))} style={inputStyle(C)}>
           <option value="">Select bot</option>
-          {filteredBots.map((account) => <option key={account.id} value={account.id}>{account.insurer_name} · {account.owner_name}</option>)}
+          {filteredBots.map((account) => <option key={account.id} value={account.id}>{displayInsurerName(account.insurer_name)} · {account.owner_name}</option>)}
         </select>
         <input type="number" value={draft.claims_completed} onChange={(e) => setDraft((prev) => ({ ...prev, claims_completed: e.target.value }))} placeholder="Claims completed" style={inputStyle(C)} />
         <input type="number" value={draft.hours_logged} onChange={(e) => setDraft((prev) => ({ ...prev, hours_logged: e.target.value }))} placeholder="Hours logged" style={inputStyle(C)} />
@@ -1479,7 +1501,7 @@ function MetricsSection({ C, metrics, botAccounts, onRefresh, setNotice }) {
                 const bot = botAccounts.find((item) => item.id === metric.bot_account_id);
                 return (
                   <tr key={metric.id}>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{bot ? `${bot.insurer_name} · ${bot.owner_name}` : metric.bot_account_id}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{bot ? `${displayInsurerName(bot.insurer_name)} · ${bot.owner_name}` : metric.bot_account_id}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric.claims_completed}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric.hours_logged}</td>
                     <td style={{ color: C.accent, fontSize: 13, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric.claims_per_hour}</td>
@@ -1500,10 +1522,17 @@ function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
   const [stateFilter, setStateFilter] = useState('active');
   const [insurerFilter, setInsurerFilter] = useState('all');
 
-  const insurerOptions = useMemo(
-    () => Array.from(new Set((trackedPiles || []).map((pile) => pile.insurer_name).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
-    [trackedPiles],
-  );
+  const insurerOptions = useMemo(() => {
+    const deduped = new Map();
+    (trackedPiles || []).forEach((pile) => {
+      if (!pile?.insurer_name) return;
+      const key = canonicalInsurerKeyClient(pile.insurer_name);
+      if (!deduped.has(key)) deduped.set(key, displayInsurerName(pile.insurer_name));
+    });
+    return [...deduped.entries()]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([value, label]) => ({ value, label }));
+  }, [trackedPiles]);
 
   const counts = useMemo(() => {
     const active = trackedPiles.filter((pile) => formatTrackedState(pile) === 'active').length;
@@ -1514,7 +1543,7 @@ function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
 
   const filteredRows = useMemo(() => {
     return [...trackedPiles]
-      .filter((pile) => (insurerFilter === 'all' ? true : pile.insurer_name === insurerFilter))
+      .filter((pile) => (insurerFilter === 'all' ? true : canonicalInsurerKeyClient(pile.insurer_name) === insurerFilter))
       .filter((pile) => (stateFilter === 'all' ? true : formatTrackedState(pile) === stateFilter))
       .sort((a, b) => new Date(b.updated_at || b.last_seen_at || 0).getTime() - new Date(a.updated_at || a.last_seen_at || 0).getTime());
   }, [trackedPiles, insurerFilter, stateFilter]);
@@ -1536,7 +1565,7 @@ function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
         </select>
         <select value={insurerFilter} onChange={(e) => setInsurerFilter(e.target.value)} style={inputStyle(C)}>
           <option value="all">All insurers</option>
-          {insurerOptions.map((insurer) => <option key={insurer} value={insurer}>{insurer}</option>)}
+          {insurerOptions.map((insurer) => <option key={insurer.value} value={insurer.value}>{insurer.label}</option>)}
         </select>
         <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
           Active: <span style={{ color: C.text, fontWeight: 700, margin: '0 10px 0 6px' }}>{counts.active}</span>
@@ -1564,7 +1593,11 @@ function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
             </thead>
             <tbody>
               {filteredRows.map((row) => {
-                const bot = botAccounts.find((item) => item.id === row.bot_account_id);
+                const bot = botAccounts.find((item) => item.id === row.bot_account_id)
+                  || botAccounts.find((item) => (
+                    canonicalInsurerKeyClient(item.insurer_name) === canonicalInsurerKeyClient(row.insurer_name)
+                    && normKeyClient(item.bot_name) === normKeyClient(row.current_assigned)
+                  ));
                 const state = formatTrackedState(row);
                 const claimsTotal = Number(row.claims_total || 0);
                 const remainingClaims = Number(row.remaining_claims || 0);
@@ -1572,7 +1605,7 @@ function TrackedPileProgressSection({ C, trackedPiles, botAccounts }) {
                 return (
                   <tr key={row.id}>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>
-                      <div>{row.insurer_name}</div>
+                      <div>{displayInsurerName(row.insurer_name)}</div>
                       <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{row.filter_month || row.claim_month || '—'}</div>
                     </td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'top' }}>{bot?.owner_name || '—'}</td>
@@ -1694,7 +1727,7 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
           const resolvedInsurer = row.insurer_name || insurerName;
           const assigneeKey = normKeyClient(row.assignee_name);
           const matchedBot = botAccounts.find((bot) => (
-            bot.insurer_name === resolvedInsurer
+            canonicalInsurerKeyClient(bot.insurer_name) === canonicalInsurerKeyClient(resolvedInsurer)
             && (
               normKeyClient(bot.bot_name) === assigneeKey
               || normKeyClient(bot.owner_name) === assigneeKey
@@ -1727,7 +1760,7 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
 
   const latestVisibleTimeLabel = filteredRows[0]?.time_label || 'Assigned At';
   const latestVisibleSource = filteredRows[0]
-    ? `${filteredRows[0].event_type} for ${filteredRows[0].insurer_name} at ${new Date(filteredRows[0].event_time).toLocaleString('en-GB')}`
+    ? `${filteredRows[0].event_type} for ${displayInsurerName(filteredRows[0].insurer_name)} at ${new Date(filteredRows[0].event_time).toLocaleString('en-GB')}`
     : null;
 
   return (
@@ -1783,7 +1816,7 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
             <tbody>
               {filteredRows.map((row) => (
                   <tr key={row.id}>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.insurer_name}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{displayInsurerName(row.insurer_name)}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.owner_name}</td>
                     <td style={{ color: C.text, fontSize: 13, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assignee_name}</td>
                     <td style={{ color: row.assignment_role === '—' ? C.sub : row.assignment_role === 'support' ? C.warn : C.accent, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.assignment_role}</td>
@@ -1810,14 +1843,21 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
   const [stateFilter, setStateFilter] = useState('active');
   const [insurerFilter, setInsurerFilter] = useState('all');
 
-  const insurerOptions = useMemo(
-    () => Array.from(new Set((externalAssignments || []).map((item) => item.insurer_name).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
-    [externalAssignments],
-  );
+  const insurerOptions = useMemo(() => {
+    const deduped = new Map();
+    (externalAssignments || []).forEach((item) => {
+      if (!item?.insurer_name) return;
+      const key = canonicalInsurerKeyClient(item.insurer_name);
+      if (!deduped.has(key)) deduped.set(key, displayInsurerName(item.insurer_name));
+    });
+    return [...deduped.entries()]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([value, label]) => ({ value, label }));
+  }, [externalAssignments]);
 
   const rows = useMemo(() => {
     return [...(externalAssignments || [])]
-      .filter((item) => (insurerFilter === 'all' ? true : item.insurer_name === insurerFilter))
+      .filter((item) => (insurerFilter === 'all' ? true : canonicalInsurerKeyClient(item.insurer_name) === insurerFilter))
       .filter((item) => (stateFilter === 'all' ? true : stateFilter === 'active' ? item.is_active : !item.is_active))
       .sort((a, b) => new Date(b.last_seen_at || b.first_detected_at || 0).getTime() - new Date(a.last_seen_at || a.first_detected_at || 0).getTime());
   }, [externalAssignments, insurerFilter, stateFilter]);
@@ -1838,7 +1878,7 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
         </select>
         <select value={insurerFilter} onChange={(e) => setInsurerFilter(e.target.value)} style={inputStyle(C)}>
           <option value="all">All insurers</option>
-          {insurerOptions.map((insurer) => <option key={insurer} value={insurer}>{insurer}</option>)}
+          {insurerOptions.map((insurer) => <option key={insurer.value} value={insurer.value}>{insurer.label}</option>)}
         </select>
         <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
           Showing {rows.length} stored external-assignment detection{rows.length === 1 ? '' : 's'}.
@@ -1866,7 +1906,7 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
               {rows.map((item) => {
                 const matchedBot = botAccounts.find((bot) => bot.id === item.bot_account_id)
                   || botAccounts.find((bot) => (
-                    bot.insurer_name === item.insurer_name
+                    canonicalInsurerKeyClient(bot.insurer_name) === canonicalInsurerKeyClient(item.insurer_name)
                     && normKeyClient(bot.bot_name) === normKeyClient(item.current_assigned)
                   ));
                 const ownerName = item.owner_name || matchedBot?.owner_name || '—';
@@ -1874,7 +1914,7 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
                 return (
                   <tr key={item.id}>
                     <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.first_detected_at ? new Date(item.first_detected_at).toLocaleString('en-GB') : '—'}</td>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.insurer_name || '—'}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{displayInsurerName(item.insurer_name)}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{ownerName}</td>
                     <td style={{ color: C.text, fontSize: 13, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{botName}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.provider || '—'}</td>
@@ -1886,6 +1926,75 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
                   </tr>
                 );
               })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LateArrivalLogSection({ C, logs }) {
+  const rows = useMemo(() => {
+    return (logs || [])
+      .filter((log) => log.event_type === 'late_arrival_detected')
+      .flatMap((log) => {
+        const details = log.details || {};
+        const lateRows = Array.isArray(details.late_arrivals) ? details.late_arrivals : [];
+        return lateRows.map((item, index) => ({
+          id: `${log.id}-${item.key || item.tracking_key || index}`,
+          detected_at: log.created_at || details.captured_at || null,
+          insurer_name: details.insurer_name || log.insurer_name || item.insurer_name || '',
+          provider: item.provider || '—',
+          claims: Number(item.claims || 0),
+          submitted_date: item.submitted_date || '—',
+          status_bucket: item.status_bucket || item.status || '—',
+          claim_month: item.filter_month || item.month || '—',
+          mode: details.mode === 'execute' ? 'Execute follow-up' : 'Preview follow-up',
+        }));
+      })
+      .sort((a, b) => new Date(b.detected_at || 0).getTime() - new Date(a.detected_at || 0).getTime());
+  }, [logs]);
+
+  return (
+    <div style={cardStyle(C)}>
+      <SectionHeader
+        C={C}
+        icon="⏱️"
+        title="Late-Arrival Piles"
+        text="These are piles that were not present in the first insurer scan but appeared unassigned before the run finished, so the runner picked them up in the follow-up mini-pass."
+      />
+      {!rows.length ? (
+        <EmptyState
+          C={C}
+          title="No late-arrival piles detected recently"
+          text="When a pile lands after the runner has already scanned an insurer, any follow-up catch will be recorded here."
+        />
+      ) : (
+        <div style={{ overflowX: 'auto', maxHeight: 360, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead style={{ position: 'sticky', top: 0, background: C.card, zIndex: 1 }}>
+              <tr>
+                {['Detected', 'Insurer', 'Provider', 'Claims', 'Submitted', 'Status', 'Month', 'Follow-up'].map((label) => (
+                  <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
+                    {label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id}>
+                  <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.detected_at ? new Date(row.detected_at).toLocaleString('en-GB') : '—'}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{displayInsurerName(row.insurer_name)}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.provider}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.claims}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.submitted_date}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.status_bucket}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.claim_month}</td>
+                  <td style={{ color: C.warn, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.mode}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
@@ -2065,6 +2174,7 @@ export default function PilesAutoAssignmentPage() {
         <StatCard C={C} label="Tracked Piles" value={data.overview?.activeTrackedPiles ?? '—'} hint="Runner-managed active assignments" />
         <StatCard C={C} label="Stale Tracked" value={data.overview?.staleTrackedPiles ?? '—'} hint="Candidates for reassignment" />
         <StatCard C={C} label="External Assignments" value={data.overview?.activeExternalAssignments ?? '—'} hint="Assigned outside runner tracking" />
+        <StatCard C={C} label="Late Arrivals" value={data.overview?.lateArrivalPileDetections ?? '—'} hint="Caught in the follow-up mini-pass" />
       </div>
 
       {loading ? (
@@ -2087,6 +2197,7 @@ export default function PilesAutoAssignmentPage() {
           <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={runnerHistoryRefreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
           <ExternalAssignmentLogSection C={C} externalAssignments={data.externalAssignments} botAccounts={data.botAccounts} />
+          <LateArrivalLogSection C={C} logs={data.recentLogs} />
           <MasterAccountsSection C={C} accounts={data.masterAccounts} onRefresh={load} setNotice={setNotice} />
           <BotAccountsSection C={C} accounts={data.botAccounts} masterAccounts={data.masterAccounts} metricsByBotId={metricsByBotId} onRefresh={load} setNotice={setNotice} />
           <BotRoleEditorSection C={C} accounts={data.botAccounts} onRefresh={load} setNotice={setNotice} />

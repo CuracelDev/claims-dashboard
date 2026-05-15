@@ -57,6 +57,10 @@ STATUS_ASSIGNMENT_TYPE = {
     "AI Audit": "Vetting",
 }
 MONTH_OPTIONS = ["All", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+INSURER_ALIAS_DISPLAY = {
+    "uapom": "OLD MUTUAL",
+    "old mutual": "OLD MUTUAL",
+}
 
 
 class TeeCapture:
@@ -101,6 +105,22 @@ def norm_key(text: Any) -> str:
 
 def label_key(text: Any) -> str:
     return re.sub(r"\s+", " ", norm(text).lower()).strip()
+
+
+def canonical_insurer_key(text: Any) -> str:
+    label = label_key(text)
+    return INSURER_ALIAS_DISPLAY.get(label, label)
+
+
+def insurer_aliases(text: Any) -> set[str]:
+    label = label_key(text)
+    canonical = canonical_insurer_key(text)
+    aliases = {label, canonical}
+    if canonical == "old mutual":
+        aliases.add("uapom")
+    if label == "uapom":
+        aliases.add("old mutual")
+    return {alias for alias in aliases if alias}
 
 
 CURACEL_BASE_URL = norm(os.getenv("CURACEL_PORTAL_BASE_URL")) or "https://health.curacel.co"
@@ -643,6 +663,19 @@ class PileRow:
     filter_month: str
 
 
+def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
+    seen = set()
+    unique_rows: list[PileRow] = []
+    for row in rows:
+        if norm(row.assigned):
+            continue
+        if row.key in seen:
+            continue
+        seen.add(row.key)
+        unique_rows.append(row)
+    return unique_rows
+
+
 @dataclass
 class PlannedAssignment:
     pile_key: str
@@ -851,21 +884,20 @@ class DataStore:
         res.raise_for_status()
 
     def get_master_account(self, insurer_name: str) -> MasterAccount:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select id, insurer_name, login_email, login_password, is_active
                 from piles_auto_assignment_master_accounts
-                where lower(insurer_name) = lower(%s)
-                limit 1
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_master_accounts",
-                filters=[("insurer_name", "eq", insurer_name)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_master_accounts")
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         if not rows:
             override_email, override_password = override_master_credentials(insurer_name, "", "")
             if override_email and override_password:
@@ -943,22 +975,22 @@ class DataStore:
         return self._rows_to_bot_accounts(rows)
 
     def _fetch_bot_account_rows(self, insurer_name: str) -> list[dict[str, Any]]:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
-            return self._fetchall_postgres(
+            rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_bot_accounts
-                where lower(insurer_name) = lower(%s)
                 order by priority_order asc, owner_name asc
-                """,
-                (insurer_name,),
+                """
             )
+            return [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            return self._fetchall_supabase(
+            rows = self._fetchall_supabase(
                 "piles_auto_assignment_bot_accounts",
-                filters=[("insurer_name", "eq", insurer_name)],
                 order="priority_order.asc",
             )
+            return [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
 
     def _rows_to_bot_accounts(self, rows: list[dict[str, Any]]) -> list[BotAccount]:
         return [
@@ -1009,21 +1041,20 @@ class DataStore:
         }
 
     def get_rule(self, insurer_name: str) -> AssignmentRule | None:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_rules
-                where lower(insurer_name) = lower(%s)
-                limit 1
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_rules",
-                filters=[("insurer_name", "eq", insurer_name)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_rules")
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         if not rows:
             return None
         row = rows[0]
@@ -1064,40 +1095,44 @@ class DataStore:
         return mapping
 
     def get_active_tracked_piles(self, insurer_name: str) -> list[TrackedPile]:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_tracked_piles
-                where lower(insurer_name) = lower(%s)
-                  and coalesce(is_active, true) = true
+                where coalesce(is_active, true) = true
                 order by assigned_at asc, provider asc
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_tracked_piles",
-                filters=[("insurer_name", "eq", insurer_name), ("is_active", "eq", "true")],
-                order="assigned_at.asc",
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_tracked_piles",
+                    filters=[("is_active", "eq", "true")],
+                    order="assigned_at.asc",
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
         return self._rows_to_tracked_piles(rows)
 
     def get_all_tracked_tracking_keys(self, insurer_name: str) -> set[str]:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select tracking_key
+                     , insurer_name
                 from piles_auto_assignment_tracked_piles
-                where lower(insurer_name) = lower(%s)
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_tracked_piles",
-                filters=[("insurer_name", "eq", insurer_name)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_tracked_piles")
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
         return {norm(row.get("tracking_key")) for row in rows if norm(row.get("tracking_key"))}
 
     def _rows_to_tracked_piles(self, rows: list[dict[str, Any]]) -> list[TrackedPile]:
@@ -1152,22 +1187,25 @@ class DataStore:
         now_iso = datetime.now(timezone.utc).isoformat()
         existing = None
         rows = []
+        aliases = insurer_aliases(plan.insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_tracked_piles
-                where lower(insurer_name) = lower(%s)
-                  and tracking_key = %s
-                limit 1
+                where tracking_key = %s
                 """,
-                (plan.insurer_name, plan.tracking_key),
+                (plan.tracking_key,),
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_tracked_piles",
-                filters=[("insurer_name", "eq", plan.insurer_name), ("tracking_key", "eq", plan.tracking_key)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_tracked_piles",
+                    filters=[("tracking_key", "eq", plan.tracking_key)],
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         if rows:
             existing = self._rows_to_tracked_piles(rows)[0]
 
@@ -1491,22 +1529,25 @@ class DataStore:
         matched_bot: BotAccount | None = None,
     ) -> tuple[ExternalAssignment, bool]:
         now_iso = datetime.now(timezone.utc).isoformat()
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_external_assignments
-                where lower(insurer_name) = lower(%s)
-                  and tracking_key = %s
-                limit 1
+                where tracking_key = %s
                 """,
-                (insurer_name, row.tracking_key),
+                (row.tracking_key,),
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_external_assignments",
-                filters=[("insurer_name", "eq", insurer_name), ("tracking_key", "eq", row.tracking_key)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    filters=[("tracking_key", "eq", row.tracking_key)],
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         existing = self._rows_to_external_assignments(rows)[0] if rows else None
         details = {
             "source": "runner_detected_external_assignment",
@@ -1630,21 +1671,25 @@ class DataStore:
 
     def sync_external_assignments_for_insurer(self, insurer_name: str, active_tracking_keys: set[str]) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select id, tracking_key
+                     , insurer_name
                 from piles_auto_assignment_external_assignments
-                where lower(insurer_name) = lower(%s)
-                  and coalesce(is_active, true) = true
-                """,
-                (insurer_name,),
+                where coalesce(is_active, true) = true
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_external_assignments",
-                filters=[("insurer_name", "eq", insurer_name), ("is_active", "eq", "true")],
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    filters=[("is_active", "eq", "true")],
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
         for row in rows:
             tracking_key = norm(row.get("tracking_key"))
             if tracking_key in active_tracking_keys:
@@ -1682,33 +1727,34 @@ class DataStore:
         bot_ids = [bot.id for bot in bots]
         if not bot_ids:
             return {}
+        aliases = insurer_aliases(insurer_name)
 
         if self.mode == "postgres":
             snapshot_rows = self._fetchall_postgres(
                 """
-                select bot_account_id, progress_claims, observed_at
+                select bot_account_id, progress_claims, observed_at, insurer_name
                 from piles_auto_assignment_pile_snapshots
-                where insurer_name = %s
-                  and bot_account_id = any(%s)
+                where bot_account_id = any(%s)
                   and observed_at >= (now() - (%s || ' hours')::interval)
                 order by observed_at asc
                 """,
-                (insurer_name, bot_ids, str(window_hours)),
+                (bot_ids, str(window_hours)),
             )
+            snapshot_rows = [row for row in snapshot_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
             active_rows = self._fetchall_postgres(
                 """
-                select bot_account_id, remaining_claims
+                select bot_account_id, remaining_claims, insurer_name
                 from piles_auto_assignment_tracked_piles
-                where insurer_name = %s
-                  and coalesce(is_active, true) = true
+                where coalesce(is_active, true) = true
                   and bot_account_id = any(%s)
                 """,
-                (insurer_name, bot_ids),
+                (bot_ids,),
             )
+            active_rows = [row for row in active_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
             snapshot_rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_pile_snapshots")
-                if norm(row.get("insurer_name")) == insurer_name and str(row.get("bot_account_id") or "") in bot_ids
+                if canonical_insurer_key(row.get("insurer_name")) in aliases and str(row.get("bot_account_id") or "") in bot_ids
             ]
             cutoff = datetime.now(timezone.utc).timestamp() - (window_hours * 3600)
             snapshot_rows = [
@@ -1717,7 +1763,7 @@ class DataStore:
             ]
             active_rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_tracked_piles")
-                if norm(row.get("insurer_name")) == insurer_name and bool(row.get("is_active", True)) and str(row.get("bot_account_id") or "") in bot_ids
+                if canonical_insurer_key(row.get("insurer_name")) in aliases and bool(row.get("is_active", True)) and str(row.get("bot_account_id") or "") in bot_ids
             ]
 
         grouped_snapshots: dict[str, list[dict[str, Any]]] = {}
@@ -2635,12 +2681,15 @@ class CuracelPilesRunner:
             synced_claims = min(claims, parse_synced_claims(claims_cell))
             remaining_claims = max(claims - synced_claims, 0)
             month = value("month", 3)
+            amount_text = value("amount", 4)
             submitted_date = value("submitted date", 6)
             row_status = value("status", 7) or status_bucket
             assigned = value("assigned", len(texts) - 2 if len(texts) >= 2 else 0)
             tracking_key = "|".join([
                 norm(provider),
                 str(claims),
+                str(synced_claims),
+                norm(amount_text),
                 norm(month),
                 norm(submitted_date),
             ])
@@ -3804,6 +3853,28 @@ def build_assignment_plan_from_portal_options(
     return plans, summary
 
 
+def merge_assignment_summaries(
+    base: dict[str, dict[str, Any]],
+    incoming: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    merged = {key: dict(value) for key, value in (base or {}).items()}
+    for key, item in (incoming or {}).items():
+        if key not in merged:
+            merged[key] = dict(item)
+            continue
+        current = merged[key]
+        current["assigned_piles"] = safe_int(current.get("assigned_piles"), 0) + safe_int(item.get("assigned_piles"), 0)
+        current["assigned_claims"] = safe_int(current.get("assigned_claims"), 0) + safe_int(item.get("assigned_claims"), 0)
+        current["projected_finish_hours"] = item.get("projected_finish_hours", current.get("projected_finish_hours"))
+        current["projected_finish_minutes"] = item.get("projected_finish_minutes", current.get("projected_finish_minutes"))
+        current["effective_speed"] = item.get("effective_speed", current.get("effective_speed"))
+        current["assignment_role"] = item.get("assignment_role", current.get("assignment_role"))
+        current["assignee_name"] = item.get("assignee_name", current.get("assignee_name"))
+        current["starting_claim_load"] = current.get("starting_claim_load", item.get("starting_claim_load", 0))
+        current["starting_load"] = current.get("starting_load", item.get("starting_load", 0))
+    return merged
+
+
 def portal_option_match_score(bot: BotAccount, option_name: str) -> int:
     option_label = label_key(option_name)
     option_lower = norm(option_name).lower()
@@ -3974,6 +4045,13 @@ def run_for_insurer(
         "new_detection_count": 0,
         "notifications": [],
     }
+    late_arrival_detection = {
+        "count": 0,
+        "claims": 0,
+        "piles": [],
+        "summary": {},
+        "results": {},
+    }
     reassignment_plans: list[PlannedAssignment] = []
     reassignment_summary: dict[str, dict[str, Any]] = {}
     reassignment_results: dict[str, int] = {}
@@ -4139,76 +4217,9 @@ def run_for_insurer(
                     f"  - {item.insurer_name}: {item.current_assigned or 'Unknown assignee'} "
                     f"({owner_label}) • {item.claims} claims • {item.status_bucket or 'Unknown status'}"
                 )
-        unassigned = []
-        seen_unassigned = set()
-        for row in scanned_rows:
-            if norm(row.assigned):
-                continue
-            if row.key in seen_unassigned:
-                continue
-            seen_unassigned.add(row.key)
-            unassigned.append(row)
+        unassigned = unique_unassigned_rows(scanned_rows)
+        initial_unassigned_keys = {row.key for row in unassigned}
         print(f"\nTotal unassigned piles found: {len(unassigned)}")
-        if not unassigned and not reassignment_plans:
-            print("No unassigned piles found. Nothing to assign.")
-            finished_at = datetime.now(timezone.utc).isoformat()
-            details = {
-                "insurer_name": insurer_name,
-                "mode": "execute" if args.execute else "dry-run",
-                "captured_at": captured_at,
-                "finished_at": finished_at,
-                "month": month_labels[0] if len(month_labels) == 1 else month_labels,
-                "months": month_labels,
-                "year": year_label,
-                "statuses": TARGET_STATUSES,
-                "summary": {},
-                "reassignment_summary": {},
-                "tracked_reconcile": {
-                    "tracked_count": tracked_reconcile["tracked_count"],
-                    "completed_count": tracked_reconcile["completed_count"],
-                    "stale_count": tracked_reconcile["stale_count"],
-                    "active_count": tracked_reconcile["active_count"],
-                },
-                "external_detection": {
-                    "active_count": external_detection["active_count"],
-                    "new_detection_count": external_detection["new_detection_count"],
-                },
-                "no_work": True,
-                "message": "No unassigned piles found. Nothing to assign.",
-                "portal_option_names": [],
-                "resolved_name_map": {},
-                "portal_mapping_warnings": [],
-            }
-            store.log_runner_event(
-                insurer_name=insurer_name,
-                event_type="runner_scan",
-                status="no_unassigned",
-                pile_count=0,
-                claim_count=0,
-                details=details,
-            )
-            store.log_runner_event(
-                insurer_name=insurer_name,
-                event_type="runner_complete",
-                status="no_work_complete",
-                pile_count=0,
-                claim_count=0,
-                details=details,
-            )
-            return {
-                "insurer_name": insurer_name,
-                "captured_at": captured_at,
-                "unassigned": [],
-                "plans": [],
-                "summary": {},
-                "results": {},
-                "applied": [],
-                "fallback_pool_used": False,
-                "portal_option_names": [],
-                "resolved_name_map": {},
-                "portal_mapping_warnings": [],
-                "external_notification_items": external_detection["notifications"],
-            }
 
         plans: list[PlannedAssignment] = []
         summary: dict[str, dict[str, Any]] = {}
@@ -4305,6 +4316,83 @@ def run_for_insurer(
         elif reassignment_plans:
             print("\nNo new unassigned piles were found after tracked-pile reconciliation.")
 
+        if args.execute and resolved_bots:
+            metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
+
+        print("\nFinal late-arrival rescan...")
+        follow_up_rows = runner.scan_all_rows(month_labels, year_label)
+        follow_up_unassigned = [
+            row for row in unique_unassigned_rows(follow_up_rows)
+            if row.key not in initial_unassigned_keys
+        ]
+        if follow_up_unassigned:
+            late_arrival_detection["count"] = len(follow_up_unassigned)
+            late_arrival_detection["claims"] = sum(row.claims for row in follow_up_unassigned)
+            late_arrival_detection["piles"] = [row.__dict__ for row in follow_up_unassigned]
+            print(
+                f"Late-arrival unassigned piles detected after the first scan: "
+                f"{late_arrival_detection['count']} pile(s), {late_arrival_detection['claims']} claim(s)"
+            )
+            ensure_portal_mapping(follow_up_unassigned[0])
+            late_plans: list[PlannedAssignment]
+            late_summary: dict[str, dict[str, Any]]
+            if not bots:
+                late_plans, late_summary = build_assignment_plan_from_portal_options(insurer_name, follow_up_unassigned, portal_assignees)
+            else:
+                late_plans, late_summary = build_assignment_plan(insurer_name, follow_up_unassigned, resolved_bots, metrics)
+            late_arrival_detection["summary"] = late_summary
+            summary = merge_assignment_summaries(summary, late_summary)
+            plans.extend(late_plans)
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="late_arrival_detected",
+                status="follow_up_execute" if args.execute else "follow_up_preview",
+                pile_count=late_arrival_detection["count"],
+                claim_count=late_arrival_detection["claims"],
+                details={
+                    "insurer_name": insurer_name,
+                    "captured_at": captured_at,
+                    "month": month_labels[0] if len(month_labels) == 1 else month_labels,
+                    "months": month_labels,
+                    "year": year_label,
+                    "mode": "execute" if args.execute else "dry-run",
+                    "late_arrivals": [row.__dict__ for row in follow_up_unassigned],
+                    "follow_up_summary": late_summary,
+                    "portal_option_names": portal_option_names,
+                    "resolved_name_map": resolved_name_map,
+                    "portal_mapping_warnings": portal_mapping_warnings,
+                },
+            )
+            if late_summary:
+                print("\nLate-arrival follow-up summary:")
+                for item in late_summary.values():
+                    print(
+                        f"  - {item['assignee_name']} [{item['assignment_role']}] "
+                        f"speed={item['effective_speed']}/hr assigned={item['assigned_claims']} "
+                        f"projected_finish={item['projected_finish_minutes']} mins"
+                    )
+            if late_plans:
+                late_results, late_applied = runner.execute_assignment_plan(month_labels, year_label, late_plans, execute=args.execute)
+                late_arrival_detection["results"] = late_results
+                if late_results:
+                    print("\nLate-arrival follow-up groups touched:")
+                    for assignee_name, count in late_results.items():
+                        print(f"  - {assignee_name}: {count} pile(s)")
+                for assignee_name, count in late_results.items():
+                    results[assignee_name] = results.get(assignee_name, 0) + count
+                applied.extend(late_applied)
+                if args.execute and resolved_bots:
+                    metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
+        elif not unassigned and not reassignment_plans:
+            print("No unassigned piles found. Nothing to assign.")
+
+        payload.update({
+            "plans": [plan.__dict__ for plan in plans],
+            "summary": summary,
+            "late_arrival_detection": late_arrival_detection,
+        })
+        output_path.write_text(json.dumps(payload, indent=2))
+
     if args.execute:
         for item in applied:
             planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
@@ -4334,9 +4422,6 @@ def run_for_insurer(
                 actual_assignee_name=actual_name,
                 planned_assignee=planned_assignee,
             )
-
-    if args.execute and resolved_bots:
-        metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
 
     notification_items: list[NotificationItem] = []
     if args.execute:
@@ -4396,6 +4481,8 @@ def run_for_insurer(
             "finished_at": finished_at,
             "fallback_pool_used": fallback_pool_used,
             "months": month_labels,
+            "no_work": total_planned == 0,
+            "message": "No unassigned piles found. Nothing to assign." if total_planned == 0 else "",
                 "tracked_reconcile": {
                     "tracked_count": tracked_reconcile["tracked_count"],
                     "completed_count": tracked_reconcile["completed_count"],
@@ -4410,6 +4497,7 @@ def run_for_insurer(
                 "slack_replies_sent": slack_replies_sent,
                 "reassignment_results": reassignment_results,
                 "reassignment_summary": reassignment_summary,
+                "late_arrival_detection": late_arrival_detection,
             "results": results,
             "summary": summary,
             "portal_option_names": portal_option_names,
@@ -4462,6 +4550,7 @@ def run_for_insurer(
         "portal_mapping_warnings": portal_mapping_warnings,
         "notification_items": notification_items,
         "external_notification_items": external_detection["notifications"],
+        "late_arrival_detection": late_arrival_detection,
     }
 
 
