@@ -12,7 +12,7 @@ export async function GET() {
       supabase.from('piles_auto_assignment_bot_accounts').select('*').order('insurer_name', { ascending: true }),
       supabase.from('piles_auto_assignment_rules').select('*').order('insurer_name', { ascending: true }),
       supabase.from('piles_auto_assignment_bot_metrics').select('*').order('updated_at', { ascending: false }),
-      supabase.from('piles_auto_assignment_logs').select('*').order('created_at', { ascending: false }).limit(25),
+      supabase.from('piles_auto_assignment_logs').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('piles_auto_assignment_tracked_piles').select('*').order('updated_at', { ascending: false }).limit(250),
       supabase.from('piles_auto_assignment_external_assignments').select('*').order('last_seen_at', { ascending: false }).limit(250),
     ]);
@@ -37,6 +37,9 @@ export async function GET() {
     const staleTrackedPiles = trackedPiles.filter((pile) => pile.is_active && pile.is_stale);
     const completedTrackedPiles = trackedPiles.filter((pile) => !pile.is_active && pile.completed_at);
     const activeExternalAssignments = externalAssignments.filter((item) => item.is_active);
+    const lateArrivalPileDetections = recentLogs
+      .filter((row) => row.event_type === 'late_arrival_detected')
+      .reduce((sum, row) => sum + Number(row.pile_count || 0), 0);
     const avgClaimsPerHour = botMetrics.length
       ? botMetrics.reduce((sum, row) => sum + Number(row.claims_per_hour || 0), 0) / botMetrics.length
       : 0;
@@ -58,6 +61,7 @@ export async function GET() {
         staleTrackedPiles: staleTrackedPiles.length,
         completedTrackedPiles: completedTrackedPiles.length,
         activeExternalAssignments: activeExternalAssignments.length,
+        lateArrivalPileDetections,
       },
       masterAccounts,
       botAccounts,

@@ -1934,6 +1934,75 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
   );
 }
 
+function LateArrivalLogSection({ C, logs }) {
+  const rows = useMemo(() => {
+    return (logs || [])
+      .filter((log) => log.event_type === 'late_arrival_detected')
+      .flatMap((log) => {
+        const details = log.details || {};
+        const lateRows = Array.isArray(details.late_arrivals) ? details.late_arrivals : [];
+        return lateRows.map((item, index) => ({
+          id: `${log.id}-${item.key || item.tracking_key || index}`,
+          detected_at: log.created_at || details.captured_at || null,
+          insurer_name: details.insurer_name || log.insurer_name || item.insurer_name || '',
+          provider: item.provider || '—',
+          claims: Number(item.claims || 0),
+          submitted_date: item.submitted_date || '—',
+          status_bucket: item.status_bucket || item.status || '—',
+          claim_month: item.filter_month || item.month || '—',
+          mode: details.mode === 'execute' ? 'Execute follow-up' : 'Preview follow-up',
+        }));
+      })
+      .sort((a, b) => new Date(b.detected_at || 0).getTime() - new Date(a.detected_at || 0).getTime());
+  }, [logs]);
+
+  return (
+    <div style={cardStyle(C)}>
+      <SectionHeader
+        C={C}
+        icon="⏱️"
+        title="Late-Arrival Piles"
+        text="These are piles that were not present in the first insurer scan but appeared unassigned before the run finished, so the runner picked them up in the follow-up mini-pass."
+      />
+      {!rows.length ? (
+        <EmptyState
+          C={C}
+          title="No late-arrival piles detected recently"
+          text="When a pile lands after the runner has already scanned an insurer, any follow-up catch will be recorded here."
+        />
+      ) : (
+        <div style={{ overflowX: 'auto', maxHeight: 360, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead style={{ position: 'sticky', top: 0, background: C.card, zIndex: 1 }}>
+              <tr>
+                {['Detected', 'Insurer', 'Provider', 'Claims', 'Submitted', 'Status', 'Month', 'Follow-up'].map((label) => (
+                  <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
+                    {label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id}>
+                  <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.detected_at ? new Date(row.detected_at).toLocaleString('en-GB') : '—'}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{displayInsurerName(row.insurer_name)}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.provider}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.claims}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.submitted_date}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.status_bucket}</td>
+                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.claim_month}</td>
+                  <td style={{ color: C.warn, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{row.mode}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LogsSection({ C, logs, botAccounts, onRefresh, setNotice }) {
   const [saving, setSaving] = useState(false);
   const [draft, setDraft] = useState({ insurer_name: '', event_type: 'assignment', pile_count: 0, claim_count: 0 });
@@ -2105,6 +2174,7 @@ export default function PilesAutoAssignmentPage() {
         <StatCard C={C} label="Tracked Piles" value={data.overview?.activeTrackedPiles ?? '—'} hint="Runner-managed active assignments" />
         <StatCard C={C} label="Stale Tracked" value={data.overview?.staleTrackedPiles ?? '—'} hint="Candidates for reassignment" />
         <StatCard C={C} label="External Assignments" value={data.overview?.activeExternalAssignments ?? '—'} hint="Assigned outside runner tracking" />
+        <StatCard C={C} label="Late Arrivals" value={data.overview?.lateArrivalPileDetections ?? '—'} hint="Caught in the follow-up mini-pass" />
       </div>
 
       {loading ? (
@@ -2127,6 +2197,7 @@ export default function PilesAutoAssignmentPage() {
           <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={runnerHistoryRefreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
           <ExternalAssignmentLogSection C={C} externalAssignments={data.externalAssignments} botAccounts={data.botAccounts} />
+          <LateArrivalLogSection C={C} logs={data.recentLogs} />
           <MasterAccountsSection C={C} accounts={data.masterAccounts} onRefresh={load} setNotice={setNotice} />
           <BotAccountsSection C={C} accounts={data.botAccounts} masterAccounts={data.masterAccounts} metricsByBotId={metricsByBotId} onRefresh={load} setNotice={setNotice} />
           <BotRoleEditorSection C={C} accounts={data.botAccounts} onRefresh={load} setNotice={setNotice} />
