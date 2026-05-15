@@ -57,6 +57,10 @@ STATUS_ASSIGNMENT_TYPE = {
     "AI Audit": "Vetting",
 }
 MONTH_OPTIONS = ["All", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+INSURER_ALIAS_DISPLAY = {
+    "uapom": "OLD MUTUAL",
+    "old mutual": "OLD MUTUAL",
+}
 
 
 class TeeCapture:
@@ -101,6 +105,22 @@ def norm_key(text: Any) -> str:
 
 def label_key(text: Any) -> str:
     return re.sub(r"\s+", " ", norm(text).lower()).strip()
+
+
+def canonical_insurer_key(text: Any) -> str:
+    label = label_key(text)
+    return INSURER_ALIAS_DISPLAY.get(label, label)
+
+
+def insurer_aliases(text: Any) -> set[str]:
+    label = label_key(text)
+    canonical = canonical_insurer_key(text)
+    aliases = {label, canonical}
+    if canonical == "old mutual":
+        aliases.add("uapom")
+    if label == "uapom":
+        aliases.add("old mutual")
+    return {alias for alias in aliases if alias}
 
 
 CURACEL_BASE_URL = norm(os.getenv("CURACEL_PORTAL_BASE_URL")) or "https://health.curacel.co"
@@ -851,21 +871,20 @@ class DataStore:
         res.raise_for_status()
 
     def get_master_account(self, insurer_name: str) -> MasterAccount:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select id, insurer_name, login_email, login_password, is_active
                 from piles_auto_assignment_master_accounts
-                where lower(insurer_name) = lower(%s)
-                limit 1
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_master_accounts",
-                filters=[("insurer_name", "eq", insurer_name)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_master_accounts")
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         if not rows:
             override_email, override_password = override_master_credentials(insurer_name, "", "")
             if override_email and override_password:
@@ -943,22 +962,22 @@ class DataStore:
         return self._rows_to_bot_accounts(rows)
 
     def _fetch_bot_account_rows(self, insurer_name: str) -> list[dict[str, Any]]:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
-            return self._fetchall_postgres(
+            rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_bot_accounts
-                where lower(insurer_name) = lower(%s)
                 order by priority_order asc, owner_name asc
-                """,
-                (insurer_name,),
+                """
             )
+            return [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            return self._fetchall_supabase(
+            rows = self._fetchall_supabase(
                 "piles_auto_assignment_bot_accounts",
-                filters=[("insurer_name", "eq", insurer_name)],
                 order="priority_order.asc",
             )
+            return [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
 
     def _rows_to_bot_accounts(self, rows: list[dict[str, Any]]) -> list[BotAccount]:
         return [
@@ -1009,21 +1028,20 @@ class DataStore:
         }
 
     def get_rule(self, insurer_name: str) -> AssignmentRule | None:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_rules
-                where lower(insurer_name) = lower(%s)
-                limit 1
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_rules",
-                filters=[("insurer_name", "eq", insurer_name)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_rules")
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         if not rows:
             return None
         row = rows[0]
@@ -1064,40 +1082,44 @@ class DataStore:
         return mapping
 
     def get_active_tracked_piles(self, insurer_name: str) -> list[TrackedPile]:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_tracked_piles
-                where lower(insurer_name) = lower(%s)
-                  and coalesce(is_active, true) = true
+                where coalesce(is_active, true) = true
                 order by assigned_at asc, provider asc
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_tracked_piles",
-                filters=[("insurer_name", "eq", insurer_name), ("is_active", "eq", "true")],
-                order="assigned_at.asc",
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_tracked_piles",
+                    filters=[("is_active", "eq", "true")],
+                    order="assigned_at.asc",
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
         return self._rows_to_tracked_piles(rows)
 
     def get_all_tracked_tracking_keys(self, insurer_name: str) -> set[str]:
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select tracking_key
+                     , insurer_name
                 from piles_auto_assignment_tracked_piles
-                where lower(insurer_name) = lower(%s)
-                """,
-                (insurer_name,),
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_tracked_piles",
-                filters=[("insurer_name", "eq", insurer_name)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_tracked_piles")
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
         return {norm(row.get("tracking_key")) for row in rows if norm(row.get("tracking_key"))}
 
     def _rows_to_tracked_piles(self, rows: list[dict[str, Any]]) -> list[TrackedPile]:
@@ -1152,22 +1174,25 @@ class DataStore:
         now_iso = datetime.now(timezone.utc).isoformat()
         existing = None
         rows = []
+        aliases = insurer_aliases(plan.insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_tracked_piles
-                where lower(insurer_name) = lower(%s)
-                  and tracking_key = %s
-                limit 1
+                where tracking_key = %s
                 """,
-                (plan.insurer_name, plan.tracking_key),
+                (plan.tracking_key,),
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_tracked_piles",
-                filters=[("insurer_name", "eq", plan.insurer_name), ("tracking_key", "eq", plan.tracking_key)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_tracked_piles",
+                    filters=[("tracking_key", "eq", plan.tracking_key)],
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         if rows:
             existing = self._rows_to_tracked_piles(rows)[0]
 
@@ -1491,22 +1516,25 @@ class DataStore:
         matched_bot: BotAccount | None = None,
     ) -> tuple[ExternalAssignment, bool]:
         now_iso = datetime.now(timezone.utc).isoformat()
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_external_assignments
-                where lower(insurer_name) = lower(%s)
-                  and tracking_key = %s
-                limit 1
+                where tracking_key = %s
                 """,
-                (insurer_name, row.tracking_key),
+                (row.tracking_key,),
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_external_assignments",
-                filters=[("insurer_name", "eq", insurer_name), ("tracking_key", "eq", row.tracking_key)],
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    filters=[("tracking_key", "eq", row.tracking_key)],
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         existing = self._rows_to_external_assignments(rows)[0] if rows else None
         details = {
             "source": "runner_detected_external_assignment",
@@ -1630,21 +1658,25 @@ class DataStore:
 
     def sync_external_assignments_for_insurer(self, insurer_name: str, active_tracking_keys: set[str]) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
+        aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select id, tracking_key
+                     , insurer_name
                 from piles_auto_assignment_external_assignments
-                where lower(insurer_name) = lower(%s)
-                  and coalesce(is_active, true) = true
-                """,
-                (insurer_name,),
+                where coalesce(is_active, true) = true
+                """
             )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_external_assignments",
-                filters=[("insurer_name", "eq", insurer_name), ("is_active", "eq", "true")],
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    filters=[("is_active", "eq", "true")],
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
         for row in rows:
             tracking_key = norm(row.get("tracking_key"))
             if tracking_key in active_tracking_keys:
@@ -1682,33 +1714,34 @@ class DataStore:
         bot_ids = [bot.id for bot in bots]
         if not bot_ids:
             return {}
+        aliases = insurer_aliases(insurer_name)
 
         if self.mode == "postgres":
             snapshot_rows = self._fetchall_postgres(
                 """
-                select bot_account_id, progress_claims, observed_at
+                select bot_account_id, progress_claims, observed_at, insurer_name
                 from piles_auto_assignment_pile_snapshots
-                where insurer_name = %s
-                  and bot_account_id = any(%s)
+                where bot_account_id = any(%s)
                   and observed_at >= (now() - (%s || ' hours')::interval)
                 order by observed_at asc
                 """,
-                (insurer_name, bot_ids, str(window_hours)),
+                (bot_ids, str(window_hours)),
             )
+            snapshot_rows = [row for row in snapshot_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
             active_rows = self._fetchall_postgres(
                 """
-                select bot_account_id, remaining_claims
+                select bot_account_id, remaining_claims, insurer_name
                 from piles_auto_assignment_tracked_piles
-                where insurer_name = %s
-                  and coalesce(is_active, true) = true
+                where coalesce(is_active, true) = true
                   and bot_account_id = any(%s)
                 """,
-                (insurer_name, bot_ids),
+                (bot_ids,),
             )
+            active_rows = [row for row in active_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
             snapshot_rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_pile_snapshots")
-                if norm(row.get("insurer_name")) == insurer_name and str(row.get("bot_account_id") or "") in bot_ids
+                if canonical_insurer_key(row.get("insurer_name")) in aliases and str(row.get("bot_account_id") or "") in bot_ids
             ]
             cutoff = datetime.now(timezone.utc).timestamp() - (window_hours * 3600)
             snapshot_rows = [
@@ -1717,7 +1750,7 @@ class DataStore:
             ]
             active_rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_tracked_piles")
-                if norm(row.get("insurer_name")) == insurer_name and bool(row.get("is_active", True)) and str(row.get("bot_account_id") or "") in bot_ids
+                if canonical_insurer_key(row.get("insurer_name")) in aliases and bool(row.get("is_active", True)) and str(row.get("bot_account_id") or "") in bot_ids
             ]
 
         grouped_snapshots: dict[str, list[dict[str, Any]]] = {}
