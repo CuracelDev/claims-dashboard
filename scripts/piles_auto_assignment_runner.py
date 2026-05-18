@@ -61,6 +61,10 @@ INSURER_ALIAS_DISPLAY = {
     "uapom": "OLD MUTUAL",
     "old mutual": "OLD MUTUAL",
 }
+PRIMARY_ASSIGNMENT_FLOOR_RATIO = min(
+    max(float(os.getenv("PILES_PRIMARY_MIN_SHARE") or "0.5"), 0.4),
+    0.9,
+)
 
 
 class TeeCapture:
@@ -161,6 +165,40 @@ def projected_finish_minutes(hours: float) -> int:
         return max(0, math.ceil(float(hours) * 60))
     except Exception:
         return 0
+
+
+def assignment_entry_subject(entry: dict[str, Any]) -> Any:
+    return entry.get("bot") or entry.get("assignee")
+
+
+def assignment_entry_role(entry: dict[str, Any]) -> str:
+    subject = assignment_entry_subject(entry)
+    return norm(getattr(subject, "assignment_role", ""))
+
+
+def assignment_entry_priority(entry: dict[str, Any]) -> int:
+    subject = assignment_entry_subject(entry)
+    return int(getattr(subject, "priority_order", 999) or 999)
+
+
+def choose_assignment_entry(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    return min(
+        entries,
+        key=lambda entry: (
+            entry["selection_score"],
+            entry["projected_hours"],
+            0 if assignment_entry_role(entry).lower() == "primary" else 1,
+            assignment_entry_priority(entry),
+        ),
+    )
+
+
+def apply_assignment_entry(entry: dict[str, Any], pile: "PileRow") -> None:
+    entry["assigned_claims"] += pile.claims
+    entry["assigned_piles"] += 1
+    entry["current_load"] += pile.claims
+    entry["projected_hours"] = entry["current_load"] / entry["effective_speed"]
+    entry["selection_score"] = entry["projected_hours"] + entry["selection_penalty_hours"]
 
 
 def default_speed_for_role(role: str) -> float:
@@ -3982,20 +4020,39 @@ def build_assignment_plan(
         raise RuntimeError(f"No available bot accounts found for insurer '{insurer_name}'.")
 
     plans: list[PlannedAssignment] = []
-    for pile in sorted(piles, key=lambda item: item.claims, reverse=True):
-        chosen = min(
-            eligible,
-            key=lambda entry: (
-                entry["selection_score"],
-                entry["projected_hours"],
-                entry["bot"].priority_order,
-            ),
-        )
-        chosen["assigned_claims"] += pile.claims
-        chosen["assigned_piles"] += 1
-        chosen["current_load"] += pile.claims
-        chosen["projected_hours"] = chosen["current_load"] / chosen["effective_speed"]
-        chosen["selection_score"] = chosen["projected_hours"] + chosen["selection_penalty_hours"]
+    sorted_piles = sorted(piles, key=lambda item: item.claims, reverse=True)
+    remaining_piles = list(sorted_piles)
+    primary_entries = [entry for entry in eligible if assignment_entry_role(entry).lower() == "primary"]
+
+    if primary_entries and len(primary_entries) < len(eligible):
+        primary_floor_claims = max(1, math.ceil(sum(pile.claims for pile in sorted_piles) * PRIMARY_ASSIGNMENT_FLOOR_RATIO))
+        primary_claims_assigned = 0
+        while remaining_piles and primary_claims_assigned < primary_floor_claims:
+            pile = remaining_piles.pop(0)
+            chosen = choose_assignment_entry(primary_entries)
+            apply_assignment_entry(chosen, pile)
+            primary_claims_assigned += pile.claims
+            plans.append(PlannedAssignment(
+                pile_key=pile.key,
+                tracking_key=pile.tracking_key,
+                assignee_id=chosen["bot"].id,
+                assignee_name=chosen["bot"].portal_name,
+                assignment_type=pile.assignment_type,
+                insurer_name=insurer_name,
+                provider=pile.provider,
+                claim_month=pile.month,
+                submitted_date=pile.submitted_date,
+                claims=pile.claims,
+                synced_claims=pile.synced_claims,
+                remaining_claims=pile.remaining_claims,
+                current_status=pile.status,
+                status_bucket=pile.status_bucket,
+                filter_month=pile.filter_month,
+            ))
+
+    for pile in remaining_piles:
+        chosen = choose_assignment_entry(eligible)
+        apply_assignment_entry(chosen, pile)
         plans.append(PlannedAssignment(
             pile_key=pile.key,
             tracking_key=pile.tracking_key,
@@ -4057,20 +4114,39 @@ def build_assignment_plan_from_portal_options(
         raise RuntimeError(f"No visible portal assignee options were available for insurer '{insurer_name}'.")
 
     plans: list[PlannedAssignment] = []
-    for pile in sorted(piles, key=lambda item: item.claims, reverse=True):
-        chosen = min(
-            eligible,
-            key=lambda entry: (
-                entry["selection_score"],
-                entry["projected_hours"],
-                entry["assignee"].priority_order,
-            ),
-        )
-        chosen["assigned_claims"] += pile.claims
-        chosen["assigned_piles"] += 1
-        chosen["current_load"] += pile.claims
-        chosen["projected_hours"] = chosen["current_load"] / chosen["effective_speed"]
-        chosen["selection_score"] = chosen["projected_hours"] + chosen["selection_penalty_hours"]
+    sorted_piles = sorted(piles, key=lambda item: item.claims, reverse=True)
+    remaining_piles = list(sorted_piles)
+    primary_entries = [entry for entry in eligible if assignment_entry_role(entry).lower() == "primary"]
+
+    if primary_entries and len(primary_entries) < len(eligible):
+        primary_floor_claims = max(1, math.ceil(sum(pile.claims for pile in sorted_piles) * PRIMARY_ASSIGNMENT_FLOOR_RATIO))
+        primary_claims_assigned = 0
+        while remaining_piles and primary_claims_assigned < primary_floor_claims:
+            pile = remaining_piles.pop(0)
+            chosen = choose_assignment_entry(primary_entries)
+            apply_assignment_entry(chosen, pile)
+            primary_claims_assigned += pile.claims
+            plans.append(PlannedAssignment(
+                pile_key=pile.key,
+                tracking_key=pile.tracking_key,
+                assignee_id=f"portal-option::{chosen['assignee'].name}",
+                assignee_name=chosen["assignee"].name,
+                assignment_type=pile.assignment_type,
+                insurer_name=insurer_name,
+                provider=pile.provider,
+                claim_month=pile.month,
+                submitted_date=pile.submitted_date,
+                claims=pile.claims,
+                synced_claims=pile.synced_claims,
+                remaining_claims=pile.remaining_claims,
+                current_status=pile.status,
+                status_bucket=pile.status_bucket,
+                filter_month=pile.filter_month,
+            ))
+
+    for pile in remaining_piles:
+        chosen = choose_assignment_entry(eligible)
+        apply_assignment_entry(chosen, pile)
         plans.append(PlannedAssignment(
             pile_key=pile.key,
             tracking_key=pile.tracking_key,
@@ -4503,6 +4579,9 @@ def run_for_insurer(
             "months": month_labels,
             "year": year_label,
             "mode": "execute" if args.execute else "dry-run",
+            "assignment_policy": {
+                "primary_min_share_ratio": PRIMARY_ASSIGNMENT_FLOOR_RATIO,
+            },
             "captured_at": captured_at,
             "unassigned_count": len(unassigned),
             "piles": [row.__dict__ for row in unassigned],
@@ -4540,6 +4619,9 @@ def run_for_insurer(
                 "mode": "execute" if args.execute else "dry-run",
                 "captured_at": captured_at,
                 "fallback_pool_used": fallback_pool_used,
+                "assignment_policy": {
+                    "primary_min_share_ratio": PRIMARY_ASSIGNMENT_FLOOR_RATIO,
+                },
                 "month": month_labels[0] if len(month_labels) == 1 else month_labels,
                 "months": month_labels,
                 "year": year_label,
@@ -4733,6 +4815,9 @@ def run_for_insurer(
             "captured_at": captured_at,
             "finished_at": finished_at,
             "fallback_pool_used": fallback_pool_used,
+            "assignment_policy": {
+                "primary_min_share_ratio": PRIMARY_ASSIGNMENT_FLOOR_RATIO,
+            },
             "months": month_labels,
             "no_work": total_planned == 0,
             "message": "No unassigned piles found. Nothing to assign." if total_planned == 0 else "",
