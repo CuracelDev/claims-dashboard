@@ -124,6 +124,7 @@ def insurer_aliases(text: Any) -> set[str]:
 
 
 CURACEL_BASE_URL = norm(os.getenv("CURACEL_PORTAL_BASE_URL")) or "https://health.curacel.co"
+CURACEL_AUTH_BASE_URL = norm(os.getenv("CURACEL_AUTH_BASE_URL")) or "https://auth.curacel.co"
 PORTAL_ENVIRONMENT = norm(os.getenv("CURACEL_PORTAL_ENVIRONMENT")) or "production"
 SLACK_PRISM_BOT_TOKEN = norm(os.getenv("SLACK_PRISM_BOT_TOKEN")) or norm(os.getenv("SLACK_BOT_TOKEN"))
 SLACK_ALERTS_CHANNEL_ID = norm(os.getenv("SLACK_ALERTS_CHANNEL_ID"))
@@ -2219,16 +2220,123 @@ class CuracelPilesRunner:
             time.sleep(0.4)
         raise RuntimeError("Piles page loaded too slowly; the filter controls/table never became ready.")
 
+    def _first_visible_locator(self, selectors: list[str], timeout_ms: int = 0) -> Any | None:
+        assert self.page
+        deadline = time.time() + (timeout_ms / 1000) if timeout_ms > 0 else time.time()
+        while True:
+            for selector in selectors:
+                try:
+                    locator = self.page.locator(selector).first
+                    if locator.count() and locator.is_visible():
+                        return locator
+                except Exception:
+                    continue
+            if timeout_ms <= 0 or time.time() >= deadline:
+                return None
+            time.sleep(0.25)
+
+    def _wait_for_login_or_app_ready(self, timeout_ms: int = 20000) -> str:
+        assert self.page
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            try:
+                self._dismiss_popup()
+            except Exception:
+                pass
+            try:
+                if "/hmo/" in self.page.url:
+                    return "app"
+                if self._first_visible_locator([".p-select.p-component", "button:has-text('Enter Account')", "a:has-text('Enter Account')"]):
+                    return "app"
+                login_input = self._first_visible_locator(
+                    [
+                        'input[name="loginId"]',
+                        'input[type="email"]',
+                        'input[name="email"]',
+                        'input[placeholder*="Email"]',
+                        'input[placeholder*="email"]',
+                        'input[placeholder*="Username"]',
+                        'input[placeholder*="username"]',
+                    ]
+                )
+                password_input = self._first_visible_locator(
+                    [
+                        'input[name="password"]',
+                        'input[type="password"]',
+                    ]
+                )
+                if login_input and password_input:
+                    return "login"
+            except Exception:
+                pass
+            time.sleep(0.35)
+        raise RuntimeError("Login page did not become ready.")
+
     def login(self, username: str, password: str) -> None:
         assert self.page
-        self._goto_with_soft_readiness(CURACEL_BASE_URL)
-        self.page.locator('input[name="loginId"]').fill(username)
-        self.page.locator('input[name="password"]').fill(password)
-        self.page.locator('input[type="Submit"]').click()
-        time.sleep(4)
-        self._dismiss_popup()
-        if "auth.curacel.co" in self.page.url:
-            raise RuntimeError("Login failed; still on auth page.")
+        last_error: Exception | None = None
+        target_urls = [CURACEL_BASE_URL, CURACEL_AUTH_BASE_URL]
+        for attempt in range(1, 4):
+            try:
+                target_url = target_urls[min(attempt - 1, len(target_urls) - 1)]
+                self._goto_with_soft_readiness(target_url)
+                ready_state = self._wait_for_login_or_app_ready(timeout_ms=20000)
+                if ready_state == "app":
+                    self._dismiss_popup()
+                    return
+
+                login_input = self._first_visible_locator(
+                    [
+                        'input[name="loginId"]',
+                        'input[type="email"]',
+                        'input[name="email"]',
+                        'input[placeholder*="Email"]',
+                        'input[placeholder*="email"]',
+                        'input[placeholder*="Username"]',
+                        'input[placeholder*="username"]',
+                    ],
+                    timeout_ms=5000,
+                )
+                password_input = self._first_visible_locator(
+                    [
+                        'input[name="password"]',
+                        'input[type="password"]',
+                    ],
+                    timeout_ms=5000,
+                )
+                submit_button = self._first_visible_locator(
+                    [
+                        'input[type="Submit"]',
+                        'button[type="submit"]',
+                        "button:has-text('Login')",
+                        "button:has-text('Sign in')",
+                        "button:has-text('Log in')",
+                    ],
+                    timeout_ms=3000,
+                )
+                if login_input is None or password_input is None or submit_button is None:
+                    raise RuntimeError("Login form fields did not become available.")
+
+                login_input.fill(username)
+                password_input.fill(password)
+                submit_button.click()
+                time.sleep(4)
+                self._dismiss_popup()
+                post_state = self._wait_for_login_or_app_ready(timeout_ms=15000)
+                if post_state == "app":
+                    return
+                raise RuntimeError("Login failed; still on auth page.")
+            except Exception as error:
+                last_error = error
+                if attempt < 3:
+                    print(f"  Login page was not ready yet. Retrying login flow ({attempt + 1}/3)...")
+                    try:
+                        self.page.reload(wait_until="domcontentloaded", timeout=45000)
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    continue
+        raise last_error or RuntimeError("Login failed.")
 
     def select_account(self, insurer_name: str) -> None:
         assert self.page
@@ -2476,6 +2584,58 @@ class CuracelPilesRunner:
             self._close_dropdown()
         return None
 
+    def _append_unique_select(self, items: list[Any], candidate: Any | None) -> None:
+        if candidate is None:
+            return
+        try:
+            box = candidate.bounding_box() or {}
+            fingerprint = (
+                round(box.get("x", 0), 1),
+                round(box.get("y", 0), 1),
+                norm(self._read_select_text(candidate)),
+            )
+        except Exception:
+            fingerprint = (id(candidate),)
+        for existing in items:
+            try:
+                box = existing.bounding_box() or {}
+                existing_fingerprint = (
+                    round(box.get("x", 0), 1),
+                    round(box.get("y", 0), 1),
+                    norm(self._read_select_text(existing)),
+                )
+            except Exception:
+                existing_fingerprint = (id(existing),)
+            if existing_fingerprint == fingerprint:
+                return
+        items.append(candidate)
+
+    def _select_candidates_for_month(self, month_label: str) -> list[Any]:
+        selects = self._visible_selects()
+        candidates: list[Any] = []
+        self._append_unique_select(candidates, self._find_select_with_options([month_label, "All", "Jan", "Feb", "Mar"]))
+        self._append_unique_select(candidates, self._select_following_label_text("Select Month"))
+        self._append_unique_select(candidates, self._select_following_label_text("Month"))
+        self._append_unique_select(candidates, self._select_in_container("Select Month"))
+        self._append_unique_select(candidates, self._select_by_label("Select Month"))
+        self._append_unique_select(candidates, self._select_by_label("Month"))
+        for select in selects:
+            self._append_unique_select(candidates, select)
+        return candidates
+
+    def _select_candidates_for_status(self, month_select: Any | None) -> list[Any]:
+        selects = self._visible_selects()
+        candidates: list[Any] = []
+        self._append_unique_select(candidates, self._find_select_with_options(TARGET_STATUSES))
+        self._append_unique_select(candidates, self._select_following_label_text("Filter by Vetting Status"))
+        self._append_unique_select(candidates, self._select_in_container("Filter by Vetting Status"))
+        self._append_unique_select(candidates, self._select_by_label("Filter by Vetting Status"))
+        for select in selects:
+            if month_select is select:
+                continue
+            self._append_unique_select(candidates, select)
+        return candidates
+
     def _set_select_value(self, select: Any | None, desired_text: str, required: bool = False) -> bool:
         assert self.page
         if select is None:
@@ -2541,46 +2701,61 @@ class CuracelPilesRunner:
 
     def apply_filters(self, month_label: str, year_label: str, status_label: str) -> None:
         assert self.page
-        selects = self._visible_selects()
-        month_select = (
-            self._find_select_with_options([month_label, "All", "Jan", "Feb", "Mar"])
-            or
-            self._select_following_label_text("Select Month")
-            or self._select_following_label_text("Month")
-            or
-            self._select_in_container("Select Month")
-            or self._select_by_label("Select Month")
-        )
-        year_select = None
-        status_select = (
-            self._find_select_with_options(TARGET_STATUSES)
-            or
-            self._select_following_label_text("Filter by Vetting Status")
-            or
-            self._select_in_container("Filter by Vetting Status")
-            or self._select_by_label("Filter by Vetting Status")
-        )
+        last_error: Exception | None = None
+        final_month_select = None
+        final_status_select = None
 
-        if month_select is None and len(selects) >= 1:
-            month_select = selects[0]
-        if status_select is None:
-            non_month_selects = [select for select in selects if select is not month_select]
-            if len(non_month_selects) == 1:
-                status_select = non_month_selects[0]
-            elif non_month_selects:
-                status_select = sorted(
-                    non_month_selects,
-                    key=lambda loc: (loc.bounding_box() or {}).get("y", 0),
-                )[-1]
+        for attempt in range(1, 4):
+            if attempt > 1:
+                print(f"  Retrying filters (attempt {attempt}/3)...")
+                self._dismiss_popup()
+                try:
+                    self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                time.sleep(1.2)
 
-        self._set_select_value(month_select, month_label)
-        self._set_select_value(status_select, status_label, required=True)
+            month_select = None
+            for candidate in self._select_candidates_for_month(month_label):
+                if self._set_select_value(candidate, month_label):
+                    month_select = candidate
+                    break
+            if month_select is None:
+                month_candidates = self._select_candidates_for_month(month_label)
+                month_select = month_candidates[0] if month_candidates else None
+                self._set_select_value(month_select, month_label)
+
+            status_select = None
+            for candidate in self._select_candidates_for_status(month_select):
+                if self._set_select_value(candidate, status_label):
+                    status_select = candidate
+                    break
+
+            if status_select is not None:
+                final_month_select = month_select
+                final_status_select = status_select
+                break
+
+            last_error = RuntimeError(f"Could not set filter to '{status_label}'.")
+            print(f"  Visible top selects at failure: {self._describe_visible_selects()}")
+            self._dismiss_popup()
+            try:
+                self.open_piles()
+            except Exception:
+                try:
+                    self.page.reload(wait_until="domcontentloaded", timeout=45000)
+                except Exception:
+                    pass
+            time.sleep(1.5)
+
+        if final_status_select is None:
+            raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
 
         print(
             "  Applied filter controls:"
-            f" month='{self._read_select_text(month_select)}'"
+            f" month='{self._read_select_text(final_month_select)}'"
             f" year='{self._read_year_chip_text() or year_label}'"
-            f" status='{self._read_select_text(status_select)}'"
+            f" status='{self._read_select_text(final_status_select)}'"
         )
 
         for selector in ["button:has-text('Filters')", "button:has-text('Filter')"]:
