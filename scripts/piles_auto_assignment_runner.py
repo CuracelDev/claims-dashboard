@@ -3003,8 +3003,11 @@ class CuracelPilesRunner:
             if "no data found" in " ".join(texts).lower():
                 continue
             provider = texts[1] if len(texts) > 1 else ""
-            claims = safe_int(texts[2] if len(texts) > 2 else "0", 0)
+            claims_cell = texts[2] if len(texts) > 2 else "0"
+            claims = safe_int(claims_cell, 0)
+            synced_claims = min(claims, parse_synced_claims(claims_cell))
             month = texts[3] if len(texts) > 3 else ""
+            amount_text = texts[4] if len(texts) > 4 else ""
             submitted = texts[6] if len(texts) > 6 else ""
             matched_keys: list[str] = []
             if idx < len(current_rows):
@@ -3012,7 +3015,9 @@ class CuracelPilesRunner:
                 if (
                     indexed_row.provider == provider
                     and indexed_row.claims == claims
+                    and indexed_row.synced_claims == synced_claims
                     and indexed_row.month == month
+                    and norm(indexed_row.key).find(norm(amount_text)) >= 0
                     and indexed_row.submitted_date == submitted
                 ):
                     matched_keys.append(indexed_row.key)
@@ -3022,8 +3027,10 @@ class CuracelPilesRunner:
                     for pile in current_rows
                     if pile.provider == provider
                     and pile.claims == claims
+                    and pile.synced_claims == synced_claims
                     and pile.month == month
                     and pile.submitted_date == submitted
+                    and norm(amount_text) in norm(pile.key)
                 ]
             if not any(key in pile_keys for key in matched_keys):
                 continue
@@ -3395,15 +3402,22 @@ class CuracelPilesRunner:
         active_month = sample_pile.filter_month or month_label
         selected = 0
         current_rows: list[PileRow] = []
+        page_candidates: list[int] = []
+        for page_number in [sample_pile.page_number, 1, max(1, sample_pile.page_number - 1), sample_pile.page_number + 1, 2, 3]:
+            if page_number not in page_candidates:
+                page_candidates.append(page_number)
         for attempt in range(3):
-            current_rows = self.reset_to_filtered_page(active_month, year_label, sample_pile.status_bucket, sample_pile.page_number)
-            candidate_keys = [sample_pile.key]
-            candidate_keys.extend([
-                row.key for row in current_rows[:6]
-                if row.key not in candidate_keys
-            ])
-            for candidate_key in candidate_keys:
-                selected = self._select_rows([candidate_key], current_rows)
+            for page_number in page_candidates:
+                current_rows = self.reset_to_filtered_page(active_month, year_label, sample_pile.status_bucket, page_number)
+                candidate_keys = [sample_pile.key]
+                candidate_keys.extend([
+                    row.key for row in current_rows[:12]
+                    if row.key not in candidate_keys
+                ])
+                for candidate_key in candidate_keys:
+                    selected = self._select_rows([candidate_key], current_rows)
+                    if selected:
+                        break
                 if selected:
                     break
             if selected:
