@@ -12,10 +12,11 @@ function normalize(value) {
 
 function normalizeMonths(value) {
   if (Array.isArray(value)) {
-    return value.map((item) => normalize(item)).filter(Boolean);
+    const months = value.map((item) => normalize(item)).filter(Boolean);
+    return months.length ? months : ['All'];
   }
   const single = normalize(value);
-  return single ? [single] : [];
+  return single ? [single] : ['All'];
 }
 
 function resolvePythonBin() {
@@ -122,7 +123,7 @@ export async function POST(request) {
       ? normalize(body.portal_environment).toLowerCase()
       : 'production';
     const months = normalizeMonths(body.months?.length ? body.months : body.month);
-    const year = normalize(body.year);
+    const year = normalize(body.year) || 'All';
     const finalizeAssignments = Boolean(body.finalize_assignments);
     const runAll = Boolean(body.run_all);
     const visible = Boolean(body.visible_browser);
