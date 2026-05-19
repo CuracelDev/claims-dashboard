@@ -849,6 +849,16 @@ class ExternalNotificationItem:
     owner_slack_user_id: str
 
 
+@dataclass
+class ReassignmentCandidate:
+    source_kind: str
+    source_id: str
+    assignment_type: str
+    observed_row: PileRow
+    current_bot: BotAccount
+    source_tracking_key: str
+
+
 def group_notification_items_by_owner(items: list[NotificationItem]) -> list[list[NotificationItem]]:
     grouped: dict[str, list[NotificationItem]] = {}
     for item in items:
@@ -1579,6 +1589,7 @@ class DataStore:
         insurer_name: str,
         row: PileRow,
         matched_bot: BotAccount | None = None,
+        last_progress_at: str | None = None,
     ) -> tuple[ExternalAssignment, bool]:
         now_iso = datetime.now(timezone.utc).isoformat()
         aliases = insurer_aliases(insurer_name)
@@ -1601,11 +1612,13 @@ class DataStore:
                 if canonical_insurer_key(row.get("insurer_name")) in aliases
             ][:1]
         existing = self._rows_to_external_assignments(rows)[0] if rows else None
+        previous_details = existing.details if existing and isinstance(existing.details, dict) else {}
         details = {
             "source": "runner_detected_external_assignment",
             "assigned_name": row.assigned,
             "status_bucket": row.status_bucket,
             "owner_name": matched_bot.owner_name if matched_bot else "",
+            "last_progress_at": last_progress_at or norm(previous_details.get("last_progress_at")),
         }
         payload = {
             "master_account_id": master_account_id or None,
@@ -1768,6 +1781,54 @@ class DataStore:
                         "updated_at": now_iso,
                     },
                 )
+
+    def get_active_external_assignments(self, insurer_name: str) -> list[ExternalAssignment]:
+        aliases = insurer_aliases(insurer_name)
+        if self.mode == "postgres":
+            rows = self._fetchall_postgres(
+                """
+                select *
+                from piles_auto_assignment_external_assignments
+                where coalesce(is_active, true) = true
+                order by first_detected_at asc, provider asc
+                """
+            )
+            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
+        else:
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    filters=[("is_active", "eq", "true")],
+                    order="first_detected_at.asc",
+                )
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ]
+        return self._rows_to_external_assignments(rows)
+
+    def clear_external_assignment(self, external_assignment_id: str) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if self.mode == "postgres":
+            self._execute_postgres(
+                """
+                update piles_auto_assignment_external_assignments
+                set is_active = false,
+                    cleared_at = coalesce(cleared_at, %s),
+                    updated_at = now()
+                where id = %s
+                """,
+                (now_iso, external_assignment_id),
+            )
+        else:
+            self._update_supabase(
+                "piles_auto_assignment_external_assignments",
+                "id",
+                external_assignment_id,
+                {
+                    "is_active": False,
+                    "cleared_at": now_iso,
+                    "updated_at": now_iso,
+                },
+            )
 
     def refresh_bot_metrics_from_tracking(
         self,
@@ -3762,9 +3823,24 @@ def match_bot_to_portal_name(bots: list[BotAccount], portal_name: str) -> BotAcc
 
 
 def shift_reassignment_hold(bot: BotAccount, now_utc: datetime) -> tuple[bool, str]:
+    grace_ends_local = shift_grace_end_local(bot, now_utc)
+    if grace_ends_local is None:
+        return False, ""
+    local_now = now_utc.astimezone(RUNNER_TIMEZONE)
+    grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
+    if local_now < grace_ends_local:
+        return True, (
+            f"{bot.owner_name or bot.portal_name} is within shift grace until "
+            f"{grace_ends_local.strftime('%H:%M')} {RUNNER_TIMEZONE.key} "
+            f"(starts {format_clock_label(bot.active_from_time)}, grace {grace_minutes} mins)."
+        )
+    return False, ""
+
+
+def shift_grace_end_local(bot: BotAccount, now_utc: datetime) -> datetime | None:
     start_minutes = parse_clock_minutes(bot.active_from_time)
     if start_minutes is None:
-        return False, ""
+        return None
 
     grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
     local_now = now_utc.astimezone(RUNNER_TIMEZONE)
@@ -3787,19 +3863,49 @@ def shift_reassignment_hold(bot: BotAccount, now_utc: datetime) -> tuple[bool, s
             microsecond=0,
         )
 
-    grace_ends_local = shift_start_local + timedelta(minutes=grace_minutes)
-    if local_now < grace_ends_local:
-        return True, (
-            f"{bot.owner_name or bot.portal_name} is within shift grace until "
-            f"{grace_ends_local.strftime('%H:%M')} {RUNNER_TIMEZONE.key} "
-            f"(starts {format_clock_label(bot.active_from_time)}, grace {grace_minutes} mins)."
-        )
-    return False, ""
+    return shift_start_local + timedelta(minutes=grace_minutes)
 
 
 def is_shift_ready_for_reassignment(bot: BotAccount, now_utc: datetime) -> bool:
     hold, _ = shift_reassignment_hold(bot, now_utc)
     return not hold
+
+
+def stale_reason_for_reassignment(
+    *,
+    bot: BotAccount | None,
+    remaining_claims: int,
+    idle_since: datetime | None,
+    has_meaningful_progress: bool,
+    now_utc: datetime,
+    rule: AssignmentRule | None,
+) -> str | None:
+    if not rule or remaining_claims < rule.stale_claim_threshold:
+        return None
+
+    if bot is not None:
+        hold_reassignment, _ = shift_reassignment_hold(bot, now_utc)
+        if hold_reassignment:
+            return None
+
+    if not has_meaningful_progress:
+        cutoff = shift_grace_end_local(bot, now_utc) if bot is not None else None
+        if cutoff is not None:
+            local_now = now_utc.astimezone(RUNNER_TIMEZONE)
+            if local_now < cutoff:
+                return None
+            return (
+                f"No progress recorded by the shift grace cutoff "
+                f"({cutoff.strftime('%H:%M')} {RUNNER_TIMEZONE.key}) with {remaining_claims} claims still open."
+            )
+        return f"No progress recorded with {remaining_claims} claims still open."
+
+    idle_minutes = 0
+    if idle_since is not None:
+        idle_minutes = max(int((now_utc - idle_since).total_seconds() / 60), 0)
+    if idle_minutes >= rule.reassignment_threshold_minutes:
+        return f"No meaningful progress for {idle_minutes} mins with {remaining_claims} claims still open."
+    return None
 
 
 def choose_best_bot_for_pile(
@@ -3883,7 +3989,7 @@ def reconcile_tracked_assignments(
 
     now = datetime.now(timezone.utc)
     bots_by_id = {bot.id: bot for bot in bots}
-    stale_candidates: list[tuple[TrackedPile, PileRow, BotAccount]] = []
+    stale_candidates: list[ReassignmentCandidate] = []
     completed_count = 0
     refreshed_tracked: list[TrackedPile] = []
     for tracked_pile in tracked:
@@ -3901,21 +4007,15 @@ def reconcile_tracked_assignments(
             progress_claims = max(0, current_completed - previous_completed)
             completed = observed.remaining_claims <= 0
             idle_since = parse_iso_datetime(tracked_pile.last_progress_at or tracked_pile.assigned_at or tracked_pile.last_seen_at or tracked_pile.first_assigned_at)
-            idle_minutes = int((now - idle_since).total_seconds() / 60) if idle_since else 0
-            if (
-                rule
-                and not completed
-                and observed.remaining_claims >= rule.stale_claim_threshold
-                and idle_minutes >= rule.reassignment_threshold_minutes
-            ):
-                hold_reassignment = False
-                hold_reason = ""
-                if current_assignee_bot is not None:
-                    hold_reassignment, hold_reason = shift_reassignment_hold(current_assignee_bot, now)
-                if hold_reassignment:
-                    stale_reason = None
-                else:
-                    stale_reason = f"No meaningful progress for {idle_minutes} mins with {observed.remaining_claims} claims still open."
+            has_meaningful_progress = bool(parse_iso_datetime(tracked_pile.last_progress_at)) or current_completed > 0
+            stale_reason = stale_reason_for_reassignment(
+                bot=current_assignee_bot,
+                remaining_claims=observed.remaining_claims,
+                idle_since=idle_since,
+                has_meaningful_progress=has_meaningful_progress,
+                now_utc=now,
+                rule=rule,
+            )
         else:
             progress_claims = max(tracked_pile.remaining_claims, 0)
             completed = True
@@ -3936,7 +4036,14 @@ def reconcile_tracked_assignments(
         if completed:
             completed_count += 1
         if updated.is_stale and observed is not None and matched_bot is not None:
-            stale_candidates.append((updated, observed, matched_bot))
+            stale_candidates.append(ReassignmentCandidate(
+                source_kind="tracked",
+                source_id=updated.id,
+                assignment_type=updated.assignment_type or observed.assignment_type,
+                observed_row=observed,
+                current_bot=matched_bot,
+                source_tracking_key=updated.tracking_key,
+            ))
 
     refreshed_metrics = store.refresh_bot_metrics_from_tracking(insurer_name, bots, previous_metrics)
     active_count = len([item for item in refreshed_tracked if item.is_active])
@@ -3960,7 +4067,10 @@ def detect_external_assignments(
     bots: list[BotAccount],
     tracked_keys: set[str],
     team_slack_map: dict[str, dict[str, str]],
+    rule: AssignmentRule | None,
 ) -> dict[str, Any]:
+    existing_records = store.get_active_external_assignments(insurer_name)
+    existing_by_tracking = {record.tracking_key: record for record in existing_records if norm(record.tracking_key)}
     assigned_rows_by_tracking: dict[str, PileRow] = {}
     for row in rows:
         if not norm(row.assigned):
@@ -3972,12 +4082,47 @@ def detect_external_assignments(
             assigned_rows_by_tracking[row.tracking_key] = row
 
     notifications: list[ExternalNotificationItem] = []
+    stale_candidates: list[ReassignmentCandidate] = []
     active_tracking_keys = set(assigned_rows_by_tracking.keys())
     new_detection_count = 0
+    now = datetime.now(timezone.utc)
 
     for row in assigned_rows_by_tracking.values():
+        previous_record = existing_by_tracking.get(row.tracking_key)
         matched_bot = match_bot_to_portal_name(bots, row.assigned) if bots else None
-        record, is_new = store.save_external_assignment(master_account_id, insurer_name, row, matched_bot)
+        progress_claims = max(0, row.synced_claims - safe_int(previous_record.synced_claims if previous_record else 0, 0))
+        last_progress_at = (
+            now.isoformat()
+            if progress_claims > 0
+            else norm((previous_record.details or {}).get("last_progress_at")) if previous_record and isinstance(previous_record.details, dict) else ""
+        )
+        record, is_new = store.save_external_assignment(
+            master_account_id,
+            insurer_name,
+            row,
+            matched_bot,
+            last_progress_at=last_progress_at,
+        )
+        if matched_bot is not None:
+            idle_since = parse_iso_datetime(last_progress_at or record.first_detected_at or record.last_seen_at)
+            has_meaningful_progress = bool(last_progress_at) or row.synced_claims > 0 or safe_int(record.synced_claims, 0) > 0
+            stale_reason = stale_reason_for_reassignment(
+                bot=matched_bot,
+                remaining_claims=row.remaining_claims,
+                idle_since=idle_since,
+                has_meaningful_progress=has_meaningful_progress,
+                now_utc=now,
+                rule=rule,
+            )
+            if stale_reason:
+                stale_candidates.append(ReassignmentCandidate(
+                    source_kind="external",
+                    source_id=record.id,
+                    assignment_type=record.assignment_type or row.assignment_type,
+                    observed_row=row,
+                    current_bot=matched_bot,
+                    source_tracking_key=record.tracking_key,
+                ))
         if not is_new:
             continue
         new_detection_count += 1
@@ -4020,12 +4165,13 @@ def detect_external_assignments(
         "active_count": len(active_tracking_keys),
         "new_detection_count": new_detection_count,
         "notifications": notifications,
+        "stale_candidates": stale_candidates,
     }
 
 
 def build_stale_reassignment_plans(
     insurer_name: str,
-    stale_candidates: list[tuple[TrackedPile, PileRow, BotAccount]],
+    stale_candidates: list[ReassignmentCandidate],
     bots: list[BotAccount],
     metrics: dict[str, BotMetric],
     rule: AssignmentRule | None,
@@ -4036,7 +4182,9 @@ def build_stale_reassignment_plans(
     now_utc = datetime.now(timezone.utc)
     plans: list[PlannedAssignment] = []
     summary: dict[str, dict[str, Any]] = {}
-    for tracked_pile, observed_row, current_bot in stale_candidates:
+    for candidate in stale_candidates:
+        observed_row = candidate.observed_row
+        current_bot = candidate.current_bot
         target = choose_best_bot_for_pile(
             max(observed_row.remaining_claims, 1),
             bots,
@@ -4083,7 +4231,7 @@ def build_stale_reassignment_plans(
             tracking_key=observed_row.tracking_key,
             assignee_id=target.id,
             assignee_name=target.portal_name,
-            assignment_type=tracked_pile.assignment_type or observed_row.assignment_type,
+            assignment_type=candidate.assignment_type or observed_row.assignment_type,
             insurer_name=insurer_name,
             provider=observed_row.provider,
             claim_month=observed_row.month,
@@ -4513,6 +4661,7 @@ def run_for_insurer(
     reassignment_results: dict[str, int] = {}
     reassignment_applied: list[AppliedAssignment] = []
     reassignment_previous_owner_by_tracking: dict[str, BotAccount] = {}
+    reassignment_source_by_tracking: dict[str, ReassignmentCandidate] = {}
     slack_thread_ts = ""
     slack_replies_sent = 0
 
@@ -4586,73 +4735,6 @@ def run_for_insurer(
                     f"stale={tracked_reconcile['stale_count']}"
                 )
 
-            stale_candidates = tracked_reconcile["stale_candidates"]
-            if stale_candidates:
-                reassignment_previous_owner_by_tracking = {
-                    tracked_pile.tracking_key: current_bot
-                    for tracked_pile, _, current_bot in stale_candidates
-                }
-                ensure_portal_mapping(stale_candidates[0][1])
-                reassignment_plans, reassignment_summary = build_stale_reassignment_plans(
-                    insurer_name,
-                    stale_candidates,
-                    resolved_bots,
-                    metrics,
-                    rule,
-                )
-                if reassignment_plans:
-                    print("\nPlanned stale-pile reassignments:")
-                    for item in reassignment_summary.values():
-                        print(
-                            f"  - {item['assignee_name']} [{item['assignment_role']}] "
-                            f"piles={item['assigned_piles']} claims={item['assigned_claims']} "
-                            f"projected_finish={item['projected_finish_minutes']} mins"
-                        )
-                    reassignment_results, reassignment_applied = runner.execute_assignment_plan(
-                        month_labels,
-                        year_label,
-                        reassignment_plans,
-                        execute=args.execute,
-                    )
-                    print("\nReassignment groups touched:")
-                    for assignee_name, count in reassignment_results.items():
-                        print(f"  - {assignee_name}: {count} pile(s)")
-
-                    if args.execute:
-                        for item in reassignment_applied:
-                            planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
-                            store.log_assignment(
-                                item.plan,
-                                execute=True,
-                                actual_assignee_name=item.actual_assignee_name,
-                                planned_assignee=planned_assignee,
-                                verified_on_table=item.verified_on_table,
-                                observed_assigned_values=item.observed_assigned_values,
-                                event_type_override="reassignment",
-                            )
-                            if planned_assignee and item.matched_planned_assignee and item.verified_on_table:
-                                store.save_tracked_assignment(
-                                    master.id,
-                                    item.plan,
-                                    item.actual_assignee_name,
-                                    planned_assignee.id,
-                                    reassigned=True,
-                                )
-                    else:
-                        for plan in reassignment_plans:
-                            planned_assignee = next((bot for bot in resolved_bots if bot.id == plan.assignee_id), None)
-                            actual_name = planned_assignee.portal_name if planned_assignee else plan.assignee_name
-                            store.log_assignment(
-                                plan,
-                                execute=False,
-                                actual_assignee_name=actual_name,
-                                planned_assignee=planned_assignee,
-                                event_type_override="reassignment",
-                            )
-
-                    if args.execute:
-                        metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
-
         print("\nScanning pages...")
         scanned_rows = runner.scan_all_rows(month_labels, year_label)
         tracked_keys = store.get_all_tracked_tracking_keys(insurer_name)
@@ -4664,6 +4746,7 @@ def run_for_insurer(
             bots,
             tracked_keys,
             team_slack_map,
+            rule,
         )
         if external_detection["new_detection_count"]:
             print("\nDetected externally assigned piles the runner is not tracking:")
@@ -4673,6 +4756,83 @@ def run_for_insurer(
                     f"  - {item.insurer_name}: {item.current_assigned or 'Unknown assignee'} "
                     f"({owner_label}) • {item.claims} claims • {item.status_bucket or 'Unknown status'}"
                 )
+
+        stale_candidates = [
+            *tracked_reconcile.get("stale_candidates", []),
+            *external_detection.get("stale_candidates", []),
+        ]
+        if stale_candidates:
+            reassignment_previous_owner_by_tracking = {
+                candidate.source_tracking_key: candidate.current_bot
+                for candidate in stale_candidates
+            }
+            reassignment_source_by_tracking = {
+                candidate.source_tracking_key: candidate
+                for candidate in stale_candidates
+            }
+            ensure_portal_mapping(stale_candidates[0].observed_row)
+            reassignment_plans, reassignment_summary = build_stale_reassignment_plans(
+                insurer_name,
+                stale_candidates,
+                resolved_bots,
+                metrics,
+                rule,
+            )
+            if reassignment_plans:
+                print("\nPlanned stale-pile reassignments:")
+                for item in reassignment_summary.values():
+                    print(
+                        f"  - {item['assignee_name']} [{item['assignment_role']}] "
+                        f"piles={item['assigned_piles']} claims={item['assigned_claims']} "
+                        f"projected_finish={item['projected_finish_minutes']} mins"
+                    )
+                reassignment_results, reassignment_applied = runner.execute_assignment_plan(
+                    month_labels,
+                    year_label,
+                    reassignment_plans,
+                    execute=args.execute,
+                )
+                print("\nReassignment groups touched:")
+                for assignee_name, count in reassignment_results.items():
+                    print(f"  - {assignee_name}: {count} pile(s)")
+
+                if args.execute:
+                    for item in reassignment_applied:
+                        planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
+                        store.log_assignment(
+                            item.plan,
+                            execute=True,
+                            actual_assignee_name=item.actual_assignee_name,
+                            planned_assignee=planned_assignee,
+                            verified_on_table=item.verified_on_table,
+                            observed_assigned_values=item.observed_assigned_values,
+                            event_type_override="reassignment",
+                        )
+                        candidate = reassignment_source_by_tracking.get(item.plan.tracking_key)
+                        if planned_assignee and item.matched_planned_assignee and item.verified_on_table:
+                            store.save_tracked_assignment(
+                                master.id,
+                                item.plan,
+                                item.actual_assignee_name,
+                                planned_assignee.id,
+                                reassigned=True,
+                            )
+                            if candidate and candidate.source_kind == "external":
+                                store.clear_external_assignment(candidate.source_id)
+                else:
+                    for plan in reassignment_plans:
+                        planned_assignee = next((bot for bot in resolved_bots if bot.id == plan.assignee_id), None)
+                        actual_name = planned_assignee.portal_name if planned_assignee else plan.assignee_name
+                        store.log_assignment(
+                            plan,
+                            execute=False,
+                            actual_assignee_name=actual_name,
+                            planned_assignee=planned_assignee,
+                            event_type_override="reassignment",
+                        )
+
+                if args.execute:
+                    metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
         unassigned = unique_unassigned_rows(scanned_rows)
         initial_unassigned_keys = {row.key for row in unassigned}
         print(f"\nTotal unassigned piles found: {len(unassigned)}")
