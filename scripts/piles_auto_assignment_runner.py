@@ -277,7 +277,7 @@ def format_clock_label(value: Any) -> str:
 def parse_month_labels(raw_value: str | None) -> list[str]:
     text = norm(raw_value)
     if not text:
-        return [datetime.now().strftime("%b")]
+        return ["All"]
     labels = []
     for part in text.split(","):
         label = norm(part)
@@ -287,7 +287,14 @@ def parse_month_labels(raw_value: str | None) -> list[str]:
             return ["All"]
         if label in MONTH_OPTIONS and label not in labels:
             labels.append(label)
-    return labels or [datetime.now().strftime("%b")]
+    return labels or ["All"]
+
+
+def parse_year_label(raw_value: str | None) -> str:
+    text = norm(raw_value)
+    if not text:
+        return "All"
+    return "All" if text.lower() == "all" else text
 
 
 def slack_mention(slack_user_id: str, fallback_name: str) -> str:
@@ -2452,6 +2459,21 @@ class CuracelPilesRunner:
         visible.sort(key=lambda item: (item[0], item[1]))
         return [item[2] for item in visible]
 
+    def _visible_multiselects(self) -> list[Any]:
+        assert self.page
+        selectors = self.page.locator(".p-multiselect.p-component")
+        visible: list[tuple[float, float, Any]] = []
+        for idx in range(selectors.count()):
+            loc = selectors.nth(idx)
+            try:
+                box = loc.bounding_box()
+                if box and box["y"] < 420:
+                    visible.append((box["y"], box["x"], loc))
+            except Exception:
+                continue
+        visible.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in visible]
+
     def _describe_visible_selects(self) -> list[dict[str, Any]]:
         descriptions: list[dict[str, Any]] = []
         for idx, loc in enumerate(self._visible_selects(), start=1):
@@ -2518,7 +2540,7 @@ class CuracelPilesRunner:
         assert self.page
         xpath = (
             f"xpath=//*[normalize-space(text())='{label_text}']"
-            "/following::*[contains(@class,'p-select') and contains(@class,'p-component')][1]"
+            "/following::*[(contains(@class,'p-select') or contains(@class,'p-multiselect')) and contains(@class,'p-component')][1]"
         )
         try:
             locs = self.page.locator(xpath)
@@ -2531,6 +2553,19 @@ class CuracelPilesRunner:
                     return loc
         except Exception:
             pass
+        return None
+
+    def _find_multiselect_with_options(self, expected_options: list[str]) -> Any | None:
+        expected_keys = [norm_key(option) for option in expected_options if norm(option)]
+        for select in self._visible_multiselects():
+            if not self._open_select(select):
+                continue
+            texts = self._dropdown_option_texts()
+            text_keys = [norm_key(text) for text in texts]
+            if any(expected in text_keys or any(expected in key for key in text_keys) for expected in expected_keys):
+                self._close_dropdown()
+                return select
+            self._close_dropdown()
         return None
 
     def _choose_option_from_open_dropdown(self, desired_text: str) -> str | None:
@@ -2680,6 +2715,17 @@ class CuracelPilesRunner:
             self._append_unique_select(candidates, select)
         return candidates
 
+    def _select_candidates_for_year(self, year_label: str) -> list[Any]:
+        multiselects = self._visible_multiselects()
+        candidates: list[Any] = []
+        expected_options = [year_label] if norm_key(year_label) != "all" else [str(datetime.now().year), str(datetime.now().year - 1)]
+        self._append_unique_select(candidates, self._find_multiselect_with_options(expected_options))
+        self._append_unique_select(candidates, self._select_following_label_text("Year"))
+        self._append_unique_select(candidates, self._select_in_container("Year"))
+        for select in multiselects:
+            self._append_unique_select(candidates, select)
+        return candidates
+
     def _set_select_value(self, select: Any | None, desired_text: str, required: bool = False) -> bool:
         assert self.page
         if select is None:
@@ -2707,6 +2753,55 @@ class CuracelPilesRunner:
                 return False
             return True
         except Exception:
+            if required:
+                raise
+            return False
+
+    def _set_multiselect_values(self, select: Any | None, desired_values: list[str], required: bool = False) -> bool:
+        assert self.page
+        if select is None:
+            if required:
+                raise RuntimeError(f"Could not find multiselect for '{desired_values}'.")
+            return False
+        desired_keys = {label_key(value) for value in desired_values if norm(value)}
+        try:
+            if not self._open_select(select):
+                raise RuntimeError(f"Could not open multiselect for '{desired_values}'.")
+            panels = self._visible_dropdown_panels()
+            option_root = panels[-1] if panels else self.page
+            options = option_root.locator("li.p-multiselect-option, li[role='option'], [data-pc-section='option']")
+            available: list[tuple[str, Any, bool]] = []
+            for idx in range(options.count()):
+                option = options.nth(idx)
+                text = norm(option.inner_text())
+                if not text:
+                    continue
+                selected = norm(option.get_attribute("aria-selected")).lower() == "true" or norm(option.get_attribute("data-p-selected")).lower() == "true"
+                available.append((text, option, selected))
+
+            if not available:
+                raise RuntimeError("No year options were visible in the multiselect.")
+
+            available_keys = {label_key(text) for text, _, _ in available}
+            if not desired_keys.issubset(available_keys):
+                raise RuntimeError(
+                    f"Requested multiselect values {desired_values} were not all visible. "
+                    f"Available options: {[text for text, _, _ in available]}"
+                )
+
+            for text, option, selected in available:
+                should_select = label_key(text) in desired_keys
+                if should_select != selected:
+                    option.click(force=True)
+                    time.sleep(0.15)
+
+            self._close_dropdown()
+            return True
+        except Exception:
+            try:
+                self._close_dropdown()
+            except Exception:
+                pass
             if required:
                 raise
             return False
@@ -2747,6 +2842,7 @@ class CuracelPilesRunner:
         assert self.page
         last_error: Exception | None = None
         final_month_select = None
+        final_year_select = None
         final_status_select = None
 
         for attempt in range(1, 4):
@@ -2769,6 +2865,36 @@ class CuracelPilesRunner:
                 month_select = month_candidates[0] if month_candidates else None
                 self._set_select_value(month_select, month_label)
 
+            year_select = None
+            desired_year_values = []
+            if norm_key(year_label) == "all":
+                desired_year_values = []
+                for candidate in self._select_candidates_for_year(year_label):
+                    if not self._open_select(candidate):
+                        continue
+                    option_texts = [text for text in self._dropdown_option_texts() if re.match(r"^20\d{2}$", text)]
+                    self._close_dropdown()
+                    if option_texts:
+                        desired_year_values = option_texts
+                        year_select = candidate
+                        break
+                if not desired_year_values:
+                    desired_year_values = [str(datetime.now().year)]
+            else:
+                desired_year_values = [year_label]
+
+            year_candidates = self._select_candidates_for_year(year_label)
+            if year_select is not None:
+                self._set_multiselect_values(year_select, desired_year_values, required=True)
+            else:
+                for candidate in year_candidates:
+                    if self._set_multiselect_values(candidate, desired_year_values):
+                        year_select = candidate
+                        break
+                if year_select is None and year_candidates:
+                    year_select = year_candidates[0]
+                    self._set_multiselect_values(year_select, desired_year_values, required=True)
+
             status_select = None
             for candidate in self._select_candidates_for_status(month_select):
                 if self._set_select_value(candidate, status_label):
@@ -2777,6 +2903,7 @@ class CuracelPilesRunner:
 
             if status_select is not None:
                 final_month_select = month_select
+                final_year_select = year_select
                 final_status_select = status_select
                 break
 
@@ -2798,7 +2925,7 @@ class CuracelPilesRunner:
         print(
             "  Applied filter controls:"
             f" month='{self._read_select_text(final_month_select)}'"
-            f" year='{self._read_year_chip_text() or year_label}'"
+            f" year='{self._read_select_text(final_year_select) or self._read_year_chip_text() or year_label}'"
             f" status='{self._read_select_text(final_status_select)}'"
         )
 
@@ -4326,8 +4453,8 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--insurer", help="Insurer name exactly as saved in the DB, e.g. 'Jubilee Kenya'")
     group.add_argument("--all-active", action="store_true", help="Run the workflow for every active master insurer account.")
     parser.add_argument("--portal-environment", choices=["production", "test"], default=norm(os.getenv("CURACEL_PORTAL_ENVIRONMENT")) or "production", help="Which portal configuration to use for this run.")
-    parser.add_argument("--month", help="Month label(s) to filter, e.g. 'All' or 'May,Jun'. Default is current month name")
-    parser.add_argument("--year", help="Year label to filter, default is current year")
+    parser.add_argument("--month", help="Month label(s) to filter, e.g. 'All' or 'May,Jun'. Default is All")
+    parser.add_argument("--year", help="Year label to filter, e.g. 'All' or '2026'. Default is All")
     parser.add_argument("--visible", action="store_true", help="Run with a visible browser")
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
@@ -4916,7 +5043,7 @@ def main() -> None:
         args = parse_args()
         configure_portal_environment(args.portal_environment)
         month_labels = parse_month_labels(args.month)
-        year_label = args.year or str(datetime.now().year)
+        year_label = parse_year_label(args.year)
         visible = args.visible or not env_bool("HEADLESS", True)
 
         if args.execute and not is_test_portal(CURACEL_BASE_URL) and not env_bool("ALLOW_PRODUCTION_ASSIGNMENTS", False):

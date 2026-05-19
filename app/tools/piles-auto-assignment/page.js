@@ -274,13 +274,12 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
   const [running, setRunning] = useState(false);
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
   const monthPickerRef = useRef(null);
-  const currentMonthLabel = new Date().toLocaleString('en-US', { month: 'short' });
   const [draft, setDraft] = useState({
     portal_environment: 'production',
     target: 'single',
     insurer_name: masterAccounts[0]?.insurer_name || '',
-    months: [currentMonthLabel],
-    year: String(new Date().getFullYear()),
+    months: ['All'],
+    year: 'All',
     finalize_assignments: false,
     visible_browser: false,
   });
