@@ -3225,6 +3225,13 @@ class CuracelPilesRunner:
             current_page += 1
         return self.rows_on_current_page(status_label, current_page, month_label)
 
+    def find_filtered_row_by_key(self, month_label: str, year_label: str, status_label: str, pile_key: str) -> PileRow | None:
+        rows = self.scan_status(month_label, year_label, status_label)
+        for row in rows:
+            if row.key == pile_key:
+                return row
+        return None
+
     def _fuzzy_match(self, insurer_name: str, option_text: str) -> bool:
         insurer_lower = norm(insurer_name).lower()
         option_lower = norm(option_text).lower()
@@ -3725,8 +3732,10 @@ class CuracelPilesRunner:
         applied: list[AppliedAssignment] = []
         for filter_month in month_labels:
             for status_label in TARGET_STATUSES:
-                status_plans = [plan for plan in plans if plan.status_bucket == status_label and plan.filter_month == filter_month]
-                if not status_plans:
+                pending_status_plans = [
+                    plan for plan in plans if plan.status_bucket == status_label and plan.filter_month == filter_month
+                ]
+                if not pending_status_plans:
                     continue
                 print(f"\nApplying assignments for month/status: {filter_month} / {status_label}")
                 self.open_piles()
@@ -3741,7 +3750,7 @@ class CuracelPilesRunner:
                         break
                     seen_pages.add(fingerprint)
                     current_keys = {row.key for row in current_rows}
-                    page_plans = [plan for plan in status_plans if plan.pile_key in current_keys]
+                    page_plans = [plan for plan in pending_status_plans if plan.pile_key in current_keys]
                     if page_plans:
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
                         for plan in page_plans:
@@ -3752,6 +3761,7 @@ class CuracelPilesRunner:
                             selected_keys: list[str] = []
                             missing_keys = requested_keys[:]
                             partial_selection_detected = False
+                            deferred_missing_keys: list[str] = []
 
                             if group_index > 0:
                                 current_rows = self.reset_to_filtered_page(filter_month, year_label, status_label, page_number)
@@ -3762,30 +3772,47 @@ class CuracelPilesRunner:
                             missing_keys = [key for key in requested_keys if key not in selected_keys]
                             if missing_keys:
                                 partial_selection_detected = bool(selected_keys)
-                                print(
-                                    f"  Partial row selection detected for '{assignee_name}' "
-                                    f"in {status_label}: selected {len(selected_keys)}/{len(requested_keys)}. "
-                                    "Retrying the missing piles one by one..."
-                                )
-                                for missing_key in missing_keys[:]:
-                                    recovered = False
-                                    for retry in range(3):
-                                        current_rows = self.reset_to_filtered_page(filter_month, year_label, status_label, page_number)
-                                        single_selection = self._select_rows([missing_key], current_rows)
-                                        if single_selection.selected_keys:
-                                            for key in single_selection.selected_keys:
-                                                if key not in selected_keys:
-                                                    selected_keys.append(key)
-                                            recovered = True
-                                            break
-                                        time.sleep(0.6)
-                                    if recovered:
-                                        missing_keys = [key for key in missing_keys if key not in selected_keys]
-                                        continue
-                                    raise RuntimeError(
-                                        f"Could not reliably select every planned pile for '{assignee_name}' "
-                                        f"in status '{status_label}'. Missing pile key: {missing_key}"
+                                if partial_selection_detected:
+                                    print(
+                                        f"  Partial row selection detected for '{assignee_name}' "
+                                        f"in {status_label}: selected {len(selected_keys)}/{len(requested_keys)}. "
+                                        "Deferring unstable pile rows to a follow-up pass so the already-selected rows stay intact..."
                                     )
+                                    deferred_missing_keys = missing_keys[:]
+                                else:
+                                    print(
+                                        f"  Planned pile rows for '{assignee_name}' moved before selection completed "
+                                        f"in {status_label}. Trying to relocate them across the filtered pages..."
+                                    )
+                                    for missing_key in missing_keys[:]:
+                                        recovered = False
+                                        for retry in range(2):
+                                            located_row = self.find_filtered_row_by_key(
+                                                filter_month,
+                                                year_label,
+                                                status_label,
+                                                missing_key,
+                                            )
+                                            if located_row is None:
+                                                break
+                                            current_rows = self.reset_to_filtered_page(
+                                                filter_month,
+                                                year_label,
+                                                status_label,
+                                                located_row.page_number,
+                                            )
+                                            single_selection = self._select_rows([missing_key], current_rows)
+                                            if single_selection.selected_keys:
+                                                for key in single_selection.selected_keys:
+                                                    if key not in selected_keys:
+                                                        selected_keys.append(key)
+                                                recovered = True
+                                                break
+                                            time.sleep(0.6)
+                                        if recovered:
+                                            missing_keys = [key for key in missing_keys if key not in selected_keys]
+                                        else:
+                                            deferred_missing_keys.append(missing_key)
 
                             if not selected_keys:
                                 continue
@@ -3823,9 +3850,71 @@ class CuracelPilesRunner:
                                     verified_on_table=verified_on_table if execute else False,
                                     observed_assigned_values=observed_assigned_values[:] if execute else [],
                                 ))
+                            applied_keys = {plan.pile_key for plan in selected_group}
+                            pending_status_plans = [
+                                plan for plan in pending_status_plans if plan.pile_key not in applied_keys
+                            ]
+                            if deferred_missing_keys:
+                                print(
+                                    f"  Deferred {len(deferred_missing_keys)} unstable pile(s) for '{assignee_name}' "
+                                    f"to a follow-up selection pass."
+                                )
                     if not self.goto_next_page():
                         break
                     page_number += 1
+                if pending_status_plans:
+                    print(
+                        f"\nFollow-up selection pass for {len(pending_status_plans)} deferred pile(s) "
+                        f"in {filter_month} / {status_label}..."
+                    )
+                for plan in pending_status_plans[:]:
+                    located_row = self.find_filtered_row_by_key(filter_month, year_label, status_label, plan.pile_key)
+                    if located_row is None:
+                        continue
+                    current_rows = self.reset_to_filtered_page(
+                        filter_month,
+                        year_label,
+                        status_label,
+                        located_row.page_number,
+                    )
+                    selection = self._select_rows([plan.pile_key], current_rows)
+                    if not selection.selected_keys:
+                        continue
+                    selected_assignee = self._apply_assignment_modal(plan.assignment_type, plan.assignee_name, execute)
+                    verified_on_table = False
+                    observed_assigned_values: list[str] = []
+                    if execute:
+                        verified_on_table, observed_assigned_values = self.verify_assigned_rows(
+                            filter_month,
+                            year_label,
+                            status_label,
+                            [plan.pile_key],
+                            selected_assignee,
+                        )
+                        if not verified_on_table:
+                            raise RuntimeError(
+                                f"Assigned column did not update to '{selected_assignee}' for 1 verified pile "
+                                f"in status '{status_label}'. Observed: {observed_assigned_values or ['<blank>']}"
+                            )
+                    results[selected_assignee] = results.get(selected_assignee, 0) + 1
+                    applied.append(AppliedAssignment(
+                        plan=plan,
+                        actual_assignee_name=selected_assignee,
+                        matched_planned_assignee=norm_key(selected_assignee) == norm_key(plan.assignee_name),
+                        verified_on_table=verified_on_table if execute else False,
+                        observed_assigned_values=observed_assigned_values[:] if execute else [],
+                    ))
+                    pending_status_plans = [
+                        pending_plan for pending_plan in pending_status_plans if pending_plan.pile_key != plan.pile_key
+                    ]
+                if pending_status_plans:
+                    unresolved = ", ".join(plan.pile_key for plan in pending_status_plans[:3])
+                    if len(pending_status_plans) > 3:
+                        unresolved += f", +{len(pending_status_plans) - 3} more"
+                    raise RuntimeError(
+                        f"Could not reliably relocate {len(pending_status_plans)} planned pile(s) for "
+                        f"status '{status_label}' after a follow-up pass. Remaining: {unresolved}"
+                    )
         return results, applied
 
 
