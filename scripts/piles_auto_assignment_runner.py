@@ -3031,11 +3031,30 @@ class CuracelPilesRunner:
 
     def _table_headers(self) -> list[str]:
         assert self.page
-        headers = []
-        ths = self.page.locator("table thead tr th")
-        for idx in range(ths.count()):
-            headers.append(norm(ths.nth(idx).inner_text()))
-        return headers
+        last_error: Exception | None = None
+        for attempt in range(3):
+            headers: list[str] = []
+            try:
+                ths = self.page.locator("table thead tr th")
+                count = ths.count()
+                if count == 0:
+                    time.sleep(0.25)
+                    continue
+                for idx in range(count):
+                    try:
+                        headers.append(norm(ths.nth(idx).inner_text(timeout=1500)))
+                    except Exception as error:
+                        last_error = error
+                        headers = []
+                        break
+                if headers:
+                    return headers
+            except Exception as error:
+                last_error = error
+            time.sleep(0.35)
+        if last_error:
+            print("  Warning: table headers were not fully readable; falling back to default column positions.")
+        return []
 
     def wait_for_table_ready(self, timeout_ms: int = 12000) -> None:
         assert self.page
@@ -4612,7 +4631,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_for_insurer(
+def is_retryable_runner_browser_error(exc: Exception) -> bool:
+    phrases = (
+        "target page, context or browser has been closed",
+        "target closed",
+        "browser has been closed",
+        "page has been closed",
+        "context has been closed",
+    )
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None:
+            continue
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        message = norm(str(current)).lower()
+        if any(phrase in message for phrase in phrases):
+            return True
+        pending.append(getattr(current, "__cause__", None))
+        pending.append(getattr(current, "__context__", None))
+    return False
+
+
+def _run_for_insurer_once(
     store: DataStore,
     args: argparse.Namespace,
     insurer_name: str,
@@ -5177,6 +5222,30 @@ def run_for_insurer(
         "external_notification_items": external_detection["notifications"],
         "late_arrival_detection": late_arrival_detection,
     }
+
+
+def run_for_insurer(
+    store: DataStore,
+    args: argparse.Namespace,
+    insurer_name: str,
+    month_labels: list[str],
+    year_label: str,
+    visible: bool,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, 3):
+        try:
+            return _run_for_insurer_once(store, args, insurer_name, month_labels, year_label, visible)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 2 or not is_retryable_runner_browser_error(exc):
+                raise
+            print(
+                f"\n  Browser session was interrupted while processing {insurer_name}. "
+                f"Restarting the insurer flow ({attempt + 1}/2)..."
+            )
+            time.sleep(2)
+    raise last_error or RuntimeError(f"Insurer run failed for {insurer_name}.")
 
 
 def main() -> None:
