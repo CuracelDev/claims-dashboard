@@ -4,12 +4,20 @@ import pg from 'pg';
 const { Pool } = pg;
 
 function loadLocalEnv() {
-  if (!fs.existsSync('.env.local')) return;
-  const lines = fs.readFileSync('.env.local', 'utf8').split(/\n/);
-  for (const line of lines) {
-    const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
-    if (match && process.env[match[1]] === undefined) {
-      process.env[match[1]] = match[2];
+  const files = ['.env', '.env.local'];
+  for (const file of files) {
+    if (!fs.existsSync(file)) continue;
+    const lines = fs.readFileSync(file, 'utf8').split(/\n/);
+    for (const line of lines) {
+      const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
+      if (match && process.env[match[1]] === undefined) {
+        // Strip any wrapping quotes
+        let val = match[2].trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.substring(1, val.length - 1);
+        }
+        process.env[match[1]] = val;
+      }
     }
   }
 }
