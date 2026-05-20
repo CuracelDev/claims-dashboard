@@ -21,9 +21,9 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
 
 (crontab -l 2>/dev/null || true) \
-  | grep -v "run-piles-auto-assignment.sh" \
-  | grep -v "piles-auto-assignment-cron.log" \
-  | grep -v "$MARKER" \
+  | (grep -v "run-piles-auto-assignment.sh" || true) \
+  | (grep -v "piles-auto-assignment-cron.log" || true) \
+  | (grep -v "$MARKER" || true) \
   > "$TMP_FILE"
 
 CRON_COMMAND="/bin/sh -lc 'cd $ROOT_DIR && set -a && . $ENV_FILE && set +a && ./scripts/run-piles-auto-assignment.sh >> $LOG_FILE 2>&1'"
