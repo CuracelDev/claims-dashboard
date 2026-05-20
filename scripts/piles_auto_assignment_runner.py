@@ -2237,6 +2237,13 @@ class CuracelPilesRunner:
         self.playwright = None
         self.browser: Browser | None = None
         self.page: Page | None = None
+        self._filter_state: dict[str, Any] = {
+            "month": "",
+            "year": "",
+            "status": "",
+            "page_size": None,
+        }
+        self._table_headers_cache: list[str] = []
 
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
@@ -2265,6 +2272,15 @@ class CuracelPilesRunner:
             self.browser.close()
         if self.playwright:
             self.playwright.stop()
+
+    def _invalidate_filter_state(self) -> None:
+        self._filter_state = {
+            "month": "",
+            "year": "",
+            "status": "",
+            "page_size": None,
+        }
+        self._table_headers_cache = []
 
     def _dismiss_popup(self) -> None:
         assert self.page
@@ -2492,6 +2508,7 @@ class CuracelPilesRunner:
                 self._wait_for_piles_page_ready()
                 time.sleep(1)
                 self._dismiss_popup()
+                self._invalidate_filter_state()
                 return
             except Exception as error:
                 last_error = error
@@ -2693,8 +2710,7 @@ class CuracelPilesRunner:
 
     def _dropdown_option_texts(self) -> list[str]:
         assert self.page
-        panels = self._visible_dropdown_panels()
-        option_root = panels[-1] if panels else self.page
+        option_root = self._active_dropdown_root()
         options = option_root.locator("li.p-select-option, .p-select-option, [role='option']")
         texts: list[str] = []
         for idx in range(options.count()):
@@ -2763,6 +2779,18 @@ class CuracelPilesRunner:
             self._append_unique_select(candidates, select)
         return candidates
 
+    def _direct_month_control(self) -> Any | None:
+        candidates: list[Any] = []
+        self._append_unique_select(candidates, self._select_following_label_text("Select Month"))
+        self._append_unique_select(candidates, self._select_following_label_text("Month"))
+        self._append_unique_select(candidates, self._select_in_container("Select Month"))
+        self._append_unique_select(candidates, self._select_by_label("Select Month"))
+        self._append_unique_select(candidates, self._select_by_label("Month"))
+        if candidates:
+            return candidates[0]
+        visible = self._visible_selects()
+        return visible[0] if visible else None
+
     def _select_candidates_for_status(self, month_select: Any | None) -> list[Any]:
         selects = self._visible_selects()
         candidates: list[Any] = []
@@ -2776,6 +2804,20 @@ class CuracelPilesRunner:
             self._append_unique_select(candidates, select)
         return candidates
 
+    def _direct_status_control(self, month_select: Any | None = None) -> Any | None:
+        candidates: list[Any] = []
+        self._append_unique_select(candidates, self._select_following_label_text("Filter by Vetting Status"))
+        self._append_unique_select(candidates, self._select_in_container("Filter by Vetting Status"))
+        self._append_unique_select(candidates, self._select_by_label("Filter by Vetting Status"))
+        if candidates:
+            return candidates[0]
+        visible = self._visible_selects()
+        for select in visible:
+            if month_select is not None and select is month_select:
+                continue
+            self._append_unique_select(candidates, select)
+        return candidates[0] if candidates else self._find_select_with_options(TARGET_STATUSES)
+
     def _select_candidates_for_year(self, year_label: str) -> list[Any]:
         multiselects = self._visible_multiselects()
         candidates: list[Any] = []
@@ -2786,6 +2828,15 @@ class CuracelPilesRunner:
         for select in multiselects:
             self._append_unique_select(candidates, select)
         return candidates
+
+    def _direct_year_control(self) -> Any | None:
+        candidates: list[Any] = []
+        self._append_unique_select(candidates, self._select_following_label_text("Year"))
+        self._append_unique_select(candidates, self._select_in_container("Year"))
+        if candidates:
+            return candidates[0]
+        visible = self._visible_multiselects()
+        return visible[0] if visible else None
 
     def _set_select_value(self, select: Any | None, desired_text: str, required: bool = False) -> bool:
         assert self.page
@@ -2828,8 +2879,7 @@ class CuracelPilesRunner:
         try:
             if not self._open_select(select):
                 raise RuntimeError(f"Could not open multiselect for '{desired_values}'.")
-            panels = self._visible_dropdown_panels()
-            option_root = panels[-1] if panels else self.page
+            option_root = self._active_multiselect_root()
             options = option_root.locator("li.p-multiselect-option, li[role='option'], [data-pc-section='option']")
             available: list[tuple[str, Any, bool]] = []
             for idx in range(options.count()):
@@ -2850,6 +2900,10 @@ class CuracelPilesRunner:
                     f"Available options: {[text for text, _, _ in available]}"
                 )
 
+            if desired_keys == available_keys and self._click_multiselect_select_all(option_root):
+                self._close_dropdown()
+                return True
+
             for text, option, selected in available:
                 should_select = label_key(text) in desired_keys
                 if should_select != selected:
@@ -2866,6 +2920,83 @@ class CuracelPilesRunner:
             if required:
                 raise
             return False
+
+    def _click_multiselect_select_all(self, option_root: Any) -> bool:
+        selectors = [
+            ".p-multiselect-header [data-pc-name='pcheadercheckbox']",
+            ".p-multiselect-header [data-pc-name='pcheadercheckbox'] [data-pc-section='input']",
+            ".p-multiselect-header [data-pc-name='pcheadercheckbox'] [data-pc-section='box']",
+            ".p-multiselect-header .p-checkbox-input[aria-label*='all items' i]",
+            ".p-multiselect-header .p-checkbox-box",
+            ".p-multiselect-header .p-checkbox",
+            "[data-pc-section='header'] [role='checkbox']",
+            "[data-pc-section='header'] .p-checkbox-box",
+            "[data-pc-section='headercheckboxcontainer']",
+            "[data-pc-section='headercheckbox']",
+            "[data-pc-section='headercheckbox'] .p-checkbox-box",
+            ".p-multiselect-select-all [role='checkbox']",
+            ".p-multiselect-select-all .p-checkbox-box",
+            ".p-multiselect-header .p-checkbox-box",
+            ".p-multiselect-header .p-checkbox",
+            ".p-multiselect-header [role='checkbox']",
+            "button[aria-label*='all' i]",
+            "button[title*='all' i]",
+            "button:has-text('Select All')",
+            "button:has-text('select all')",
+        ]
+        for selector in selectors:
+            try:
+                locs = option_root.locator(selector)
+                for idx in range(locs.count()):
+                    loc = locs.nth(idx)
+                    if not loc.is_visible():
+                        continue
+                    click_targets = [
+                        loc,
+                        loc.locator("[data-pc-name='pcheadercheckbox']").first,
+                        loc.locator("[data-pc-section='input']").first,
+                        loc.locator("[data-pc-section='box']").first,
+                        loc.locator("[role='checkbox']").first,
+                        loc.locator("input[type='checkbox']").first,
+                        loc.locator(".p-checkbox-box").first,
+                        loc.locator(".p-checkbox").first,
+                    ]
+                    for target in click_targets:
+                        try:
+                            if target.count() == 0 or not target.is_visible():
+                                continue
+                            current = norm(target.get_attribute("aria-checked")).lower()
+                            input_label = norm(target.get_attribute("aria-label")).lower()
+                            classes = norm(target.get_attribute("class")).lower()
+                            if current == "true" or "checked" in classes or "all items selected" in input_label:
+                                return True
+                            target.click(force=True)
+                            time.sleep(0.25)
+                            verify_targets = [
+                                option_root.locator(".p-multiselect-header [data-pc-name='pcheadercheckbox']").first,
+                                option_root.locator(".p-multiselect-header .p-checkbox-input").first,
+                                target,
+                            ]
+                            for verify in verify_targets:
+                                try:
+                                    if verify.count() == 0:
+                                        continue
+                                    verify_checked = norm(verify.get_attribute("aria-checked")).lower()
+                                    verify_label = norm(verify.get_attribute("aria-label")).lower()
+                                    verify_classes = norm(verify.get_attribute("class")).lower()
+                                    if (
+                                        verify_checked == "true"
+                                        or "checked" in verify_classes
+                                        or "all items selected" in verify_label
+                                    ):
+                                        return True
+                                except Exception:
+                                    continue
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        return False
 
     def _read_select_text(self, select: Any | None) -> str:
         if select is None:
@@ -2905,6 +3036,14 @@ class CuracelPilesRunner:
         final_month_select = None
         final_year_select = None
         final_status_select = None
+        desired_year_state = "All" if norm_key(year_label) == "all" else year_label
+        month_changed = self._filter_state["month"] != month_label
+        year_changed = self._filter_state["year"] != desired_year_state
+        status_changed = self._filter_state["status"] != status_label
+
+        if not month_changed and not year_changed and not status_changed:
+            self.wait_for_table_ready(timeout_ms=6000)
+            return
 
         for attempt in range(1, 4):
             if attempt > 1:
@@ -2917,50 +3056,80 @@ class CuracelPilesRunner:
                 time.sleep(1.2)
 
             month_select = None
-            for candidate in self._select_candidates_for_month(month_label):
-                if self._set_select_value(candidate, month_label):
-                    month_select = candidate
-                    break
-            if month_select is None:
-                month_candidates = self._select_candidates_for_month(month_label)
-                month_select = month_candidates[0] if month_candidates else None
-                self._set_select_value(month_select, month_label)
+            if month_changed:
+                direct_month = self._direct_month_control()
+                if direct_month is not None and self._set_select_value(direct_month, month_label):
+                    month_select = direct_month
+                if month_select is None:
+                    for candidate in self._select_candidates_for_month(month_label):
+                        if self._set_select_value(candidate, month_label):
+                            month_select = candidate
+                            break
+                if month_select is None:
+                    month_candidates = self._select_candidates_for_month(month_label)
+                    month_select = month_candidates[0] if month_candidates else None
+                    self._set_select_value(month_select, month_label)
 
             year_select = None
-            desired_year_values = []
-            if norm_key(year_label) == "all":
-                desired_year_values = []
-                for candidate in self._select_candidates_for_year(year_label):
-                    if not self._open_select(candidate):
-                        continue
-                    option_texts = [text for text in self._dropdown_option_texts() if re.match(r"^20\d{2}$", text)]
-                    self._close_dropdown()
-                    if option_texts:
-                        desired_year_values = option_texts
-                        year_select = candidate
-                        break
-                if not desired_year_values:
-                    desired_year_values = [str(datetime.now().year)]
-            else:
-                desired_year_values = [year_label]
+            desired_year_values: list[str] = []
+            year_select_all_applied = False
+            if year_changed:
+                year_select = self._direct_year_control()
+                if norm_key(year_label) == "all":
+                    probe_candidates: list[Any] = []
+                    if year_select is not None:
+                        probe_candidates.append(year_select)
+                    for candidate in self._select_candidates_for_year(year_label):
+                        if candidate is year_select:
+                            continue
+                        probe_candidates.append(candidate)
+                    for candidate in probe_candidates:
+                        if not self._open_select(candidate):
+                            continue
+                        option_texts = [text for text in self._dropdown_option_texts() if re.match(r"^20\d{2}$", text)]
+                        panel_root = self._active_multiselect_root()
+                        if option_texts:
+                            desired_year_values = option_texts
+                            year_select = candidate
+                            if self._click_multiselect_select_all(panel_root):
+                                year_select_all_applied = True
+                                self._close_dropdown()
+                                break
+                        self._close_dropdown()
+                    if not desired_year_values:
+                        desired_year_values = [str(datetime.now().year)]
+                else:
+                    desired_year_values = [year_label]
 
-            year_candidates = self._select_candidates_for_year(year_label)
-            if year_select is not None:
-                self._set_multiselect_values(year_select, desired_year_values, required=True)
-            else:
-                for candidate in year_candidates:
-                    if self._set_multiselect_values(candidate, desired_year_values):
-                        year_select = candidate
-                        break
-                if year_select is None and year_candidates:
-                    year_select = year_candidates[0]
+                year_candidates = self._select_candidates_for_year(year_label)
+                if year_select_all_applied:
+                    pass
+                elif year_select is not None:
                     self._set_multiselect_values(year_select, desired_year_values, required=True)
+                else:
+                    for candidate in year_candidates:
+                        if self._set_multiselect_values(candidate, desired_year_values):
+                            year_select = candidate
+                            break
+                    if year_select is None and year_candidates:
+                        year_select = year_candidates[0]
+                        self._set_multiselect_values(year_select, desired_year_values, required=True)
 
             status_select = None
-            for candidate in self._select_candidates_for_status(month_select):
-                if self._set_select_value(candidate, status_label):
-                    status_select = candidate
-                    break
+            if month_changed or year_changed or status_changed:
+                direct_status = self._direct_status_control(month_select)
+                if direct_status is not None and self._set_select_value(direct_status, status_label):
+                    status_select = direct_status
+                if status_select is None:
+                    for candidate in self._select_candidates_for_status(month_select):
+                        if self._set_select_value(candidate, status_label):
+                            status_select = candidate
+                            break
+            else:
+                status_select = self._direct_status_control(month_select)
+                if status_select is None:
+                    status_candidates = self._select_candidates_for_status(month_select)
+                    status_select = status_candidates[0] if status_candidates else None
 
             if status_select is not None:
                 final_month_select = month_select
@@ -2983,10 +3152,18 @@ class CuracelPilesRunner:
         if final_status_select is None:
             raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
 
+        self._filter_state["month"] = month_label
+        self._filter_state["year"] = desired_year_state
+        self._filter_state["status"] = status_label
+        self._filter_state["page_size"] = None
+
+        month_display = self._read_select_text(final_month_select) or month_label
+        year_display = self._read_select_text(final_year_select) or self._read_year_chip_text() or year_label
+
         print(
             "  Applied filter controls:"
-            f" month='{self._read_select_text(final_month_select)}'"
-            f" year='{self._read_select_text(final_year_select) or self._read_year_chip_text() or year_label}'"
+            f" month='{month_display}'"
+            f" year='{desired_year_state if desired_year_state == 'All' else year_display}'"
             f" status='{self._read_select_text(final_status_select)}'"
         )
 
@@ -2998,15 +3175,13 @@ class CuracelPilesRunner:
                     break
             except Exception:
                 continue
-        try:
-            self.page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-        time.sleep(1.5)
-        self.wait_for_table_ready()
+        time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
+        self.wait_for_table_ready(timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000)
 
     def try_set_page_size(self, page_size: int = 100) -> None:
         assert self.page
+        if self._filter_state.get("page_size") == page_size:
+            return
         # Best-effort only; pagination controls vary.
         selectors = [
             "[aria-label='Rows per page']",
@@ -3024,6 +3199,7 @@ class CuracelPilesRunner:
                     time.sleep(0.4)
                     if self._choose_option_from_open_dropdown(str(page_size)):
                         time.sleep(1)
+                        self._filter_state["page_size"] = page_size
                         return
                     self.page.keyboard.press("Escape")
             except Exception:
@@ -3031,6 +3207,8 @@ class CuracelPilesRunner:
 
     def _table_headers(self) -> list[str]:
         assert self.page
+        if self._table_headers_cache:
+            return list(self._table_headers_cache)
         last_error: Exception | None = None
         for attempt in range(3):
             headers: list[str] = []
@@ -3048,6 +3226,7 @@ class CuracelPilesRunner:
                         headers = []
                         break
                 if headers:
+                    self._table_headers_cache = list(headers)
                     return headers
             except Exception as error:
                 last_error = error
@@ -3073,11 +3252,11 @@ class CuracelPilesRunner:
                 else:
                     stable_ticks = 0
                     last_fingerprint = fingerprint
-                if stable_ticks >= 2 and (texts or no_data):
+                if stable_ticks >= 1 and (texts or no_data):
                     return
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(0.3)
 
     def rows_on_current_page(self, status_bucket: str, page_number: int, filter_month: str) -> list[PileRow]:
         assert self.page
@@ -3159,7 +3338,7 @@ class CuracelPilesRunner:
                 if disabled or "disabled" in classes:
                     return False
                 loc.click()
-                time.sleep(1)
+                time.sleep(0.45)
                 self.wait_for_table_ready()
                 return True
             except Exception:
@@ -3436,12 +3615,15 @@ class CuracelPilesRunner:
     def _visible_dropdown_panels(self) -> list[Any]:
         assert self.page
         selectors = [
+            ".p-multiselect-panel:visible",
+            ".p-multiselect-overlay:visible",
             ".p-select-overlay:visible",
             ".p-dropdown-panel:visible",
             "[role='listbox']:visible",
         ]
-        panels: list[tuple[float, Any]] = []
-        for selector in selectors:
+        panels: list[tuple[int, float, float, Any]] = []
+        seen_boxes: set[tuple[int, int, int, int]] = set()
+        for priority, selector in enumerate(selectors):
             try:
                 locs = self.page.locator(selector)
                 for idx in range(locs.count()):
@@ -3451,11 +3633,45 @@ class CuracelPilesRunner:
                     box = loc.bounding_box()
                     if not box:
                         continue
-                    panels.append((box["y"], loc))
+                    fingerprint = (
+                        round(box["x"]),
+                        round(box["y"]),
+                        round(box["width"]),
+                        round(box["height"]),
+                    )
+                    if fingerprint in seen_boxes:
+                        continue
+                    seen_boxes.add(fingerprint)
+                    area = box["width"] * box["height"]
+                    panels.append((priority, box["y"], -area, loc))
             except Exception:
                 continue
-        panels.sort(key=lambda item: item[0])
-        return [item[1] for item in panels]
+        panels.sort(key=lambda item: (item[1], item[0], item[2]))
+        return [item[3] for item in panels]
+
+    def _active_dropdown_root(self) -> Any:
+        assert self.page
+        panels = self._visible_dropdown_panels()
+        return panels[-1] if panels else self.page
+
+    def _active_multiselect_root(self) -> Any:
+        assert self.page
+        selectors = [
+            ".p-multiselect-panel:visible",
+            ".p-multiselect-overlay:visible",
+            ".p-overlay:has(.p-multiselect-header):visible",
+            ".p-overlay:has(.p-multiselect-list):visible",
+        ]
+        for selector in selectors:
+            try:
+                locs = self.page.locator(selector)
+                for idx in range(locs.count() - 1, -1, -1):
+                    loc = locs.nth(idx)
+                    if loc.is_visible():
+                        return loc
+            except Exception:
+                continue
+        return self._active_dropdown_root()
 
     def _visible_dropdown_option_texts(self) -> list[str]:
         assert self.page
