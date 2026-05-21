@@ -739,6 +739,7 @@ class PlannedAssignment:
     current_status: str
     status_bucket: str
     filter_month: str
+    source_page_number: int
 
 
 @dataclass
@@ -3290,6 +3291,8 @@ class CuracelPilesRunner:
             submitted_date = value("submitted date", 6)
             row_status = value("status", 7) or status_bucket
             assigned = value("assigned", len(texts) - 2 if len(texts) >= 2 else 0)
+            if claims <= 0 and not any([provider, amount_text, month, submitted_date, row_status, assigned]):
+                continue
             tracking_key = "|".join([
                 norm(provider),
                 str(claims),
@@ -3345,7 +3348,7 @@ class CuracelPilesRunner:
                 continue
         return False
 
-    def scan_status(self, month_label: str, year_label: str, status_label: str) -> list[PileRow]:
+    def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
         self.apply_filters(month_label, year_label, status_label)
         self.try_set_page_size(100)
         seen_pages = set()
@@ -3357,7 +3360,7 @@ class CuracelPilesRunner:
             if fingerprint in seen_pages:
                 break
             seen_pages.add(fingerprint)
-            piles.extend(page_rows)
+            piles.extend([row for row in page_rows if not only_unassigned or not norm(row.assigned)])
             if not self.goto_next_page():
                 break
             page_number += 1
@@ -3393,6 +3396,30 @@ class CuracelPilesRunner:
                     all_rows.append(row)
         return all_rows
 
+    def scan_selected_statuses(
+        self,
+        month_status_pairs: list[tuple[str, str]],
+        year_label: str,
+        *,
+        only_unassigned: bool = False,
+    ) -> list[PileRow]:
+        all_rows: list[PileRow] = []
+        seen: set[str] = set()
+        for month_label, status_label in month_status_pairs:
+            print(f"\nScanning follow-up context: {month_label} / {status_label}")
+            rows = self.scan_status(month_label, year_label, status_label, only_unassigned=only_unassigned)
+            if only_unassigned:
+                print(f"  Found {len(rows)} unassigned rows")
+            else:
+                unassigned = [row for row in rows if not norm(row.assigned)]
+                print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
+            for row in rows:
+                if row.key in seen:
+                    continue
+                seen.add(row.key)
+                all_rows.append(row)
+        return all_rows
+
     def reset_to_filtered_page(self, month_label: str, year_label: str, status_label: str, page_number: int) -> list[PileRow]:
         self.open_piles()
         self.apply_filters(month_label, year_label, status_label)
@@ -3404,11 +3431,35 @@ class CuracelPilesRunner:
             current_page += 1
         return self.rows_on_current_page(status_label, current_page, month_label)
 
-    def find_filtered_row_by_key(self, month_label: str, year_label: str, status_label: str, pile_key: str) -> PileRow | None:
-        rows = self.scan_status(month_label, year_label, status_label)
-        for row in rows:
-            if row.key == pile_key:
-                return row
+    def find_filtered_row_by_key(
+        self,
+        month_label: str,
+        year_label: str,
+        status_label: str,
+        pile_key: str,
+        *,
+        preferred_page: int = 1,
+        current_page: int | None = None,
+    ) -> PileRow | None:
+        page_candidates: list[int] = []
+        for page_number in [
+            current_page or preferred_page,
+            preferred_page,
+            max(1, preferred_page - 1),
+            preferred_page + 1,
+            max(1, preferred_page - 2),
+            preferred_page + 2,
+            1,
+            2,
+            3,
+        ]:
+            if page_number not in page_candidates and page_number > 0:
+                page_candidates.append(page_number)
+        for page_number in page_candidates:
+            current_rows = self.reset_to_filtered_page(month_label, year_label, status_label, page_number)
+            for row in current_rows:
+                if row.key == pile_key:
+                    return row
         return None
 
     def _fuzzy_match(self, insurer_name: str, option_text: str) -> bool:
@@ -4008,6 +4059,11 @@ class CuracelPilesRunner:
                                                 year_label,
                                                 status_label,
                                                 missing_key,
+                                                preferred_page=next(
+                                                    (plan.source_page_number for plan in group if plan.pile_key == missing_key),
+                                                    page_number,
+                                                ),
+                                                current_page=page_number,
                                             )
                                             if located_row is None:
                                                 break
@@ -4084,7 +4140,13 @@ class CuracelPilesRunner:
                         f"in {filter_month} / {status_label}..."
                     )
                 for plan in pending_status_plans[:]:
-                    located_row = self.find_filtered_row_by_key(filter_month, year_label, status_label, plan.pile_key)
+                    located_row = self.find_filtered_row_by_key(
+                        filter_month,
+                        year_label,
+                        status_label,
+                        plan.pile_key,
+                        preferred_page=plan.source_page_number,
+                    )
                     if located_row is None:
                         continue
                     current_rows = self.reset_to_filtered_page(
@@ -4566,6 +4628,7 @@ def build_stale_reassignment_plans(
             current_status=observed_row.status,
             status_bucket=observed_row.status_bucket,
             filter_month=observed_row.filter_month,
+            source_page_number=observed_row.page_number,
         ))
 
         entry = summary.setdefault(target.id, {
@@ -4647,6 +4710,7 @@ def build_assignment_plan(
                 current_status=pile.status,
                 status_bucket=pile.status_bucket,
                 filter_month=pile.filter_month,
+                source_page_number=pile.page_number,
             ))
 
     for pile in remaining_piles:
@@ -4668,6 +4732,7 @@ def build_assignment_plan(
             current_status=pile.status,
             status_bucket=pile.status_bucket,
             filter_month=pile.filter_month,
+            source_page_number=pile.page_number,
         ))
 
     summary = {
@@ -4741,6 +4806,7 @@ def build_assignment_plan_from_portal_options(
                 current_status=pile.status,
                 status_bucket=pile.status_bucket,
                 filter_month=pile.filter_month,
+                source_page_number=pile.page_number,
             ))
 
     for pile in remaining_piles:
@@ -4762,6 +4828,7 @@ def build_assignment_plan_from_portal_options(
             current_status=pile.status,
             status_bucket=pile.status_bucket,
             filter_month=pile.filter_month,
+            source_page_number=pile.page_number,
         ))
 
     summary = {
@@ -5005,6 +5072,7 @@ def _run_for_insurer_once(
         "piles": [],
         "summary": {},
         "results": {},
+        "contexts": [],
     }
     reassignment_plans: list[PlannedAssignment] = []
     reassignment_summary: dict[str, dict[str, Any]] = {}
@@ -5185,6 +5253,11 @@ def _run_for_insurer_once(
                     metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
         unassigned = unique_unassigned_rows(scanned_rows)
         initial_unassigned_keys = {row.key for row in unassigned}
+        follow_up_context_pairs = {
+            (row.filter_month, row.status_bucket)
+            for row in unassigned
+            if norm(row.filter_month) and norm(row.status_bucket)
+        }
         print(f"\nTotal unassigned piles found: {len(unassigned)}")
 
         plans: list[PlannedAssignment] = []
@@ -5280,6 +5353,11 @@ def _run_for_insurer_once(
         results: dict[str, int] = {}
         applied: list[AppliedAssignment] = []
         if plans:
+            follow_up_context_pairs.update(
+                (plan.filter_month, plan.status_bucket)
+                for plan in plans
+                if norm(plan.filter_month) and norm(plan.status_bucket)
+            )
             print("\nApplying assignment flow...")
             results, applied = runner.execute_assignment_plan(month_labels, year_label, plans, execute=args.execute)
             print("\nUI assignment groups touched:")
@@ -5291,8 +5369,22 @@ def _run_for_insurer_once(
         if args.execute and resolved_bots:
             metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
 
-        print("\nFinal late-arrival rescan...")
-        follow_up_rows = runner.scan_all_rows(month_labels, year_label)
+        follow_up_context_pairs.update(
+            (plan.filter_month, plan.status_bucket)
+            for plan in reassignment_plans
+            if norm(plan.filter_month) and norm(plan.status_bucket)
+        )
+        follow_up_contexts = sorted(follow_up_context_pairs, key=lambda item: (MONTH_OPTIONS.index(item[0]) if item[0] in MONTH_OPTIONS else 99, TARGET_STATUSES.index(item[1]) if item[1] in TARGET_STATUSES else 99))
+        late_arrival_detection["contexts"] = [
+            {"month": month_label, "status": status_label}
+            for month_label, status_label in follow_up_contexts
+        ]
+
+        if follow_up_contexts:
+            print("\nFinal late-arrival targeted rescan...")
+            follow_up_rows = runner.scan_selected_statuses(follow_up_contexts, year_label, only_unassigned=True)
+        else:
+            follow_up_rows = []
         follow_up_unassigned = [
             row for row in unique_unassigned_rows(follow_up_rows)
             if row.key not in initial_unassigned_keys
@@ -5344,7 +5436,8 @@ def _run_for_insurer_once(
                         f"projected_finish={item['projected_finish_minutes']} mins"
                     )
             if late_plans:
-                late_results, late_applied = runner.execute_assignment_plan(month_labels, year_label, late_plans, execute=args.execute)
+                late_month_labels = list(dict.fromkeys(plan.filter_month for plan in late_plans if norm(plan.filter_month))) or month_labels
+                late_results, late_applied = runner.execute_assignment_plan(late_month_labels, year_label, late_plans, execute=args.execute)
                 late_arrival_detection["results"] = late_results
                 if late_results:
                     print("\nLate-arrival follow-up groups touched:")
