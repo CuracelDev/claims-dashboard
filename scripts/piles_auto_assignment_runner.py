@@ -766,6 +766,15 @@ class RowSelectionResult:
 
 
 @dataclass
+class AssignmentVerificationResult:
+    ok: bool
+    observed_values: list[str]
+    matched_count: int
+    missing_count: int
+    wrong_values: list[str]
+
+
+@dataclass
 class TrackedPile:
     id: str
     master_account_id: str
@@ -3462,6 +3471,81 @@ class CuracelPilesRunner:
                     return row
         return None
 
+    def _page_candidates_for_plan(self, plan: PlannedAssignment, current_page: int | None = None) -> list[int]:
+        candidates: list[int] = []
+        for page_number in [
+            current_page or plan.source_page_number,
+            plan.source_page_number,
+            max(1, plan.source_page_number - 1),
+            plan.source_page_number + 1,
+            max(1, plan.source_page_number - 2),
+            plan.source_page_number + 2,
+            1,
+            2,
+            3,
+        ]:
+            if page_number > 0 and page_number not in candidates:
+                candidates.append(page_number)
+        return candidates
+
+    def _apply_selected_group(
+        self,
+        filter_month: str,
+        year_label: str,
+        status_label: str,
+        assignee_name: str,
+        assignment_type: str,
+        selected_group: list[PlannedAssignment],
+        execute: bool,
+    ) -> tuple[str, list[AppliedAssignment]]:
+        selected_keys = [plan.pile_key for plan in selected_group]
+        self._open_assign_modal()
+        selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
+        verified_on_table = False
+        observed_assigned_values: list[str] = []
+        if execute:
+            source_pages: list[int] = []
+            for plan in selected_group:
+                for page_number in self._page_candidates_for_plan(plan):
+                    if page_number not in source_pages:
+                        source_pages.append(page_number)
+            verification = self.verify_assigned_rows(
+                filter_month,
+                year_label,
+                status_label,
+                selected_keys,
+                selected_assignee,
+                source_pages=source_pages,
+            )
+            verified_on_table = verification.ok
+            observed_assigned_values = verification.observed_values
+            if not verified_on_table:
+                raise RuntimeError(
+                    f"Assigned column did not update to '{selected_assignee}' for "
+                    f"{len(selected_group)} verified pile(s) in status '{status_label}'. "
+                    f"Observed: {observed_assigned_values or ['<blank>']}. "
+                    f"Matched={verification.matched_count}, missing={verification.missing_count}, "
+                    f"wrong={verification.wrong_values or []}"
+                )
+            if verification.missing_count:
+                print(
+                    f"  Verification accepted {verification.matched_count}/{len(selected_group)} "
+                    f"visible row(s) for '{selected_assignee}'; "
+                    f"{verification.missing_count} row(s) moved out of the filtered table after assignment."
+                )
+
+        applied = [
+            AppliedAssignment(
+                plan=plan,
+                actual_assignee_name=selected_assignee,
+                matched_planned_assignee=norm_key(selected_assignee) == norm_key(assignee_name),
+                verified_on_table=verified_on_table if execute else False,
+                observed_assigned_values=observed_assigned_values[:] if execute else [],
+            )
+            for plan in selected_group
+        ]
+        return selected_assignee, applied
+
     def _fuzzy_match(self, insurer_name: str, option_text: str) -> bool:
         insurer_lower = norm(insurer_name).lower()
         option_lower = norm(option_text).lower()
@@ -3551,24 +3635,61 @@ class CuracelPilesRunner:
         pile_keys: list[str],
         expected_assignee: str,
         timeout_ms: int = 15000,
-    ) -> tuple[bool, list[str]]:
+        source_pages: list[int] | None = None,
+    ) -> AssignmentVerificationResult:
         deadline = time.time() + (timeout_ms / 1000)
         last_observed: list[str] = []
         target_keys = list(dict.fromkeys(pile_keys))
+        matched_count = 0
+        missing_count = len(target_keys)
+        wrong_values: list[str] = []
+        page_candidates = list(dict.fromkeys(page for page in (source_pages or []) if page > 0))
+        target_key_set = set(target_keys)
         while time.time() < deadline:
-            current_rows = self.scan_status(month_label, year_label, status_label)
+            if page_candidates:
+                current_rows: list[PileRow] = []
+                seen_keys: set[str] = set()
+                target_seen: set[str] = set()
+                for page_number in page_candidates:
+                    page_rows = self.reset_to_filtered_page(month_label, year_label, status_label, page_number)
+                    for row in page_rows:
+                        if row.key in seen_keys:
+                            continue
+                        seen_keys.add(row.key)
+                        if row.key in target_key_set:
+                            target_seen.add(row.key)
+                        current_rows.append(row)
+                    if target_key_set.issubset(target_seen):
+                        break
+            else:
+                current_rows = self.scan_status(month_label, year_label, status_label)
             row_map = {row.key: row for row in current_rows if row.key in target_keys}
             last_observed = [
                 row_map[key].assigned if key in row_map else "<missing>"
                 for key in target_keys
             ]
-            if len(row_map) == len(target_keys) and all(
-                self._assignee_matches_assigned_text(expected_assignee, row_map[key].assigned)
+            matched_count = sum(
+                1
                 for key in target_keys
-            ):
-                return True, last_observed
+                if key in row_map and self._assignee_matches_assigned_text(expected_assignee, row_map[key].assigned)
+            )
+            missing_count = len(target_keys) - len(row_map)
+            wrong_values = [
+                row_map[key].assigned
+                for key in target_keys
+                if key in row_map and not self._assignee_matches_assigned_text(expected_assignee, row_map[key].assigned)
+            ]
+            if len(row_map) == len(target_keys) and matched_count == len(target_keys):
+                return AssignmentVerificationResult(True, last_observed, matched_count, missing_count, wrong_values)
+
+            # The portal can remove or reshuffle a row from the current status table immediately
+            # after a successful group assignment. Treat a tiny number of missing rows as verified
+            # only when every still-visible target row has the expected assignee.
+            allowed_missing = 0 if len(target_keys) < 10 else max(1, math.floor(len(target_keys) * 0.05))
+            if wrong_values == [] and matched_count > 0 and missing_count <= allowed_missing:
+                return AssignmentVerificationResult(True, last_observed, matched_count, missing_count, wrong_values)
             time.sleep(1)
-        return False, last_observed
+        return AssignmentVerificationResult(False, last_observed, matched_count, missing_count, wrong_values)
 
     def _open_assign_modal(self) -> None:
         assert self.page
@@ -3805,6 +3926,7 @@ class CuracelPilesRunner:
         click_targets = [
             control,
             control.locator("xpath=ancestor-or-self::*[contains(@class,'p-select')][1]").first,
+            control.locator("xpath=ancestor::*[contains(@class,'user-select-wrapper')][1]").first,
             control.locator(".p-select-dropdown").first,
             control.locator(".p-dropdown-trigger").first,
             control.locator("[aria-haspopup='listbox']").first,
@@ -3865,12 +3987,21 @@ class CuracelPilesRunner:
         assignment_type = "Vetting"
         roots = self._visible_overlay_roots()
         dialog = roots[-1] if roots else None
-        time.sleep(2)
-        control = self._wait_for_assign_user_control()
-        if control is None:
-            raise RuntimeError("Could not open the Select User control inside the assign modal.")
-        opened = self._open_select_control(control)
-        if not opened:
+        control = None
+        opened = False
+        for attempt in range(1, 4):
+            time.sleep(0.8 if attempt == 1 else 1.2)
+            control = self._wait_for_assign_user_control(timeout_ms=9000)
+            if control is not None:
+                opened = self._open_select_control(control)
+                if opened:
+                    break
+            try:
+                if self._visible_dropdown_panels():
+                    self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+        if control is None or not opened:
             raise RuntimeError("Could not open the Select User control inside the assign modal.")
         selected_assignee = self._choose_option_from_open_dropdown(assignee_name)
         if not selected_assignee:
@@ -4090,38 +4221,22 @@ class CuracelPilesRunner:
                                 continue
 
                             selected_group = [plan for plan in group if plan.pile_key in selected_keys]
-                            self._open_assign_modal()
-                            selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
-                            verified_on_table = False
-                            observed_assigned_values: list[str] = []
-                            if execute:
-                                verified_on_table, observed_assigned_values = self.verify_assigned_rows(
-                                    filter_month,
-                                    year_label,
-                                    status_label,
-                                    [plan.pile_key for plan in selected_group],
-                                    selected_assignee,
-                                )
-                                if not verified_on_table:
-                                    raise RuntimeError(
-                                        f"Assigned column did not update to '{selected_assignee}' for "
-                                        f"{len(selected_group)} verified pile(s) in status '{status_label}'. "
-                                        f"Observed: {observed_assigned_values or ['<blank>']}"
-                                    )
+                            selected_assignee, applied_group = self._apply_selected_group(
+                                filter_month,
+                                year_label,
+                                status_label,
+                                assignee_name,
+                                assignment_type,
+                                selected_group,
+                                execute,
+                            )
                             if partial_selection_detected:
                                 print(
                                     f"  Recovered all {len(selected_group)} planned pile(s) for '{assignee_name}' "
                                     f"after retrying individual row selection."
                                 )
                             results[selected_assignee] = results.get(selected_assignee, 0) + len(selected_group)
-                            for plan in selected_group:
-                                applied.append(AppliedAssignment(
-                                    plan=plan,
-                                    actual_assignee_name=selected_assignee,
-                                    matched_planned_assignee=norm_key(selected_assignee) == norm_key(assignee_name),
-                                    verified_on_table=verified_on_table if execute else False,
-                                    observed_assigned_values=observed_assigned_values[:] if execute else [],
-                                ))
+                            applied.extend(applied_group)
                             applied_keys = {plan.pile_key for plan in selected_group}
                             pending_status_plans = [
                                 plan for plan in pending_status_plans if plan.pile_key not in applied_keys
@@ -4139,60 +4254,95 @@ class CuracelPilesRunner:
                         f"\nFollow-up selection pass for {len(pending_status_plans)} deferred pile(s) "
                         f"in {filter_month} / {status_label}..."
                     )
-                for plan in pending_status_plans[:]:
-                    located_row = self.find_filtered_row_by_key(
-                        filter_month,
-                        year_label,
-                        status_label,
-                        plan.pile_key,
-                        preferred_page=plan.source_page_number,
-                    )
-                    if located_row is None:
-                        continue
-                    current_rows = self.reset_to_filtered_page(
-                        filter_month,
-                        year_label,
-                        status_label,
-                        located_row.page_number,
-                    )
-                    selection = self._select_rows([plan.pile_key], current_rows)
-                    if not selection.selected_keys:
-                        continue
-                    selected_assignee = self._apply_assignment_modal(plan.assignment_type, plan.assignee_name, execute)
-                    verified_on_table = False
-                    observed_assigned_values: list[str] = []
-                    if execute:
-                        verified_on_table, observed_assigned_values = self.verify_assigned_rows(
+                for recovery_round in range(2):
+                    if not pending_status_plans:
+                        break
+                    page_candidates: list[int] = []
+                    for plan in pending_status_plans:
+                        for page_candidate in self._page_candidates_for_plan(plan):
+                            if page_candidate not in page_candidates:
+                                page_candidates.append(page_candidate)
+                    for recovery_page in page_candidates:
+                        if not pending_status_plans:
+                            break
+                        current_rows = self.reset_to_filtered_page(
                             filter_month,
                             year_label,
                             status_label,
-                            [plan.pile_key],
-                            selected_assignee,
+                            recovery_page,
                         )
-                        if not verified_on_table:
-                            raise RuntimeError(
-                                f"Assigned column did not update to '{selected_assignee}' for 1 verified pile "
-                                f"in status '{status_label}'. Observed: {observed_assigned_values or ['<blank>']}"
+                        selectable_rows = [row for row in current_rows if not norm(row.assigned)]
+                        rows_by_key = {row.key: row for row in selectable_rows}
+                        rows_by_tracking = {row.tracking_key: row for row in selectable_rows}
+                        page_plans: list[PlannedAssignment] = []
+                        for plan in pending_status_plans:
+                            matched_row = rows_by_key.get(plan.pile_key) or rows_by_tracking.get(plan.tracking_key)
+                            if matched_row is None:
+                                continue
+                            plan.pile_key = matched_row.key
+                            plan.source_page_number = matched_row.page_number
+                            page_plans.append(plan)
+                        if not page_plans:
+                            continue
+                        grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
+                        for plan in page_plans:
+                            grouped.setdefault((plan.assignee_name, plan.assignment_type), []).append(plan)
+                        for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped.items()):
+                            if group_index > 0:
+                                current_rows = self.reset_to_filtered_page(
+                                    filter_month,
+                                    year_label,
+                                    status_label,
+                                    recovery_page,
+                                )
+                            requested_keys = [plan.pile_key for plan in group]
+                            selection = self._select_rows(requested_keys, current_rows)
+                            if not selection.selected_keys:
+                                continue
+                            selected_group = [plan for plan in group if plan.pile_key in selection.selected_keys]
+                            selected_assignee, applied_group = self._apply_selected_group(
+                                filter_month,
+                                year_label,
+                                status_label,
+                                assignee_name,
+                                assignment_type,
+                                selected_group,
+                                execute,
                             )
-                    results[selected_assignee] = results.get(selected_assignee, 0) + 1
-                    applied.append(AppliedAssignment(
-                        plan=plan,
-                        actual_assignee_name=selected_assignee,
-                        matched_planned_assignee=norm_key(selected_assignee) == norm_key(plan.assignee_name),
-                        verified_on_table=verified_on_table if execute else False,
-                        observed_assigned_values=observed_assigned_values[:] if execute else [],
-                    ))
-                    pending_status_plans = [
-                        pending_plan for pending_plan in pending_status_plans if pending_plan.pile_key != plan.pile_key
-                    ]
+                            results[selected_assignee] = results.get(selected_assignee, 0) + len(selected_group)
+                            applied.extend(applied_group)
+                            selected_keys = {plan.pile_key for plan in selected_group}
+                            pending_status_plans = [
+                                pending_plan for pending_plan in pending_status_plans if pending_plan.pile_key not in selected_keys
+                            ]
+                    if pending_status_plans:
+                        time.sleep(0.5)
+
                 if pending_status_plans:
-                    unresolved = ", ".join(plan.pile_key for plan in pending_status_plans[:3])
-                    if len(pending_status_plans) > 3:
-                        unresolved += f", +{len(pending_status_plans) - 3} more"
-                    raise RuntimeError(
-                        f"Could not reliably relocate {len(pending_status_plans)} planned pile(s) for "
-                        f"status '{status_label}' after a follow-up pass. Remaining: {unresolved}"
-                    )
+                    final_unassigned = self.scan_status(filter_month, year_label, status_label, only_unassigned=True)
+                    unassigned_by_key = {row.key: row for row in final_unassigned}
+                    unassigned_by_tracking = {row.tracking_key: row for row in final_unassigned}
+                    still_visible: list[PlannedAssignment] = []
+                    no_longer_unassigned: list[PlannedAssignment] = []
+                    for plan in pending_status_plans:
+                        matched_row = unassigned_by_key.get(plan.pile_key) or unassigned_by_tracking.get(plan.tracking_key)
+                        if matched_row:
+                            still_visible.append(plan)
+                        else:
+                            no_longer_unassigned.append(plan)
+                    if no_longer_unassigned:
+                        print(
+                            f"  Warning: {len(no_longer_unassigned)} planned pile(s) were no longer visible as "
+                            f"unassigned in {filter_month} / {status_label}; leaving them for the next scan."
+                        )
+                    if still_visible:
+                        unresolved = ", ".join(plan.pile_key for plan in still_visible[:3])
+                        if len(still_visible) > 3:
+                            unresolved += f", +{len(still_visible) - 3} more"
+                        raise RuntimeError(
+                            f"Could not reliably relocate {len(still_visible)} planned pile(s) for "
+                            f"status '{status_label}' after a follow-up pass. Remaining: {unresolved}"
+                        )
         return results, applied
 
 
@@ -4342,6 +4492,7 @@ def reconcile_tracked_assignments(
     previous_metrics: dict[str, BotMetric],
     rule: AssignmentRule | None,
     requested_month_labels: list[str],
+    scanned_rows: list[PileRow] | None = None,
 ) -> dict[str, Any]:
     tracked = store.get_active_tracked_piles(insurer_name)
     if not tracked:
@@ -4354,19 +4505,20 @@ def reconcile_tracked_assignments(
             "metrics": previous_metrics,
         }
 
-    months = sorted(
-        {
-            month for month in (
-                [item.filter_month for item in tracked]
-                + [item.claim_month for item in tracked]
-                + requested_month_labels
-            )
-            if norm(month)
-        },
-        key=lambda month: MONTH_OPTIONS.index(month) if month in MONTH_OPTIONS else 99,
-    )
     print("\nReconciling tracked assigned piles...")
-    scanned_rows = runner.scan_all_rows(months or requested_month_labels, year_label)
+    if scanned_rows is None:
+        months = sorted(
+            {
+                month for month in (
+                    [item.filter_month for item in tracked]
+                    + [item.claim_month for item in tracked]
+                    + requested_month_labels
+                )
+                if norm(month)
+            },
+            key=lambda month: MONTH_OPTIONS.index(month) if month in MONTH_OPTIONS else 99,
+        )
+        scanned_rows = runner.scan_all_rows(months or requested_month_labels, year_label)
     row_map: dict[str, PileRow] = {}
     for row in scanned_rows:
         existing = row_map.get(row.tracking_key)
@@ -5132,6 +5284,9 @@ def _run_for_insurer_once(
         runner.select_account(insurer_name)
         runner.open_piles()
 
+        print("\nScanning pages...")
+        scanned_rows = runner.scan_all_rows(month_labels, year_label)
+
         if bots:
             tracked_reconcile = reconcile_tracked_assignments(
                 store,
@@ -5142,6 +5297,7 @@ def _run_for_insurer_once(
                 metrics,
                 rule,
                 month_labels,
+                scanned_rows=scanned_rows,
             )
             metrics = tracked_reconcile["metrics"]
             if tracked_reconcile["tracked_count"]:
@@ -5153,8 +5309,6 @@ def _run_for_insurer_once(
                     f"stale={tracked_reconcile['stale_count']}"
                 )
 
-        print("\nScanning pages...")
-        scanned_rows = runner.scan_all_rows(month_labels, year_label)
         tracked_keys = store.get_all_tracked_tracking_keys(insurer_name)
         external_detection = detect_external_assignments(
             store,
