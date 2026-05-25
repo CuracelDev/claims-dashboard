@@ -5054,13 +5054,47 @@ def detect_external_assignments(
         existing_by_tracking[canonical_pile_tracking_key(record.tracking_key)] = record
     tracked_key_set = expanded_tracking_key_set(tracked_keys)
     candidate_rows_by_tracking: dict[str, list[PileRow]] = {}
+    matched_bot_by_tracking: dict[str, BotAccount] = {}
+    unmapped_assignment_count = 0
+    unmapped_assignment_claims = 0
+    unmapped_assignment_samples: list[dict[str, Any]] = []
     for row in rows:
         if not norm(row.assigned):
+            continue
+        matched_bot = match_bot_to_portal_name(bots, row.assigned) if bots else None
+        if matched_bot is None:
+            unmapped_assignment_count += 1
+            unmapped_assignment_claims += max(row.claims, 0)
+            if len(unmapped_assignment_samples) < 10:
+                unmapped_assignment_samples.append({
+                    "assigned": row.assigned,
+                    "provider": row.provider,
+                    "claim_month": row.month,
+                    "submitted_date": row.submitted_date,
+                    "claims_total": row.claims,
+                    "amount": row.amount_text,
+                    "status_bucket": row.status_bucket,
+                })
             continue
         row_keys = expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key])
         if row_keys & tracked_key_set:
             continue
         candidate_rows_by_tracking.setdefault(row.tracking_key, []).append(row)
+        matched_bot_by_tracking[row.tracking_key] = matched_bot
+
+    if unmapped_assignment_count:
+        store.log_runner_event(
+            insurer_name=insurer_name,
+            event_type="external_assignment_unmapped_assignee_skipped",
+            status="skipped",
+            pile_count=unmapped_assignment_count,
+            claim_count=unmapped_assignment_claims,
+            details={
+                "reason": "Assigned portal rows were skipped because their assignee did not match any configured bot owner/account.",
+                "sample_count": len(unmapped_assignment_samples),
+                "samples": unmapped_assignment_samples,
+            },
+        )
 
     assigned_rows_by_tracking: dict[str, PileRow] = {}
     skipped_active_tracking_keys: set[str] = set()
@@ -5106,7 +5140,9 @@ def detect_external_assignments(
 
     for row in assigned_rows_by_tracking.values():
         previous_record = existing_by_tracking.get(row.tracking_key) or existing_by_tracking.get(canonical_pile_tracking_key(row.tracking_key))
-        matched_bot = match_bot_to_portal_name(bots, row.assigned) if bots else None
+        matched_bot = matched_bot_by_tracking.get(row.tracking_key)
+        if matched_bot is None:
+            continue
         progress_claims = max(0, row.synced_claims - safe_int(previous_record.synced_claims if previous_record else 0, 0))
         last_progress_at = (
             now.isoformat()
