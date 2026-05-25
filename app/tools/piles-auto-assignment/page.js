@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../../context/ThemeContext';
-import { getMemberName } from '../../lib/auth';
+import { getMemberId, getMemberName } from '../../lib/auth';
 
 const ROLE_OPTIONS = [
   { value: 'primary', label: 'Primary' },
@@ -261,6 +261,10 @@ function compareMonthLabels(a, b) {
   return MONTH_OPTIONS.indexOf(a) - MONTH_OPTIONS.indexOf(b);
 }
 
+function rosterOwnerKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/^@+/, '').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
 function SaveBanner({ C, notice }) {
   if (!notice) return null;
   return (
@@ -280,6 +284,7 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
     insurer_name: masterAccounts[0]?.insurer_name || '',
     months: ['All'],
     year: 'All',
+    effective_date: '',
     finalize_assignments: false,
     visible_browser: false,
   });
@@ -314,6 +319,7 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
         insurer_name: draft.target === 'single' ? draft.insurer_name : '',
         months: draft.months,
         year: draft.year,
+        effective_date: draft.effective_date,
         finalize_assignments: draft.finalize_assignments,
         visible_browser: draft.visible_browser,
       };
@@ -454,6 +460,7 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
           )}
         </div>
         <input value={draft.year} onChange={(e) => setDraft((prev) => ({ ...prev, year: e.target.value }))} placeholder="Year" style={inputStyle(C)} />
+        <input type="date" value={draft.effective_date} onChange={(e) => setDraft((prev) => ({ ...prev, effective_date: e.target.value }))} title="Optional weekend roster test date" style={inputStyle(C)} />
       </div>
       <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.sub, fontSize: 12, marginBottom: 16 }}>
         Months selected: <span style={{ color: C.text, fontWeight: 700 }}>{selectedMonthsLabel}</span>
@@ -1015,7 +1022,11 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       const res = await fetch('/api/tools/piles-auto-assignment/bot-accounts', {
         method: editingId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(editingId ? { id: editingId, ...draft } : draft),
+        body: JSON.stringify({
+          ...(editingId ? { id: editingId, ...draft } : draft),
+          updated_by_name: getMemberName() || 'Dashboard User',
+          updated_by_member_id: getMemberId() || null,
+        }),
       });
       const data = await res.json();
       if (!data.success) throw new Error(data.error || 'Failed to save bot account.');
@@ -1113,7 +1124,7 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
-                    <tr>{['Owner', 'Role', 'Weight', 'Bot Name', 'Shift', 'Claims/Hr', 'Current Load', 'Availability', 'Action'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
+                    <tr>{['Owner', 'Role', 'Weight', 'Bot Name', 'Shift', 'Claims/Hr', 'Current Load', 'Availability', 'Last Modified', 'Action'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
                   </thead>
                   <tbody>
                     {insurerAccounts.map((account) => {
@@ -1136,6 +1147,10 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
                             <span style={{ fontSize: 11, fontWeight: 700, color: account.is_active && account.is_available ? C.accent : C.warn }}>
                               {account.availability_status || (account.is_active && account.is_available ? 'available' : 'paused')}
                             </span>
+                          </td>
+                          <td style={{ color: C.muted, fontSize: 11, padding: '12px', borderBottom: `1px solid ${C.border}`, minWidth: 150 }}>
+                            <div>{account.updated_by_name || '—'}</div>
+                            <div>{account.updated_at ? new Date(account.updated_at).toLocaleString('en-GB') : '—'}</div>
                           </td>
                           <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
                             <button onClick={() => startEdit(account)} style={{ background: editingId === account.id ? C.accent : C.card, color: editingId === account.id ? '#0B0F1A' : C.text, border: `1px solid ${editingId === account.id ? C.accent : C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
@@ -1202,6 +1217,8 @@ function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
           id: selected.id,
           ...draft,
           is_available: draft.availability_status === 'available',
+          updated_by_name: getMemberName() || 'Dashboard User',
+          updated_by_member_id: getMemberId() || null,
         }),
       });
       const data = await res.json();
@@ -1838,6 +1855,71 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
   );
 }
 
+function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
+  const latestRoster = rosters?.[0] || null;
+  const latestMembers = latestRoster ? (rosterMembers || []).filter((member) => member.roster_id === latestRoster.id) : [];
+  const onShift = latestMembers.filter((member) => member.duty_status === 'on_shift');
+  const offDuty = latestMembers.filter((member) => member.duty_status === 'off_duty');
+  const onShiftKeys = onShift.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
+  const activeWeekendBots = botAccounts.filter((bot) => onShiftKeys.includes(rosterOwnerKey(bot.owner_name)));
+  const botsByInsurer = activeWeekendBots.reduce((acc, bot) => {
+    const key = displayInsurerName(bot.insurer_name);
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(bot);
+    return acc;
+  }, {});
+
+  return (
+    <div style={cardStyle(C)}>
+      <SectionHeader C={C} icon="🗓️" title="Weekend Roster" text="n8n posts the Friday roster here; weekend runs pause off-duty owners and use the remaining on-shift bot rows for each insurer." />
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginBottom: 16 }}>
+        <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
+          <div style={{ color: C.sub, fontSize: 11, textTransform: 'uppercase', fontWeight: 800, letterSpacing: '0.06em' }}>Current roster</div>
+          <div style={{ color: C.text, fontWeight: 800, marginTop: 6 }}>{latestRoster ? `${latestRoster.weekend_start} to ${latestRoster.weekend_end}` : 'No roster received'}</div>
+          <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>{latestRoster ? `Last sync: ${new Date(latestRoster.updated_at || latestRoster.created_at).toLocaleString()}` : 'Waiting for the Friday n8n workflow.'}</div>
+        </div>
+        <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
+          <div style={{ color: C.sub, fontSize: 11, textTransform: 'uppercase', fontWeight: 800, letterSpacing: '0.06em' }}>On shift</div>
+          <div style={{ color: C.accent, fontWeight: 800, marginTop: 6 }}>{onShift.map((member) => member.owner_name).join(', ') || '—'}</div>
+          <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>These owners are eligible for weekend assignment.</div>
+        </div>
+        <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
+          <div style={{ color: C.sub, fontSize: 11, textTransform: 'uppercase', fontWeight: 800, letterSpacing: '0.06em' }}>Off duty</div>
+          <div style={{ color: C.sub, fontWeight: 800, marginTop: 6 }}>{offDuty.map((member) => member.owner_name).join(', ') || '—'}</div>
+          <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Off-duty bot rows are excluded on weekends.</div>
+        </div>
+      </div>
+
+      {!activeWeekendBots.length ? (
+        <EmptyState C={C} title="No active weekend bot rows visible yet" text="Once n8n posts a roster, this section shows which bot rows will remain available per insurer during the weekend run." />
+      ) : (
+        <div style={{ overflowX: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: C.sub, fontSize: 12, textAlign: 'left', background: C.inputBg }}>
+                {['Insurer', 'Weekend Active Bot(s)', 'Owners', 'Current Role(s)', 'What the runner will do'].map((head) => <th key={head} style={{ padding: 12 }}>{head}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(botsByInsurer).sort(([a], [b]) => a.localeCompare(b)).map(([insurer, bots]) => {
+                return (
+                  <tr key={insurer} style={{ borderTop: `1px solid ${C.border}`, color: C.text, fontSize: 13 }}>
+                    <td style={{ padding: 12, fontWeight: 800 }}>{insurer}</td>
+                    <td style={{ padding: 12 }}>{bots.map((bot) => bot.bot_name || bot.owner_name).join(', ')}</td>
+                    <td style={{ padding: 12 }}>{bots.map((bot) => bot.owner_name).join(', ')}</td>
+                    <td style={{ padding: 12 }}>{bots.map((bot) => bot.assignment_role || 'primary').join(', ')}</td>
+                    <td style={{ padding: 12, color: C.sub }}>{bots.length === 1 ? 'All new piles go to this on-shift bot.' : 'Normal primary/support balancing applies across these on-shift bots.'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
   const [stateFilter, setStateFilter] = useState('active');
   const [insurerFilter, setInsurerFilter] = useState('all');
@@ -2100,7 +2182,7 @@ export default function PilesAutoAssignmentPage() {
   const { C } = useTheme();
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState(null);
-  const [data, setData] = useState({ overview: null, masterAccounts: [], botAccounts: [], rules: [], botMetrics: [], recentLogs: [], trackedPiles: [], externalAssignments: [] });
+  const [data, setData] = useState({ overview: null, masterAccounts: [], botAccounts: [], rules: [], botMetrics: [], recentLogs: [], trackedPiles: [], externalAssignments: [], weekendRosters: [], weekendRosterMembers: [] });
   const [teamMembers, setTeamMembers] = useState([]);
   const [runnerState, setRunnerState] = useState({ runOutput: '', runMeta: null });
   const [runnerHistoryRefreshToken, setRunnerHistoryRefreshToken] = useState(0);
@@ -2124,6 +2206,8 @@ export default function PilesAutoAssignmentPage() {
         recentLogs: json.recentLogs || [],
         trackedPiles: json.trackedPiles || [],
         externalAssignments: json.externalAssignments || [],
+        weekendRosters: json.weekendRosters || [],
+        weekendRosterMembers: json.weekendRosterMembers || [],
       });
       setTeamMembers(teamJson.data || []);
     } catch (error) {
@@ -2174,6 +2258,7 @@ export default function PilesAutoAssignmentPage() {
         <StatCard C={C} label="Stale Tracked" value={data.overview?.staleTrackedPiles ?? '—'} hint="Candidates for reassignment" />
         <StatCard C={C} label="External Assignments" value={data.overview?.activeExternalAssignments ?? '—'} hint="Assigned outside runner tracking" />
         <StatCard C={C} label="Late Arrivals" value={data.overview?.lateArrivalPileDetections ?? '—'} hint="Caught in the follow-up mini-pass" />
+        <StatCard C={C} label="Weekend Rosters" value={data.overview?.weekendRostersConfigured ?? '—'} hint="n8n roster syncs stored" />
       </div>
 
       {loading ? (
@@ -2193,6 +2278,12 @@ export default function PilesAutoAssignmentPage() {
             runnerOutputFallback={runnerOutputFallback}
           />
           <RunnerHistorySection C={C} refreshToken={runnerHistoryRefreshToken} />
+          <WeekendRosterSection
+            C={C}
+            rosters={data.weekendRosters}
+            rosterMembers={data.weekendRosterMembers}
+            botAccounts={data.botAccounts}
+          />
           <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={runnerHistoryRefreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
           <ExternalAssignmentLogSection C={C} externalAssignments={data.externalAssignments} botAccounts={data.botAccounts} />

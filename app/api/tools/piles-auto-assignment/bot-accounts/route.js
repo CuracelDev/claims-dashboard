@@ -76,6 +76,8 @@ export async function POST(request) {
       is_available: toBool(body.is_available, true),
       priority_order: toInt(body.priority_order, 100),
       current_claim_load: toInt(body.current_claim_load, 0),
+      updated_by_name: body.updated_by_name?.trim() || null,
+      updated_by_member_id: body.updated_by_member_id ? String(body.updated_by_member_id).trim() : null,
       updated_at: new Date().toISOString(),
     };
 
@@ -122,6 +124,8 @@ export async function PATCH(request) {
     if (body.current_claim_load !== undefined) updates.current_claim_load = toInt(body.current_claim_load, 0);
     if (body.last_assigned_at !== undefined) updates.last_assigned_at = body.last_assigned_at || null;
     if (body.last_completed_at !== undefined) updates.last_completed_at = body.last_completed_at || null;
+    if (body.updated_by_name !== undefined) updates.updated_by_name = body.updated_by_name?.trim() || null;
+    if (body.updated_by_member_id !== undefined) updates.updated_by_member_id = body.updated_by_member_id ? String(body.updated_by_member_id).trim() : null;
 
     const supabase = getSupabase();
     const { data, error } = await supabase

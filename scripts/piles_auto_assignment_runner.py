@@ -26,7 +26,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -107,6 +107,64 @@ def norm_key(text: Any) -> str:
     return "".join(ch.lower() for ch in norm(text) if ch.isalnum())
 
 
+def stable_pile_tracking_key(provider: Any, claims: Any, amount: Any, month: Any, submitted_date: Any) -> str:
+    return "|".join([
+        norm(provider),
+        str(safe_int(claims, 0)),
+        norm(amount),
+        norm(month),
+        norm(submitted_date),
+    ])
+
+
+def legacy_pile_tracking_key(
+    provider: Any,
+    claims: Any,
+    synced_claims: Any,
+    amount: Any,
+    month: Any,
+    submitted_date: Any,
+) -> str:
+    return "|".join([
+        norm(provider),
+        str(safe_int(claims, 0)),
+        str(safe_int(synced_claims, 0)),
+        norm(amount),
+        norm(month),
+        norm(submitted_date),
+    ])
+
+
+def canonical_pile_tracking_key(tracking_key: Any) -> str:
+    key = norm(tracking_key)
+    parts = key.split("|")
+    if len(parts) == 6 and parts[1].isdigit() and parts[2].isdigit():
+        return "|".join([parts[0], parts[1], parts[3], parts[4], parts[5]])
+    return key
+
+
+def expanded_tracking_key_set(keys: Iterable[Any]) -> set[str]:
+    expanded: set[str] = set()
+    for key in keys:
+        value = norm(key)
+        if not value:
+            continue
+        expanded.add(value)
+        expanded.add(canonical_pile_tracking_key(value))
+    return expanded
+
+
+def roster_owner_key(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", norm(text).lower().lstrip("@")).strip()
+
+
+def roster_owner_matches(owner_key: str, roster_keys: set[str]) -> bool:
+    if owner_key in roster_keys:
+        return True
+    owner_first = owner_key.split(" ", 1)[0] if owner_key else ""
+    return bool(owner_first and any(key == owner_first or key.startswith(f"{owner_first} ") for key in roster_keys))
+
+
 def label_key(text: Any) -> str:
     return re.sub(r"\s+", " ", norm(text).lower()).strip()
 
@@ -125,6 +183,11 @@ def insurer_aliases(text: Any) -> set[str]:
     if label == "uapom":
         aliases.add("old mutual")
     return {alias for alias in aliases if alias}
+
+
+def display_insurer_name(text: Any) -> str:
+    label = canonical_insurer_key(text)
+    return INSURER_ALIAS_DISPLAY.get(label, norm(text) or "Unknown insurer")
 
 
 CURACEL_BASE_URL = norm(os.getenv("CURACEL_PORTAL_BASE_URL")) or "https://health.curacel.co"
@@ -327,6 +390,52 @@ def slack_post_message(
     if not data.get("ok"):
         raise RuntimeError(f"Slack API error: {data.get('error', 'unknown_error')}")
     return data
+
+
+def send_weekend_schedule_update(
+    *,
+    insurer_name: str,
+    policy: WeekendRosterPolicy,
+    eligible_bots: list[BotAccount],
+    paused_bots: list[BotAccount],
+) -> None:
+    if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
+        return
+    active_lines = [
+        f"• {bot.owner_name} → {bot.portal_name} ({bot.assignment_role})"
+        for bot in eligible_bots
+    ] or ["• No active weekend bot mapped"]
+    paused_names = ", ".join(bot.owner_name for bot in paused_bots) or "None"
+    text = (
+        f":spiral_calendar_pad: Weekend assignment schedule activated for *{display_insurer_name(insurer_name)}*\n"
+        f"Roster: {policy.weekend_start} to {policy.weekend_end}\n"
+        f"Active bot(s):\n" + "\n".join(active_lines) + "\n"
+        f"Paused/off-duty owners for this insurer: {paused_names}"
+    )
+    try:
+        slack_post_message(SLACK_PRISM_BOT_TOKEN, SLACK_ALERTS_CHANNEL_ID, text)
+    except Exception as exc:
+        print(f"\n⚠️ Slack weekend schedule update failed for {insurer_name}: {exc}")
+
+
+def send_weekend_restore_update(restored_rows: list[dict[str, Any]]) -> None:
+    if not restored_rows or not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
+        return
+    by_insurer: dict[str, list[str]] = {}
+    for row in restored_rows:
+        by_insurer.setdefault(display_insurer_name(row.get("insurer_name")), []).append(norm(row.get("owner_name")))
+    lines = [
+        f"• {insurer}: {', '.join(sorted({name for name in owners if name}))}"
+        for insurer, owners in sorted(by_insurer.items())
+    ]
+    text = (
+        ":sunrise: Weekend assignment settings restored for weekday operations.\n"
+        + "\n".join(lines)
+    )
+    try:
+        slack_post_message(SLACK_PRISM_BOT_TOKEN, SLACK_ALERTS_CHANNEL_ID, text)
+    except Exception as exc:
+        print(f"\n⚠️ Slack weekend restore update failed: {exc}")
 
 
 def create_assignment_thread(
@@ -682,6 +791,18 @@ class BotMetric:
 
 
 @dataclass
+class WeekendRosterPolicy:
+    roster_id: str
+    weekend_start: str
+    weekend_end: str
+    effective_date: str
+    on_shift_owner_names: list[str]
+    off_duty_owner_names: list[str]
+    eligible_bots: list[BotAccount]
+    missing_reason: str = ""
+
+
+@dataclass
 class AssignmentRule:
     insurer_name: str
     distribution_mode: str
@@ -699,6 +820,7 @@ class PileRow:
     claims: int
     synced_claims: int
     remaining_claims: int
+    amount_text: str
     month: str
     submitted_date: str
     status: str
@@ -707,6 +829,7 @@ class PileRow:
     page_number: int
     assignment_type: str
     filter_month: str
+    legacy_tracking_key: str = ""
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -740,6 +863,7 @@ class PlannedAssignment:
     status_bucket: str
     filter_month: str
     source_page_number: int
+    legacy_tracking_key: str = ""
 
 
 @dataclass
@@ -1030,6 +1154,301 @@ class DataStore:
     def get_bot_accounts(self, insurer_name: str) -> list[BotAccount]:
         return self._rows_to_bot_accounts(self._fetch_bot_account_rows(insurer_name))
 
+    def get_weekend_roster_policy(
+        self,
+        *,
+        effective_date: str,
+        insurer_name: str,
+        bots: list[BotAccount],
+    ) -> WeekendRosterPolicy | None:
+        try:
+            target_date = datetime.strptime(effective_date, "%Y-%m-%d").date()
+        except Exception:
+            return None
+        if target_date.weekday() not in {5, 6}:
+            return None
+
+        if self.mode == "postgres":
+            rosters = self._fetchall_postgres(
+                """
+                select *
+                from piles_auto_assignment_weekend_rosters
+                where weekend_start <= %s::date and weekend_end >= %s::date
+                order by updated_at desc
+                limit 1
+                """,
+                (effective_date, effective_date),
+            )
+        else:
+            rosters = [
+                row for row in self._fetchall_supabase("piles_auto_assignment_weekend_rosters", order="updated_at.desc")
+                if str(row.get("weekend_start")) <= effective_date <= str(row.get("weekend_end"))
+            ][:1]
+
+        if not rosters:
+            return WeekendRosterPolicy(
+                roster_id="",
+                weekend_start=effective_date,
+                weekend_end=effective_date,
+                effective_date=effective_date,
+                on_shift_owner_names=[],
+                off_duty_owner_names=[],
+                eligible_bots=[],
+                missing_reason=f"No weekend roster found for {effective_date}.",
+            )
+
+        roster = rosters[0]
+        roster_id = str(roster["id"])
+        if self.mode == "postgres":
+            members = self._fetchall_postgres(
+                """
+                select *
+                from piles_auto_assignment_weekend_roster_members
+                where roster_id = %s
+                order by duty_status asc, owner_name asc
+                """,
+                (roster_id,),
+            )
+        else:
+            members = self._fetchall_supabase(
+                "piles_auto_assignment_weekend_roster_members",
+                filters=[("roster_id", "eq", roster_id)],
+                order="owner_name.asc",
+            )
+
+        on_shift_members = [row for row in members if norm(row.get("duty_status")).lower() == "on_shift"]
+        off_duty_members = [row for row in members if norm(row.get("duty_status")).lower() == "off_duty"]
+        on_shift_keys = {roster_owner_key(row.get("owner_name")) for row in on_shift_members if roster_owner_key(row.get("owner_name"))}
+        off_duty_keys = {roster_owner_key(row.get("owner_name")) for row in off_duty_members if roster_owner_key(row.get("owner_name"))}
+
+        eligible_bots = []
+        for bot in bots:
+            owner_key = roster_owner_key(bot.owner_name)
+            if not bot.is_active:
+                continue
+            if not roster_owner_matches(owner_key, on_shift_keys):
+                continue
+            if roster_owner_matches(owner_key, off_duty_keys):
+                continue
+            eligible_bots.append(bot)
+
+        missing_reason = ""
+        if not on_shift_keys:
+            missing_reason = f"Weekend roster {roster_id} has no on-shift members."
+        elif not eligible_bots:
+            missing_reason = (
+                f"Weekend roster {roster_id} has no active bot row for {insurer_name} "
+                f"owned by on-shift people: {', '.join(sorted(on_shift_keys))}."
+            )
+
+        return WeekendRosterPolicy(
+            roster_id=roster_id,
+            weekend_start=str(roster.get("weekend_start") or ""),
+            weekend_end=str(roster.get("weekend_end") or ""),
+            effective_date=effective_date,
+            on_shift_owner_names=[norm(row.get("owner_name")) for row in on_shift_members],
+            off_duty_owner_names=[norm(row.get("owner_name")) for row in off_duty_members],
+            eligible_bots=eligible_bots,
+            missing_reason=missing_reason,
+        )
+
+    def apply_weekend_bot_state(
+        self,
+        policy: WeekendRosterPolicy,
+        bots: list[BotAccount],
+    ) -> tuple[list[BotAccount], list[BotAccount], int]:
+        if not policy.roster_id:
+            return policy.eligible_bots, [], 0
+
+        eligible_ids = {bot.id for bot in policy.eligible_bots}
+        role_by_bot_id = {bot.id: bot.assignment_role for bot in policy.eligible_bots}
+        paused_bots = [bot for bot in bots if bot.is_active and bot.id not in eligible_ids]
+        update_rows = []
+        for bot in bots:
+            if not bot.is_active:
+                continue
+            is_weekend_available = bot.id in eligible_ids
+            update_rows.append({
+                "bot": bot,
+                "is_available": is_weekend_available,
+                "availability_status": "available" if is_weekend_available else "weekend_off",
+                "availability_note": (
+                    f"Weekend roster {policy.weekend_start} to {policy.weekend_end}: on shift"
+                    if is_weekend_available
+                    else f"Paused by weekend roster {policy.weekend_start} to {policy.weekend_end}"
+                ),
+                "assignment_role": role_by_bot_id.get(bot.id, bot.assignment_role),
+            })
+
+        inserted_count = 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if self.mode == "postgres":
+            for row in update_rows:
+                bot = row["bot"]
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        insert into piles_auto_assignment_weekend_bot_state_snapshots
+                          (id, roster_id, bot_account_id, insurer_name, owner_name,
+                           previous_assignment_role, previous_availability_status,
+                           previous_availability_note, previous_is_available, previous_is_active,
+                           details, created_at, updated_at)
+                        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                        on conflict (roster_id, bot_account_id) do nothing
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            policy.roster_id,
+                            bot.id,
+                            bot.insurer_name,
+                            bot.owner_name,
+                            bot.assignment_role,
+                            bot.availability_status,
+                            bot.availability_note,
+                            bot.is_available,
+                            bot.is_active,
+                            json.dumps({
+                                "weekend_start": policy.weekend_start,
+                                "weekend_end": policy.weekend_end,
+                                "effective_date": policy.effective_date,
+                            }),
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+                    inserted_count += cur.rowcount
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_bot_accounts
+                    set assignment_role = %s,
+                        availability_status = %s,
+                        availability_note = %s,
+                        is_available = %s,
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (
+                        row["assignment_role"],
+                        row["availability_status"],
+                        row["availability_note"],
+                        row["is_available"],
+                        bot.id,
+                    ),
+                )
+        else:
+            existing = self._fetchall_supabase(
+                "piles_auto_assignment_weekend_bot_state_snapshots",
+                filters=[("roster_id", "eq", policy.roster_id)],
+            )
+            existing_bot_ids = {str(row.get("bot_account_id")) for row in existing}
+            for row in update_rows:
+                bot = row["bot"]
+                if bot.id not in existing_bot_ids:
+                    inserted_count += 1
+                    self._insert_supabase("piles_auto_assignment_weekend_bot_state_snapshots", {
+                        "id": str(uuid.uuid4()),
+                        "roster_id": policy.roster_id,
+                        "bot_account_id": bot.id,
+                        "insurer_name": bot.insurer_name,
+                        "owner_name": bot.owner_name,
+                        "previous_assignment_role": bot.assignment_role,
+                        "previous_availability_status": bot.availability_status,
+                        "previous_availability_note": bot.availability_note,
+                        "previous_is_available": bot.is_available,
+                        "previous_is_active": bot.is_active,
+                        "details": {
+                            "weekend_start": policy.weekend_start,
+                            "weekend_end": policy.weekend_end,
+                            "effective_date": policy.effective_date,
+                        },
+                    })
+                self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot.id, {
+                    "assignment_role": row["assignment_role"],
+                    "availability_status": row["availability_status"],
+                    "availability_note": row["availability_note"],
+                    "is_available": row["is_available"],
+                    "updated_at": now_iso,
+                })
+
+        return policy.eligible_bots, paused_bots, inserted_count
+
+    def restore_due_weekend_bot_states(self, effective_date: str) -> list[dict[str, Any]]:
+        try:
+            target_date = datetime.strptime(effective_date, "%Y-%m-%d").date()
+        except Exception:
+            return []
+        if target_date.weekday() in {5, 6}:
+            return []
+
+        if self.mode == "postgres":
+            snapshots = self._fetchall_postgres(
+                """
+                select s.*
+                from piles_auto_assignment_weekend_bot_state_snapshots s
+                join piles_auto_assignment_weekend_rosters r on r.id = s.roster_id
+                where s.restored_at is null
+                  and r.weekend_end < %s::date
+                order by s.applied_at asc
+                """,
+                (effective_date,),
+            )
+            for row in snapshots:
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_bot_accounts
+                    set assignment_role = %s,
+                        availability_status = %s,
+                        availability_note = %s,
+                        is_available = %s,
+                        is_active = %s,
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (
+                        row.get("previous_assignment_role") or "primary",
+                        row.get("previous_availability_status") or "available",
+                        row.get("previous_availability_note"),
+                        bool(row.get("previous_is_available", True)),
+                        bool(row.get("previous_is_active", True)),
+                        row["bot_account_id"],
+                    ),
+                )
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_weekend_bot_state_snapshots
+                    set restored_at = now(), updated_at = now()
+                    where id = %s
+                    """,
+                    (row["id"],),
+                )
+            return snapshots
+
+        rosters = [
+            row for row in self._fetchall_supabase("piles_auto_assignment_weekend_rosters")
+            if str(row.get("weekend_end")) < effective_date
+        ]
+        roster_ids = {str(row.get("id")) for row in rosters}
+        if not roster_ids:
+            return []
+        snapshots = [
+            row for row in self._fetchall_supabase("piles_auto_assignment_weekend_bot_state_snapshots")
+            if str(row.get("roster_id")) in roster_ids and not row.get("restored_at")
+        ]
+        for row in snapshots:
+            self._update_supabase("piles_auto_assignment_bot_accounts", "id", str(row["bot_account_id"]), {
+                "assignment_role": row.get("previous_assignment_role") or "primary",
+                "availability_status": row.get("previous_availability_status") or "available",
+                "availability_note": row.get("previous_availability_note"),
+                "is_available": bool(row.get("previous_is_available", True)),
+                "is_active": bool(row.get("previous_is_active", True)),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._update_supabase("piles_auto_assignment_weekend_bot_state_snapshots", "id", str(row["id"]), {
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+        return snapshots
+
     def get_all_bot_accounts(self) -> list[BotAccount]:
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
@@ -1205,7 +1624,7 @@ class DataStore:
                 row for row in self._fetchall_supabase("piles_auto_assignment_tracked_piles")
                 if canonical_insurer_key(row.get("insurer_name")) in aliases
             ]
-        return {norm(row.get("tracking_key")) for row in rows if norm(row.get("tracking_key"))}
+        return expanded_tracking_key_set(row.get("tracking_key") for row in rows)
 
     def _rows_to_tracked_piles(self, rows: list[dict[str, Any]]) -> list[TrackedPile]:
         tracked: list[TrackedPile] = []
@@ -1260,23 +1679,26 @@ class DataStore:
         existing = None
         rows = []
         aliases = insurer_aliases(plan.insurer_name)
+        plan_tracking_key = canonical_pile_tracking_key(plan.tracking_key)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_tracked_piles
-                where tracking_key = %s
                 """,
-                (plan.tracking_key,),
             )
-            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
+            rows = [
+                row for row in rows
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+                and canonical_pile_tracking_key(row.get("tracking_key")) == plan_tracking_key
+            ][:1]
         else:
             rows = [
                 row for row in self._fetchall_supabase(
                     "piles_auto_assignment_tracked_piles",
-                    filters=[("tracking_key", "eq", plan.tracking_key)],
                 )
                 if canonical_insurer_key(row.get("insurer_name")) in aliases
+                and canonical_pile_tracking_key(row.get("tracking_key")) == plan_tracking_key
             ][:1]
         if rows:
             existing = self._rows_to_tracked_piles(rows)[0]
@@ -1603,32 +2025,46 @@ class DataStore:
     ) -> tuple[ExternalAssignment, bool]:
         now_iso = datetime.now(timezone.utc).isoformat()
         aliases = insurer_aliases(insurer_name)
+        row_tracking_key = canonical_pile_tracking_key(row.tracking_key)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
                 select *
                 from piles_auto_assignment_external_assignments
-                where tracking_key = %s
                 """,
-                (row.tracking_key,),
             )
-            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
+            rows = [
+                existing_row for existing_row in rows
+                if canonical_insurer_key(existing_row.get("insurer_name")) in aliases
+                and canonical_pile_tracking_key(existing_row.get("tracking_key")) == row_tracking_key
+            ][:1]
         else:
             rows = [
-                row for row in self._fetchall_supabase(
+                existing_row for existing_row in self._fetchall_supabase(
                     "piles_auto_assignment_external_assignments",
-                    filters=[("tracking_key", "eq", row.tracking_key)],
                 )
-                if canonical_insurer_key(row.get("insurer_name")) in aliases
+                if canonical_insurer_key(existing_row.get("insurer_name")) in aliases
+                and canonical_pile_tracking_key(existing_row.get("tracking_key")) == row_tracking_key
             ][:1]
         existing = self._rows_to_external_assignments(rows)[0] if rows else None
         previous_details = existing.details if existing and isinstance(existing.details, dict) else {}
         details = {
             "source": "runner_detected_external_assignment",
+            "identity_version": "stable_v2",
+            "legacy_tracking_key": row.legacy_tracking_key,
             "assigned_name": row.assigned,
             "status_bucket": row.status_bucket,
             "owner_name": matched_bot.owner_name if matched_bot else "",
             "last_progress_at": last_progress_at or norm(previous_details.get("last_progress_at")),
+            "identity_fields": {
+                "provider": row.provider,
+                "claims_total": row.claims,
+                "amount": row.amount_text,
+                "claim_month": row.month,
+                "submitted_date": row.submitted_date,
+                "synced_claims": row.synced_claims,
+                "status_bucket": row.status_bucket,
+            },
         }
         payload = {
             "master_account_id": master_account_id or None,
@@ -1747,6 +2183,7 @@ class DataStore:
     def sync_external_assignments_for_insurer(self, insurer_name: str, active_tracking_keys: set[str]) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
         aliases = insurer_aliases(insurer_name)
+        active_key_set = expanded_tracking_key_set(active_tracking_keys)
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
@@ -1767,7 +2204,7 @@ class DataStore:
             ]
         for row in rows:
             tracking_key = norm(row.get("tracking_key"))
-            if tracking_key in active_tracking_keys:
+            if tracking_key in active_key_set or canonical_pile_tracking_key(tracking_key) in active_key_set:
                 continue
             if self.mode == "postgres":
                 self._execute_postgres(
@@ -3302,16 +3739,11 @@ class CuracelPilesRunner:
             assigned = value("assigned", len(texts) - 2 if len(texts) >= 2 else 0)
             if claims <= 0 and not any([provider, amount_text, month, submitted_date, row_status, assigned]):
                 continue
-            tracking_key = "|".join([
-                norm(provider),
-                str(claims),
-                str(synced_claims),
-                norm(amount_text),
-                norm(month),
-                norm(submitted_date),
-            ])
+            tracking_key = stable_pile_tracking_key(provider, claims, amount_text, month, submitted_date)
+            legacy_tracking_key = legacy_pile_tracking_key(provider, claims, synced_claims, amount_text, month, submitted_date)
             key = "|".join([
                 tracking_key,
+                str(synced_claims),
                 norm(status_bucket),
             ])
             piles.append(PileRow(
@@ -3321,6 +3753,7 @@ class CuracelPilesRunner:
                 claims=claims,
                 synced_claims=synced_claims,
                 remaining_claims=remaining_claims,
+                amount_text=amount_text,
                 month=month,
                 submitted_date=submitted_date,
                 status=row_status,
@@ -3329,6 +3762,7 @@ class CuracelPilesRunner:
                 page_number=page_number,
                 assignment_type=STATUS_ASSIGNMENT_TYPE[status_bucket],
                 filter_month=filter_month,
+                legacy_tracking_key=legacy_tracking_key,
             ))
         return piles
 
@@ -4524,6 +4958,10 @@ def reconcile_tracked_assignments(
         existing = row_map.get(row.tracking_key)
         if existing is None or (not norm(existing.assigned) and norm(row.assigned)):
             row_map[row.tracking_key] = row
+        if norm(row.legacy_tracking_key):
+            legacy_existing = row_map.get(row.legacy_tracking_key)
+            if legacy_existing is None or (not norm(legacy_existing.assigned) and norm(row.assigned)):
+                row_map[row.legacy_tracking_key] = row
 
     now = datetime.now(timezone.utc)
     bots_by_id = {bot.id: bot for bot in bots}
@@ -4531,7 +4969,7 @@ def reconcile_tracked_assignments(
     completed_count = 0
     refreshed_tracked: list[TrackedPile] = []
     for tracked_pile in tracked:
-        observed = row_map.get(tracked_pile.tracking_key)
+        observed = row_map.get(tracked_pile.tracking_key) or row_map.get(canonical_pile_tracking_key(tracked_pile.tracking_key))
         previous_completed = max(tracked_pile.synced_claims, tracked_pile.claims_total - tracked_pile.remaining_claims)
         matched_bot = match_bot_to_portal_name(bots, observed.assigned if observed else tracked_pile.current_assigned) if (observed or tracked_pile.current_assigned) else None
         active_bot_id = matched_bot.id if matched_bot else tracked_pile.bot_account_id
@@ -4608,25 +5046,66 @@ def detect_external_assignments(
     rule: AssignmentRule | None,
 ) -> dict[str, Any]:
     existing_records = store.get_active_external_assignments(insurer_name)
-    existing_by_tracking = {record.tracking_key: record for record in existing_records if norm(record.tracking_key)}
-    assigned_rows_by_tracking: dict[str, PileRow] = {}
+    existing_by_tracking: dict[str, ExternalAssignment] = {}
+    for record in existing_records:
+        if not norm(record.tracking_key):
+            continue
+        existing_by_tracking[record.tracking_key] = record
+        existing_by_tracking[canonical_pile_tracking_key(record.tracking_key)] = record
+    tracked_key_set = expanded_tracking_key_set(tracked_keys)
+    candidate_rows_by_tracking: dict[str, list[PileRow]] = {}
     for row in rows:
         if not norm(row.assigned):
             continue
-        if norm(row.tracking_key) in tracked_keys:
+        row_keys = expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key])
+        if row_keys & tracked_key_set:
             continue
+        candidate_rows_by_tracking.setdefault(row.tracking_key, []).append(row)
+
+    assigned_rows_by_tracking: dict[str, PileRow] = {}
+    skipped_active_tracking_keys: set[str] = set()
+    identity_collision_count = 0
+    for tracking_key, matches in candidate_rows_by_tracking.items():
+        distinct_volatile_keys = {row.key for row in matches if norm(row.key)}
+        if len(distinct_volatile_keys) > 1:
+            identity_collision_count += 1
+            skipped_active_tracking_keys.add(tracking_key)
+            sample = matches[0]
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="external_assignment_identity_collision",
+                status="skipped",
+                pile_count=len(matches),
+                claim_count=sum(max(row.claims, 0) for row in matches),
+                details={
+                    "reason": "Multiple assigned rows shared the same stable tracking key, so external detection skipped them to avoid a false callout.",
+                    "tracking_key": tracking_key,
+                    "volatile_keys": sorted(distinct_volatile_keys)[:10],
+                    "provider": sample.provider,
+                    "claim_month": sample.month,
+                    "submitted_date": sample.submitted_date,
+                    "amount": sample.amount_text,
+                    "claims_total": sample.claims,
+                    "assigned_values": sorted({norm(row.assigned) for row in matches if norm(row.assigned)}),
+                },
+            )
+            continue
+        row = matches[0]
         existing = assigned_rows_by_tracking.get(row.tracking_key)
         if existing is None or (not norm(existing.assigned) and norm(row.assigned)):
             assigned_rows_by_tracking[row.tracking_key] = row
 
     notifications: list[ExternalNotificationItem] = []
     stale_candidates: list[ReassignmentCandidate] = []
-    active_tracking_keys = set(assigned_rows_by_tracking.keys())
+    active_tracking_keys = expanded_tracking_key_set([
+        *assigned_rows_by_tracking.keys(),
+        *skipped_active_tracking_keys,
+    ])
     new_detection_count = 0
     now = datetime.now(timezone.utc)
 
     for row in assigned_rows_by_tracking.values():
-        previous_record = existing_by_tracking.get(row.tracking_key)
+        previous_record = existing_by_tracking.get(row.tracking_key) or existing_by_tracking.get(canonical_pile_tracking_key(row.tracking_key))
         matched_bot = match_bot_to_portal_name(bots, row.assigned) if bots else None
         progress_claims = max(0, row.synced_claims - safe_int(previous_record.synced_claims if previous_record else 0, 0))
         last_progress_at = (
@@ -4684,11 +5163,15 @@ def detect_external_assignments(
             claim_count=row.claims,
             details={
                 "tracking_key": row.tracking_key,
+                "legacy_tracking_key": row.legacy_tracking_key,
+                "identity_version": "stable_v2",
                 "pile_key": row.key,
                 "provider": row.provider,
                 "claim_month": row.month,
                 "submitted_date": row.submitted_date,
+                "amount": row.amount_text,
                 "claims_total": row.claims,
+                "synced_claims": row.synced_claims,
                 "remaining_claims": row.remaining_claims,
                 "status_bucket": row.status_bucket,
                 "current_assigned": row.assigned,
@@ -4702,6 +5185,7 @@ def detect_external_assignments(
     return {
         "active_count": len(active_tracking_keys),
         "new_detection_count": new_detection_count,
+        "identity_collision_count": identity_collision_count,
         "notifications": notifications,
         "stale_candidates": stale_candidates,
     }
@@ -5152,6 +5636,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
     parser.add_argument("--run-source", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUN_SOURCE")) or "manual", help="How this run was triggered, e.g. manual or schedule.")
     parser.add_argument("--invocation-backend", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND")) or "local", help="Which compute backend launched this run, e.g. local or remote.")
+    parser.add_argument("--effective-date", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_EFFECTIVE_DATE")), help="Override the local date used for weekend roster selection, e.g. 2026-05-23.")
     return parser.parse_args()
 
 
@@ -5181,6 +5666,16 @@ def is_retryable_runner_browser_error(exc: Exception) -> bool:
     return False
 
 
+def runner_effective_date(args: argparse.Namespace) -> str:
+    override = norm(getattr(args, "effective_date", ""))
+    if override:
+        try:
+            return datetime.strptime(override, "%Y-%m-%d").date().isoformat()
+        except Exception:
+            raise RuntimeError(f"Invalid --effective-date '{override}'. Use YYYY-MM-DD.")
+    return datetime.now(RUNNER_TIMEZONE).date().isoformat()
+
+
 def _run_for_insurer_once(
     store: DataStore,
     args: argparse.Namespace,
@@ -5194,8 +5689,112 @@ def _run_for_insurer_once(
     if not master.login_email or not master.login_password:
         raise RuntimeError(f"Master account for '{insurer_name}' is missing login email or password.")
 
-    bots = store.get_bot_accounts(insurer_name)
-    metrics = store.get_bot_metrics([bot.id for bot in bots])
+    configured_bots = store.get_bot_accounts(insurer_name)
+    bots = configured_bots[:]
+    effective_date = runner_effective_date(args)
+    weekend_policy = store.get_weekend_roster_policy(
+        effective_date=effective_date,
+        insurer_name=insurer_name,
+        bots=configured_bots,
+    )
+    if weekend_policy is not None:
+        if weekend_policy.missing_reason:
+            print("=" * 72)
+            print("Piles Auto-Assignment Runner")
+            print(f"Insurer: {insurer_name}")
+            print(f"Weekend roster date: {weekend_policy.effective_date}")
+            print(f"Weekend roster skip: {weekend_policy.missing_reason}")
+            print("=" * 72)
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="weekend_roster_missing_mapping",
+                status="skipped",
+                details={
+                    "insurer_name": insurer_name,
+                    "effective_date": weekend_policy.effective_date,
+                    "roster_id": weekend_policy.roster_id or None,
+                    "weekend_start": weekend_policy.weekend_start,
+                    "weekend_end": weekend_policy.weekend_end,
+                    "on_shift_owner_names": weekend_policy.on_shift_owner_names,
+                    "off_duty_owner_names": weekend_policy.off_duty_owner_names,
+                    "missing_reason": weekend_policy.missing_reason,
+                    "mode": "execute" if args.execute else "dry-run",
+                },
+            )
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="weekend_roster_skipped_insurer",
+                status="skipped",
+                details={
+                    "insurer_name": insurer_name,
+                    "effective_date": weekend_policy.effective_date,
+                    "reason": weekend_policy.missing_reason,
+                },
+            )
+            return {
+                "insurer_name": insurer_name,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "tracked_reconcile": {"tracked_count": 0, "completed_count": 0, "stale_count": 0, "active_count": 0},
+                "reassignment_plans": [],
+                "reassignment_summary": {},
+                "reassignment_results": {},
+                "reassignment_applied": [],
+                "unassigned": [],
+                "plans": [],
+                "summary": {},
+                "results": {},
+                "applied": [],
+                "fallback_pool_used": False,
+                "portal_option_names": [],
+                "resolved_name_map": {},
+                "portal_mapping_warnings": [weekend_policy.missing_reason],
+                "notification_items": [],
+                "external_notification_items": [],
+                "late_arrival_detection": {"count": 0, "claims": 0, "piles": [], "summary": {}, "results": {}, "contexts": []},
+            }
+        bots = weekend_policy.eligible_bots
+        paused_weekend_bots = [bot for bot in configured_bots if bot.is_active and bot.id not in {eligible.id for eligible in bots}]
+        weekend_state_inserted = 0
+        if args.execute:
+            bots, paused_weekend_bots, weekend_state_inserted = store.apply_weekend_bot_state(weekend_policy, configured_bots)
+        if weekend_state_inserted:
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="weekend_roster_state_applied",
+                status="applied",
+                details={
+                    "insurer_name": insurer_name,
+                    "effective_date": weekend_policy.effective_date,
+                    "roster_id": weekend_policy.roster_id,
+                    "eligible_bot_ids": [bot.id for bot in bots],
+                    "eligible_bot_names": [bot.portal_name for bot in bots],
+                    "paused_bot_ids": [bot.id for bot in paused_weekend_bots],
+                    "paused_owners": [bot.owner_name for bot in paused_weekend_bots],
+                },
+            )
+            send_weekend_schedule_update(
+                insurer_name=insurer_name,
+                policy=weekend_policy,
+                eligible_bots=bots,
+                paused_bots=paused_weekend_bots,
+            )
+        elif weekend_policy is not None and not args.execute:
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="weekend_roster_preview",
+                status="preview",
+                details={
+                    "insurer_name": insurer_name,
+                    "effective_date": weekend_policy.effective_date,
+                    "roster_id": weekend_policy.roster_id,
+                    "eligible_bot_ids": [bot.id for bot in bots],
+                    "eligible_bot_names": [bot.portal_name for bot in bots],
+                    "would_pause_bot_ids": [bot.id for bot in paused_weekend_bots],
+                    "would_pause_owners": [bot.owner_name for bot in paused_weekend_bots],
+                },
+            )
+
+    metrics = store.get_bot_metrics([bot.id for bot in configured_bots])
     rule = store.get_rule(insurer_name)
     fallback_pool_used = False
     portal_assignees: list[PortalAssignee] = []
@@ -5242,9 +5841,36 @@ def _run_for_insurer_once(
     print(f"Portal: {CURACEL_BASE_URL}")
     print(f"Month/Year: {', '.join(month_labels)} {year_label}")
     print(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+    if weekend_policy is not None:
+        print(
+            f"Weekend roster: {weekend_policy.weekend_start} to {weekend_policy.weekend_end} "
+            f"| on shift: {', '.join(weekend_policy.on_shift_owner_names) or '—'}"
+        )
+        print(
+            "Weekend eligible bots: "
+            + (", ".join(f"{bot.owner_name} -> {bot.portal_name} ({bot.assignment_role})" for bot in bots) or "—")
+        )
     if rule:
         print(f"Rule mode: {rule.distribution_mode} | min chunk: {rule.minimum_claim_chunk}")
     print("=" * 72)
+
+    if weekend_policy is not None:
+        store.log_runner_event(
+            insurer_name=insurer_name,
+            event_type="weekend_roster_applied",
+            status="applied",
+            details={
+                "insurer_name": insurer_name,
+                "effective_date": weekend_policy.effective_date,
+                "roster_id": weekend_policy.roster_id,
+                "weekend_start": weekend_policy.weekend_start,
+                "weekend_end": weekend_policy.weekend_end,
+                "on_shift_owner_names": weekend_policy.on_shift_owner_names,
+                "off_duty_owner_names": weekend_policy.off_duty_owner_names,
+                "eligible_bot_ids": [bot.id for bot in bots],
+                "eligible_bot_names": [bot.portal_name for bot in bots],
+            },
+        )
 
     with CuracelPilesRunner(visible=visible, slow_mo=args.slow_mo) as runner:
         runner.allow_test_any_assignee = False
@@ -5293,7 +5919,7 @@ def _run_for_insurer_once(
                 runner,
                 insurer_name,
                 year_label,
-                bots,
+                configured_bots if weekend_policy is not None else bots,
                 metrics,
                 rule,
                 month_labels,
@@ -5315,7 +5941,7 @@ def _run_for_insurer_once(
             master.id,
             insurer_name,
             scanned_rows,
-            bots,
+            configured_bots,
             tracked_keys,
             team_slack_map,
             rule,
@@ -5834,6 +6460,23 @@ def main() -> None:
             )
 
         store = DataStore()
+        restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args)) if args.execute else []
+        if restored_weekend_rows:
+            restored_by_insurer: dict[str, list[str]] = {}
+            for row in restored_weekend_rows:
+                restored_by_insurer.setdefault(norm(row.get("insurer_name")), []).append(norm(row.get("owner_name")))
+            for insurer_name, owners in restored_by_insurer.items():
+                store.log_runner_event(
+                    insurer_name=insurer_name,
+                    event_type="weekend_roster_state_restored",
+                    status="restored",
+                    details={
+                        "effective_date": runner_effective_date(args),
+                        "restored_owners": sorted({owner for owner in owners if owner}),
+                        "restored_count": len(owners),
+                    },
+                )
+            send_weekend_restore_update(restored_weekend_rows)
         insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
         if not insurers:
             raise RuntimeError("No active insurer master accounts were found to run.")
@@ -5846,6 +6489,7 @@ def main() -> None:
             "visible_browser": visible,
             "finalize_assignments": bool(args.execute),
             "insurers": insurers,
+            "effective_date": runner_effective_date(args),
         }
         run_id = store.create_runner_run(
             insurer_name=args.insurer or "",
