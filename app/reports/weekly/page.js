@@ -21,6 +21,7 @@ const METRIC_GROUPS = [
     color: '#5B8DEF',
     metrics: [
       { key: 'providers_mapped', label: 'Providers Mapped' },
+      { key: 'claims_processed', label: 'Claims Processed' },
       { key: 'care_items_mapped', label: 'Care Items Mapped' },
       { key: 'care_items_grouped', label: 'Care Items Grouped' },
       { key: 'resolved_cares', label: 'Resolved Cares' },

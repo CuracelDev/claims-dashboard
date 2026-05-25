@@ -118,6 +118,7 @@ export async function POST(request) {
         claims_hadiel:      toInt(row.claims_hadiel),
         claims_axa:         toInt(row.claims_axa),
         providers_mapped:   toInt(row.providers_mapped),
+        claims_processed:   toInt(row.claims_processed),
         care_items_mapped:  toInt(row.care_items_mapped),
         care_items_grouped: toInt(row.care_items_grouped),
         resolved_cares:     toInt(row.resolved_cares),

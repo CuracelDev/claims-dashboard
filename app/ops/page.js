@@ -7,6 +7,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LineCh
 
 const METRIC_LABELS = {
   providers_mapped: 'Providers Mapped',
+  claims_processed: 'Claims Processed',
   care_items_mapped: 'Care Items Mapped',
   care_items_grouped: 'Care Items Grouped',
   resolved_cares: 'Resolved Cares',
@@ -26,6 +27,7 @@ const METRIC_LABELS = {
 
 const KEY_METRICS = [
   { key: 'care_items_mapped', label: 'Care Items Mapped', color: '#00E5A0' },
+  { key: 'claims_processed', label: 'Claims Processed', color: '#38BDF8' },
   { key: 'resolved_cares', label: 'Resolved Cares', color: '#5B8DEF' },
   { key: 'providers_mapped', label: 'Providers Mapped', color: '#A78BFA' },
   { key: 'care_items_grouped', label: 'Care Items Grouped', color: '#F59E0B' },

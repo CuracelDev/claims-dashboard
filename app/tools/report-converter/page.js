@@ -9,6 +9,9 @@ import * as XLSX from 'xlsx';
 
 const METRIC_MAP = {
   'Num of Providers Mapped':            'providers_mapped',
+  'Num of Claims Processed':            'claims_processed',
+  'Num of claims processed':            'claims_processed',
+  'Claims Processed':                   'claims_processed',
   'Num of Care items Mapped':           'care_items_mapped',
   'Num of Care Items Mapped':           'care_items_mapped',
   'Num of care items Mapped':           'care_items_mapped',
@@ -35,7 +38,7 @@ const METRIC_MAP = {
 const CSV_COLS = [
   'member_name','report_date','claims_kenya','claims_tanzania','claims_uganda',
   'claims_uap','claims_defmis','claims_hadiel','claims_axa','providers_mapped',
-  'care_items_mapped','care_items_grouped','resolved_cares','auto_pa_reviewed',
+  'claims_processed','care_items_mapped','care_items_grouped','resolved_cares','auto_pa_reviewed',
   'flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned',
   'tasks_completed','notes',
 ];

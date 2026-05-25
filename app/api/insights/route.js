@@ -166,6 +166,7 @@ export async function GET() {
 
     const KEY_METRICS = [
       { key: 'care_items_mapped', label: 'Care Items Mapped' },
+      { key: 'claims_processed', label: 'Claims Processed' },
       { key: 'resolved_cares', label: 'Resolved Cares' },
       { key: 'providers_mapped', label: 'Providers Mapped' },
       { key: 'care_items_grouped', label: 'Care Items Grouped' },

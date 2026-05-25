@@ -4,6 +4,7 @@ const METRIC_LABELS = {
   claims_kenya: 'Kenya', claims_tanzania: 'Tanzania', claims_uganda: 'Uganda',
   claims_uap: 'UAP Old Mutual', claims_defmis: 'Defmis',
   claims_hadiel: 'Hadiel Tech', claims_axa: 'AXA',
+  claims_processed: 'Claims Processed',
   providers_mapped: 'Providers Mapped', care_items_mapped: 'Care Items Mapped',
   care_items_grouped: 'Care Items Grouped', resolved_cares: 'Resolved Cares',
   auto_pa_reviewed: 'Auto PA Reviewed/Approved', flagged_care_items: 'Flagged Care Items',
@@ -13,7 +14,7 @@ const METRIC_LABELS = {
 
 const METRIC_GROUPS = [
   { label: '📊 Claims Piles Checked', keys: ['claims_kenya','claims_tanzania','claims_uganda','claims_uap','claims_defmis','claims_hadiel','claims_axa'] },
-  { label: '📦 Mapping & Data', keys: ['providers_mapped','care_items_mapped','care_items_grouped','resolved_cares'] },
+  { label: '📦 Mapping & Data', keys: ['providers_mapped','claims_processed','care_items_mapped','care_items_grouped','resolved_cares'] },
   { label: '✅ Quality & Review', keys: ['auto_pa_reviewed','flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned'] },
 ];
 

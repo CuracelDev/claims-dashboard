@@ -20,6 +20,7 @@ const METRIC_GROUPS = [
     category: 'mapping_data', label: 'Mapping & Data',
     metrics: [
       { key: 'providers_mapped',   label: 'Num of Providers Mapped' },
+      { key: 'claims_processed',   label: 'Num of Claims Processed' },
       { key: 'care_items_mapped',  label: 'Num of Care Items Mapped' },
       { key: 'care_items_grouped', label: 'Num of Care Items Grouped' },
       { key: 'resolved_cares',     label: 'Resolved Cares' },
@@ -699,11 +700,11 @@ export default function ReportsPage() {
     const headers = [
       'member_name','report_date','claims_kenya','claims_tanzania','claims_uganda',
       'claims_uap','claims_defmis','claims_hadiel','claims_axa','providers_mapped',
-      'care_items_mapped','care_items_grouped','resolved_cares','auto_pa_reviewed',
+      'claims_processed','care_items_mapped','care_items_grouped','resolved_cares','auto_pa_reviewed',
       'flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned',
       'tasks_completed','notes'
     ].join(',');
-    const example = 'Emmanuel,09/03/2026,0,0,104,0,0,0,0,0,22180,3,4106,0,98194,0,0,0,,';
+    const example = 'Emmanuel,09/03/2026,0,0,104,0,0,0,0,0,250,22180,3,4106,0,98194,0,0,0,,';
     const blob = new Blob([headers + '\n' + example], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

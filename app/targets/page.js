@@ -400,6 +400,7 @@ function NewTargetModal({ C, onSave, onClose }) {
             'resolved_cares',
             'care_items_grouped',
             'providers_mapped',
+            'claims_processed',
             'claims_kenya',
             'claims_tanzania',
             'claims_uganda',
