@@ -38,7 +38,10 @@ export async function GET() {
     const botMetrics = metricsRes.data || [];
     const recentLogs = logsRes.data || [];
     const trackedPiles = trackedRes.data || [];
-    const externalAssignments = externalRes.data || [];
+    const knownBotIds = new Set(botAccounts.map((bot) => String(bot.id)).filter(Boolean));
+    const externalAssignments = (externalRes.data || []).filter((item) => (
+      item.bot_account_id && knownBotIds.has(String(item.bot_account_id))
+    ));
     const weekendRosters = weekendSchemaReady ? (weekendRostersRes.data || []) : [];
     const weekendRosterMembers = weekendSchemaReady ? (weekendMembersRes.data || []) : [];
 
