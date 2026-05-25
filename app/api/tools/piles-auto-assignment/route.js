@@ -4,10 +4,14 @@ import { decryptCredentialFields } from '../../../../lib/piles-auto-assignment-c
 
 export const dynamic = 'force-dynamic';
 
+function isMissingTableError(error) {
+  return /does not exist|relation .* not found|42P01/i.test(String(error?.message || error || ''));
+}
+
 export async function GET() {
   try {
     const supabase = getSupabase();
-    const [masterRes, botsRes, rulesRes, metricsRes, logsRes, trackedRes, externalRes] = await Promise.all([
+    const [masterRes, botsRes, rulesRes, metricsRes, logsRes, trackedRes, externalRes, weekendRostersRes, weekendMembersRes] = await Promise.all([
       supabase.from('piles_auto_assignment_master_accounts').select('*').order('insurer_name', { ascending: true }),
       supabase.from('piles_auto_assignment_bot_accounts').select('*').order('insurer_name', { ascending: true }),
       supabase.from('piles_auto_assignment_rules').select('*').order('insurer_name', { ascending: true }),
@@ -15,11 +19,18 @@ export async function GET() {
       supabase.from('piles_auto_assignment_logs').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('piles_auto_assignment_tracked_piles').select('*').order('updated_at', { ascending: false }).limit(250),
       supabase.from('piles_auto_assignment_external_assignments').select('*').order('last_seen_at', { ascending: false }).limit(250),
+      supabase.from('piles_auto_assignment_weekend_rosters').select('*').order('weekend_start', { ascending: false }).limit(20),
+      supabase.from('piles_auto_assignment_weekend_roster_members').select('*').order('updated_at', { ascending: false }).limit(200),
     ]);
 
-    const responses = [masterRes, botsRes, rulesRes, metricsRes, logsRes, trackedRes, externalRes];
-    const firstError = responses.find((res) => res.error);
-    if (firstError?.error) throw firstError.error;
+    const coreResponses = [masterRes, botsRes, rulesRes, metricsRes, logsRes, trackedRes, externalRes];
+    const weekendResponses = [weekendRostersRes, weekendMembersRes];
+    const firstCoreError = coreResponses.find((res) => res.error);
+    if (firstCoreError?.error) throw firstCoreError.error;
+    const weekendSchemaReady = weekendResponses.every((res) => !res.error);
+    if (!weekendSchemaReady && !weekendResponses.every((res) => !res.error || isMissingTableError(res.error))) {
+      throw weekendResponses.find((res) => res.error)?.error;
+    }
 
     const masterAccounts = (masterRes.data || []).map((item) => decryptCredentialFields(item, ['login_email', 'login_password']));
     const botAccounts = (botsRes.data || []).map((item) => decryptCredentialFields(item, ['bot_email', 'bot_password']));
@@ -28,6 +39,8 @@ export async function GET() {
     const recentLogs = logsRes.data || [];
     const trackedPiles = trackedRes.data || [];
     const externalAssignments = externalRes.data || [];
+    const weekendRosters = weekendSchemaReady ? (weekendRostersRes.data || []) : [];
+    const weekendRosterMembers = weekendSchemaReady ? (weekendMembersRes.data || []) : [];
 
     const activeBots = botAccounts.filter((bot) => bot.is_active);
     const availableBots = botAccounts.filter((bot) => bot.is_active && bot.is_available);
@@ -62,6 +75,7 @@ export async function GET() {
         completedTrackedPiles: completedTrackedPiles.length,
         activeExternalAssignments: activeExternalAssignments.length,
         lateArrivalPileDetections,
+        weekendRostersConfigured: weekendRosters.length,
       },
       masterAccounts,
       botAccounts,
@@ -70,6 +84,8 @@ export async function GET() {
       recentLogs,
       trackedPiles,
       externalAssignments,
+      weekendRosters,
+      weekendRosterMembers,
     });
   } catch (error) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });

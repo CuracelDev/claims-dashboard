@@ -127,6 +127,7 @@ export async function POST(request) {
     const finalizeAssignments = Boolean(body.finalize_assignments);
     const runAll = Boolean(body.run_all);
     const visible = Boolean(body.visible_browser);
+    const effectiveDate = normalize(body.effective_date);
     const backend = resolveRunnerBackend();
 
     if (!runAll && !insurerName) {
@@ -142,6 +143,7 @@ export async function POST(request) {
     args.push('--portal-environment', portalEnvironment);
     if (months.length) args.push('--month', months.join(','));
     if (year) args.push('--year', year);
+    if (effectiveDate) args.push('--effective-date', effectiveDate);
     if (visible) args.push('--visible');
     if (finalizeAssignments) args.push('--execute');
 
@@ -155,6 +157,7 @@ export async function POST(request) {
         finalize_assignments: finalizeAssignments,
         run_all: runAll,
         visible_browser: visible,
+        effective_date: effectiveDate,
       });
     } else {
       const startedAt = Date.now();

@@ -60,6 +60,7 @@ Optional:
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_EXECUTE=true`
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_VISIBLE=false`
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_PORTAL_ENVIRONMENT=production`
+- `PILES_WEEKEND_ROSTER_TOKEN` for the secured n8n weekend roster ingestion endpoint
 
 ## Local development
 

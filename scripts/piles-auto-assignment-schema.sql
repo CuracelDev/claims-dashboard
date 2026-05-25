@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_bot_accounts (
   current_claim_load integer DEFAULT 0,
   last_assigned_at timestamptz,
   last_completed_at timestamptz,
+  updated_by_name text,
+  updated_by_member_id text,
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now()
 );
@@ -62,6 +64,12 @@ ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
 
 ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
   ADD COLUMN IF NOT EXISTS shift_grace_minutes integer DEFAULT 120;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
+  ADD COLUMN IF NOT EXISTS updated_by_name text;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
+  ADD COLUMN IF NOT EXISTS updated_by_member_id text;
 
 ALTER TABLE IF EXISTS piles_auto_assignment_bot_accounts
   ALTER COLUMN active_from_time SET DEFAULT '09:00';
@@ -214,6 +222,62 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_external_assignments (
 
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_external_assignments_insurer_active_idx
   ON piles_auto_assignment_external_assignments (insurer_name, is_active, last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_weekend_rosters (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  weekend_start date NOT NULL,
+  weekend_end date NOT NULL,
+  timezone text DEFAULT 'Africa/Lagos',
+  source text DEFAULT 'n8n_weekend_shift_roster',
+  status text DEFAULT 'received',
+  raw_message text,
+  raw_payload jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE (weekend_start, weekend_end, source)
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_weekend_rosters_dates_idx
+  ON piles_auto_assignment_weekend_rosters (weekend_start, weekend_end, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_weekend_roster_members (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  roster_id text NOT NULL REFERENCES piles_auto_assignment_weekend_rosters(id) ON DELETE CASCADE,
+  team_member_id text,
+  owner_name text NOT NULL,
+  slack_user_id text,
+  slack_mention text,
+  duty_status text NOT NULL,
+  raw_payload jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE (roster_id, owner_name, duty_status)
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_weekend_roster_members_roster_idx
+  ON piles_auto_assignment_weekend_roster_members (roster_id, duty_status, owner_name);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_weekend_bot_state_snapshots (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  roster_id text REFERENCES piles_auto_assignment_weekend_rosters(id) ON DELETE CASCADE,
+  bot_account_id text NOT NULL REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE CASCADE,
+  insurer_name text NOT NULL,
+  owner_name text NOT NULL,
+  previous_assignment_role text,
+  previous_availability_status text,
+  previous_availability_note text,
+  previous_is_available boolean,
+  previous_is_active boolean,
+  applied_at timestamptz DEFAULT now(),
+  restored_at timestamptz,
+  details jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE (roster_id, bot_account_id)
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_weekend_bot_state_snapshots_restore_idx
+  ON piles_auto_assignment_weekend_bot_state_snapshots (restored_at, applied_at DESC);
 
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_runner_runs (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
