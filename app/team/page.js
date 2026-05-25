@@ -123,6 +123,42 @@ function EditMemberModal({ member, onSave, onClose, C }) {
   );
 }
 
+function RemoveMetricDialog({ metric, onConfirm, onCancel, C }) {
+  if (!metric) return null;
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: '#00000088', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ background: C.card, borderRadius: 16, padding: 28, maxWidth: 440, width: '90%', border: `1px solid ${C.border}` }}>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Remove Metric?</div>
+        <p style={{ color: C.sub, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
+          Remove <strong style={{ color: C.text }}>{metric.label}</strong> from Team Management and Daily Reports? Historical report data already submitted for this metric will be preserved.
+        </p>
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={btn(C.elevated, C.sub, false)}>Cancel</button>
+          <button onClick={() => onConfirm(metric)} style={btn(C.danger, '#FFFFFF', false)}>Remove Metric</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DisableMetricDialog({ metric, onConfirm, onCancel, C }) {
+  if (!metric) return null;
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: '#00000088', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ background: C.card, borderRadius: 16, padding: 28, maxWidth: 440, width: '90%', border: `1px solid ${C.border}` }}>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Disable Metric?</div>
+        <p style={{ color: C.sub, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
+          Disable <strong style={{ color: C.text }}>{metric.label}</strong>? It will stop appearing in Daily Reports, but it will stay visible here so you can enable it again later.
+        </p>
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={btn(C.elevated, C.sub, false)}>Cancel</button>
+          <button onClick={() => onConfirm(metric)} style={btn(C.warn, '#0B0F1A', false)}>Disable Metric</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TeamPage() {
   const { C } = useTheme();
   const [members, setMembers] = useState([]);
@@ -143,6 +179,8 @@ export default function TeamPage() {
   const [newMetricMembers, setNewMetricMembers] = useState([]);
   const [addingMetric, setAddingMetric] = useState(false);
   const [metricMsg, setMetricMsg] = useState(null);
+  const [metricToDisable, setMetricToDisable] = useState(null);
+  const [metricToRemove, setMetricToRemove] = useState(null);
   const [testingBirthday, setTestingBirthday] = useState(null);
 
   const load = () => {
@@ -202,6 +240,35 @@ export default function TeamPage() {
     load();
   };
 
+  const handleToggleMetric = async (metric) => {
+    setMetricMsg(null);
+    const res = await fetch('/api/metrics', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: metric.id, active: !metric.active }),
+    });
+    const result = await res.json();
+    if (result.error) {
+      setMetricMsg({ type: 'error', text: result.error });
+      return;
+    }
+    setMetricToDisable(null);
+    load();
+  };
+
+  const handleRemoveMetric = async (metric) => {
+    setMetricMsg(null);
+    const res = await fetch(`/api/metrics?id=${metric.id}`, { method: 'DELETE' });
+    const result = await res.json();
+    setMetricToRemove(null);
+    if (result.error) {
+      setMetricMsg({ type: 'error', text: result.error });
+      return;
+    }
+    setMetricMsg({ type: 'success', text: `"${metric.label}" removed. Historical report data is preserved.` });
+    load();
+  };
+
   const handleTestBirthday = async (member) => {
     setTestingBirthday(member.id);
     const res = await fetch(`/api/birthday-wish?secret=DataOps2026&test_id=${member.id}`);
@@ -212,7 +279,8 @@ export default function TeamPage() {
 
   const activeMembers = members.filter(m => m.active !== false);
   const inactiveMembers = members.filter(m => m.active === false);
-  const activeMetrics = metrics.filter(m => m.active !== false);
+  const visibleMetrics = metrics.filter(m => m.is_active !== false);
+  const activeMetrics = visibleMetrics.filter(m => m.active !== false);
   const missingSlack = activeMembers.filter(m => !m.slack_user_id);
 
   // Sort by upcoming birthday
@@ -235,6 +303,8 @@ export default function TeamPage() {
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, paddingBottom: 60 }}>
       {collision && <CollisionDialog collision={collision} newName={newName} onResolve={handleCollisionResolve} onCancel={() => { setCollision(null); setPendingMember(null); }} C={C} />}
       {editingMember && <EditMemberModal member={editingMember} onSave={handleEditSave} onClose={() => setEditingMember(null)} C={C} />}
+      {metricToDisable && <DisableMetricDialog metric={metricToDisable} onConfirm={handleToggleMetric} onCancel={() => setMetricToDisable(null)} C={C} />}
+      {metricToRemove && <RemoveMetricDialog metric={metricToRemove} onConfirm={handleRemoveMetric} onCancel={() => setMetricToRemove(null)} C={C} />}
 
       <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '20px 32px' }}>
         <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>Team Management</h1>
@@ -459,7 +529,7 @@ export default function TeamPage() {
             </div>
 
             {CATEGORIES.map(cat => {
-              const catMetrics = metrics.filter(m => m.category === cat.key);
+              const catMetrics = visibleMetrics.filter(m => m.category === cat.key);
               if (!catMetrics.length) return null;
               return (
                 <div key={cat.key} style={cardStyle}>
@@ -471,10 +541,10 @@ export default function TeamPage() {
                           <div style={{ fontSize: 13, fontWeight: 500 }}>{m.label}</div>
                           <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>key: {m.key} · {m.applies_to_all ? 'Everyone' : 'Selected members'}</div>
                         </div>
-                        <button onClick={async () => { await fetch('/api/metrics', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: m.id, active: !m.active }) }); load(); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'none', color: m.active === false ? C.success : C.warn, cursor: 'pointer' }}>
+                        <button onClick={() => (m.active === false ? handleToggleMetric(m) : setMetricToDisable(m))} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'none', color: m.active === false ? C.success : C.warn, cursor: 'pointer' }}>
                           {m.active === false ? 'Enable' : 'Disable'}
                         </button>
-                        <button onClick={async () => { if (!confirm(`Remove "${m.label}"?`)) return; await fetch(`/api/metrics?id=${m.id}`, { method: 'DELETE' }); load(); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'none', color: C.danger, cursor: 'pointer' }}>Remove</button>
+                        <button onClick={() => setMetricToRemove(m)} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'none', color: C.danger, cursor: 'pointer' }}>Remove</button>
                       </div>
                     ))}
                   </div>

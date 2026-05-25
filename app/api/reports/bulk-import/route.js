@@ -7,6 +7,10 @@
 // - Date format: DD/MM/YYYY (as per team spreadsheet convention)
 // ─────────────────────────────────────────────────────────────
 import { getSupabase } from '../../../../lib/supabase';
+import {
+  DAILY_REPORT_METRIC_KEYS,
+  metricKeySetFromDefinitions,
+} from '../../../../lib/report-metrics';
 
 export const dynamic = 'force-dynamic';
 
@@ -71,6 +75,11 @@ export async function POST(request) {
 
   // ── Get mode: 'skip' (default) or 'update' (sheet wins) ─────
   const mode = body.mode || 'skip';
+  const { data: metricDefinitions } = await supabase
+    .from('metric_definitions')
+    .select('key, metric_key, active, is_active');
+  const metricKeys = metricKeySetFromDefinitions(metricDefinitions || [], { includeInactive: false });
+  for (const key of DAILY_REPORT_METRIC_KEYS) metricKeys.add(key);
 
   // ── Validate and build upsert rows ───────────────────────────
   const toUpsert  = [];
@@ -105,30 +114,17 @@ export async function POST(request) {
     }
     seenKeys.add(dupKey);
 
+    const metrics = {};
+    for (const key of metricKeys) {
+      metrics[key] = toInt(row[key]);
+    }
+
     toUpsert.push({
       team_member_id: memberId,
       report_date:    reportDate,
       status:         'imported',
-      metrics: {
-        claims_kenya:       toInt(row.claims_kenya),
-        claims_tanzania:    toInt(row.claims_tanzania),
-        claims_uganda:      toInt(row.claims_uganda),
-        claims_uap:         toInt(row.claims_uap),
-        claims_defmis:      toInt(row.claims_defmis),
-        claims_hadiel:      toInt(row.claims_hadiel),
-        claims_axa:         toInt(row.claims_axa),
-        providers_mapped:   toInt(row.providers_mapped),
-        claims_processed:   toInt(row.claims_processed),
-        care_items_mapped:  toInt(row.care_items_mapped),
-        care_items_grouped: toInt(row.care_items_grouped),
-        resolved_cares:     toInt(row.resolved_cares),
-        auto_pa_reviewed:   toInt(row.auto_pa_reviewed),
-        flagged_care_items: toInt(row.flagged_care_items),
-        icd10_adjusted:     toInt(row.icd10_adjusted),
-        benefits_set_up:    toInt(row.benefits_set_up),
-        providers_assigned: toInt(row.providers_assigned),
-        tasks_completed:    toInt(row.tasks_completed),
-      },
+      metrics,
+      tasks_completed: row.tasks_completed || null,
       notes: row.notes || null,
     });
   }

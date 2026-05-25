@@ -2,41 +2,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '../context/ThemeContext';
 import { getSession } from '../lib/auth';
+import {
+  DEFAULT_REPORT_METRIC_GROUPS,
+  groupReportMetricDefinitions,
+} from '../../lib/report-metrics';
 
-const METRIC_GROUPS = [
-  {
-    category: 'claims_piles', label: 'Claims Piles Checked',
-    metrics: [
-      { key: 'claims_kenya',    label: 'Kenya' },
-      { key: 'claims_tanzania', label: 'Tanzania' },
-      { key: 'claims_uganda',   label: 'Uganda' },
-      { key: 'claims_uap',      label: 'UAP Old Mutual' },
-      { key: 'claims_defmis',   label: 'Defmis' },
-      { key: 'claims_hadiel',   label: 'Hadiel Tech' },
-      { key: 'claims_axa',      label: 'AXA' },
-    ],
-  },
-  {
-    category: 'mapping_data', label: 'Mapping & Data',
-    metrics: [
-      { key: 'providers_mapped',   label: 'Num of Providers Mapped' },
-      { key: 'claims_processed',   label: 'Num of Claims Processed' },
-      { key: 'care_items_mapped',  label: 'Num of Care Items Mapped' },
-      { key: 'care_items_grouped', label: 'Num of Care Items Grouped' },
-      { key: 'resolved_cares',     label: 'Resolved Cares' },
-    ],
-  },
-  {
-    category: 'quality_review', label: 'Quality & Review',
-    metrics: [
-      { key: 'auto_pa_reviewed',   label: 'Num of Auto P.A Reviewed/Approved' },
-      { key: 'flagged_care_items', label: 'Num of Flagged Care Items' },
-      { key: 'icd10_adjusted',     label: 'Number of ICD10 Adjusted (Jubilee)' },
-      { key: 'benefits_set_up',    label: 'Num Benefits Set Up' },
-      { key: 'providers_assigned', label: 'Providers Assigned' },
-    ],
-  },
-];
+const FALLBACK_METRIC_GROUPS = DEFAULT_REPORT_METRIC_GROUPS;
 
 const GROUP_COLORS = {
   claims_piles: '#A78BFA',
@@ -183,7 +154,7 @@ function LeavePanel({ memberId, memberName, reportDate, onLeaveActive }) {
   );
 }
 
-function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
+function PreviewModal({ report, teamMembers, metricGroups, onClose, onSendSlack }) {
   const { C } = useTheme();
   const member = teamMembers.find(m => String(m.id) === String(report.team_member_id));
   const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
@@ -192,7 +163,7 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
 
   const copyText = () => {
     const lines = [`📊 Daily Report — ${member?.name || ''} | ${dateStr}`, ''];
-    METRIC_GROUPS.forEach(g => {
+    metricGroups.forEach(g => {
       const items = g.metrics.filter(m => parseInt(report.metrics?.[m.key]) > 0);
       if (items.length > 0) {
         lines.push(`*${g.label}*`);
@@ -225,7 +196,7 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
             <div style={{ fontSize: 12, color: C.sub }}>Metrics Filled</div>
           </div>
         </div>
-        {METRIC_GROUPS.map(g => {
+        {metricGroups.map(g => {
           const items = g.metrics.filter(m => parseInt(report.metrics?.[m.key]) > 0);
           if (!items.length) return null;
           return (
@@ -261,12 +232,15 @@ function PreviewModal({ report, teamMembers, onClose, onSendSlack }) {
   );
 }
 
-function ReportCard({ report, teamMembers, onEdit }) {
+function ReportCard({ report, teamMembers, metricKeys, onEdit }) {
   const { C } = useTheme();
   const S = makeS(C);
   const member = teamMembers.find(m => m.id === report.team_member_id) || report.team_members;
   const name = member?.display_name || member?.name || 'Unknown';
-  const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
+  const visibleKeys = new Set(metricKeys || []);
+  const total = Object.entries(report.metrics || {}).reduce((sum, [key, value]) => (
+    visibleKeys.has(key) ? sum + (parseInt(value) || 0) : sum
+  ), 0);
   const dateStr = report.report_date ? new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
   return (
     <div style={{ ...S.card, marginBottom: 0 }}>
@@ -455,7 +429,7 @@ function MissedDaysBanner({ memberId, onSelectDate }) {
   );
 }
 
-function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
+function ReportForm({ teamMembers, authSession, metricGroups, editPreset, onPresetUsed }) {
   const { C } = useTheme();
   const S = makeS(C);
   const [selectedMember] = useState(String(authSession.memberId));
@@ -478,6 +452,16 @@ function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
   const [showPreview, setShowPreview] = useState(false);
 
   const selectedMemberName = teamMembers.find(m => String(m.id) === String(selectedMember))?.name || '';
+  const applicableMetricGroups = metricGroups
+    .map(group => ({
+      ...group,
+      metrics: group.metrics.filter(metric => {
+        if (metric.applies_to_all !== false) return true;
+        const memberIds = Array.isArray(metric.applicable_members) ? metric.applicable_members : [];
+        return memberIds.map(String).includes(String(selectedMember));
+      }),
+    }))
+    .filter(group => group.metrics.length > 0);
 
   useEffect(() => {
     if (!selectedMember || !reportDate) {
@@ -572,7 +556,7 @@ function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
 
       {!isLeaveActive && (
         <>
-          {METRIC_GROUPS.map(group => (
+          {applicableMetricGroups.map(group => (
             <MetricGroup key={group.category} group={group} metrics={metrics} onChangeMetric={(key, val) => setMetrics(prev => ({ ...prev, [key]: val }))} />
           ))}
 
@@ -622,7 +606,7 @@ function ReportForm({ teamMembers, authSession, editPreset, onPresetUsed }) {
       )}
 
       {showPreview && editingReport && (
-        <PreviewModal report={editingReport} teamMembers={teamMembers} onClose={() => setShowPreview(false)} onSendSlack={handleSendSlack} />
+        <PreviewModal report={editingReport} teamMembers={teamMembers} metricGroups={applicableMetricGroups} onClose={() => setShowPreview(false)} onSendSlack={handleSendSlack} />
       )}
     </>
   );
@@ -633,6 +617,7 @@ export default function ReportsPage() {
   const { C } = useTheme();
   const [tab, setTab] = useState('form');
   const [teamMembers, setTeamMembers] = useState([]);
+  const [metricGroups, setMetricGroups] = useState(FALLBACK_METRIC_GROUPS);
   const [authSession, setAuthSession] = useState(null);
   const [reports, setReports] = useState([]);
   const [histFilter, setHistFilter] = useState({ person: '', date: '' });
@@ -642,6 +627,13 @@ export default function ReportsPage() {
 
   useEffect(() => {
     fetch('/api/team').then(r => r.json()).then(({ data }) => setTeamMembers(data || []));
+    fetch('/api/metrics')
+      .then(r => r.json())
+      .then(({ data }) => {
+        const groups = groupReportMetricDefinitions(data || []);
+        setMetricGroups(groups.length ? groups : FALLBACK_METRIC_GROUPS);
+      })
+      .catch(() => setMetricGroups(FALLBACK_METRIC_GROUPS));
     const session = getSession();
     if (session && session.member_id) {
       setAuthSession({ memberId: session.member_id, memberName: session.member_name });
@@ -697,14 +689,20 @@ export default function ReportsPage() {
   };
 
   const downloadTemplate = () => {
+    const metricKeys = metricGroups.flatMap(group => group.metrics.map(metric => metric.key));
     const headers = [
-      'member_name','report_date','claims_kenya','claims_tanzania','claims_uganda',
-      'claims_uap','claims_defmis','claims_hadiel','claims_axa','providers_mapped',
-      'claims_processed','care_items_mapped','care_items_grouped','resolved_cares','auto_pa_reviewed',
-      'flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned',
+      'member_name','report_date',
+      ...metricKeys,
       'tasks_completed','notes'
     ].join(',');
-    const example = 'Emmanuel,09/03/2026,0,0,104,0,0,0,0,0,250,22180,3,4106,0,98194,0,0,0,,';
+    const exampleValues = headers.split(',').map((header, index) => {
+      if (header === 'member_name') return 'Emmanuel';
+      if (header === 'report_date') return '09/03/2026';
+      if (header === 'notes') return '';
+      if (header === 'tasks_completed') return '';
+      return index === 4 ? '104' : '0';
+    });
+    const example = exampleValues.join(',');
     const blob = new Blob([headers + '\n' + example], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -741,7 +739,7 @@ export default function ReportsPage() {
       <div style={{ padding: '20px 24px' }}>
         {tab === 'form' && (
           <div style={{ maxWidth: '100%' }}>
-            {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} editPreset={editPreset} onPresetUsed={() => setEditPreset(null)} />}
+            {authSession && <ReportForm teamMembers={teamMembers} authSession={authSession} metricGroups={metricGroups} editPreset={editPreset} onPresetUsed={() => setEditPreset(null)} />}
           </div>
         )}
 
@@ -842,7 +840,7 @@ export default function ReportsPage() {
               <div style={{ textAlign: 'center', padding: 60, color: C.sub }}>No reports found.</div>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
-                {reports.map(r => <ReportCard key={r.id} report={r} teamMembers={teamMembers} onEdit={handleEditReport} />)}
+                {reports.map(r => <ReportCard key={r.id} report={r} teamMembers={teamMembers} metricKeys={metricGroups.flatMap(group => group.metrics.map(metric => metric.key))} onEdit={handleEditReport} />)}
               </div>
             )}
           </div>
