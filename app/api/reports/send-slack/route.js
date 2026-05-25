@@ -1,22 +1,32 @@
+import { getSupabase } from '../../../../lib/supabase';
+import {
+  DEFAULT_REPORT_METRIC_GROUPS,
+  groupReportMetricDefinitions,
+} from '../../../../lib/report-metrics';
+
 export const dynamic = 'force-dynamic';
 
-const METRIC_LABELS = {
-  claims_kenya: 'Kenya', claims_tanzania: 'Tanzania', claims_uganda: 'Uganda',
-  claims_uap: 'UAP Old Mutual', claims_defmis: 'Defmis',
-  claims_hadiel: 'Hadiel Tech', claims_axa: 'AXA',
-  claims_processed: 'Claims Processed',
-  providers_mapped: 'Providers Mapped', care_items_mapped: 'Care Items Mapped',
-  care_items_grouped: 'Care Items Grouped', resolved_cares: 'Resolved Cares',
-  auto_pa_reviewed: 'Auto PA Reviewed/Approved', flagged_care_items: 'Flagged Care Items',
-  icd10_adjusted: 'ICD10 Adjusted (Jubilee)', benefits_set_up: 'Benefits Set Up',
-  providers_assigned: 'Providers Assigned',
+const CATEGORY_ICONS = {
+  claims_piles: '📊',
+  mapping_data: '📦',
+  quality_review: '✅',
 };
 
-const METRIC_GROUPS = [
-  { label: '📊 Claims Piles Checked', keys: ['claims_kenya','claims_tanzania','claims_uganda','claims_uap','claims_defmis','claims_hadiel','claims_axa'] },
-  { label: '📦 Mapping & Data', keys: ['providers_mapped','claims_processed','care_items_mapped','care_items_grouped','resolved_cares'] },
-  { label: '✅ Quality & Review', keys: ['auto_pa_reviewed','flagged_care_items','icd10_adjusted','benefits_set_up','providers_assigned'] },
-];
+async function getMetricGroups() {
+  try {
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('metric_definitions')
+      .select('key, metric_key, label, category, display_order, active, is_active')
+      .order('category')
+      .order('display_order');
+    if (error) throw error;
+    const groups = groupReportMetricDefinitions(data || []);
+    return groups.length ? groups : DEFAULT_REPORT_METRIC_GROUPS;
+  } catch {
+    return DEFAULT_REPORT_METRIC_GROUPS;
+  }
+}
 
 export async function POST(request) {
   try {
@@ -38,6 +48,7 @@ export async function POST(request) {
     }
 
     const metrics = report.metrics || {};
+    const metricGroups = await getMetricGroups();
     const total = Object.values(metrics).reduce((a, b) => a + (parseInt(b) || 0), 0);
     const date = new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
@@ -59,14 +70,18 @@ export async function POST(request) {
     ];
 
     // Add each group that has values
-    for (const group of METRIC_GROUPS) {
-      const rows = group.keys
+    for (const group of metricGroups) {
+      const rows = group.metrics
+        .map((metric) => metric.key)
         .filter(k => parseInt(metrics[k]) > 0)
-        .map(k => `• *${METRIC_LABELS[k]}:* ${metrics[k]}`);
+        .map(k => {
+          const metric = group.metrics.find((item) => item.key === k);
+          return `• *${metric?.label || k}:* ${metrics[k]}`;
+        });
       if (rows.length > 0) {
         blocks.push({
           type: 'section',
-          text: { type: 'mrkdwn', text: `*${group.label}*\n${rows.join('\n')}` }
+          text: { type: 'mrkdwn', text: `*${CATEGORY_ICONS[group.category] || '•'} ${group.label}*\n${rows.join('\n')}` }
         });
       }
     }

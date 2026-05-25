@@ -2,10 +2,22 @@
 import { getSupabase } from '../../../lib/supabase';
 import {
   DAILY_REPORT_METRIC_KEYS,
+  metricKeySetFromDefinitions,
   normalizeDailyReport,
   normalizeDailyReports,
+  parseReportMetrics,
 } from '../../../lib/report-metrics';
 export const dynamic = 'force-dynamic';
+
+async function getAllowedMetricKeys(supabase) {
+  const { data, error } = await supabase
+    .from('metric_definitions')
+    .select('key, metric_key, active, is_active');
+  if (error) return DAILY_REPORT_METRIC_KEYS;
+  const keys = metricKeySetFromDefinitions(data || [], { includeInactive: true });
+  for (const key of DAILY_REPORT_METRIC_KEYS) keys.add(key);
+  return keys;
+}
 
 function normalizeReportDate(value) {
   if (!value) return null;
@@ -119,14 +131,8 @@ export async function POST(request) {
 
     const memberId = team_member_id;
 
-    const safeMetrics = {};
-    if (metrics && typeof metrics === 'object' && !Array.isArray(metrics)) {
-      for (const [k, v] of Object.entries(metrics)) {
-        if (!DAILY_REPORT_METRIC_KEYS.has(k)) continue;
-        const num = parseInt(v);
-        if (!isNaN(num)) safeMetrics[k] = num;
-      }
-    }
+    const allowedMetricKeys = await getAllowedMetricKeys(supabase);
+    const safeMetrics = parseReportMetrics(metrics, allowedMetricKeys);
 
     const payload = {
       team_member_id: memberId,

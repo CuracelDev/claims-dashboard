@@ -1,47 +1,21 @@
 'use client';
 import { useState, useEffect } from 'react';
 import { useTheme } from '../../context/ThemeContext';
+import {
+  DEFAULT_REPORT_METRIC_GROUPS,
+  groupReportMetricDefinitions,
+} from '../../../lib/report-metrics';
 
-const METRIC_GROUPS = [
-  {
-    label: 'Claims Piles Checked',
-    color: '#A78BFA',
-    metrics: [
-      { key: 'claims_kenya', label: 'Kenya' },
-      { key: 'claims_tanzania', label: 'Tanzania' },
-      { key: 'claims_uganda', label: 'Uganda' },
-      { key: 'claims_uap', label: 'UAP Old Mutual' },
-      { key: 'claims_defmis', label: 'Defmis' },
-      { key: 'claims_hadiel', label: 'Hadiel Tech' },
-      { key: 'claims_axa', label: 'AXA' },
-    ],
-  },
-  {
-    label: 'Mapping & Data',
-    color: '#5B8DEF',
-    metrics: [
-      { key: 'providers_mapped', label: 'Providers Mapped' },
-      { key: 'claims_processed', label: 'Claims Processed' },
-      { key: 'care_items_mapped', label: 'Care Items Mapped' },
-      { key: 'care_items_grouped', label: 'Care Items Grouped' },
-      { key: 'resolved_cares', label: 'Resolved Cares' },
-    ],
-  },
-  {
-    label: 'Quality & Review',
-    color: '#00B87D',
-    metrics: [
-      { key: 'auto_pa_reviewed', label: 'Auto PA Reviewed/Approved' },
-      { key: 'flagged_care_items', label: 'Flagged Care Items' },
-      { key: 'icd10_adjusted', label: 'ICD10 Adjusted (Jubilee)' },
-      { key: 'benefits_set_up', label: 'Benefits Set Up' },
-      { key: 'providers_assigned', label: 'Providers Assigned' },
-    ],
-  },
-];
+const GROUP_COLORS = {
+  claims_piles: '#A78BFA',
+  mapping_data: '#5B8DEF',
+  quality_review: '#00B87D',
+};
 
-const ALL_METRICS = METRIC_GROUPS.flatMap((g) => g.metrics);
-const KNOWN_METRIC_KEYS = new Set(ALL_METRICS.map((m) => m.key));
+const FALLBACK_METRIC_GROUPS = DEFAULT_REPORT_METRIC_GROUPS.map(group => ({
+  ...group,
+  color: GROUP_COLORS[group.category] || '#5B8DEF',
+}));
 
 function toLocalYMD(date) {
   const y = date.getFullYear();
@@ -117,8 +91,11 @@ export default function WeeklyPage() {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [data, setData] = useState(null);
+  const [metricGroups, setMetricGroups] = useState(FALLBACK_METRIC_GROUPS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const allMetrics = metricGroups.flatMap((group) => group.metrics);
+  const knownMetricKeys = new Set(allMetrics.map((metric) => metric.key));
 
   useEffect(() => {
     const [f, t] = QUICK[0].fn();
@@ -126,6 +103,19 @@ export default function WeeklyPage() {
     setTo(t);
     setCustomFrom(f);
     setCustomTo(t);
+  }, []);
+
+  useEffect(() => {
+    fetch('/api/metrics')
+      .then(r => r.json())
+      .then(({ data }) => {
+        const groups = groupReportMetricDefinitions(data || []).map(group => ({
+          ...group,
+          color: GROUP_COLORS[group.category] || '#5B8DEF',
+        }));
+        setMetricGroups(groups.length ? groups : FALLBACK_METRIC_GROUPS);
+      })
+      .catch(() => setMetricGroups(FALLBACK_METRIC_GROUPS));
   }, []);
 
   useEffect(() => {
@@ -170,7 +160,7 @@ export default function WeeklyPage() {
     const headers = ['Group', 'Metric', ...members.map((p) => p.person?.name), 'Team Total'];
     const rows = [];
 
-    METRIC_GROUPS.forEach((g) => {
+    metricGroups.forEach((g) => {
       g.metrics.forEach((m) => {
         const vals = members.map((p) => p.totals[m.key] || 0);
         const total = vals.reduce((a, b) => a + b, 0);
@@ -390,7 +380,7 @@ export default function WeeklyPage() {
                 </thead>
 
                 <tbody>
-                  {METRIC_GROUPS.map((group, gi) => {
+                  {metricGroups.map((group, gi) => {
                     const activeMetrics = group.metrics.filter((m) =>
                       members.some((p) => (p.totals[m.key] || 0) > 0)
                     );
@@ -531,7 +521,7 @@ export default function WeeklyPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: 14 }}>
               {members.map((p, i) => {
                 const top = Object.entries(p.totals)
-                  .filter(([key, v]) => KNOWN_METRIC_KEYS.has(key) && v > 0)
+                  .filter(([key, v]) => knownMetricKeys.has(key) && v > 0)
                   .sort((a, b) => b[1] - a[1])
                   .slice(0, 4);
 
@@ -553,7 +543,7 @@ export default function WeeklyPage() {
                     </div>
 
                     {top.map(([key, val]) => {
-                      const label = ALL_METRICS.find((m) => m.key === key)?.label || key;
+                      const label = allMetrics.find((m) => m.key === key)?.label || key;
                       return (
                         <div
                           key={key}

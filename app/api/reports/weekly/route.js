@@ -1,6 +1,7 @@
 import { getSupabase } from '../../../../lib/supabase';
 import {
   DAILY_REPORT_METRIC_KEYS,
+  metricKeySetFromDefinitions,
   normalizeDailyReports,
 } from '../../../../lib/report-metrics';
 
@@ -87,6 +88,11 @@ export async function GET(request) {
     if (membersError) throw membersError;
 
     const allMembers = normalizeActiveMembers(allMembersRaw);
+    const { data: metricDefinitions } = await supabase
+      .from('metric_definitions')
+      .select('key, metric_key, active, is_active');
+    const metricKeys = metricKeySetFromDefinitions(metricDefinitions || [], { includeInactive: false });
+    for (const key of DAILY_REPORT_METRIC_KEYS) metricKeys.add(key);
 
     const { data: rawReports, error: reportsError } = await supabase
       .from('daily_reports')
@@ -158,7 +164,7 @@ export async function GET(request) {
 
       const metrics = report.metrics || {};
       for (const [key, val] of Object.entries(metrics)) {
-        if (!DAILY_REPORT_METRIC_KEYS.has(key)) continue;
+        if (!metricKeys.has(key)) continue;
         const num = Number(val);
         if (Number.isFinite(num)) {
           byPerson[pid].totals[key] = (byPerson[pid].totals[key] || 0) + num;
