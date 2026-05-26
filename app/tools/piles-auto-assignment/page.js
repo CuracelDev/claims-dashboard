@@ -299,6 +299,25 @@ function formatWeekendRosterDateTime(value) {
   });
 }
 
+function sortWeekendBots(bots) {
+  return [...(bots || [])].sort((a, b) => {
+    const roleRank = (a.assignment_role === 'primary' ? 0 : 1) - (b.assignment_role === 'primary' ? 0 : 1);
+    if (roleRank !== 0) return roleRank;
+    const priorityRank = Number(a.priority_order || 100) - Number(b.priority_order || 100);
+    if (priorityRank !== 0) return priorityRank;
+    return String(a.owner_name || '').localeCompare(String(b.owner_name || ''));
+  });
+}
+
+function getWeekendPrimaryBot(bots) {
+  return sortWeekendBots(bots)[0] || null;
+}
+
+function getEffectiveWeekendRole(bot, bots) {
+  const primaryBot = getWeekendPrimaryBot(bots);
+  return primaryBot?.id === bot?.id ? 'primary' : 'support';
+}
+
 function SaveBanner({ C, notice }) {
   if (!notice) return null;
   return (
@@ -1908,10 +1927,15 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
     return acc;
   }, {});
 
-  async function updateWeekendRole(bot, assignmentRole) {
-    if (!bot?.id || assignmentRole === bot.assignment_role) return;
+  async function updateWeekendRole(bot, assignmentRole, insurerBots) {
+    const currentEffectiveRole = getEffectiveWeekendRole(bot, insurerBots);
+    if (!bot?.id || assignmentRole === currentEffectiveRole) return;
     if (!latestRoster?.id) {
       setNotice({ type: 'error', text: 'No weekend roster is available for this role change.' });
+      return;
+    }
+    if (assignmentRole !== 'primary' && currentEffectiveRole === 'primary') {
+      setNotice({ type: 'error', text: 'Each weekend insurer needs one primary. Pick another bot as Primary instead; the current primary will be moved to Support automatically.' });
       return;
     }
     setSavingRoleId(bot.id);
@@ -1923,13 +1947,15 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
           roster_id: latestRoster.id,
           bot_account_id: bot.id,
           assignment_role: assignmentRole,
+          support_bot_account_ids: assignmentRole === 'primary' ? insurerBots.filter((item) => item.id !== bot.id).map((item) => item.id) : [],
           updated_by_name: getMemberName() || 'Dashboard User',
           updated_by_member_id: getMemberId() || null,
         }),
       });
       const data = await res.json();
       if (!data.success) throw new Error(data.error || 'Failed to update weekend bot role.');
-      setNotice({ type: 'success', text: `${data.item.owner_name} is now ${data.item.assignment_role} for ${displayInsurerName(data.item.insurer_name)} this weekend. The weekday role is snapshotted for restore.` });
+      const demotedCount = data.demotedItems?.length || 0;
+      setNotice({ type: 'success', text: `${data.item.owner_name} is now ${data.item.assignment_role} for ${displayInsurerName(data.item.insurer_name)} this weekend${demotedCount ? `; ${demotedCount} other bot row(s) moved to support` : ''}. The weekday role is snapshotted for restore.` });
       onRefresh();
     } catch (error) {
       setNotice({ type: 'error', text: error.message });
@@ -1976,25 +2002,36 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
             </thead>
             <tbody>
               {Object.entries(botsByInsurer).sort(([a], [b]) => a.localeCompare(b)).map(([insurer, bots]) => {
+                const sortedBots = sortWeekendBots(bots);
+                const primaryBot = getWeekendPrimaryBot(sortedBots);
+                const hasSavedPrimary = sortedBots.some((bot) => bot.assignment_role === 'primary');
                 return (
                   <tr key={insurer} style={{ borderTop: `1px solid ${C.border}`, color: C.text, fontSize: 13 }}>
                     <td style={{ padding: 12, fontWeight: 800 }}>{insurer}</td>
-                    <td style={{ padding: 12 }}>{bots.map((bot) => bot.bot_name || bot.owner_name).join(', ')}</td>
-                    <td style={{ padding: 12 }}>{bots.map((bot) => bot.owner_name).join(', ')}</td>
+                    <td style={{ padding: 12 }}>{sortedBots.map((bot) => bot.bot_name || bot.owner_name).join(', ')}</td>
+                    <td style={{ padding: 12 }}>{sortedBots.map((bot) => bot.owner_name).join(', ')}</td>
                     <td style={{ padding: 12, minWidth: 220 }}>
                       <div style={{ display: 'grid', gap: 8 }}>
-                        {bots.map((bot) => (
+                        {sortedBots.map((bot) => {
+                          const effectiveRole = getEffectiveWeekendRole(bot, sortedBots);
+                          const isAutoPrimary = effectiveRole === 'primary' && bot.assignment_role !== 'primary';
+                          return (
                           <label key={bot.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(80px, 1fr) 120px', gap: 8, alignItems: 'center', color: C.sub }}>
-                            <span style={{ color: C.text, fontWeight: 700 }}>{bot.owner_name}</span>
-                            <select value={bot.assignment_role || 'primary'} onChange={(event) => updateWeekendRole(bot, event.target.value)} disabled={savingRoleId === bot.id} style={{ ...inputStyle(C), padding: '7px 9px' }}>
-                              {ROLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                            <span style={{ color: C.text, fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                              {bot.owner_name}
+                              {isAutoPrimary ? <span style={{ color: C.warn, border: `1px solid ${C.warn}55`, borderRadius: 999, padding: '2px 7px', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Primary auto</span> : null}
+                            </span>
+                            <select value={effectiveRole} onChange={(event) => updateWeekendRole(bot, event.target.value, sortedBots)} disabled={savingRoleId === bot.id} style={{ ...inputStyle(C), padding: '7px 9px' }}>
+                              {ROLE_OPTIONS.filter((option) => option.value !== 'admin').map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                             </select>
                           </label>
-                        ))}
-                        {savingRoleId && bots.some((bot) => bot.id === savingRoleId) ? <div style={{ color: C.muted, fontSize: 12 }}>Saving role change...</div> : null}
+                          );
+                        })}
+                        {!hasSavedPrimary ? <div style={{ color: C.warn, fontSize: 12 }}>No saved weekend primary yet. {primaryBot?.owner_name || 'The first bot'} is shown as Primary (auto); choose Primary on any row to save the weekend override.</div> : null}
+                        {savingRoleId && sortedBots.some((bot) => bot.id === savingRoleId) ? <div style={{ color: C.muted, fontSize: 12 }}>Saving role change...</div> : null}
                       </div>
                     </td>
-                    <td style={{ padding: 12, color: C.sub }}>{bots.length === 1 ? 'All new piles go to this on-shift bot.' : 'Normal primary/support balancing applies across these on-shift bots.'}</td>
+                    <td style={{ padding: 12, color: C.sub }}>{sortedBots.length === 1 ? 'All new piles go to this on-shift bot.' : `${primaryBot?.owner_name || 'The primary'} gets the primary floor first; support rows share the remainder by speed/load.`}</td>
                   </tr>
                 );
               })}

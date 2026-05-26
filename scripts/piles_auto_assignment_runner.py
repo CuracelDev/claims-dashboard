@@ -165,6 +165,18 @@ def roster_owner_matches(owner_key: str, roster_keys: set[str]) -> bool:
     return bool(owner_first and any(key == owner_first or key.startswith(f"{owner_first} ") for key in roster_keys))
 
 
+def normalize_weekend_primary_roles(bots: list["BotAccount"]) -> list["BotAccount"]:
+    """Weekend coverage must have one clear primary per insurer."""
+    if not bots:
+        return []
+    ordered = sorted(bots, key=lambda bot: (0 if bot.assignment_role == "primary" else 1, bot.priority_order, bot.owner_name))
+    primary_id = ordered[0].id
+    return [
+        replace(bot, assignment_role="primary" if bot.id == primary_id else "support")
+        for bot in bots
+    ]
+
+
 def label_key(text: Any) -> str:
     return re.sub(r"\s+", " ", norm(text).lower()).strip()
 
@@ -1231,6 +1243,7 @@ class DataStore:
             if roster_owner_matches(owner_key, off_duty_keys):
                 continue
             eligible_bots.append(bot)
+        eligible_bots = normalize_weekend_primary_roles(eligible_bots)
 
         missing_reason = ""
         if not on_shift_keys:
