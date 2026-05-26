@@ -62,6 +62,8 @@ Optional:
 - `PILES_AUTO_ASSIGNMENT_SCHEDULE_PORTAL_ENVIRONMENT=production`
 - `PILES_WEEKEND_ROSTER_TOKEN` for the secured n8n weekend roster ingestion endpoint
 
+After adding or rotating `PILES_WEEKEND_ROSTER_TOKEN` in GitHub Actions, redeploy the app so the production VM rewrites its runtime environment before n8n posts the next weekend roster.
+
 ## Local development
 
 Local manual trigger stays local as long as:
