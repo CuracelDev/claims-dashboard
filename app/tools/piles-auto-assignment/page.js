@@ -2004,7 +2004,6 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
               {Object.entries(botsByInsurer).sort(([a], [b]) => a.localeCompare(b)).map(([insurer, bots]) => {
                 const sortedBots = sortWeekendBots(bots);
                 const primaryBot = getWeekendPrimaryBot(sortedBots);
-                const hasSavedPrimary = sortedBots.some((bot) => bot.assignment_role === 'primary');
                 return (
                   <tr key={insurer} style={{ borderTop: `1px solid ${C.border}`, color: C.text, fontSize: 13 }}>
                     <td style={{ padding: 12, fontWeight: 800 }}>{insurer}</td>
@@ -2027,7 +2026,6 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
                           </label>
                           );
                         })}
-                        {!hasSavedPrimary ? <div style={{ color: C.warn, fontSize: 12 }}>No saved weekend primary yet. {primaryBot?.owner_name || 'The first bot'} is shown as Primary (auto); choose Primary on any row to save the weekend override.</div> : null}
                         {savingRoleId && sortedBots.some((bot) => bot.id === savingRoleId) ? <div style={{ color: C.muted, fontSize: 12 }}>Saving role change...</div> : null}
                       </div>
                     </td>
