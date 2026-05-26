@@ -69,6 +69,7 @@ function parseRosterText(rawMessage) {
 }
 
 function requireRosterToken(request) {
+  // n8n posts weekend rosters with this shared Bearer token after the Friday roster workflow.
   const configuredToken = normalize(process.env.PILES_WEEKEND_ROSTER_TOKEN);
   if (!configuredToken && process.env.NODE_ENV !== 'production') return null;
   if (!configuredToken) return 'PILES_WEEKEND_ROSTER_TOKEN is not configured.';
