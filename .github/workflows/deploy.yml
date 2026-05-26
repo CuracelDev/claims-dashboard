@@ -35,6 +35,7 @@ jobs:
           METABASE_URL: ${{ secrets.METABASE_URL }}
           METABASE_USERNAME: ${{ secrets.METABASE_USERNAME }}
           METABASE_PASSWORD: ${{ secrets.METABASE_PASSWORD }}
+          PILES_WEEKEND_ROSTER_TOKEN: ${{ secrets.PILES_WEEKEND_ROSTER_TOKEN }}
 
       - name: Rsync files to server
         uses: appleboy/scp-action@master
@@ -81,6 +82,7 @@ jobs:
             PYTHONUNBUFFERED="${{ vars.PYTHONUNBUFFERED }}"
             SCREENSHOT_ON_ERROR="${{ vars.SCREENSHOT_ON_ERROR }}"
             PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE="${{ vars.PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE }}"
+            PILES_WEEKEND_ROSTER_TOKEN="${{ secrets.PILES_WEEKEND_ROSTER_TOKEN }}"
             EOF
             export PATH="$HOME/.local/bin:$PATH"
             export PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
