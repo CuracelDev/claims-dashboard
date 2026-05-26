@@ -8,7 +8,41 @@ function normalize(value) {
   return String(value ?? '').trim();
 }
 
-const VALID_ROLES = new Set(['primary', 'support', 'admin']);
+const VALID_ROLES = new Set(['primary', 'support']);
+
+function uniqueValues(values) {
+  return [...new Set((values || []).map((value) => normalize(value)).filter(Boolean))];
+}
+
+async function snapshotBotState(supabase, roster, bot, now, body, assignmentRole) {
+  const snapshotPayload = {
+    id: randomUUID(),
+    roster_id: roster.id,
+    bot_account_id: bot.id,
+    insurer_name: bot.insurer_name,
+    owner_name: bot.owner_name,
+    previous_assignment_role: bot.assignment_role || 'primary',
+    previous_availability_status: bot.availability_status || 'available',
+    previous_availability_note: bot.availability_note || null,
+    previous_is_available: bot.is_available !== false,
+    previous_is_active: bot.is_active !== false,
+    details: {
+      source: 'weekend_roster_role_editor',
+      weekend_start: roster.weekend_start,
+      weekend_end: roster.weekend_end,
+      requested_assignment_role: assignmentRole,
+      updated_by_name: normalize(body.updated_by_name) || null,
+      updated_by_member_id: normalize(body.updated_by_member_id) || null,
+    },
+    created_at: now,
+    updated_at: now,
+  };
+
+  const { error } = await supabase
+    .from('piles_auto_assignment_weekend_bot_state_snapshots')
+    .upsert(snapshotPayload, { onConflict: 'roster_id,bot_account_id', ignoreDuplicates: true });
+  if (error) throw error;
+}
 
 export async function PATCH(request) {
   try {
@@ -21,7 +55,7 @@ export async function PATCH(request) {
       return NextResponse.json({ success: false, error: 'Roster id and bot account id are required.' }, { status: 400 });
     }
     if (!VALID_ROLES.has(assignmentRole)) {
-      return NextResponse.json({ success: false, error: 'Assignment role must be primary, support, or admin.' }, { status: 400 });
+      return NextResponse.json({ success: false, error: 'Assignment role must be primary or support.' }, { status: 400 });
     }
 
     const supabase = getSupabase();
@@ -46,33 +80,7 @@ export async function PATCH(request) {
     }
 
     const now = new Date().toISOString();
-    const snapshotPayload = {
-      id: randomUUID(),
-      roster_id: rosterId,
-      bot_account_id: botAccountId,
-      insurer_name: bot.insurer_name,
-      owner_name: bot.owner_name,
-      previous_assignment_role: bot.assignment_role || 'primary',
-      previous_availability_status: bot.availability_status || 'available',
-      previous_availability_note: bot.availability_note || null,
-      previous_is_available: bot.is_available !== false,
-      previous_is_active: bot.is_active !== false,
-      details: {
-        source: 'weekend_roster_role_editor',
-        weekend_start: roster.weekend_start,
-        weekend_end: roster.weekend_end,
-        requested_assignment_role: assignmentRole,
-        updated_by_name: normalize(body.updated_by_name) || null,
-        updated_by_member_id: normalize(body.updated_by_member_id) || null,
-      },
-      created_at: now,
-      updated_at: now,
-    };
-
-    const { error: snapshotError } = await supabase
-      .from('piles_auto_assignment_weekend_bot_state_snapshots')
-      .upsert(snapshotPayload, { onConflict: 'roster_id,bot_account_id', ignoreDuplicates: true });
-    if (snapshotError) throw snapshotError;
+    await snapshotBotState(supabase, roster, bot, now, body, assignmentRole);
 
     const { data: updatedBot, error: updateError } = await supabase
       .from('piles_auto_assignment_bot_accounts')
@@ -88,7 +96,34 @@ export async function PATCH(request) {
       .single();
     if (updateError) throw updateError;
 
-    return NextResponse.json({ success: true, item: updatedBot, roster });
+    const demotedItems = [];
+    const supportBotIds = assignmentRole === 'primary' ? uniqueValues(body.support_bot_account_ids).filter((id) => id !== botAccountId) : [];
+    for (const supportBotId of supportBotIds) {
+      const { data: supportBot, error: supportFetchError } = await supabase
+        .from('piles_auto_assignment_bot_accounts')
+        .select('*')
+        .eq('id', supportBotId)
+        .maybeSingle();
+      if (supportFetchError) throw supportFetchError;
+      if (!supportBot) continue;
+      await snapshotBotState(supabase, roster, supportBot, now, body, 'support');
+      const { data: demotedBot, error: demoteError } = await supabase
+        .from('piles_auto_assignment_bot_accounts')
+        .update({
+          assignment_role: 'support',
+          availability_note: `Weekend roster ${roster.weekend_start} to ${roster.weekend_end}: role override`,
+          updated_by_name: normalize(body.updated_by_name) || null,
+          updated_by_member_id: normalize(body.updated_by_member_id) || null,
+          updated_at: now,
+        })
+        .eq('id', supportBotId)
+        .select('*')
+        .single();
+      if (demoteError) throw demoteError;
+      demotedItems.push(demotedBot);
+    }
+
+    return NextResponse.json({ success: true, item: updatedBot, demotedItems, roster });
   } catch (error) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
