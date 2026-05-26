@@ -265,6 +265,13 @@ function rosterOwnerKey(value) {
   return String(value || '').trim().toLowerCase().replace(/^@+/, '').replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+function rosterOwnerMatches(ownerKey, rosterKeys) {
+  if (!ownerKey) return false;
+  if (rosterKeys.includes(ownerKey)) return true;
+  const ownerFirst = ownerKey.split(' ')[0];
+  return Boolean(ownerFirst && rosterKeys.some((key) => key === ownerFirst || key.startsWith(`${ownerFirst} `)));
+}
+
 function SaveBanner({ C, notice }) {
   if (!notice) return null;
   return (
@@ -1861,7 +1868,11 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
   const onShift = latestMembers.filter((member) => member.duty_status === 'on_shift');
   const offDuty = latestMembers.filter((member) => member.duty_status === 'off_duty');
   const onShiftKeys = onShift.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
-  const activeWeekendBots = botAccounts.filter((bot) => onShiftKeys.includes(rosterOwnerKey(bot.owner_name)));
+  const offDutyKeys = offDuty.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
+  const activeWeekendBots = botAccounts.filter((bot) => {
+    const ownerKey = rosterOwnerKey(bot.owner_name);
+    return bot.is_active !== false && rosterOwnerMatches(ownerKey, onShiftKeys) && !rosterOwnerMatches(ownerKey, offDutyKeys);
+  });
   const botsByInsurer = activeWeekendBots.reduce((acc, bot) => {
     const key = displayInsurerName(bot.insurer_name);
     if (!acc[key]) acc[key] = [];
