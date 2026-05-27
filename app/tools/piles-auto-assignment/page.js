@@ -309,11 +309,17 @@ function sortWeekendBots(bots) {
   });
 }
 
+function isWeekendBotAvailable(bot) {
+  const status = String(bot?.availability_status || 'available').toLowerCase();
+  return status !== 'weekend_paused';
+}
+
 function getWeekendPrimaryBot(bots) {
-  return sortWeekendBots(bots)[0] || null;
+  return sortWeekendBots(bots).filter(isWeekendBotAvailable)[0] || null;
 }
 
 function getEffectiveWeekendRole(bot, bots) {
+  if (!isWeekendBotAvailable(bot)) return bot?.assignment_role === 'primary' ? 'primary' : 'support';
   const primaryBot = getWeekendPrimaryBot(bots);
   return primaryBot?.id === bot?.id ? 'primary' : 'support';
 }
@@ -1908,19 +1914,22 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
   );
 }
 
-function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefresh, setNotice }) {
+function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
   const [savingRoleId, setSavingRoleId] = useState('');
+  const [sectionNotice, setSectionNotice] = useState(null);
+  const [botOverrides, setBotOverrides] = useState({});
   const latestRoster = rosters?.[0] || null;
   const latestMembers = latestRoster ? (rosterMembers || []).filter((member) => member.roster_id === latestRoster.id) : [];
   const onShift = latestMembers.filter((member) => member.duty_status === 'on_shift');
   const offDuty = latestMembers.filter((member) => member.duty_status === 'off_duty');
   const onShiftKeys = onShift.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
   const offDutyKeys = offDuty.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
-  const activeWeekendBots = botAccounts.filter((bot) => {
+  const effectiveBotAccounts = botAccounts.map((bot) => (botOverrides[bot.id] ? { ...bot, ...botOverrides[bot.id] } : bot));
+  const weekendRosterBots = effectiveBotAccounts.filter((bot) => {
     const ownerKey = rosterOwnerKey(bot.owner_name);
     return bot.is_active !== false && rosterOwnerMatches(ownerKey, onShiftKeys) && !rosterOwnerMatches(ownerKey, offDutyKeys);
   });
-  const botsByInsurer = activeWeekendBots.reduce((acc, bot) => {
+  const botsByInsurer = weekendRosterBots.reduce((acc, bot) => {
     const key = displayInsurerName(bot.insurer_name);
     if (!acc[key]) acc[key] = [];
     acc[key].push(bot);
@@ -1931,11 +1940,11 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
     const currentEffectiveRole = getEffectiveWeekendRole(bot, insurerBots);
     if (!bot?.id || assignmentRole === currentEffectiveRole) return;
     if (!latestRoster?.id) {
-      setNotice({ type: 'error', text: 'No weekend roster is available for this role change.' });
+      setSectionNotice({ type: 'error', text: 'No weekend roster is available for this role change.' });
       return;
     }
     if (assignmentRole !== 'primary' && currentEffectiveRole === 'primary') {
-      setNotice({ type: 'error', text: 'Each weekend insurer needs one primary. Pick another bot as Primary instead; the current primary will be moved to Support automatically.' });
+      setSectionNotice({ type: 'error', text: 'Each weekend insurer needs one primary. Pick another bot as Primary instead; the current primary will be moved to Support automatically.' });
       return;
     }
     setSavingRoleId(bot.id);
@@ -1955,10 +1964,48 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
       const data = await res.json();
       if (!data.success) throw new Error(data.error || 'Failed to update weekend bot role.');
       const demotedCount = data.demotedItems?.length || 0;
-      setNotice({ type: 'success', text: `${data.item.owner_name} is now ${data.item.assignment_role} for ${displayInsurerName(data.item.insurer_name)} this weekend${demotedCount ? `; ${demotedCount} other bot row(s) moved to support` : ''}. The weekday role is snapshotted for restore.` });
-      onRefresh();
+      setBotOverrides((prev) => {
+        const next = { ...prev, [data.item.id]: data.item };
+        (data.demotedItems || []).forEach((item) => {
+          next[item.id] = item;
+        });
+        return next;
+      });
+      setSectionNotice({ type: 'success', text: `${data.item.owner_name} is now ${data.item.assignment_role} for ${displayInsurerName(data.item.insurer_name)} this weekend${demotedCount ? `; ${demotedCount} other bot row(s) moved to support` : ''}.` });
     } catch (error) {
-      setNotice({ type: 'error', text: error.message });
+      setSectionNotice({ type: 'error', text: error.message });
+    } finally {
+      setSavingRoleId('');
+    }
+  }
+
+  async function updateWeekendAvailability(bot, availabilityStatus) {
+    if (!bot?.id) return;
+    const currentStatus = isWeekendBotAvailable(bot) ? 'available' : 'paused';
+    if (availabilityStatus === currentStatus) return;
+    if (!latestRoster?.id) {
+      setSectionNotice({ type: 'error', text: 'No weekend roster is available for this availability change.' });
+      return;
+    }
+    setSavingRoleId(bot.id);
+    try {
+      const res = await fetch('/api/tools/piles-auto-assignment/weekend-roster/availability', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roster_id: latestRoster.id,
+          bot_account_id: bot.id,
+          availability_status: availabilityStatus,
+          updated_by_name: getMemberName() || 'Dashboard User',
+          updated_by_member_id: getMemberId() || null,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed to update weekend availability.');
+      setBotOverrides((prev) => ({ ...prev, [data.item.id]: data.item }));
+      setSectionNotice({ type: 'success', text: `${data.item.owner_name} is now ${availabilityStatus === 'available' ? 'active' : 'paused'} for ${displayInsurerName(data.item.insurer_name)} this weekend.` });
+    } catch (error) {
+      setSectionNotice({ type: 'error', text: error.message });
     } finally {
       setSavingRoleId('');
     }
@@ -1970,6 +2017,11 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
       <div style={{ color: C.muted, fontSize: 12, marginBottom: 14 }}>
         Role changes in this section are weekend overrides. The runner snapshots the weekday role and restores it after the roster window ends.
       </div>
+      {sectionNotice ? (
+        <div style={{ background: sectionNotice.type === 'error' ? '#EF444418' : '#00E5A012', border: `1px solid ${sectionNotice.type === 'error' ? '#EF444444' : '#00E5A040'}`, borderRadius: 10, padding: '10px 12px', color: sectionNotice.type === 'error' ? C.danger : C.accent, fontSize: 12, marginBottom: 14 }}>
+          {sectionNotice.text}
+        </div>
+      ) : null}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginBottom: 16 }}>
         <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
           <div style={{ color: C.sub, fontSize: 11, textTransform: 'uppercase', fontWeight: 800, letterSpacing: '0.06em' }}>Current roster</div>
@@ -1990,20 +2042,19 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
         </div>
       </div>
 
-      {!activeWeekendBots.length ? (
+      {!weekendRosterBots.length ? (
         <EmptyState C={C} title="No active weekend bot rows visible yet" text="Once n8n posts a roster, this section shows which bot rows will remain available per insurer during the weekend run." />
       ) : (
         <div style={{ overflowX: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ color: C.sub, fontSize: 12, textAlign: 'left', background: C.inputBg }}>
-                {['Insurer', 'Weekend Active Bot(s)', 'Owners', 'Weekend Role(s)', 'What the runner will do'].map((head) => <th key={head} style={{ padding: 12 }}>{head}</th>)}
+                {['Insurer', 'Weekend Bot(s)', 'Owners', 'Weekend Role(s)', 'Weekend Availability'].map((head) => <th key={head} style={{ padding: 12 }}>{head}</th>)}
               </tr>
             </thead>
             <tbody>
               {Object.entries(botsByInsurer).sort(([a], [b]) => a.localeCompare(b)).map(([insurer, bots]) => {
                 const sortedBots = sortWeekendBots(bots);
-                const primaryBot = getWeekendPrimaryBot(sortedBots);
                 return (
                   <tr key={insurer} style={{ borderTop: `1px solid ${C.border}`, color: C.text, fontSize: 13 }}>
                     <td style={{ padding: 12, fontWeight: 800 }}>{insurer}</td>
@@ -2020,7 +2071,7 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
                               {bot.owner_name}
                               {isAutoPrimary ? <span style={{ color: C.warn, border: `1px solid ${C.warn}55`, borderRadius: 999, padding: '2px 7px', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Primary auto</span> : null}
                             </span>
-                            <select value={effectiveRole} onChange={(event) => updateWeekendRole(bot, event.target.value, sortedBots)} disabled={savingRoleId === bot.id} style={{ ...inputStyle(C), padding: '7px 9px' }}>
+                            <select value={effectiveRole} onChange={(event) => updateWeekendRole(bot, event.target.value, sortedBots)} disabled={savingRoleId === bot.id || !isWeekendBotAvailable(bot)} style={{ ...inputStyle(C), padding: '7px 9px' }}>
                               {ROLE_OPTIONS.filter((option) => option.value !== 'admin').map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                             </select>
                           </label>
@@ -2029,7 +2080,35 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, onRefres
                         {savingRoleId && sortedBots.some((bot) => bot.id === savingRoleId) ? <div style={{ color: C.muted, fontSize: 12 }}>Saving role change...</div> : null}
                       </div>
                     </td>
-                    <td style={{ padding: 12, color: C.sub }}>{sortedBots.length === 1 ? 'All new piles go to this on-shift bot.' : `${primaryBot?.owner_name || 'The primary'} gets the primary floor first; support rows share the remainder by speed/load.`}</td>
+                    <td style={{ padding: 12, minWidth: 170 }}>
+                      <div style={{ display: 'grid', gap: 8 }}>
+                        {sortedBots.map((bot) => {
+                          const available = isWeekendBotAvailable(bot);
+                          return (
+                            <select
+                              key={bot.id}
+                              value={available ? 'available' : 'paused'}
+                              onChange={(event) => updateWeekendAvailability(bot, event.target.value)}
+                              disabled={savingRoleId === bot.id}
+                              style={{
+                                ...inputStyle(C),
+                                width: 130,
+                                border: `1px solid ${available ? '#00E5A055' : '#F59E0B55'}`,
+                                background: available ? '#00E5A012' : '#F59E0B14',
+                                color: available ? C.accent : C.warn,
+                                padding: '7px 9px',
+                                fontWeight: 800,
+                                cursor: savingRoleId === bot.id ? 'not-allowed' : 'pointer',
+                                opacity: savingRoleId === bot.id ? 0.65 : 1,
+                              }}
+                            >
+                              <option value="available">Active</option>
+                              <option value="paused">Paused</option>
+                            </select>
+                          );
+                        })}
+                      </div>
+                    </td>
                   </tr>
                 );
               })}
@@ -2404,8 +2483,6 @@ export default function PilesAutoAssignmentPage() {
             rosters={data.weekendRosters}
             rosterMembers={data.weekendRosterMembers}
             botAccounts={data.botAccounts}
-            onRefresh={load}
-            setNotice={setNotice}
           />
           <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={runnerHistoryRefreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />

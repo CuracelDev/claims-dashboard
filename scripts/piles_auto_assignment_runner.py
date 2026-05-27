@@ -1238,6 +1238,8 @@ class DataStore:
             owner_key = roster_owner_key(bot.owner_name)
             if not bot.is_active:
                 continue
+            if bot.availability_status == "weekend_paused":
+                continue
             if not roster_owner_matches(owner_key, on_shift_keys):
                 continue
             if roster_owner_matches(owner_key, off_duty_keys):
