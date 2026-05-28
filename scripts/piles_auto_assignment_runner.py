@@ -62,7 +62,7 @@ INSURER_ALIAS_DISPLAY = {
     "old mutual": "OLD MUTUAL",
 }
 PRIMARY_ASSIGNMENT_FLOOR_RATIO = min(
-    max(float(os.getenv("PILES_PRIMARY_MIN_SHARE") or "0.5"), 0.4),
+    max(float(os.getenv("PILES_PRIMARY_MIN_SHARE") or "0.6"), 0.4),
     0.9,
 )
 
