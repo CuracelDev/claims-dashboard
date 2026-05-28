@@ -3964,6 +3964,7 @@ class CuracelPilesRunner:
                 status_label,
                 selected_keys,
                 selected_assignee,
+                tracking_keys=[plan.tracking_key for plan in selected_group],
                 source_pages=source_pages,
             )
             verified_on_table = verification.ok
@@ -4083,12 +4084,19 @@ class CuracelPilesRunner:
         status_label: str,
         pile_keys: list[str],
         expected_assignee: str,
+        tracking_keys: list[str] | None = None,
         timeout_ms: int = 15000,
         source_pages: list[int] | None = None,
     ) -> AssignmentVerificationResult:
         deadline = time.time() + (timeout_ms / 1000)
         last_observed: list[str] = []
         target_keys = list(dict.fromkeys(pile_keys))
+        target_tracking_by_key = {
+            key: canonical_pile_tracking_key(tracking_keys[idx])
+            for idx, key in enumerate(pile_keys)
+            if tracking_keys and idx < len(tracking_keys) and norm(tracking_keys[idx])
+        }
+        target_tracking_set = {value for value in target_tracking_by_key.values() if value}
         matched_count = 0
         missing_count = len(target_keys)
         wrong_values: list[str] = []
@@ -4099,6 +4107,7 @@ class CuracelPilesRunner:
                 current_rows: list[PileRow] = []
                 seen_keys: set[str] = set()
                 target_seen: set[str] = set()
+                target_tracking_seen: set[str] = set()
                 for page_number in page_candidates:
                     page_rows = self.reset_to_filtered_page(month_label, year_label, status_label, page_number)
                     for row in page_rows:
@@ -4107,12 +4116,30 @@ class CuracelPilesRunner:
                         seen_keys.add(row.key)
                         if row.key in target_key_set:
                             target_seen.add(row.key)
+                        row_tracking_key = canonical_pile_tracking_key(row.tracking_key)
+                        if row_tracking_key in target_tracking_set:
+                            target_tracking_seen.add(row_tracking_key)
                         current_rows.append(row)
-                    if target_key_set.issubset(target_seen):
+                    if target_key_set.issubset(target_seen) or (
+                        target_tracking_set and target_tracking_set.issubset(target_tracking_seen)
+                    ):
                         break
             else:
                 current_rows = self.scan_status(month_label, year_label, status_label)
-            row_map = {row.key: row for row in current_rows if row.key in target_keys}
+            rows_by_key = {row.key: row for row in current_rows}
+            rows_by_tracking = {
+                canonical_pile_tracking_key(row.tracking_key): row
+                for row in current_rows
+                if norm(row.tracking_key)
+            }
+            row_map = {}
+            for key in target_keys:
+                row = rows_by_key.get(key)
+                if row is None:
+                    tracking_key = target_tracking_by_key.get(key)
+                    row = rows_by_tracking.get(tracking_key)
+                if row is not None:
+                    row_map[key] = row
             last_observed = [
                 row_map[key].assigned if key in row_map else "<missing>"
                 for key in target_keys
