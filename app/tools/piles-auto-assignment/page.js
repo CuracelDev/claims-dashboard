@@ -314,6 +314,10 @@ function isWeekendBotAvailable(bot) {
   return status !== 'weekend_paused';
 }
 
+function isExplicitWeekendAddedBot(bot) {
+  return String(bot?.availability_status || '').toLowerCase() === 'weekend_added';
+}
+
 function getWeekendPrimaryBot(bots) {
   return sortWeekendBots(bots).filter(isWeekendBotAvailable)[0] || null;
 }
@@ -1918,6 +1922,9 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
   const [savingRoleId, setSavingRoleId] = useState('');
   const [sectionNotice, setSectionNotice] = useState(null);
   const [botOverrides, setBotOverrides] = useState({});
+  const [addInsurer, setAddInsurer] = useState('');
+  const [addBotId, setAddBotId] = useState('');
+  const [savingAddBot, setSavingAddBot] = useState(false);
   const latestRoster = rosters?.[0] || null;
   const latestMembers = latestRoster ? (rosterMembers || []).filter((member) => member.roster_id === latestRoster.id) : [];
   const onShift = latestMembers.filter((member) => member.duty_status === 'on_shift');
@@ -1927,7 +1934,10 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
   const effectiveBotAccounts = botAccounts.map((bot) => (botOverrides[bot.id] ? { ...bot, ...botOverrides[bot.id] } : bot));
   const weekendRosterBots = effectiveBotAccounts.filter((bot) => {
     const ownerKey = rosterOwnerKey(bot.owner_name);
-    return bot.is_active !== false && rosterOwnerMatches(ownerKey, onShiftKeys) && !rosterOwnerMatches(ownerKey, offDutyKeys);
+    const explicitlyAdded = isExplicitWeekendAddedBot(bot);
+    return bot.is_active !== false && (
+      explicitlyAdded || (rosterOwnerMatches(ownerKey, onShiftKeys) && !rosterOwnerMatches(ownerKey, offDutyKeys))
+    );
   });
   const botsByInsurer = weekendRosterBots.reduce((acc, bot) => {
     const key = displayInsurerName(bot.insurer_name);
@@ -1935,6 +1945,12 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
     acc[key].push(bot);
     return acc;
   }, {});
+  const insurerOptions = [...new Set(effectiveBotAccounts.filter((bot) => bot.is_active !== false).map((bot) => displayInsurerName(bot.insurer_name)).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const selectedAddInsurer = addInsurer || insurerOptions[0] || '';
+  const currentWeekendBotIds = new Set(weekendRosterBots.filter((bot) => displayInsurerName(bot.insurer_name) === selectedAddInsurer).map((bot) => bot.id));
+  const addableBots = effectiveBotAccounts
+    .filter((bot) => bot.is_active !== false && displayInsurerName(bot.insurer_name) === selectedAddInsurer && !currentWeekendBotIds.has(bot.id))
+    .sort((a, b) => `${a.owner_name} ${a.bot_name}`.localeCompare(`${b.owner_name} ${b.bot_name}`));
 
   async function updateWeekendRole(bot, assignmentRole, insurerBots) {
     const currentEffectiveRole = getEffectiveWeekendRole(bot, insurerBots);
@@ -2011,6 +2027,81 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
     }
   }
 
+  async function addWeekendBot() {
+    const botId = addBotId || addableBots[0]?.id || '';
+    if (!latestRoster?.id) {
+      setSectionNotice({ type: 'error', text: 'No weekend roster is available for this bot override.' });
+      return;
+    }
+    if (!botId) {
+      setSectionNotice({ type: 'error', text: 'Choose a bot to add for the weekend.' });
+      return;
+    }
+    setSavingAddBot(true);
+    try {
+      const res = await fetch('/api/tools/piles-auto-assignment/weekend-roster/add-bot', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roster_id: latestRoster.id,
+          bot_account_id: botId,
+          updated_by_name: getMemberName() || 'Dashboard User',
+          updated_by_member_id: getMemberId() || null,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed to add weekend bot.');
+      setBotOverrides((prev) => {
+        const next = { ...prev };
+        (data.items || []).forEach((item) => {
+          next[item.id] = item;
+        });
+        return next;
+      });
+      setAddBotId('');
+      setSectionNotice({ type: 'success', text: `${data.addedItem.owner_name} was added as Primary for ${displayInsurerName(data.addedItem.insurer_name)} this weekend. Previous active rows were adjusted.` });
+    } catch (error) {
+      setSectionNotice({ type: 'error', text: error.message });
+    } finally {
+      setSavingAddBot(false);
+    }
+  }
+
+  async function removeWeekendBot(bot) {
+    if (!bot?.id) return;
+    if (!latestRoster?.id) {
+      setSectionNotice({ type: 'error', text: 'No weekend roster is available for this remove action.' });
+      return;
+    }
+    setSavingRoleId(bot.id);
+    try {
+      const res = await fetch('/api/tools/piles-auto-assignment/weekend-roster/remove-bot', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roster_id: latestRoster.id,
+          bot_account_id: bot.id,
+          updated_by_name: getMemberName() || 'Dashboard User',
+          updated_by_member_id: getMemberId() || null,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed to remove extra weekend bot.');
+      setBotOverrides((prev) => {
+        const next = { ...prev };
+        (data.items || []).forEach((item) => {
+          next[item.id] = item;
+        });
+        return next;
+      });
+      setSectionNotice({ type: 'success', text: `${bot.owner_name} was removed as an extra weekend bot for ${displayInsurerName(bot.insurer_name)}. The remaining weekend roster rows were restored.` });
+    } catch (error) {
+      setSectionNotice({ type: 'error', text: error.message });
+    } finally {
+      setSavingRoleId('');
+    }
+  }
+
   return (
     <div style={cardStyle(C)}>
       <SectionHeader C={C} icon="🗓️" title="Weekend Roster" text="n8n posts the Friday roster here; weekend runs pause off-duty owners and use the remaining on-shift bot rows for each insurer." />
@@ -2041,6 +2132,22 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
           <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Off-duty bot rows are excluded on weekends.</div>
         </div>
       </div>
+
+      {latestRoster ? (
+        <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 1fr 1fr', gap: 12, marginBottom: 16 }}>
+          <select value={selectedAddInsurer} onChange={(event) => { setAddInsurer(event.target.value); setAddBotId(''); }} style={inputStyle(C)} aria-label="Choose insurer for extra weekend bot">
+            {insurerOptions.map((insurer) => <option key={insurer} value={insurer}>{insurer}</option>)}
+          </select>
+          <select value={addBotId || addableBots[0]?.id || ''} onChange={(event) => setAddBotId(event.target.value)} style={inputStyle(C)} disabled={!addableBots.length} aria-label="Choose extra weekend bot">
+            {addableBots.length ? addableBots.map((bot) => (
+              <option key={bot.id} value={bot.id}>Add {bot.owner_name} - {bot.bot_name || bot.owner_name}</option>
+            )) : <option value="">No extra bot rows available</option>}
+          </select>
+          <button type="button" onClick={addWeekendBot} disabled={savingAddBot || !addableBots.length} style={{ ...inputStyle(C), background: savingAddBot || !addableBots.length ? C.elevated : C.accent, color: savingAddBot || !addableBots.length ? C.sub : '#0B0F1A', border: `1px solid ${savingAddBot || !addableBots.length ? C.border : C.accent}`, fontWeight: 800, cursor: savingAddBot || !addableBots.length ? 'not-allowed' : 'pointer' }}>
+            {savingAddBot ? 'Adding...' : 'Add extra weekend bot'}
+          </button>
+        </div>
+      ) : null}
 
       {!weekendRosterBots.length ? (
         <EmptyState C={C} title="No active weekend bot rows visible yet" text="Once n8n posts a roster, this section shows which bot rows will remain available per insurer during the weekend run." />
@@ -2084,27 +2191,49 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
                       <div style={{ display: 'grid', gap: 8 }}>
                         {sortedBots.map((bot) => {
                           const available = isWeekendBotAvailable(bot);
+                          const extraWeekendBot = isExplicitWeekendAddedBot(bot);
                           return (
-                            <select
-                              key={bot.id}
-                              value={available ? 'available' : 'paused'}
-                              onChange={(event) => updateWeekendAvailability(bot, event.target.value)}
-                              disabled={savingRoleId === bot.id}
-                              style={{
-                                ...inputStyle(C),
-                                width: 130,
-                                border: `1px solid ${available ? '#00E5A055' : '#F59E0B55'}`,
-                                background: available ? '#00E5A012' : '#F59E0B14',
-                                color: available ? C.accent : C.warn,
-                                padding: '7px 9px',
-                                fontWeight: 800,
-                                cursor: savingRoleId === bot.id ? 'not-allowed' : 'pointer',
-                                opacity: savingRoleId === bot.id ? 0.65 : 1,
-                              }}
-                            >
-                              <option value="available">Active</option>
-                              <option value="paused">Paused</option>
-                            </select>
+                            <div key={bot.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                              <select
+                                value={available ? 'available' : 'paused'}
+                                onChange={(event) => updateWeekendAvailability(bot, event.target.value)}
+                                disabled={savingRoleId === bot.id}
+                                style={{
+                                  ...inputStyle(C),
+                                  width: 130,
+                                  border: `1px solid ${available ? '#00E5A055' : '#F59E0B55'}`,
+                                  background: available ? '#00E5A012' : '#F59E0B14',
+                                  color: available ? C.accent : C.warn,
+                                  padding: '7px 9px',
+                                  fontWeight: 800,
+                                  cursor: savingRoleId === bot.id ? 'not-allowed' : 'pointer',
+                                  opacity: savingRoleId === bot.id ? 0.65 : 1,
+                                }}
+                              >
+                                <option value="available">Active</option>
+                                <option value="paused">Paused</option>
+                              </select>
+                              {extraWeekendBot ? (
+                                <button
+                                  type="button"
+                                  onClick={() => removeWeekendBot(bot)}
+                                  disabled={savingRoleId === bot.id}
+                                  style={{
+                                    background: '#EF444414',
+                                    color: C.danger,
+                                    border: `1px solid ${C.danger}44`,
+                                    borderRadius: 8,
+                                    padding: '7px 10px',
+                                    fontWeight: 800,
+                                    cursor: savingRoleId === bot.id ? 'not-allowed' : 'pointer',
+                                    opacity: savingRoleId === bot.id ? 0.65 : 1,
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                >
+                                  Remove
+                                </button>
+                              ) : null}
+                            </div>
                           );
                         })}
                       </div>
