@@ -10,6 +10,18 @@ function normalize(value) {
 
 const VALID_STATUSES = new Set(['available', 'paused']);
 
+function ownerKey(value) {
+  return normalize(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function ownerMatches(owner, keys) {
+  const key = ownerKey(owner);
+  if (!key) return false;
+  if (keys.includes(key)) return true;
+  const ownerFirst = key.split(' ')[0] || key;
+  return keys.some((candidate) => candidate === ownerFirst || candidate.startsWith(`${ownerFirst} `));
+}
+
 async function snapshotBotState(supabase, roster, bot, now, body, availabilityStatus) {
   const snapshotPayload = {
     id: randomUUID(),
@@ -79,10 +91,29 @@ export async function PATCH(request) {
     await snapshotBotState(supabase, roster, bot, now, body, availabilityStatus);
 
     const isAvailable = availabilityStatus === 'available';
+    let nextAvailabilityStatus = isAvailable ? 'available' : 'weekend_paused';
+    if (isAvailable) {
+      const { data: members, error: membersError } = await supabase
+        .from('piles_auto_assignment_weekend_roster_members')
+        .select('*')
+        .eq('roster_id', rosterId);
+      if (membersError) throw membersError;
+      const onShiftKeys = (members || [])
+        .filter((member) => normalize(member.duty_status).toLowerCase() === 'on_shift')
+        .map((member) => ownerKey(member.owner_name))
+        .filter(Boolean);
+      const offDutyKeys = (members || [])
+        .filter((member) => normalize(member.duty_status).toLowerCase() === 'off_duty')
+        .map((member) => ownerKey(member.owner_name))
+        .filter(Boolean);
+      if (!ownerMatches(bot.owner_name, onShiftKeys) || ownerMatches(bot.owner_name, offDutyKeys) || bot.availability_status === 'weekend_added') {
+        nextAvailabilityStatus = 'weekend_added';
+      }
+    }
     const { data: updatedBot, error: updateError } = await supabase
       .from('piles_auto_assignment_bot_accounts')
       .update({
-        availability_status: isAvailable ? 'available' : 'weekend_paused',
+        availability_status: nextAvailabilityStatus,
         availability_note: `Weekend roster ${roster.weekend_start} to ${roster.weekend_end}: ${isAvailable ? 'active' : 'paused'}`,
         is_available: isAvailable,
         updated_by_name: normalize(body.updated_by_name) || null,

@@ -65,6 +65,7 @@ PRIMARY_ASSIGNMENT_FLOOR_RATIO = min(
     max(float(os.getenv("PILES_PRIMARY_MIN_SHARE") or "0.6"), 0.4),
     0.9,
 )
+AVAILABLE_BOT_STATUSES = {"available", "", "weekend_added"}
 
 
 class TeeCapture:
@@ -1240,6 +1241,9 @@ class DataStore:
                 continue
             if bot.availability_status == "weekend_paused":
                 continue
+            if bot.availability_status == "weekend_added":
+                eligible_bots.append(bot)
+                continue
             if not roster_owner_matches(owner_key, on_shift_keys):
                 continue
             if roster_owner_matches(owner_key, off_duty_keys):
@@ -1286,7 +1290,13 @@ class DataStore:
             update_rows.append({
                 "bot": bot,
                 "is_available": is_weekend_available,
-                "availability_status": "available" if is_weekend_available else "weekend_off",
+                "availability_status": (
+                    bot.availability_status
+                    if is_weekend_available and bot.availability_status == "weekend_added"
+                    else "available" if is_weekend_available
+                    else "weekend_paused" if bot.availability_status == "weekend_paused"
+                    else "weekend_off"
+                ),
                 "availability_note": (
                     f"Weekend roster {policy.weekend_start} to {policy.weekend_end}: on shift"
                     if is_weekend_available
@@ -4934,7 +4944,7 @@ def choose_best_bot_for_pile(
     for bot in bots:
         if bot.id in exclude_bot_ids:
             continue
-        if not bot.is_active or not bot.is_available or bot.availability_status not in {"available", ""}:
+        if not bot.is_active or not bot.is_available or bot.availability_status not in AVAILABLE_BOT_STATUSES:
             continue
         if require_shift_ready and not is_shift_ready_for_reassignment(bot, now_utc):
             continue
@@ -5372,7 +5382,7 @@ def build_assignment_plan(
     for bot in bots:
         if not bot.is_active:
             continue
-        if bot.availability_status not in {"available", ""} or not bot.is_available:
+        if bot.availability_status not in AVAILABLE_BOT_STATUSES or not bot.is_available:
             continue
         metric = metrics.get(bot.id)
         observed_speed = metric.claims_per_hour if metric and metric.claims_per_hour > 0 else 0
@@ -5618,7 +5628,7 @@ def resolve_bots_to_portal_options(
 ) -> tuple[list[BotAccount], dict[str, str], list[str]]:
     eligible = [
         bot for bot in bots
-        if bot.is_active and bot.is_available and bot.availability_status in {"available", ""}
+        if bot.is_active and bot.is_available and bot.availability_status in AVAILABLE_BOT_STATUSES
     ]
     resolved_names: dict[str, str] = {}
     used_options: set[str] = set()
