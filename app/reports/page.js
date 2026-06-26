@@ -4,6 +4,7 @@ import { useTheme } from '../context/ThemeContext';
 import { getSession } from '../lib/auth';
 import {
   DEFAULT_REPORT_METRIC_GROUPS,
+  formatDailyReportDate,
   groupReportMetricDefinitions,
 } from '../../lib/report-metrics';
 
@@ -159,7 +160,7 @@ function PreviewModal({ report, teamMembers, metricGroups, onClose, onSendSlack 
   const member = teamMembers.find(m => String(m.id) === String(report.team_member_id));
   const total = Object.values(report.metrics || {}).reduce((a, b) => a + (parseInt(b) || 0), 0);
   const filled = Object.keys(report.metrics || {}).filter(k => parseInt(report.metrics[k]) > 0).length;
-  const dateStr = report.report_date ? new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+  const dateStr = formatDailyReportDate(report.report_date, { weekday: 'long', day: 'numeric', month: 'long' }, '');
 
   const copyText = () => {
     const lines = [`📊 Daily Report — ${member?.name || ''} | ${dateStr}`, ''];
@@ -241,7 +242,7 @@ function ReportCard({ report, teamMembers, metricKeys, onEdit }) {
   const total = Object.entries(report.metrics || {}).reduce((sum, [key, value]) => (
     visibleKeys.has(key) ? sum + (parseInt(value) || 0) : sum
   ), 0);
-  const dateStr = report.report_date ? new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
+  const dateStr = formatDailyReportDate(report.report_date, { day: 'numeric', month: 'short' }, '');
   return (
     <div style={{ ...S.card, marginBottom: 0 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>

@@ -5,6 +5,7 @@ import {
   metricKeySetFromDefinitions,
   normalizeDailyReport,
   normalizeDailyReports,
+  normalizeReportDate,
   parseReportMetrics,
 } from '../../../lib/report-metrics';
 export const dynamic = 'force-dynamic';
@@ -17,12 +18,6 @@ async function getAllowedMetricKeys(supabase) {
   const keys = metricKeySetFromDefinitions(data || [], { includeInactive: true });
   for (const key of DAILY_REPORT_METRIC_KEYS) keys.add(key);
   return keys;
-}
-
-function normalizeReportDate(value) {
-  if (!value) return null;
-  const raw = String(value);
-  return raw.length >= 10 ? raw.slice(0, 10) : raw;
 }
 
 function dedupeLatestReports(reports) {
@@ -118,13 +113,17 @@ export async function POST(request) {
     // Partial update (e.g. sent_to_slack)
     if (body.id) {
       const { id, ...updates } = body;
+      if (updates.report_date !== undefined) {
+        updates.report_date = normalizeReportDate(updates.report_date);
+      }
       const { data, error } = await supabase
         .from('daily_reports').update(updates).eq('id', id).select().single();
       if (error) return Response.json({ error: error.message }, { status: 500 });
       return Response.json({ data });
     }
 
-    const { team_member_id, report_date, metrics, tasks_completed, notes, status } = body;
+    const { team_member_id, metrics, tasks_completed, notes, status } = body;
+    const report_date = normalizeReportDate(body.report_date);
     if (!team_member_id || !report_date) {
       return Response.json({ error: 'team_member_id and report_date are required' }, { status: 400 });
     }

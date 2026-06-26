@@ -1,6 +1,7 @@
 import { getSupabase } from '../../../../lib/supabase';
 import {
   DEFAULT_REPORT_METRIC_GROUPS,
+  formatDailyReportDate,
   groupReportMetricDefinitions,
 } from '../../../../lib/report-metrics';
 
@@ -50,9 +51,9 @@ export async function POST(request) {
     const metrics = report.metrics || {};
     const metricGroups = await getMetricGroups();
     const total = Object.values(metrics).reduce((a, b) => a + (parseInt(b) || 0), 0);
-    const date = new Date(report.report_date + 'T12:00:00').toLocaleDateString('en-GB', {
+    const date = formatDailyReportDate(report.report_date, {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
-    });
+    }, 'Unknown date');
 
     const blocks = [
       {
