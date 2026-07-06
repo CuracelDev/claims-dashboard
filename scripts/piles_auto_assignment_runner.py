@@ -65,6 +65,10 @@ PRIMARY_ASSIGNMENT_FLOOR_RATIO = min(
     max(float(os.getenv("PILES_PRIMARY_MIN_SHARE") or "0.6"), 0.4),
     0.9,
 )
+PLANNING_SPEED_FLOOR_RATIO = min(
+    max(float(os.getenv("PILES_PLANNING_SPEED_FLOOR_RATIO") or "0.5"), 0.1),
+    1.0,
+)
 AVAILABLE_BOT_STATUSES = {"available", "", "weekend_added"}
 
 
@@ -277,6 +281,13 @@ def apply_assignment_entry(entry: dict[str, Any], pile: "PileRow") -> None:
     entry["selection_score"] = entry["projected_hours"] + entry["selection_penalty_hours"]
 
 
+def apply_remainder_assignment_entry(entry: dict[str, Any], pile: "PileRow") -> None:
+    apply_assignment_entry(entry, pile)
+    entry["remainder_assigned_claims"] = entry.get("remainder_assigned_claims", 0) + pile.claims
+    target = max(float(entry.get("remainder_target_claims") or 0), 1.0)
+    entry["remainder_fill_ratio"] = entry["remainder_assigned_claims"] / target
+
+
 def default_speed_for_role(role: str) -> float:
     return 35.0 if norm(role).lower() == "primary" else 20.0
 
@@ -293,6 +304,36 @@ def role_selection_penalty_hours(role: str, support_capacity_ratio: float | int 
         return 0.0
     ratio = min(max(float(support_capacity_ratio or 0.6), 0.25), 1.0)
     return max(0.35, (1.0 - ratio) * 1.5)
+
+
+def assignment_planning_speed(role: str, observed_speed: float, previous_speed: float = 0.0) -> float:
+    """Avoid permanently starving a bot because sparse assignments made its measured speed tiny."""
+    smoothed_speed = smoothed_claims_per_hour(role, observed_speed, previous_speed)
+    role_floor = default_speed_for_role(role) * PLANNING_SPEED_FLOOR_RATIO
+    return max(smoothed_speed, role_floor)
+
+
+def prepare_speed_weighted_remainder(entries: list[dict[str, Any]], remaining_piles: list["PileRow"]) -> None:
+    remaining_claims = sum(max(pile.claims, 0) for pile in remaining_piles)
+    total_weight = sum(max(float(entry.get("effective_speed") or 0), 1.0) for entry in entries)
+
+    for entry in entries:
+        weight = max(float(entry.get("effective_speed") or 0), 1.0)
+        entry["remainder_assigned_claims"] = 0
+        entry["remainder_target_claims"] = (remaining_claims * weight / total_weight) if total_weight else 0
+        entry["remainder_fill_ratio"] = 0
+
+
+def choose_remainder_assignment_entry(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    return min(
+        entries,
+        key=lambda entry: (
+            entry.get("remainder_fill_ratio", 0),
+            -float(entry.get("remainder_target_claims") or 0),
+            entry["selection_score"],
+            assignment_entry_priority(entry),
+        ),
+    )
 
 
 def smoothed_claims_per_hour(
@@ -4950,7 +4991,7 @@ def choose_best_bot_for_pile(
             continue
         metric = metrics.get(bot.id)
         observed_speed = metric.claims_per_hour if metric and metric.claims_per_hour > 0 else 0
-        base_speed = smoothed_claims_per_hour(bot.assignment_role, observed_speed, observed_speed)
+        base_speed = assignment_planning_speed(bot.assignment_role, observed_speed, 0.0)
         role_weight = role_capacity_weight(bot.assignment_role, bot.support_capacity_ratio)
         effective_speed = max(base_speed * role_weight, 1)
         current_load = metric.active_claim_load if metric else bot.current_claim_load
@@ -5318,7 +5359,7 @@ def build_stale_reassignment_plans(
         current_metric = metrics.get(current_bot.id)
         current_observed_speed = current_metric.claims_per_hour if current_metric and current_metric.claims_per_hour > 0 else 0
         current_speed = max(
-            smoothed_claims_per_hour(current_bot.assignment_role, current_observed_speed, current_observed_speed)
+            assignment_planning_speed(current_bot.assignment_role, current_observed_speed, 0.0)
             * role_capacity_weight(current_bot.assignment_role, current_bot.support_capacity_ratio),
             1,
         )
@@ -5327,7 +5368,7 @@ def build_stale_reassignment_plans(
         target_metric = metrics.get(target.id)
         target_observed_speed = target_metric.claims_per_hour if target_metric and target_metric.claims_per_hour > 0 else 0
         target_speed = max(
-            smoothed_claims_per_hour(target.assignment_role, target_observed_speed, target_observed_speed)
+            assignment_planning_speed(target.assignment_role, target_observed_speed, 0.0)
             * role_capacity_weight(target.assignment_role, target.support_capacity_ratio),
             1,
         )
@@ -5386,7 +5427,7 @@ def build_assignment_plan(
             continue
         metric = metrics.get(bot.id)
         observed_speed = metric.claims_per_hour if metric and metric.claims_per_hour > 0 else 0
-        base_speed = smoothed_claims_per_hour(bot.assignment_role, observed_speed, observed_speed)
+        base_speed = assignment_planning_speed(bot.assignment_role, observed_speed, 0.0)
         role_weight = role_capacity_weight(bot.assignment_role, bot.support_capacity_ratio)
         effective_speed = max(base_speed * role_weight, 1)
         current_load = metric.active_claim_load if metric else bot.current_claim_load
@@ -5437,9 +5478,10 @@ def build_assignment_plan(
                 source_page_number=pile.page_number,
             ))
 
+    prepare_speed_weighted_remainder(eligible, remaining_piles)
     for pile in remaining_piles:
-        chosen = choose_assignment_entry(eligible)
-        apply_assignment_entry(chosen, pile)
+        chosen = choose_remainder_assignment_entry(eligible)
+        apply_remainder_assignment_entry(chosen, pile)
         plans.append(PlannedAssignment(
             pile_key=pile.key,
             tracking_key=pile.tracking_key,
@@ -5468,6 +5510,8 @@ def build_assignment_plan(
             "starting_load": entry["starting_claim_load"],
             "assigned_piles": entry["assigned_piles"],
             "assigned_claims": entry["assigned_claims"],
+            "remainder_target_claims": round(float(entry.get("remainder_target_claims") or 0), 2),
+            "remainder_assigned_claims": entry.get("remainder_assigned_claims", 0),
             "projected_finish_hours": round(entry["projected_hours"], 2),
             "projected_finish_minutes": projected_finish_minutes(entry["projected_hours"]),
         }
@@ -5483,7 +5527,7 @@ def build_assignment_plan_from_portal_options(
 ) -> tuple[list[PlannedAssignment], dict[str, dict[str, Any]]]:
     eligible = []
     for assignee in portal_assignees:
-        base_speed = default_speed_for_role(assignee.assignment_role)
+        base_speed = assignment_planning_speed(assignee.assignment_role, 0, 0)
         role_weight = role_capacity_weight(assignee.assignment_role, assignee.support_capacity_ratio)
         effective_speed = max(base_speed * role_weight, 1)
         eligible.append({
@@ -5533,9 +5577,10 @@ def build_assignment_plan_from_portal_options(
                 source_page_number=pile.page_number,
             ))
 
+    prepare_speed_weighted_remainder(eligible, remaining_piles)
     for pile in remaining_piles:
-        chosen = choose_assignment_entry(eligible)
-        apply_assignment_entry(chosen, pile)
+        chosen = choose_remainder_assignment_entry(eligible)
+        apply_remainder_assignment_entry(chosen, pile)
         plans.append(PlannedAssignment(
             pile_key=pile.key,
             tracking_key=pile.tracking_key,
@@ -5564,6 +5609,8 @@ def build_assignment_plan_from_portal_options(
             "starting_load": entry["starting_claim_load"],
             "assigned_piles": entry["assigned_piles"],
             "assigned_claims": entry["assigned_claims"],
+            "remainder_target_claims": round(float(entry.get("remainder_target_claims") or 0), 2),
+            "remainder_assigned_claims": entry.get("remainder_assigned_claims", 0),
             "projected_finish_hours": round(entry["projected_hours"], 2),
             "projected_finish_minutes": projected_finish_minutes(entry["projected_hours"]),
         }
