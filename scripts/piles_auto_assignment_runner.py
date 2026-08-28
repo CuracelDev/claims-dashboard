@@ -108,6 +108,11 @@ def norm(text: Any) -> str:
     return str(text or "").strip()
 
 
+def enabled_by_default(value: Any) -> bool:
+    """Match SQL coalesce(flag, true): only an explicit false disables a row."""
+    return value is not False
+
+
 def norm_key(text: Any) -> str:
     return "".join(ch.lower() for ch in norm(text) if ch.isalnum())
 
@@ -281,13 +286,6 @@ def apply_assignment_entry(entry: dict[str, Any], pile: "PileRow") -> None:
     entry["selection_score"] = entry["projected_hours"] + entry["selection_penalty_hours"]
 
 
-def apply_remainder_assignment_entry(entry: dict[str, Any], pile: "PileRow") -> None:
-    apply_assignment_entry(entry, pile)
-    entry["remainder_assigned_claims"] = entry.get("remainder_assigned_claims", 0) + pile.claims
-    target = max(float(entry.get("remainder_target_claims") or 0), 1.0)
-    entry["remainder_fill_ratio"] = entry["remainder_assigned_claims"] / target
-
-
 def default_speed_for_role(role: str) -> float:
     return 35.0 if norm(role).lower() == "primary" else 20.0
 
@@ -311,29 +309,6 @@ def assignment_planning_speed(role: str, observed_speed: float, previous_speed: 
     smoothed_speed = smoothed_claims_per_hour(role, observed_speed, previous_speed)
     role_floor = default_speed_for_role(role) * PLANNING_SPEED_FLOOR_RATIO
     return max(smoothed_speed, role_floor)
-
-
-def prepare_speed_weighted_remainder(entries: list[dict[str, Any]], remaining_piles: list["PileRow"]) -> None:
-    remaining_claims = sum(max(pile.claims, 0) for pile in remaining_piles)
-    total_weight = sum(max(float(entry.get("effective_speed") or 0), 1.0) for entry in entries)
-
-    for entry in entries:
-        weight = max(float(entry.get("effective_speed") or 0), 1.0)
-        entry["remainder_assigned_claims"] = 0
-        entry["remainder_target_claims"] = (remaining_claims * weight / total_weight) if total_weight else 0
-        entry["remainder_fill_ratio"] = 0
-
-
-def choose_remainder_assignment_entry(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    return min(
-        entries,
-        key=lambda entry: (
-            entry.get("remainder_fill_ratio", 0),
-            -float(entry.get("remainder_target_claims") or 0),
-            entry["selection_score"],
-            assignment_entry_priority(entry),
-        ),
-    )
 
 
 def smoothed_claims_per_hour(
@@ -1170,7 +1145,7 @@ class DataStore:
             insurer_name=norm(row["insurer_name"]),
             login_email=login_email,
             login_password=login_password,
-            is_active=bool(row.get("is_active", True)),
+            is_active=enabled_by_default(row.get("is_active")),
         )
 
     def get_active_master_accounts(self) -> list[MasterAccount]:
@@ -1184,11 +1159,13 @@ class DataStore:
                 """
             )
         else:
-            rows = self._fetchall_supabase(
-                "piles_auto_assignment_master_accounts",
-                filters=[("is_active", "eq", "true")],
-                order="insurer_name.asc",
-            )
+            rows = [
+                row for row in self._fetchall_supabase(
+                    "piles_auto_assignment_master_accounts",
+                    order="insurer_name.asc",
+                )
+                if enabled_by_default(row.get("is_active"))
+            ]
         accounts: list[MasterAccount] = []
         for row in rows:
             login_email, login_password = override_master_credentials(
@@ -1201,7 +1178,7 @@ class DataStore:
                 insurer_name=norm(row["insurer_name"]),
                 login_email=login_email,
                 login_password=login_password,
-                is_active=bool(row.get("is_active", True)),
+                is_active=enabled_by_default(row.get("is_active")),
             ))
         return accounts
 
@@ -1466,7 +1443,6 @@ class DataStore:
                         availability_status = %s,
                         availability_note = %s,
                         is_available = %s,
-                        is_active = %s,
                         updated_at = now()
                     where id = %s
                     """,
@@ -1475,7 +1451,6 @@ class DataStore:
                         row.get("previous_availability_status") or "available",
                         row.get("previous_availability_note"),
                         bool(row.get("previous_is_available", True)),
-                        bool(row.get("previous_is_active", True)),
                         row["bot_account_id"],
                     ),
                 )
@@ -1506,7 +1481,6 @@ class DataStore:
                 "availability_status": row.get("previous_availability_status") or "available",
                 "availability_note": row.get("previous_availability_note"),
                 "is_available": bool(row.get("previous_is_available", True)),
-                "is_active": bool(row.get("previous_is_active", True)),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
             self._update_supabase("piles_auto_assignment_weekend_bot_state_snapshots", "id", str(row["id"]), {
@@ -1565,8 +1539,8 @@ class DataStore:
                 active_from_time=norm(row.get("active_from_time") or "09:00"),
                 active_to_time=norm(row.get("active_to_time")),
                 shift_grace_minutes=safe_int(row.get("shift_grace_minutes"), 120),
-                is_active=bool(row.get("is_active", True)),
-                is_available=bool(row.get("is_available", True)),
+                is_active=enabled_by_default(row.get("is_active")),
+                is_available=enabled_by_default(row.get("is_available")),
                 current_claim_load=safe_int(row.get("current_claim_load"), 0),
                 priority_order=safe_int(row.get("priority_order"), 100),
             )
@@ -5478,10 +5452,12 @@ def build_assignment_plan(
                 source_page_number=pile.page_number,
             ))
 
-    prepare_speed_weighted_remainder(eligible, remaining_piles)
     for pile in remaining_piles:
-        chosen = choose_remainder_assignment_entry(eligible)
-        apply_remainder_assignment_entry(chosen, pile)
+        # The primary floor is a minimum, not a separate allocation pool. Continue
+        # balancing by projected finish time so current load and completed floor work
+        # are accounted for and support bots are not starved.
+        chosen = choose_assignment_entry(eligible)
+        apply_assignment_entry(chosen, pile)
         plans.append(PlannedAssignment(
             pile_key=pile.key,
             tracking_key=pile.tracking_key,
@@ -5510,8 +5486,6 @@ def build_assignment_plan(
             "starting_load": entry["starting_claim_load"],
             "assigned_piles": entry["assigned_piles"],
             "assigned_claims": entry["assigned_claims"],
-            "remainder_target_claims": round(float(entry.get("remainder_target_claims") or 0), 2),
-            "remainder_assigned_claims": entry.get("remainder_assigned_claims", 0),
             "projected_finish_hours": round(entry["projected_hours"], 2),
             "projected_finish_minutes": projected_finish_minutes(entry["projected_hours"]),
         }
@@ -5577,10 +5551,9 @@ def build_assignment_plan_from_portal_options(
                 source_page_number=pile.page_number,
             ))
 
-    prepare_speed_weighted_remainder(eligible, remaining_piles)
     for pile in remaining_piles:
-        chosen = choose_remainder_assignment_entry(eligible)
-        apply_remainder_assignment_entry(chosen, pile)
+        chosen = choose_assignment_entry(eligible)
+        apply_assignment_entry(chosen, pile)
         plans.append(PlannedAssignment(
             pile_key=pile.key,
             tracking_key=pile.tracking_key,
@@ -5609,8 +5582,6 @@ def build_assignment_plan_from_portal_options(
             "starting_load": entry["starting_claim_load"],
             "assigned_piles": entry["assigned_piles"],
             "assigned_claims": entry["assigned_claims"],
-            "remainder_target_claims": round(float(entry.get("remainder_target_claims") or 0), 2),
-            "remainder_assigned_claims": entry.get("remainder_assigned_claims", 0),
             "projected_finish_hours": round(entry["projected_hours"], 2),
             "projected_finish_minutes": projected_finish_minutes(entry["projected_hours"]),
         }
@@ -5821,6 +5792,10 @@ def _run_for_insurer_once(
 ) -> dict[str, Any]:
     captured_at = datetime.now(timezone.utc).isoformat()
     master = store.get_master_account(insurer_name)
+    if not master.is_active:
+        raise RuntimeError(
+            f"Master account for '{insurer_name}' is inactive. Enable it in Master Insurer Credentials before running it."
+        )
     if not master.login_email or not master.login_password:
         raise RuntimeError(f"Master account for '{insurer_name}' is missing login email or password.")
 

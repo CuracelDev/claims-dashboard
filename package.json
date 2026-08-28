@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test:piles": "python3 -m unittest scripts/test_piles_auto_assignment_runner.py",
     "db:audit": "node scripts/db-schema-audit.mjs",
     "db:prism-chat": "node scripts/apply-prism-chat-schema.mjs",
     "db:piles-auto-assignment": "node scripts/apply-piles-auto-assignment-schema.mjs",

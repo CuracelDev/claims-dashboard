@@ -32,8 +32,16 @@ export async function GET() {
       throw weekendResponses.find((res) => res.error)?.error;
     }
 
-    const masterAccounts = (masterRes.data || []).map((item) => decryptCredentialFields(item, ['login_email', 'login_password']));
-    const botAccounts = (botsRes.data || []).map((item) => decryptCredentialFields(item, ['bot_email', 'bot_password']));
+    const masterAccounts = (masterRes.data || []).map((item) => ({
+      ...decryptCredentialFields(item, ['login_email']),
+      login_password: '',
+      has_login_password: Boolean(item.login_password),
+    }));
+    const botAccounts = (botsRes.data || []).map((item) => ({
+      ...decryptCredentialFields(item, ['bot_email']),
+      bot_password: '',
+      has_bot_password: Boolean(item.bot_password),
+    }));
     const rules = rulesRes.data || [];
     const botMetrics = metricsRes.data || [];
     const recentLogs = logsRes.data || [];
@@ -45,8 +53,20 @@ export async function GET() {
     const weekendRosters = weekendSchemaReady ? (weekendRostersRes.data || []) : [];
     const weekendRosterMembers = weekendSchemaReady ? (weekendMembersRes.data || []) : [];
 
-    const activeBots = botAccounts.filter((bot) => bot.is_active);
-    const availableBots = botAccounts.filter((bot) => bot.is_active && bot.is_available);
+    const activeMasterKeys = new Set(
+      masterAccounts
+        .filter((account) => account.is_active !== false)
+        .map((account) => {
+          const key = String(account.insurer_name || '').trim().toLowerCase();
+          return key === 'uapom' ? 'old mutual' : key;
+        })
+    );
+    const runnerEligibleBots = botAccounts.filter((bot) => {
+      const key = String(bot.insurer_name || '').trim().toLowerCase();
+      return activeMasterKeys.has(key === 'uapom' ? 'old mutual' : key);
+    });
+    const activeBots = runnerEligibleBots.filter((bot) => bot.is_active);
+    const availableBots = runnerEligibleBots.filter((bot) => bot.is_active && bot.is_available);
     const primaryBots = activeBots.filter((bot) => bot.assignment_role === 'primary');
     const supportBots = activeBots.filter((bot) => bot.assignment_role === 'support');
     const activeTrackedPiles = trackedPiles.filter((pile) => pile.is_active);
@@ -64,7 +84,7 @@ export async function GET() {
       success: true,
       overview: {
         insurersConfigured: masterAccounts.length,
-        activeMasterAccounts: masterAccounts.filter((account) => account.is_active).length,
+        activeMasterAccounts: masterAccounts.filter((account) => account.is_active !== false).length,
         activeBots: activeBots.length,
         availableBots: availableBots.length,
         primaryBots: primaryBots.length,

@@ -2,12 +2,18 @@ import { NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { getSupabase } from '../../../../../lib/supabase';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
 
 function normalize(value) {
   return String(value ?? '').trim();
+}
+
+function canonicalInsurerKey(value) {
+  const label = normalize(value).toLowerCase().replace(/\s+/g, ' ');
+  return label === 'uapom' || label === 'old mutual' ? 'old mutual' : label;
 }
 
 function normalizeMonths(value) {
@@ -45,6 +51,25 @@ function resolveRunnerBackend() {
   return 'local';
 }
 
+async function requireActiveMasterAccount(insurerName) {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('piles_auto_assignment_master_accounts')
+    .select('id, insurer_name, is_active');
+
+  if (error) throw error;
+  const account = (data || []).find(
+    (item) => canonicalInsurerKey(item.insurer_name) === canonicalInsurerKey(insurerName)
+  );
+  if (!account) {
+    return `No master insurer account was found for '${insurerName}'.`;
+  }
+  if (account.is_active === false) {
+    return `${account.insurer_name} is inactive. Enable it in Master Insurer Credentials before running it.`;
+  }
+  return null;
+}
+
 function runProcess(args, backend = 'local') {
   return new Promise((resolve) => {
     const pythonBin = resolvePythonBin();
@@ -62,6 +87,10 @@ function runProcess(args, backend = 'local') {
 
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
+    });
+
+    child.on('error', (error) => {
+      resolve({ code: 1, stdout, stderr: `${stderr}${stderr ? '\n' : ''}${error.message}` });
     });
 
     child.on('close', (code) => {
@@ -132,6 +161,13 @@ export async function POST(request) {
 
     if (!runAll && !insurerName) {
       return NextResponse.json({ success: false, error: 'Choose an insurer or run all active insurers.' }, { status: 400 });
+    }
+
+    if (!runAll) {
+      const accountError = await requireActiveMasterAccount(insurerName);
+      if (accountError) {
+        return NextResponse.json({ success: false, error: accountError }, { status: 400 });
+      }
     }
 
     const args = [];

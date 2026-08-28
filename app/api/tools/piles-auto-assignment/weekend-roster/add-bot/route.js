@@ -8,6 +8,11 @@ function normalize(value) {
   return String(value ?? '').trim();
 }
 
+function canonicalInsurerKey(value) {
+  const label = normalize(value).toLowerCase().replace(/\s+/g, ' ');
+  return label === 'uapom' || label === 'old mutual' ? 'old mutual' : label;
+}
+
 function ownerKey(value) {
   return normalize(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
@@ -108,6 +113,9 @@ export async function PATCH(request) {
     if (!addedBot) {
       return NextResponse.json({ success: false, error: 'Bot account was not found.' }, { status: 404 });
     }
+    if (addedBot.is_active === false) {
+      return NextResponse.json({ success: false, error: 'Inactive bot accounts cannot be added to a weekend roster.' }, { status: 400 });
+    }
 
     const [{ data: members, error: membersError }, { data: insurerBots, error: botsError }] = await Promise.all([
       supabase
@@ -116,8 +124,7 @@ export async function PATCH(request) {
         .eq('roster_id', rosterId),
       supabase
         .from('piles_auto_assignment_bot_accounts')
-        .select('*')
-        .eq('insurer_name', addedBot.insurer_name),
+        .select('*'),
     ]);
     if (membersError) throw membersError;
     if (botsError) throw botsError;
@@ -131,8 +138,12 @@ export async function PATCH(request) {
       .map((member) => ownerKey(member.owner_name))
       .filter(Boolean);
 
+    const addedInsurerKey = canonicalInsurerKey(addedBot.insurer_name);
     const currentlyEligible = sortWeekendBots((insurerBots || []).filter((bot) => (
-      bot.id !== botAccountId && isWeekendEligible(bot, onShiftKeys, offDutyKeys) && isWeekendAvailable(bot)
+      canonicalInsurerKey(bot.insurer_name) === addedInsurerKey
+      && bot.id !== botAccountId
+      && isWeekendEligible(bot, onShiftKeys, offDutyKeys)
+      && isWeekendAvailable(bot)
     )));
     const previousPrimary = currentlyEligible[0] || null;
     const previousSupportRows = currentlyEligible.filter((bot) => bot.id !== previousPrimary?.id);

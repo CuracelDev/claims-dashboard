@@ -341,10 +341,14 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
   const [running, setRunning] = useState(false);
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
   const monthPickerRef = useRef(null);
+  const activeMasterAccounts = useMemo(
+    () => (masterAccounts || []).filter((account) => account.is_active !== false),
+    [masterAccounts]
+  );
   const [draft, setDraft] = useState({
     portal_environment: 'production',
     target: 'single',
-    insurer_name: masterAccounts[0]?.insurer_name || '',
+    insurer_name: activeMasterAccounts[0]?.insurer_name || '',
     months: ['All'],
     year: 'All',
     effective_date: '',
@@ -353,10 +357,18 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
   });
 
   useEffect(() => {
-    if (draft.target === 'single' && !draft.insurer_name && masterAccounts.length) {
-      setDraft((prev) => ({ ...prev, insurer_name: masterAccounts[0].insurer_name }));
+    if (draft.target !== 'single') return;
+
+    const selectedIsActive = activeMasterAccounts.some(
+      (account) => account.insurer_name === draft.insurer_name
+    );
+    if (!selectedIsActive) {
+      setDraft((prev) => ({
+        ...prev,
+        insurer_name: activeMasterAccounts[0]?.insurer_name || '',
+      }));
     }
-  }, [draft.target, draft.insurer_name, masterAccounts]);
+  }, [draft.target, draft.insurer_name, activeMasterAccounts]);
 
   useEffect(() => {
     function handleClickOutside(event) {
@@ -454,9 +466,9 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
           <option value="single">One insurer</option>
           <option value="all">All active insurers</option>
         </select>
-        <select value={draft.insurer_name} onChange={(e) => setDraft((prev) => ({ ...prev, insurer_name: e.target.value }))} style={inputStyle(C)} disabled={draft.target !== 'single'}>
-          <option value="">Select insurer</option>
-          {masterAccounts.map((account) => (
+        <select value={draft.insurer_name} onChange={(e) => setDraft((prev) => ({ ...prev, insurer_name: e.target.value }))} style={inputStyle(C)} disabled={draft.target !== 'single' || !activeMasterAccounts.length}>
+          <option value="">{activeMasterAccounts.length ? 'Select insurer' : 'No active insurers'}</option>
+          {activeMasterAccounts.map((account) => (
             <option key={account.id} value={account.insurer_name}>{account.insurer_name}</option>
           ))}
         </select>
@@ -547,10 +559,10 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
         </label>
         <button
           onClick={runFlow}
-          disabled={running}
-          style={{ background: running ? C.muted : C.accent, color: running ? C.sub : '#0B0F1A', border: 'none', borderRadius: 10, fontWeight: 700, cursor: running ? 'not-allowed' : 'pointer' }}
+          disabled={running || !activeMasterAccounts.length}
+          style={{ background: running || !activeMasterAccounts.length ? C.muted : C.accent, color: running || !activeMasterAccounts.length ? C.sub : '#0B0F1A', border: 'none', borderRadius: 10, fontWeight: 700, cursor: running || !activeMasterAccounts.length ? 'not-allowed' : 'pointer' }}
         >
-          {running ? 'Running...' : 'Start Runner'}
+          {running ? 'Running...' : !activeMasterAccounts.length ? 'No Active Insurers' : 'Start Runner'}
         </button>
       </div>
       <div style={{ background: draft.finalize_assignments ? '#FFB84D14' : '#00E5A012', border: `1px solid ${draft.finalize_assignments ? '#FFB84D44' : '#00E5A040'}`, borderRadius: 10, padding: '12px 14px', color: draft.finalize_assignments ? C.warn : C.accent, fontSize: 12, marginBottom: 16, lineHeight: 1.6 }}>
@@ -907,11 +919,12 @@ function TeamSlackSection({ C, members, onRefresh, setNotice }) {
 
 function MasterAccountsSection({ C, accounts, onRefresh, setNotice }) {
   const [saving, setSaving] = useState(false);
+  const [togglingId, setTogglingId] = useState('');
   const [editingId, setEditingId] = useState('');
-  const [draft, setDraft] = useState({ insurer_name: '', login_email: '', login_password: '', notes: '' });
+  const [draft, setDraft] = useState({ insurer_name: '', login_email: '', login_password: '', notes: '', is_active: true });
 
   function resetDraft() {
-    setDraft({ insurer_name: '', login_email: '', login_password: '', notes: '' });
+    setDraft({ insurer_name: '', login_email: '', login_password: '', notes: '', is_active: true });
     setEditingId('');
   }
 
@@ -927,16 +940,18 @@ function MasterAccountsSection({ C, accounts, onRefresh, setNotice }) {
   }
 
   async function submit() {
-    if (!draft.insurer_name.trim() || !draft.login_email.trim()) {
-      setNotice({ type: 'error', text: 'Master account needs an insurer name and login email.' });
+    if (!draft.insurer_name.trim() || !draft.login_email.trim() || (!editingId && !draft.login_password)) {
+      setNotice({ type: 'error', text: 'Master account needs an insurer name, login email, and login password.' });
       return;
     }
     setSaving(true);
     try {
+      const payload = { ...draft };
+      if (editingId && !payload.login_password) delete payload.login_password;
       const res = await fetch('/api/tools/piles-auto-assignment/master-accounts', {
         method: editingId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(editingId ? { id: editingId, ...draft } : draft),
+        body: JSON.stringify(editingId ? { id: editingId, ...payload } : payload),
       });
       const data = await res.json();
       if (!data.success) throw new Error(data.error || 'Failed to save master account.');
@@ -950,13 +965,41 @@ function MasterAccountsSection({ C, accounts, onRefresh, setNotice }) {
     }
   }
 
+  async function toggleActive(account) {
+    const nextActive = account.is_active === false;
+    if (!nextActive && !window.confirm(`Disable ${account.insurer_name}? Scheduled and manual all-insurer runs will stop checking this insurer.`)) {
+      return;
+    }
+
+    setTogglingId(account.id);
+    try {
+      const res = await fetch('/api/tools/piles-auto-assignment/master-accounts', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: account.id, is_active: nextActive }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed to update insurer status.');
+      if (editingId === account.id) resetDraft();
+      setNotice({
+        type: 'success',
+        text: `${data.item.insurer_name} is now ${nextActive ? 'active' : 'inactive'}. ${nextActive ? 'It is available to the runner again.' : 'It will be excluded from scheduled, all-insurer, and manual runs.'}`,
+      });
+      await onRefresh();
+    } catch (error) {
+      setNotice({ type: 'error', text: error.message });
+    } finally {
+      setTogglingId('');
+    }
+  }
+
   return (
     <div style={cardStyle(C)}>
-      <SectionHeader C={C} icon="🔑" title="Master Insurer Credentials" text="These are the primary insurer logins the runner will use to sign in and reach the piles screens." />
+      <SectionHeader C={C} icon="🔑" title="Master Insurer Credentials" text="These are the primary insurer logins the runner will use. Inactive insurers are skipped by scheduled and all-insurer runs and hidden from Runner Control." />
       <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr 1fr 0.8fr', gap: 12, marginBottom: 16 }}>
         <input value={draft.insurer_name} onChange={(e) => setDraft((prev) => ({ ...prev, insurer_name: e.target.value }))} placeholder="Insurer name" style={inputStyle(C)} />
         <input value={draft.login_email} onChange={(e) => setDraft((prev) => ({ ...prev, login_email: e.target.value }))} placeholder="Login email" style={inputStyle(C)} />
-        <input value={draft.login_password} onChange={(e) => setDraft((prev) => ({ ...prev, login_password: e.target.value }))} placeholder="Login password" style={inputStyle(C)} />
+        <input type="password" value={draft.login_password} onChange={(e) => setDraft((prev) => ({ ...prev, login_password: e.target.value }))} placeholder={editingId ? 'New password (leave blank to keep)' : 'Login password'} autoComplete="new-password" style={inputStyle(C)} />
         <button onClick={submit} disabled={saving} style={{ background: saving ? C.muted : C.accent, color: saving ? C.sub : '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>{saving ? 'Saving...' : editingId ? 'Save Changes' : 'Add Account'}</button>
       </div>
       <textarea value={draft.notes} onChange={(e) => setDraft((prev) => ({ ...prev, notes: e.target.value }))} placeholder="Notes, access caveats, MFA reminders, or portal quirks" style={{ ...inputStyle(C), minHeight: 72, marginBottom: 18, resize: 'vertical' }} />
@@ -980,13 +1023,30 @@ function MasterAccountsSection({ C, accounts, onRefresh, setNotice }) {
                 <tr key={account.id}>
                   <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.insurer_name}</td>
                   <td style={{ color: C.sub, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.login_email}</td>
-                  <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.login_password || '—'}</td>
-                  <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}><span style={{ fontSize: 11, fontWeight: 700, color: account.is_active ? C.accent : C.sub }}>{account.is_active ? 'Active' : 'Inactive'}</span></td>
+                  <td style={{ color: account.has_login_password ? C.text : C.warn, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.has_login_password ? '••••••••' : 'Missing'}</td>
+                  <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}><span style={{ fontSize: 11, fontWeight: 700, color: account.is_active !== false ? C.accent : C.sub }}>{account.is_active !== false ? 'Active' : 'Inactive'}</span></td>
                   <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.last_password_update ? new Date(account.last_password_update).toLocaleString('en-GB') : 'Not updated yet'}</td>
                   <td style={{ padding: '12px', borderBottom: `1px solid ${C.border}` }}>
-                    <button onClick={() => startEdit(account)} style={{ background: C.elevated, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>
-                      Edit
-                    </button>
+                    <div style={{ display: 'flex', gap: 8, whiteSpace: 'nowrap' }}>
+                      <button onClick={() => startEdit(account)} disabled={togglingId === account.id} style={{ background: C.elevated, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 12px', fontWeight: 700, cursor: togglingId === account.id ? 'not-allowed' : 'pointer' }}>
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => toggleActive(account)}
+                        disabled={togglingId === account.id}
+                        style={{
+                          background: account.is_active !== false ? `${C.danger}14` : `${C.accent}14`,
+                          color: account.is_active !== false ? C.danger : C.accent,
+                          border: `1px solid ${account.is_active !== false ? `${C.danger}44` : `${C.accent}44`}`,
+                          borderRadius: 8,
+                          padding: '8px 12px',
+                          fontWeight: 700,
+                          cursor: togglingId === account.id ? 'not-allowed' : 'pointer',
+                        }}
+                      >
+                        {togglingId === account.id ? 'Saving...' : account.is_active !== false ? 'Disable' : 'Enable'}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -1082,11 +1142,13 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
     }
     setSaving(true);
     try {
+      const payload = { ...draft };
+      if (editingId && !payload.bot_password) delete payload.bot_password;
       const res = await fetch('/api/tools/piles-auto-assignment/bot-accounts', {
         method: editingId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...(editingId ? { id: editingId, ...draft } : draft),
+          ...(editingId ? { id: editingId, ...payload } : payload),
           updated_by_name: getMemberName() || 'Dashboard User',
           updated_by_member_id: getMemberId() || null,
         }),
@@ -1115,6 +1177,7 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
     }
     return Array.from(grouped.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   }, [accounts]);
+  const editingHasPassword = accounts.some((account) => account.id === editingId && account.has_bot_password);
 
   return (
     <div style={cardStyle(C)}>
@@ -1130,7 +1193,7 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 0.8fr', gap: 12, marginBottom: 12 }}>
         <input value={draft.insurer_name} onChange={(e) => setDraft((prev) => ({ ...prev, insurer_name: e.target.value }))} placeholder="Insurer name" style={inputStyle(C)} />
-        <input value={draft.bot_password} onChange={(e) => setDraft((prev) => ({ ...prev, bot_password: e.target.value }))} placeholder="Bot password" style={inputStyle(C)} />
+        <input type="password" value={draft.bot_password} onChange={(e) => setDraft((prev) => ({ ...prev, bot_password: e.target.value }))} placeholder={editingId && editingHasPassword ? 'New password (leave blank to keep)' : 'Bot password'} autoComplete="new-password" style={inputStyle(C)} />
         <select value={draft.assignment_role} onChange={(e) => setDraft((prev) => ({ ...prev, assignment_role: e.target.value }))} style={inputStyle(C)}>
           {ROLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
@@ -1918,7 +1981,7 @@ function LiveAssignmentScoreboard({ C, logs, botAccounts, refreshToken }) {
   );
 }
 
-function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
+function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts, masterAccounts }) {
   const [savingRoleId, setSavingRoleId] = useState('');
   const [sectionNotice, setSectionNotice] = useState(null);
   const [botOverrides, setBotOverrides] = useState({});
@@ -1931,7 +1994,14 @@ function WeekendRosterSection({ C, rosters, rosterMembers, botAccounts }) {
   const offDuty = latestMembers.filter((member) => member.duty_status === 'off_duty');
   const onShiftKeys = onShift.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
   const offDutyKeys = offDuty.map((member) => rosterOwnerKey(member.owner_name)).filter(Boolean).sort();
-  const effectiveBotAccounts = botAccounts.map((bot) => (botOverrides[bot.id] ? { ...bot, ...botOverrides[bot.id] } : bot));
+  const activeMasterKeys = new Set(
+    (masterAccounts || [])
+      .filter((account) => account.is_active !== false)
+      .map((account) => canonicalInsurerKeyClient(account.insurer_name))
+  );
+  const effectiveBotAccounts = botAccounts
+    .filter((bot) => activeMasterKeys.has(canonicalInsurerKeyClient(bot.insurer_name)))
+    .map((bot) => (botOverrides[bot.id] ? { ...bot, ...botOverrides[bot.id] } : bot));
   const weekendRosterBots = effectiveBotAccounts.filter((bot) => {
     const ownerKey = rosterOwnerKey(bot.owner_name);
     const explicitlyAdded = isExplicitWeekendAddedBot(bot);
@@ -2612,6 +2682,7 @@ export default function PilesAutoAssignmentPage() {
             rosters={data.weekendRosters}
             rosterMembers={data.weekendRosterMembers}
             botAccounts={data.botAccounts}
+            masterAccounts={data.masterAccounts}
           />
           <LiveAssignmentScoreboard C={C} logs={data.recentLogs} botAccounts={data.botAccounts} refreshToken={runnerHistoryRefreshToken} />
           <TrackedPileProgressSection C={C} trackedPiles={data.trackedPiles} botAccounts={data.botAccounts} />
