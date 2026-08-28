@@ -34,6 +34,14 @@ function toClock(value) {
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 }
 
+function presentBotAccount(item) {
+  return {
+    ...decryptCredentialFields(item, ['bot_email']),
+    bot_password: '',
+    has_bot_password: Boolean(item?.bot_password),
+  };
+}
+
 export async function GET() {
   try {
     const supabase = getSupabase();
@@ -46,7 +54,7 @@ export async function GET() {
     if (error) throw error;
     return NextResponse.json({
       success: true,
-      items: (data || []).map((item) => decryptCredentialFields(item, ['bot_email', 'bot_password'])),
+      items: (data || []).map(presentBotAccount),
     });
   } catch (error) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
@@ -92,7 +100,7 @@ export async function POST(request) {
       .single();
 
     if (error) throw error;
-    return NextResponse.json({ success: true, item: decryptCredentialFields(data, ['bot_email', 'bot_password']) });
+    return NextResponse.json({ success: true, item: presentBotAccount(data) });
   } catch (error) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
@@ -106,14 +114,20 @@ export async function PATCH(request) {
     }
 
     const updates = { updated_at: new Date().toISOString() };
-    const textFields = ['master_account_id', 'insurer_name', 'owner_name', 'bot_name', 'bot_email', 'bot_password', 'assignment_role', 'availability_status', 'availability_note', 'notes'];
+    if (body.insurer_name !== undefined && !String(body.insurer_name || '').trim()) {
+      return NextResponse.json({ success: false, error: 'Insurer name cannot be empty.' }, { status: 400 });
+    }
+    if (body.owner_name !== undefined && !String(body.owner_name || '').trim()) {
+      return NextResponse.json({ success: false, error: 'Owner name cannot be empty.' }, { status: 400 });
+    }
+    const textFields = ['master_account_id', 'insurer_name', 'owner_name', 'bot_name', 'assignment_role', 'availability_status', 'availability_note', 'notes'];
     for (const field of textFields) {
       if (body[field] !== undefined) {
         updates[field] = typeof body[field] === 'string' ? body[field].trim() || null : body[field];
       }
     }
     if (body.bot_email !== undefined) updates.bot_email = body.bot_email ? encryptCredential(body.bot_email.trim()) : null;
-    if (body.bot_password !== undefined) updates.bot_password = body.bot_password ? encryptCredential(body.bot_password) : '';
+    if (typeof body.bot_password === 'string' && body.bot_password.length > 0) updates.bot_password = encryptCredential(body.bot_password);
     if (body.is_active !== undefined) updates.is_active = toBool(body.is_active, true);
     if (body.is_available !== undefined) updates.is_available = toBool(body.is_available, true);
     if (body.support_capacity_ratio !== undefined) updates.support_capacity_ratio = toNum(body.support_capacity_ratio, 1);
@@ -136,7 +150,7 @@ export async function PATCH(request) {
       .single();
 
     if (error) throw error;
-    return NextResponse.json({ success: true, item: decryptCredentialFields(data, ['bot_email', 'bot_password']) });
+    return NextResponse.json({ success: true, item: presentBotAccount(data) });
   } catch (error) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }

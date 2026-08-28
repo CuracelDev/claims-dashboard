@@ -7,6 +7,11 @@ function normalize(value) {
   return String(value ?? '').trim();
 }
 
+function canonicalInsurerKey(value) {
+  const label = normalize(value).toLowerCase().replace(/\s+/g, ' ');
+  return label === 'uapom' || label === 'old mutual' ? 'old mutual' : label;
+}
+
 function ownerKey(value) {
   return normalize(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
@@ -80,8 +85,7 @@ export async function PATCH(request) {
         .eq('roster_id', rosterId),
       supabase
         .from('piles_auto_assignment_bot_accounts')
-        .select('*')
-        .eq('insurer_name', removedBot.insurer_name),
+        .select('*'),
       supabase
         .from('piles_auto_assignment_weekend_bot_state_snapshots')
         .select('*')
@@ -116,13 +120,13 @@ export async function PATCH(request) {
       availability_status: removedSnapshot?.previous_availability_status || 'weekend_off',
       availability_note: removedSnapshot?.previous_availability_note || `${noteBase}: extra weekend bot removed`,
       is_available: removedSnapshot?.previous_is_available ?? false,
-      is_active: removedSnapshot?.previous_is_active ?? removedBot.is_active !== false,
       ...updater,
     });
     items.push(restoredRemovedBot);
 
+    const removedInsurerKey = canonicalInsurerKey(removedBot.insurer_name);
     const rosterEligibleBots = (insurerBots || [])
-      .filter((bot) => bot.id !== removedBot.id && bot.is_active !== false)
+      .filter((bot) => canonicalInsurerKey(bot.insurer_name) === removedInsurerKey && bot.id !== removedBot.id && bot.is_active !== false)
       .filter((bot) => ownerMatches(bot.owner_name, onShiftKeys) && !ownerMatches(bot.owner_name, offDutyKeys))
       .map((bot) => {
         const snapshot = snapshotByBotId.get(bot.id);
@@ -141,7 +145,6 @@ export async function PATCH(request) {
         availability_status: snapshot?.previous_availability_status === 'weekend_added' ? 'weekend_added' : 'available',
         availability_note: `${noteBase}: restored after extra weekend bot was removed`,
         is_available: true,
-        is_active: snapshot?.previous_is_active ?? bot.is_active !== false,
         ...updater,
       });
       items.push(updatedBot);

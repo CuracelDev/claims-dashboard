@@ -86,6 +86,9 @@ export async function PATCH(request) {
     if (!bot) {
       return NextResponse.json({ success: false, error: 'Bot account was not found.' }, { status: 404 });
     }
+    if (bot.is_active === false) {
+      return NextResponse.json({ success: false, error: 'Inactive bot accounts cannot receive weekend availability overrides.' }, { status: 400 });
+    }
 
     const now = new Date().toISOString();
     await snapshotBotState(supabase, roster, bot, now, body, availabilityStatus);

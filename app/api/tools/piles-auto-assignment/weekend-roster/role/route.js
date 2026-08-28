@@ -8,6 +8,11 @@ function normalize(value) {
   return String(value ?? '').trim();
 }
 
+function canonicalInsurerKey(value) {
+  const label = normalize(value).toLowerCase().replace(/\s+/g, ' ');
+  return label === 'uapom' || label === 'old mutual' ? 'old mutual' : label;
+}
+
 const VALID_ROLES = new Set(['primary', 'support']);
 
 function uniqueValues(values) {
@@ -78,6 +83,9 @@ export async function PATCH(request) {
     if (!bot) {
       return NextResponse.json({ success: false, error: 'Bot account was not found.' }, { status: 404 });
     }
+    if (bot.is_active === false) {
+      return NextResponse.json({ success: false, error: 'Inactive bot accounts cannot receive weekend roles.' }, { status: 400 });
+    }
 
     const now = new Date().toISOString();
     await snapshotBotState(supabase, roster, bot, now, body, assignmentRole);
@@ -106,6 +114,9 @@ export async function PATCH(request) {
         .maybeSingle();
       if (supportFetchError) throw supportFetchError;
       if (!supportBot) continue;
+      if (supportBot.is_active === false || canonicalInsurerKey(supportBot.insurer_name) !== canonicalInsurerKey(bot.insurer_name)) {
+        continue;
+      }
       await snapshotBotState(supabase, roster, supportBot, now, body, 'support');
       const { data: demotedBot, error: demoteError } = await supabase
         .from('piles_auto_assignment_bot_accounts')
