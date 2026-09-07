@@ -827,6 +827,69 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertTrue(year_2025.clicked)
         self.assertFalse(year_2026.clicked)
 
+    def test_multiselect_all_years_selects_each_missing_option(self):
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+                self.clicked = False
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def inner_text(self):
+                return self.text
+
+            def click(self, **_kwargs):
+                self.clicked = True
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        option_selector = ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+        year_2026 = Locator(text="2026", attributes={"aria-selected": "true"})
+        year_2025 = Locator(text="2025", attributes={"aria-selected": "false"})
+        year_panel = Locator(children={
+            option_selector: LocatorList([year_2026, year_2025]),
+        })
+        control = Locator(attributes={"aria-controls": "year-options"})
+        page = Locator(children={'[id="year-options"]': year_panel})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._active_dropdown_root = lambda: year_panel
+        portal_runner._close_dropdown = lambda: None
+        portal_runner._click_multiselect_select_all = lambda _root: True
+
+        selected = runner.CuracelPilesRunner._set_multiselect_values(
+            portal_runner,
+            control,
+            ["2026", "2025"],
+            required=True,
+        )
+
+        self.assertTrue(selected)
+        self.assertFalse(year_2026.clicked)
+        self.assertTrue(year_2025.clicked)
+
     def test_year_candidates_include_primevue_combobox_without_legacy_root_class(self):
         class Control:
             def bounding_box(self):

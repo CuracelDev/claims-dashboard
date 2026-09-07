@@ -3781,10 +3781,6 @@ class CuracelPilesRunner:
                     f"Available options: {[text for text, _, _ in available]}"
                 )
 
-            if desired_keys == available_keys and self._click_multiselect_select_all(option_root):
-                self._close_dropdown()
-                return True
-
             for text, option, selected in available:
                 should_select = label_key(text) in desired_keys
                 if should_select != selected:
