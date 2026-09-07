@@ -543,6 +543,72 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertEqual(available_years, ["2026", "2025"])
         self.assertFalse(supports_multiple)
 
+    def test_year_inspection_reads_multiselect_aria_from_owned_listbox_root(self):
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+        option_selector = ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+        year_listbox = Locator(
+            attributes={"id": "year-options", "role": "listbox", "aria-multiselectable": "true"},
+            children={
+                option_selector: LocatorList([Locator(text="2026"), Locator(text="2025")]),
+                "[role='listbox']": LocatorList([]),
+            },
+        )
+        control = Locator(attributes={
+            "class": "custom-year-picker",
+            "aria-controls": "year-options",
+        })
+        page = Locator(children={'[id="year-options"]': year_listbox})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._close_dropdown = lambda: None
+
+        available_years, supports_multiple = runner.CuracelPilesRunner._inspect_year_control(
+            portal_runner,
+            control,
+        )
+
+        self.assertEqual(available_years, ["2026", "2025"])
+        self.assertTrue(supports_multiple)
+
     def test_single_year_selection_uses_the_panel_owned_by_the_control(self):
         class Keyboard:
             def press(self, _key):

@@ -3589,10 +3589,13 @@ class CuracelPilesRunner:
             available_years = list(dict.fromkeys(
                 text for text in option_texts if re.fullmatch(r"20\d{2}", text)
             ))
-            listbox = option_root.locator("[role='listbox']").first
             listbox_aria = ""
-            if listbox.count():
-                listbox_aria = norm(listbox.get_attribute("aria-multiselectable"))
+            if norm(option_root.get_attribute("role")).lower() == "listbox":
+                listbox_aria = norm(option_root.get_attribute("aria-multiselectable"))
+            else:
+                listbox = option_root.locator("[role='listbox']").first
+                if listbox.count():
+                    listbox_aria = norm(listbox.get_attribute("aria-multiselectable"))
             supports_multiple = supports_multiple_year_selection(
                 control_classes=norm(control.get_attribute("class")),
                 control_multiple_attribute=control.get_attribute("multiple") is not None,
