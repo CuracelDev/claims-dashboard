@@ -737,6 +737,56 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertTrue(year_2025.clicked)
         self.assertFalse(year_2026.clicked)
 
+    def test_year_candidates_include_primevue_combobox_without_legacy_root_class(self):
+        class Control:
+            def bounding_box(self):
+                return {"x": 310, "y": 116, "width": 150, "height": 40}
+
+            def get_attribute(self, name):
+                return {"data-pc-name": "multiselect", "role": "combobox"}.get(name)
+
+            def inner_text(self):
+                return ""
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        control = Control()
+        page = type("Page", (), {
+            "locator": lambda _self, _selector: LocatorList([control]),
+        })()
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._select_following_label_text = lambda _label: None
+        portal_runner._select_in_container = lambda _label: None
+        portal_runner._visible_multiselects = lambda: []
+        portal_runner._visible_selects = lambda: []
+
+        candidates = runner.CuracelPilesRunner._year_control_candidates(portal_runner)
+
+        self.assertEqual(candidates, [control])
+
+    def test_year_discovery_failure_reports_generic_filter_controls(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._year_control_candidates = lambda: [object()]
+        portal_runner._inspect_year_control = lambda _control: ([], False)
+        portal_runner._describe_visible_selects = lambda: []
+        portal_runner._describe_visible_filter_controls = lambda: [{
+            "data_pc_name": "multiselect",
+            "role": "combobox",
+            "aria_controls": "year-options",
+        }]
+
+        with self.assertRaisesRegex(RuntimeError, "multiselect.*year-options"):
+            runner.CuracelPilesRunner._find_year_filter_control(portal_runner)
+
     def test_current_single_select_rejects_an_unconfirmed_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         control = object()

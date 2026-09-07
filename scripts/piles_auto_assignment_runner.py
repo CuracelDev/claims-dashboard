@@ -3159,6 +3159,24 @@ class CuracelPilesRunner:
         visible.sort(key=lambda item: (item[0], item[1]))
         return [item[2] for item in visible]
 
+    def _visible_filter_controls(self) -> list[Any]:
+        assert self.page
+        selectors = self.page.locator(
+            ".p-select.p-component, .p-multiselect.p-component, "
+            "[data-pc-name='select'], [data-pc-name='multiselect'], [role='combobox']"
+        )
+        visible: list[tuple[float, float, Any]] = []
+        for index in range(selectors.count()):
+            control = selectors.nth(index)
+            try:
+                box = control.bounding_box()
+                if box and box["y"] < 420 and box["width"] > 0 and box["height"] > 0:
+                    visible.append((box["y"], box["x"], control))
+            except Exception:
+                continue
+        visible.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in visible]
+
     def _describe_visible_selects(self) -> list[dict[str, Any]]:
         descriptions: list[dict[str, Any]] = []
         for idx, loc in enumerate(self._visible_selects(), start=1):
@@ -3169,6 +3187,26 @@ class CuracelPilesRunner:
                     "x": round(box.get("x", 0), 1),
                     "y": round(box.get("y", 0), 1),
                     "text": self._read_select_text(loc),
+                })
+            except Exception:
+                continue
+        return descriptions
+
+    def _describe_visible_filter_controls(self) -> list[dict[str, Any]]:
+        descriptions: list[dict[str, Any]] = []
+        for index, control in enumerate(self._visible_filter_controls(), start=1):
+            try:
+                box = control.bounding_box() or {}
+                descriptions.append({
+                    "index": index,
+                    "x": round(box.get("x", 0), 1),
+                    "y": round(box.get("y", 0), 1),
+                    "text": self._read_select_text(control),
+                    "class": norm(control.get_attribute("class")),
+                    "data_pc_name": norm(control.get_attribute("data-pc-name")),
+                    "role": norm(control.get_attribute("role")),
+                    "aria_label": norm(control.get_attribute("aria-label")),
+                    "aria_controls": norm(control.get_attribute("aria-controls")),
                 })
             except Exception:
                 continue
@@ -3452,7 +3490,7 @@ class CuracelPilesRunner:
         candidates: list[Any] = []
         self._append_unique_select(candidates, self._select_following_label_text("Year"))
         self._append_unique_select(candidates, self._select_in_container("Year"))
-        for control in [*self._visible_multiselects(), *self._visible_selects()]:
+        for control in self._visible_filter_controls():
             self._append_unique_select(candidates, control)
         return candidates
 
@@ -3524,7 +3562,7 @@ class CuracelPilesRunner:
                 continue
         raise RuntimeError(
             "Could not identify the Year filter from the visible controls. "
-            f"Visible top selects: {self._describe_visible_selects()}"
+            f"Visible filter controls: {self._describe_visible_filter_controls()}"
         )
 
     def year_filter_capabilities(self) -> tuple[bool, list[str]]:
