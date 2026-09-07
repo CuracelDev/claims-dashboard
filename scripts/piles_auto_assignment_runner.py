@@ -2918,6 +2918,7 @@ class CuracelPilesRunner:
             except Exception:
                 pass
             for selector in [
+                ".swal2-cancel",
                 ".p-dialog-close",
                 "[aria-label='Close']",
                 "button:has-text('Close')",
@@ -3326,10 +3327,7 @@ class CuracelPilesRunner:
             if text:
                 option_texts.append((text, option))
             if label_key(text) == label_key(desired_text):
-                try:
-                    option.evaluate("element => element.click()")
-                except Exception:
-                    option.click(force=True)
+                option.click()
                 time.sleep(0.8)
                 return text
         if self.allow_test_any_assignee:
@@ -3337,10 +3335,7 @@ class CuracelPilesRunner:
                 lowered = text.lower()
                 if lowered in {"select user", "no results found", "all"}:
                     continue
-                try:
-                    option.evaluate("element => element.click()")
-                except Exception:
-                    option.click(force=True)
+                option.click()
                 time.sleep(0.8)
                 print(f"  Test fallback: selected available assignee '{text}' instead of requested '{desired_text}'.")
                 return text

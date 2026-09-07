@@ -620,7 +620,6 @@ class YearFilterScanningTests(unittest.TestCase):
                 self.children = children or {}
                 self.text = text
                 self.clicked = False
-                self.dom_clicked = False
 
             def get_attribute(self, name):
                 return self.attributes.get(name)
@@ -643,9 +642,6 @@ class YearFilterScanningTests(unittest.TestCase):
 
             def click(self, **_kwargs):
                 self.clicked = True
-
-            def evaluate(self, expression):
-                self.dom_clicked = expression == "element => element.click()"
 
         class LocatorList:
             def __init__(self, items):
@@ -676,11 +672,11 @@ class YearFilterScanningTests(unittest.TestCase):
             "aria-controls": "year-options",
         })
 
-        def select_2025(expression):
-            year_2025.dom_clicked = expression == "element => element.click()"
+        def select_2025(**_kwargs):
+            year_2025.clicked = True
             control.text = "2025"
 
-        year_2025.evaluate = select_2025
+        year_2025.click = select_2025
         page = Locator(children={'[id="year-options"]': year_panel})
         page.keyboard = Keyboard()
         portal_runner = object.__new__(runner.CuracelPilesRunner)
@@ -697,8 +693,7 @@ class YearFilterScanningTests(unittest.TestCase):
         )
 
         self.assertTrue(selected)
-        self.assertFalse(year_2025.clicked)
-        self.assertTrue(year_2025.dom_clicked)
+        self.assertTrue(year_2025.clicked)
         self.assertFalse(year_2026.clicked)
 
     def test_single_select_rejects_an_unconfirmed_option(self):
@@ -721,6 +716,42 @@ class YearFilterScanningTests(unittest.TestCase):
         )
 
         self.assertFalse(selected)
+
+    def test_sweetalert_survey_is_dismissed_with_cancel(self):
+        class Keyboard:
+            def press(self, _key):
+                return None
+
+        class Button:
+            def __init__(self, visible=False):
+                self.visible = visible
+                self.clicked = False
+
+            def is_visible(self, timeout=0):
+                return self.visible
+
+            @property
+            def first(self):
+                return self
+
+            def click(self):
+                self.clicked = True
+
+        cancel = Button(visible=True)
+        hidden = Button()
+
+        class Page:
+            keyboard = Keyboard()
+
+            def locator(self, selector):
+                return cancel if selector == ".swal2-cancel" else hidden
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = Page()
+
+        runner.CuracelPilesRunner._dismiss_popup(portal_runner)
+
+        self.assertTrue(cancel.clicked)
 
     def test_selected_multiselect_years_are_read_from_the_owned_panel(self):
         class Locator:
