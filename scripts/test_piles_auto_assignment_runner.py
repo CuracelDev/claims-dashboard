@@ -272,6 +272,30 @@ class WeekendRestoreTests(unittest.TestCase):
         self.assertNotIn("is_active =", bot_update_sql)
 
 
+class RunnerConcurrencyTests(unittest.TestCase):
+    def test_database_lock_result_controls_whether_a_runner_may_start(self):
+        locked_store = object.__new__(runner.DataStore)
+        locked_store.mode = "postgres"
+        locked_store._fetchall_postgres = lambda *_args, **_kwargs: [{"acquired": True}]
+
+        competing_store = object.__new__(runner.DataStore)
+        competing_store.mode = "postgres"
+        competing_store._fetchall_postgres = lambda *_args, **_kwargs: [{"acquired": False}]
+
+        acquire_locked = getattr(locked_store, "try_acquire_runner_lock", lambda: False)
+        acquire_competing = getattr(competing_store, "try_acquire_runner_lock", lambda: True)
+
+        self.assertTrue(acquire_locked())
+        self.assertFalse(acquire_competing())
+
+    def test_runner_start_fails_closed_when_another_run_holds_the_lock(self):
+        store = type("Store", (), {"try_acquire_runner_lock": lambda _self: False})()
+        ensure_lock = getattr(runner, "ensure_runner_lock_available", lambda _store: None)
+
+        with self.assertRaisesRegex(RuntimeError, "already in progress"):
+            ensure_lock(store)
+
+
 class YearFilterScanningTests(unittest.TestCase):
     def make_runner(self, *, supports_multiple, available_years):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
@@ -438,6 +462,516 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertIs(selected_control, control)
         self.assertEqual(applied, [(control, "2025", True)])
+
+    def test_year_inspection_uses_the_panel_owned_by_the_control(self):
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def nth(self, index):
+                if index != 0:
+                    raise IndexError(index)
+                return self
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+            def get_attribute(self, _name):
+                return None
+
+        year_options = LocatorList([Locator(text="2026"), Locator(text="2025")])
+        year_listbox = Locator(attributes={"aria-multiselectable": "false"})
+        year_panel = Locator(children={
+            ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']": year_options,
+            "[role='listbox']": year_listbox,
+        })
+        wrong_panel = Locator(children={
+            ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']": LocatorList([
+                Locator(text="Vetting Pending"),
+            ]),
+            "[role='listbox']": LocatorList([]),
+        })
+        combobox = Locator(attributes={"aria-controls": "year-options"})
+        control = Locator(
+            attributes={"class": "p-select p-component", "multiple": ""},
+            children={"[role='combobox']": combobox},
+        )
+        page = Locator(children={'[id="year-options"]': year_panel})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._active_dropdown_root = lambda: wrong_panel
+        portal_runner._close_dropdown = lambda: None
+
+        available_years, supports_multiple = runner.CuracelPilesRunner._inspect_year_control(
+            portal_runner,
+            control,
+        )
+
+        self.assertEqual(available_years, ["2026", "2025"])
+        self.assertFalse(supports_multiple)
+
+    def test_year_inspection_reads_multiselect_aria_from_owned_listbox_root(self):
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+        option_selector = ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+        year_listbox = Locator(
+            attributes={"id": "year-options", "role": "listbox", "aria-multiselectable": "true"},
+            children={
+                option_selector: LocatorList([Locator(text="2026"), Locator(text="2025")]),
+                "[role='listbox']": LocatorList([]),
+            },
+        )
+        control = Locator(attributes={
+            "class": "custom-year-picker",
+            "aria-controls": "year-options",
+        })
+        page = Locator(children={'[id="year-options"]': year_listbox})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._close_dropdown = lambda: None
+
+        available_years, supports_multiple = runner.CuracelPilesRunner._inspect_year_control(
+            portal_runner,
+            control,
+        )
+
+        self.assertEqual(available_years, ["2026", "2025"])
+        self.assertTrue(supports_multiple)
+
+    def test_single_year_selection_uses_the_panel_owned_by_the_control(self):
+        class Keyboard:
+            def press(self, _key):
+                return None
+
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+                self.clicked = False
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+            def click(self, **_kwargs):
+                self.clicked = True
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        year_2026 = Locator(text="2026")
+        year_2025 = Locator(text="2025")
+        year_panel = Locator(children={
+            "li.p-select-option, .p-select-option, [role='option']": LocatorList([year_2026, year_2025]),
+        })
+        wrong_panel = Locator(children={
+            "li.p-select-option, .p-select-option, [role='option']": LocatorList([
+                Locator(text="Vetting Pending"),
+            ]),
+        })
+        control = Locator(attributes={
+            "class": "p-select p-component",
+            "aria-controls": "year-options",
+        })
+        page = Locator(children={'[id="year-options"]': year_panel})
+        page.keyboard = Keyboard()
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._visible_dropdown_panels = lambda: [wrong_panel]
+        portal_runner._active_dropdown_root = lambda: wrong_panel
+
+        selected = runner.CuracelPilesRunner._set_select_value(
+            portal_runner,
+            control,
+            "2025",
+            required=False,
+        )
+
+        self.assertTrue(selected)
+        self.assertTrue(year_2025.clicked)
+        self.assertFalse(year_2026.clicked)
+
+    def test_selected_multiselect_years_are_read_from_the_owned_panel(self):
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        option_selector = ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+        year_panel = Locator(children={
+            option_selector: LocatorList([
+                Locator(text="2026", attributes={"aria-selected": "true"}),
+                Locator(text="2025", attributes={"data-p-selected": "true"}),
+            ]),
+        })
+        wrong_panel = Locator(children={
+            option_selector: LocatorList([Locator(text="Vetting Pending")]),
+        })
+        control = Locator(attributes={"aria-controls": "year-options"})
+        page = Locator(children={'[id="year-options"]': year_panel})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._active_dropdown_root = lambda: wrong_panel
+        portal_runner._close_dropdown = lambda: None
+
+        selected_years = runner.CuracelPilesRunner._read_selected_multiselect_years(
+            portal_runner,
+            control,
+        )
+
+        self.assertEqual(selected_years, {"2026", "2025"})
+
+    def test_multiselect_year_changes_are_applied_in_the_owned_panel(self):
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+                self.clicked = False
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+            def click(self, **_kwargs):
+                self.clicked = True
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        option_selector = ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+        year_2026 = Locator(text="2026", attributes={"aria-selected": "false"})
+        year_2025 = Locator(text="2025", attributes={"aria-selected": "false"})
+        year_panel = Locator(children={
+            option_selector: LocatorList([year_2026, year_2025]),
+        })
+        wrong_panel = Locator(children={
+            option_selector: LocatorList([Locator(text="Audit Pending")]),
+        })
+        control = Locator(attributes={"aria-controls": "year-options"})
+        page = Locator(children={'[id="year-options"]': year_panel})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._active_dropdown_root = lambda: wrong_panel
+        portal_runner._close_dropdown = lambda: None
+
+        selected = runner.CuracelPilesRunner._set_multiselect_values(
+            portal_runner,
+            control,
+            ["2025"],
+            required=False,
+        )
+
+        self.assertTrue(selected)
+        self.assertTrue(year_2025.clicked)
+        self.assertFalse(year_2026.clicked)
+
+    def test_year_candidates_include_primevue_combobox_without_legacy_root_class(self):
+        class Control:
+            def bounding_box(self):
+                return {"x": 310, "y": 116, "width": 150, "height": 40}
+
+            def get_attribute(self, name):
+                return {"data-pc-name": "multiselect", "role": "combobox"}.get(name)
+
+            def inner_text(self):
+                return ""
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        control = Control()
+        page = type("Page", (), {
+            "locator": lambda _self, _selector: LocatorList([control]),
+        })()
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._select_following_label_text = lambda _label: None
+        portal_runner._select_in_container = lambda _label: None
+        portal_runner._visible_multiselects = lambda: []
+        portal_runner._visible_selects = lambda: []
+
+        candidates = runner.CuracelPilesRunner._year_control_candidates(portal_runner)
+
+        self.assertEqual(candidates, [control])
+
+    def test_year_discovery_failure_reports_generic_filter_controls(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._year_control_candidates = lambda: [object()]
+        portal_runner._inspect_year_control = lambda _control: ([], False)
+        portal_runner._describe_visible_selects = lambda: []
+        portal_runner._describe_visible_filter_controls = lambda: [{
+            "data_pc_name": "multiselect",
+            "role": "combobox",
+            "aria_controls": "year-options",
+        }]
+
+        with self.assertRaisesRegex(RuntimeError, "multiselect.*year-options"):
+            runner.CuracelPilesRunner._find_year_filter_control(portal_runner)
+
+    def test_open_select_waits_for_its_owned_panel_not_hidden_global_options(self):
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        class Panel:
+            def __init__(self):
+                self.visibility_checks = 0
+
+            def count(self):
+                return 1
+
+            @property
+            def first(self):
+                return self
+
+            def is_visible(self):
+                self.visibility_checks += 1
+                return self.visibility_checks >= 2
+
+            def locator(self, _selector):
+                return LocatorList([object()])
+
+        class Control:
+            def click(self):
+                return None
+
+            def get_attribute(self, name):
+                return "year-options" if name == "aria-controls" else None
+
+            def locator(self, _selector):
+                return LocatorList([])
+
+        panel = Panel()
+
+        class Page:
+            def locator(self, selector):
+                if selector == '[id="year-options"]':
+                    return panel
+                return LocatorList([object()])
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = Page()
+
+        opened = runner.CuracelPilesRunner._open_select(portal_runner, Control())
+
+        self.assertTrue(opened)
+        self.assertGreaterEqual(panel.visibility_checks, 2)
+
+    def test_dropdown_wait_uses_visible_panel_when_control_has_no_aria_owner(self):
+        class Options:
+            def count(self):
+                return 1
+
+        class Panel:
+            def __init__(self):
+                self.option_reads = 0
+
+            def locator(self, _selector):
+                self.option_reads += 1
+                return Options()
+
+        class EmptyLocator:
+            def count(self):
+                return 0
+
+        class Control:
+            def get_attribute(self, _name):
+                return None
+
+            def locator(self, _selector):
+                return EmptyLocator()
+
+        panel = Panel()
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = object()
+        portal_runner._visible_dropdown_panels = lambda: [panel]
+
+        runner.CuracelPilesRunner._wait_for_dropdown_options(
+            portal_runner,
+            Control(),
+            timeout_ms=1,
+        )
+
+        self.assertEqual(panel.option_reads, 1)
 
     def test_current_single_select_rejects_an_unconfirmed_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)

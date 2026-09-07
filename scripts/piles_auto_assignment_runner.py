@@ -70,6 +70,7 @@ PLANNING_SPEED_FLOOR_RATIO = min(
     1.0,
 )
 AVAILABLE_BOT_STATUSES = {"available", "", "weekend_added"}
+RUNNER_ADVISORY_LOCK_KEY = 564795289053896123
 
 
 class TeeCapture:
@@ -1136,6 +1137,17 @@ class DataStore:
     def close(self) -> None:
         if self.conn:
             self.conn.close()
+
+    def try_acquire_runner_lock(self) -> bool:
+        if self.mode != "postgres":
+            raise RuntimeError(
+                "Piles runner concurrency protection requires DATABASE_URL so all runner hosts share one lock."
+            )
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(%s) as acquired",
+            (RUNNER_ADVISORY_LOCK_KEY,),
+        )
+        return bool(rows and rows[0].get("acquired"))
 
     def _fetchall_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         assert self.conn
@@ -2792,6 +2804,14 @@ class DataStore:
             self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot_id, payload)
 
 
+def ensure_runner_lock_available(store: DataStore) -> None:
+    if not store.try_acquire_runner_lock():
+        raise RuntimeError(
+            "Another Piles Auto-Assignment run is already in progress. "
+            "This run stopped before scanning or assigning claims."
+        )
+
+
 class CuracelPilesRunner:
     def __init__(self, visible: bool = True, slow_mo: int = 350) -> None:
         self.visible = visible
@@ -3159,6 +3179,24 @@ class CuracelPilesRunner:
         visible.sort(key=lambda item: (item[0], item[1]))
         return [item[2] for item in visible]
 
+    def _visible_filter_controls(self) -> list[Any]:
+        assert self.page
+        selectors = self.page.locator(
+            ".p-select.p-component, .p-multiselect.p-component, "
+            "[data-pc-name='select'], [data-pc-name='multiselect'], [role='combobox']"
+        )
+        visible: list[tuple[float, float, Any]] = []
+        for index in range(selectors.count()):
+            control = selectors.nth(index)
+            try:
+                box = control.bounding_box()
+                if box and box["y"] < 420 and box["width"] > 0 and box["height"] > 0:
+                    visible.append((box["y"], box["x"], control))
+            except Exception:
+                continue
+        visible.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in visible]
+
     def _describe_visible_selects(self) -> list[dict[str, Any]]:
         descriptions: list[dict[str, Any]] = []
         for idx, loc in enumerate(self._visible_selects(), start=1):
@@ -3169,6 +3207,26 @@ class CuracelPilesRunner:
                     "x": round(box.get("x", 0), 1),
                     "y": round(box.get("y", 0), 1),
                     "text": self._read_select_text(loc),
+                })
+            except Exception:
+                continue
+        return descriptions
+
+    def _describe_visible_filter_controls(self) -> list[dict[str, Any]]:
+        descriptions: list[dict[str, Any]] = []
+        for index, control in enumerate(self._visible_filter_controls(), start=1):
+            try:
+                box = control.bounding_box() or {}
+                descriptions.append({
+                    "index": index,
+                    "x": round(box.get("x", 0), 1),
+                    "y": round(box.get("y", 0), 1),
+                    "text": self._read_select_text(control),
+                    "class": norm(control.get_attribute("class")),
+                    "data_pc_name": norm(control.get_attribute("data-pc-name")),
+                    "role": norm(control.get_attribute("role")),
+                    "aria_label": norm(control.get_attribute("aria-label")),
+                    "aria_controls": norm(control.get_attribute("aria-controls")),
                 })
             except Exception:
                 continue
@@ -3253,10 +3311,13 @@ class CuracelPilesRunner:
             self._close_dropdown()
         return None
 
-    def _choose_option_from_open_dropdown(self, desired_text: str) -> str | None:
+    def _choose_option_from_open_dropdown(self, desired_text: str, control: Any | None = None) -> str | None:
         assert self.page
-        panels = self._visible_dropdown_panels()
-        option_root = panels[-1] if panels else self.page
+        if control is not None:
+            option_root = self._dropdown_root_for_control(control)
+        else:
+            panels = self._visible_dropdown_panels()
+            option_root = panels[-1] if panels else self.page
         options = option_root.locator("li.p-select-option, .p-select-option, [role='option']")
         option_texts: list[tuple[str, Any]] = []
         for idx in range(options.count()):
@@ -3279,15 +3340,38 @@ class CuracelPilesRunner:
                 return text
         return None
 
-    def _wait_for_dropdown_options(self, timeout_ms: int = 4000) -> None:
+    def _wait_for_dropdown_options(self, control: Any | None = None, timeout_ms: int = 4000) -> None:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
             try:
-                if self.page.locator(".p-select-option, .p-select-list li, [role='option']").count() > 0:
-                    return
-                if self.page.locator("input[placeholder*='Search'], input[placeholder*='search']").count() > 0:
-                    return
+                if control is not None:
+                    option_root = self._dropdown_root_owned_by(control)
+                    if option_root is not None:
+                        options = option_root.locator(
+                            ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                            "[data-pc-section='option']"
+                        )
+                        if options.count() > 0:
+                            return
+                    elif not self._dropdown_reference_ids(control):
+                        panels = self._visible_dropdown_panels()
+                        if panels:
+                            options = panels[-1].locator(
+                                ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                                "[data-pc-section='option']"
+                            )
+                            if options.count() > 0:
+                                return
+                else:
+                    panels = self._visible_dropdown_panels()
+                    if panels:
+                        options = panels[-1].locator(
+                            ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                            "[data-pc-section='option']"
+                        )
+                        if options.count() > 0:
+                            return
             except Exception:
                 pass
             time.sleep(0.2)
@@ -3312,12 +3396,12 @@ class CuracelPilesRunner:
                         raise
                 except Exception:
                     return False
-        self._wait_for_dropdown_options()
+        self._wait_for_dropdown_options(select)
         return True
 
-    def _dropdown_option_texts(self) -> list[str]:
+    def _dropdown_option_texts(self, control: Any | None = None) -> list[str]:
         assert self.page
-        option_root = self._active_dropdown_root()
+        option_root = self._dropdown_root_for_control(control) if control is not None else self._active_dropdown_root()
         options = option_root.locator("li.p-select-option, .p-select-option, [role='option']")
         texts: list[str] = []
         for idx in range(options.count()):
@@ -3449,16 +3533,52 @@ class CuracelPilesRunner:
         candidates: list[Any] = []
         self._append_unique_select(candidates, self._select_following_label_text("Year"))
         self._append_unique_select(candidates, self._select_in_container("Year"))
-        for control in [*self._visible_multiselects(), *self._visible_selects()]:
+        for control in self._visible_filter_controls():
             self._append_unique_select(candidates, control)
         return candidates
+
+    def _dropdown_reference_ids(self, control: Any) -> list[str]:
+        owners: list[Any] = [control]
+        for selector in ("[role='combobox']", "[aria-controls]", "[aria-owns]"):
+            try:
+                descendants = control.locator(selector)
+                for index in range(descendants.count()):
+                    owners.append(descendants.nth(index))
+            except Exception:
+                continue
+
+        referenced_ids: list[str] = []
+        for owner in owners:
+            for attribute in ("aria-controls", "aria-owns"):
+                try:
+                    owner_ids = norm(owner.get_attribute(attribute)).split()
+                except Exception:
+                    continue
+                for referenced_id in owner_ids:
+                    if referenced_id not in referenced_ids:
+                        referenced_ids.append(referenced_id)
+        return referenced_ids
+
+    def _dropdown_root_owned_by(self, control: Any) -> Any | None:
+        assert self.page
+        for referenced_id in self._dropdown_reference_ids(control):
+            try:
+                panel = self.page.locator(f"[id={json.dumps(referenced_id)}]").first
+                if panel.count() and panel.is_visible():
+                    return panel
+            except Exception:
+                continue
+        return None
+
+    def _dropdown_root_for_control(self, control: Any) -> Any:
+        return self._dropdown_root_owned_by(control) or self._active_dropdown_root()
 
     def _inspect_year_control(self, control: Any) -> tuple[list[str], bool]:
         assert self.page
         if not self._open_select(control):
             return [], False
         try:
-            option_root = self._active_dropdown_root()
+            option_root = self._dropdown_root_for_control(control)
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
@@ -3469,10 +3589,13 @@ class CuracelPilesRunner:
             available_years = list(dict.fromkeys(
                 text for text in option_texts if re.fullmatch(r"20\d{2}", text)
             ))
-            listbox = option_root.locator("[role='listbox']").first
             listbox_aria = ""
-            if listbox.count():
-                listbox_aria = norm(listbox.get_attribute("aria-multiselectable"))
+            if norm(option_root.get_attribute("role")).lower() == "listbox":
+                listbox_aria = norm(option_root.get_attribute("aria-multiselectable"))
+            else:
+                listbox = option_root.locator("[role='listbox']").first
+                if listbox.count():
+                    listbox_aria = norm(listbox.get_attribute("aria-multiselectable"))
             supports_multiple = supports_multiple_year_selection(
                 control_classes=norm(control.get_attribute("class")),
                 control_multiple_attribute=control.get_attribute("multiple") is not None,
@@ -3492,7 +3615,7 @@ class CuracelPilesRunner:
                 continue
         raise RuntimeError(
             "Could not identify the Year filter from the visible controls. "
-            f"Visible top selects: {self._describe_visible_selects()}"
+            f"Visible filter controls: {self._describe_visible_filter_controls()}"
         )
 
     def year_filter_capabilities(self) -> tuple[bool, list[str]]:
@@ -3503,7 +3626,7 @@ class CuracelPilesRunner:
         if not self._open_select(control):
             return set()
         try:
-            option_root = self._active_dropdown_root()
+            option_root = self._dropdown_root_for_control(control)
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
@@ -3583,9 +3706,9 @@ class CuracelPilesRunner:
         try:
             if not self._open_select(select):
                 raise RuntimeError(f"Could not open select for '{desired_text}'.")
-            selected_text = self._choose_option_from_open_dropdown(desired_text)
+            selected_text = self._choose_option_from_open_dropdown(desired_text, select)
             if not selected_text:
-                available_options = self._dropdown_option_texts()
+                available_options = self._dropdown_option_texts(select)
                 try:
                     self.page.keyboard.press("Escape")
                 except Exception:
@@ -3615,7 +3738,7 @@ class CuracelPilesRunner:
         try:
             if not self._open_select(select):
                 raise RuntimeError(f"Could not open multiselect for '{desired_values}'.")
-            option_root = self._active_dropdown_root()
+            option_root = self._dropdown_root_for_control(select)
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
@@ -6829,6 +6952,7 @@ def main() -> None:
             )
 
         store = DataStore()
+        ensure_runner_lock_available(store)
         restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args)) if args.execute else []
         if restored_weekend_rows:
             restored_by_insurer: dict[str, list[str]] = {}
