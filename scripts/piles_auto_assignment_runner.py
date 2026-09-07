@@ -3802,6 +3802,12 @@ class CuracelPilesRunner:
                     f"Available options: {[text for text, _ in available]}"
                 )
 
+            if desired_keys == available_keys:
+                overlay_root = self._active_multiselect_root()
+                if self._click_multiselect_select_all(overlay_root):
+                    self._close_dropdown()
+                    return True
+
             self._close_dropdown()
             for text, selected in available:
                 should_select = label_key(text) in desired_keys
@@ -3840,82 +3846,21 @@ class CuracelPilesRunner:
                 raise
             return False
 
-    def _click_multiselect_select_all(self, option_root: Any) -> bool:
-        selectors = [
-            ".p-multiselect-header [data-pc-name='pcheadercheckbox']",
-            ".p-multiselect-header [data-pc-name='pcheadercheckbox'] [data-pc-section='input']",
-            ".p-multiselect-header [data-pc-name='pcheadercheckbox'] [data-pc-section='box']",
-            ".p-multiselect-header .p-checkbox-input[aria-label*='all items' i]",
-            ".p-multiselect-header .p-checkbox-box",
-            ".p-multiselect-header .p-checkbox",
-            "[data-pc-section='header'] [role='checkbox']",
-            "[data-pc-section='header'] .p-checkbox-box",
-            "[data-pc-section='headercheckboxcontainer']",
-            "[data-pc-section='headercheckbox']",
-            "[data-pc-section='headercheckbox'] .p-checkbox-box",
-            ".p-multiselect-select-all [role='checkbox']",
-            ".p-multiselect-select-all .p-checkbox-box",
-            ".p-multiselect-header .p-checkbox-box",
-            ".p-multiselect-header .p-checkbox",
-            ".p-multiselect-header [role='checkbox']",
-            "button[aria-label*='all' i]",
-            "button[title*='all' i]",
-            "button:has-text('Select All')",
-            "button:has-text('select all')",
-        ]
-        for selector in selectors:
+    def _click_multiselect_select_all(self, overlay_root: Any) -> bool:
+        try:
+            target = overlay_root.locator(".p-multiselect-header .p-checkbox-input").first
+            if target.count() == 0 or not target.is_visible():
+                return False
+            input_label = norm(target.get_attribute("aria-label")).lower()
+            if "all items selected" in input_label:
+                return True
             try:
-                locs = option_root.locator(selector)
-                for idx in range(locs.count()):
-                    loc = locs.nth(idx)
-                    if not loc.is_visible():
-                        continue
-                    click_targets = [
-                        loc,
-                        loc.locator("[data-pc-name='pcheadercheckbox']").first,
-                        loc.locator("[data-pc-section='input']").first,
-                        loc.locator("[data-pc-section='box']").first,
-                        loc.locator("[role='checkbox']").first,
-                        loc.locator("input[type='checkbox']").first,
-                        loc.locator(".p-checkbox-box").first,
-                        loc.locator(".p-checkbox").first,
-                    ]
-                    for target in click_targets:
-                        try:
-                            if target.count() == 0 or not target.is_visible():
-                                continue
-                            current = norm(target.get_attribute("aria-checked")).lower()
-                            input_label = norm(target.get_attribute("aria-label")).lower()
-                            classes = norm(target.get_attribute("class")).lower()
-                            if current == "true" or "checked" in classes or "all items selected" in input_label:
-                                return True
-                            target.click(force=True)
-                            time.sleep(0.25)
-                            verify_targets = [
-                                option_root.locator(".p-multiselect-header [data-pc-name='pcheadercheckbox']").first,
-                                option_root.locator(".p-multiselect-header .p-checkbox-input").first,
-                                target,
-                            ]
-                            for verify in verify_targets:
-                                try:
-                                    if verify.count() == 0:
-                                        continue
-                                    verify_checked = norm(verify.get_attribute("aria-checked")).lower()
-                                    verify_label = norm(verify.get_attribute("aria-label")).lower()
-                                    verify_classes = norm(verify.get_attribute("class")).lower()
-                                    if (
-                                        verify_checked == "true"
-                                        or "checked" in verify_classes
-                                        or "all items selected" in verify_label
-                                    ):
-                                        return True
-                                except Exception:
-                                    continue
-                        except Exception:
-                            continue
+                target.evaluate("element => element.click()")
             except Exception:
-                continue
-        return False
+                target.click(force=True)
+            return True
+        except Exception:
+            return False
 
     def _read_select_text(self, select: Any | None) -> str:
         if select is None:

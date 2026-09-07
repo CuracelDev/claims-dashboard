@@ -827,7 +827,7 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertTrue(year_2025.clicked)
         self.assertFalse(year_2026.clicked)
 
-    def test_multiselect_all_years_selects_each_missing_option(self):
+    def test_multiselect_all_years_uses_native_header_checkbox(self):
         class Locator:
             def __init__(self, *, attributes=None, children=None, text=""):
                 self.attributes = attributes or {}
@@ -844,6 +844,9 @@ class YearFilterScanningTests(unittest.TestCase):
 
             def count(self):
                 return 1
+
+            def is_visible(self):
+                return True
 
             def inner_text(self):
                 return self.text
@@ -869,10 +872,13 @@ class YearFilterScanningTests(unittest.TestCase):
                 return self.items[0] if self.items else self
 
         option_selector = ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+        header_selector = ".p-multiselect-header .p-checkbox-input"
         year_2026 = Locator(text="2026", attributes={"aria-selected": "true"})
         year_2025 = Locator(text="2025", attributes={"aria-selected": "false"})
+        header_checkbox = Locator(attributes={"aria-label": "All items unselected"})
         year_panel = Locator(children={
             option_selector: LocatorList([year_2026, year_2025]),
+            header_selector: LocatorList([header_checkbox]),
         })
         control = Locator(attributes={"aria-controls": "year-options"})
         page = Locator(children={'[id="year-options"]': year_panel})
@@ -880,8 +886,8 @@ class YearFilterScanningTests(unittest.TestCase):
         portal_runner.page = page
         portal_runner._open_select = lambda _control: True
         portal_runner._active_dropdown_root = lambda: year_panel
+        portal_runner._active_multiselect_root = lambda: year_panel
         portal_runner._close_dropdown = lambda: None
-        portal_runner._click_multiselect_select_all = lambda _root: True
 
         selected = runner.CuracelPilesRunner._set_multiselect_values(
             portal_runner,
@@ -893,7 +899,8 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertFalse(year_2026.clicked)
         self.assertFalse(year_2025.clicked)
-        self.assertTrue(year_2025.dom_clicked)
+        self.assertFalse(year_2025.dom_clicked)
+        self.assertTrue(header_checkbox.dom_clicked)
 
     def test_year_candidates_include_primevue_combobox_without_legacy_root_class(self):
         class Control:
