@@ -3326,7 +3326,10 @@ class CuracelPilesRunner:
             if text:
                 option_texts.append((text, option))
             if label_key(text) == label_key(desired_text):
-                option.click(force=True)
+                try:
+                    option.evaluate("element => element.click()")
+                except Exception:
+                    option.click(force=True)
                 time.sleep(0.8)
                 return text
         if self.allow_test_any_assignee:
@@ -3334,7 +3337,10 @@ class CuracelPilesRunner:
                 lowered = text.lower()
                 if lowered in {"select user", "no results found", "all"}:
                     continue
-                option.click(force=True)
+                try:
+                    option.evaluate("element => element.click()")
+                except Exception:
+                    option.click(force=True)
                 time.sleep(0.8)
                 print(f"  Test fallback: selected available assignee '{text}' instead of requested '{desired_text}'.")
                 return text
@@ -3763,7 +3769,17 @@ class CuracelPilesRunner:
                         pass
                     raise RuntimeError(f"Could not set filter to '{desired_text}'.")
                 return False
-            return True
+            timeout_ms = getattr(self, "select_confirmation_timeout_ms", 5000)
+            deadline = time.time() + (timeout_ms / 1000)
+            observed_text = ""
+            while time.time() < deadline:
+                observed_text = self._read_select_text(select)
+                if label_key(observed_text) == label_key(selected_text):
+                    return True
+                time.sleep(0.1)
+            raise RuntimeError(
+                f"Select value was not confirmed. Requested '{selected_text}', observed '{observed_text}'."
+            )
         except Exception:
             if required:
                 raise
