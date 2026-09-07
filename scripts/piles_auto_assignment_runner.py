@@ -3340,7 +3340,7 @@ class CuracelPilesRunner:
                 return text
         return None
 
-    def _wait_for_dropdown_options(self, control: Any | None = None, timeout_ms: int = 4000) -> None:
+    def _wait_for_dropdown_options(self, control: Any | None = None, timeout_ms: int = 4000) -> bool:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
@@ -3353,7 +3353,7 @@ class CuracelPilesRunner:
                             "[data-pc-section='option']"
                         )
                         if options.count() > 0:
-                            return
+                            return True
                     elif not self._dropdown_reference_ids(control):
                         panels = self._visible_dropdown_panels()
                         if panels:
@@ -3362,7 +3362,7 @@ class CuracelPilesRunner:
                                 "[data-pc-section='option']"
                             )
                             if options.count() > 0:
-                                return
+                                return True
                 else:
                     panels = self._visible_dropdown_panels()
                     if panels:
@@ -3371,33 +3371,53 @@ class CuracelPilesRunner:
                             "[data-pc-section='option']"
                         )
                         if options.count() > 0:
-                            return
+                            return True
             except Exception:
                 pass
             time.sleep(0.2)
+        return False
 
     def _open_select(self, select: Any) -> bool:
         assert self.page
-        try:
-            select.click()
-        except Exception:
+        control_classes = norm(select.get_attribute("class")).lower().split()
+        is_primevue_multiselect = "p-multiselect" in control_classes
+
+        if is_primevue_multiselect:
             try:
-                label = select.locator("[role='combobox'], .p-select-label").first
-                if label.count() and label.is_visible():
-                    label.click(force=True)
-                else:
-                    raise
+                select.evaluate("element => element.click()")
+                if self._wait_for_dropdown_options(select):
+                    return True
             except Exception:
-                try:
-                    dropdown = select.locator(".p-select-dropdown, [data-pc-section='dropdown']").first
-                    if dropdown.count() and dropdown.is_visible():
-                        dropdown.click(force=True)
-                    else:
-                        raise
-                except Exception:
-                    return False
-        self._wait_for_dropdown_options(select)
-        return True
+                pass
+
+        click_targets = [
+            select,
+            select.locator("[role='combobox'], .p-select-label").first,
+            select.locator(
+                ".p-select-dropdown, .p-multiselect-dropdown, [data-pc-section='dropdown']"
+            ).first,
+        ]
+        for target in click_targets:
+            try:
+                if target is not select and (not target.count() or not target.is_visible()):
+                    continue
+                if target is select:
+                    target.click()
+                else:
+                    target.click(force=True)
+                if self._wait_for_dropdown_options(select):
+                    return True
+            except Exception:
+                continue
+
+        if not is_primevue_multiselect:
+            try:
+                select.evaluate("element => element.click()")
+                if self._wait_for_dropdown_options(select):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _dropdown_option_texts(self, control: Any | None = None) -> list[str]:
         assert self.page
