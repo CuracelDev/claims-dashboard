@@ -27,7 +27,7 @@ from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -405,6 +405,21 @@ def year_scan_labels(requested_year: str, available_years: list[str], *, support
             f"Visible years: {', '.join(normalized_years)}"
         )
     return [requested]
+
+
+def piles_response_matches_filter_year(url: str, requested_year: str) -> bool:
+    parsed_url = urlsplit(norm(url))
+    if not re.search(r"/piles(?:/|$)", parsed_url.path, flags=re.IGNORECASE):
+        return False
+    requested = parse_year_label(requested_year)
+    if norm_key(requested) == "all":
+        return True
+    for key, value in parse_qsl(parsed_url.query, keep_blank_values=True):
+        if not re.fullmatch(r"year(?:\[\d*\])?", key, flags=re.IGNORECASE):
+            continue
+        if requested in re.findall(r"\b20\d{2}\b", value):
+            return True
+    return False
 
 
 def supports_multiple_year_selection(
@@ -895,6 +910,14 @@ class PileRow:
 
 def effective_filter_year(pile: "PileRow", requested_year: str) -> str:
     return norm(pile.filter_year) or requested_year
+
+
+def pile_row_matches_filter_year(pile: "PileRow", requested_year: str) -> bool:
+    expected_year = parse_year_label(requested_year)
+    if norm_key(expected_year) == "all":
+        return True
+    rendered_years = set(re.findall(r"\b20\d{2}\b", norm(pile.month)))
+    return not rendered_years or rendered_years == {expected_year}
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -2784,6 +2807,9 @@ class CuracelPilesRunner:
             "page_size": None,
         }
         self._table_headers_cache: list[str] = []
+        self._piles_response_events: list[tuple[int, int, str, Any]] = []
+        self._piles_response_sequence = 0
+        self.year_filter_confirmation_timeout_ms = 5000
 
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
@@ -2805,6 +2831,7 @@ class CuracelPilesRunner:
             self._ensure_playwright_browsers()
             self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
         self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
+        self.page.on("response", self._capture_piles_response)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -2821,6 +2848,46 @@ class CuracelPilesRunner:
             "page_size": None,
         }
         self._table_headers_cache = []
+
+    def _capture_piles_response(self, response: Any) -> None:
+        try:
+            if norm(response.request.method).upper() != "GET":
+                return
+            if not piles_response_matches_filter_year(response.url, "All"):
+                return
+            self._piles_response_sequence = getattr(self, "_piles_response_sequence", 0) + 1
+            self._piles_response_events.append((
+                self._piles_response_sequence,
+                safe_int(response.status, 0),
+                norm(response.url),
+                response,
+            ))
+            if len(self._piles_response_events) > 100:
+                self._piles_response_events = self._piles_response_events[-100:]
+        except Exception:
+            return
+
+    def _wait_for_piles_filter_response(self, marker: int, year_label: str, timeout_ms: int = 10000) -> None:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            matching_events = [
+                (status, url, response)
+                for sequence, status, url, response in self._piles_response_events
+                if sequence > marker
+                if piles_response_matches_filter_year(url, year_label)
+            ]
+            if matching_events:
+                status, url, response = matching_events[-1]
+                if 200 <= status < 400:
+                    response.finished()
+                    return
+                raise RuntimeError(
+                    f"Piles data request for year '{year_label}' failed with HTTP {status}: {url}"
+                )
+            time.sleep(0.1)
+        raise RuntimeError(
+            f"No completed Piles data request confirmed the year '{year_label}' within {timeout_ms}ms."
+        )
 
     def _dismiss_popup(self) -> None:
         assert self.page
@@ -3432,6 +3499,56 @@ class CuracelPilesRunner:
         _control, available_years, supports_multiple = self._find_year_filter_control()
         return supports_multiple, available_years
 
+    def _read_selected_multiselect_years(self, control: Any) -> set[str]:
+        if not self._open_select(control):
+            return set()
+        try:
+            option_root = self._active_dropdown_root()
+            options = option_root.locator(
+                ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+            )
+            selected_years: set[str] = set()
+            for index in range(options.count()):
+                option = options.nth(index)
+                text = norm(option.inner_text())
+                if not re.fullmatch(r"20\d{2}", text):
+                    continue
+                is_selected = (
+                    norm(option.get_attribute("aria-selected")).lower() == "true"
+                    or norm(option.get_attribute("data-p-selected")).lower() == "true"
+                )
+                if is_selected:
+                    selected_years.add(text)
+            return selected_years
+        finally:
+            self._close_dropdown()
+
+    def _wait_for_year_filter_selection(
+        self,
+        control: Any,
+        desired_years: set[str],
+        *,
+        supports_multiple: bool,
+    ) -> None:
+        timeout_ms = getattr(self, "year_filter_confirmation_timeout_ms", 5000)
+        deadline = time.time() + (timeout_ms / 1000)
+        observed_years: set[str] = set()
+        observed_text = ""
+        while time.time() < deadline:
+            if supports_multiple:
+                observed_years = self._read_selected_multiselect_years(control)
+            else:
+                observed_text = self._read_select_text(control)
+                observed_years = set(re.findall(r"\b20\d{2}\b", observed_text))
+            if observed_years == desired_years:
+                return
+            time.sleep(0.1)
+        observed_label = sorted(observed_years, reverse=True) if supports_multiple else observed_text
+        raise RuntimeError(
+            "Year filter selection was not confirmed. "
+            f"Requested {sorted(desired_years, reverse=True)}, observed {observed_label}."
+        )
+
     def _apply_year_filter(self, year_label: str) -> Any:
         year_select, available_years, supports_multiple = self._find_year_filter_control()
         desired_year_values = year_scan_labels(
@@ -3442,8 +3559,19 @@ class CuracelPilesRunner:
         if supports_multiple:
             values_to_select = available_years if desired_year_values == ["All"] else desired_year_values
             self._set_multiselect_values(year_select, values_to_select, required=True)
+            self._wait_for_year_filter_selection(
+                year_select,
+                set(values_to_select),
+                supports_multiple=True,
+            )
         else:
-            self._set_select_value(year_select, desired_year_values[0], required=True)
+            desired_year = desired_year_values[0]
+            self._set_select_value(year_select, desired_year, required=True)
+            self._wait_for_year_filter_selection(
+                year_select,
+                {desired_year},
+                supports_multiple=False,
+            )
         return year_select
 
     def _set_select_value(self, select: Any | None, desired_text: str, required: bool = False) -> bool:
@@ -3646,6 +3774,7 @@ class CuracelPilesRunner:
         final_month_select = None
         final_year_select = None
         final_status_select = None
+        year_response_marker: int | None = None
         desired_year_state = "All" if norm_key(year_label) == "all" else year_label
         month_changed = self._filter_state["month"] != month_label
         year_changed = self._filter_state["year"] != desired_year_state
@@ -3682,6 +3811,7 @@ class CuracelPilesRunner:
 
             year_select = None
             if year_changed:
+                year_response_marker = self._piles_response_sequence
                 year_select = self._apply_year_filter(year_label)
 
             status_select = None
@@ -3720,6 +3850,9 @@ class CuracelPilesRunner:
 
         if final_status_select is None:
             raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
+
+        if year_changed and year_response_marker is not None:
+            self._wait_for_piles_filter_response(year_response_marker, year_label)
 
         self._filter_state["month"] = month_label
         self._filter_state["year"] = desired_year_state
@@ -3928,6 +4061,16 @@ class CuracelPilesRunner:
         page_number = 1
         while True:
             page_rows = self.rows_on_current_page(status_label, page_number, month_label, year_label)
+            mismatched_rows = [
+                row for row in page_rows
+                if not pile_row_matches_filter_year(row, year_label)
+            ]
+            if mismatched_rows:
+                rendered_months = sorted({norm(row.month) or "<empty>" for row in mismatched_rows})
+                raise RuntimeError(
+                    f"Piles table did not settle on expected year '{year_label}'. "
+                    f"Rendered month values: {', '.join(rendered_months[:5])}"
+                )
             fingerprint = tuple(row.key for row in page_rows)
             if fingerprint in seen_pages:
                 break

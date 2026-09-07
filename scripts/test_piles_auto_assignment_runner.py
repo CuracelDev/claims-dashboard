@@ -386,11 +386,47 @@ class YearFilterScanningTests(unittest.TestCase):
             ],
         )
 
+    def test_scan_rejects_rows_rendered_for_a_different_year(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.apply_filters = lambda *_args: None
+        portal_runner.try_set_page_size = lambda *_args: None
+        stale_row = make_pile(1, filter_year="2025")
+        stale_row.month = "Jul 2026"
+        portal_runner.rows_on_current_page = lambda *_args: [stale_row]
+        portal_runner.goto_next_page = lambda: False
+
+        with self.assertRaisesRegex(RuntimeError, "expected year '2025'.*Jul 2026"):
+            runner.CuracelPilesRunner.scan_status(
+                portal_runner,
+                "All",
+                "2025",
+                "Vetting Pending",
+            )
+
+    def test_scan_accepts_month_only_rows_after_the_filter_request_is_confirmed(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.apply_filters = lambda *_args: None
+        portal_runner.try_set_page_size = lambda *_args: None
+        month_only_row = make_pile(1, filter_year="2025")
+        month_only_row.month = "Jul"
+        portal_runner.rows_on_current_page = lambda *_args: [month_only_row]
+        portal_runner.goto_next_page = lambda: False
+
+        rows = runner.CuracelPilesRunner.scan_status(
+            portal_runner,
+            "All",
+            "2025",
+            "Vetting Pending",
+        )
+
+        self.assertEqual(rows, [month_only_row])
+
     def test_current_single_select_applies_one_concrete_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         control = object()
         applied = []
         portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], False)
+        portal_runner._read_select_text = lambda _control: "2025"
         portal_runner._set_select_value = lambda selected, value, required=False: applied.append(
             (selected, value, required)
         )
@@ -403,11 +439,35 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertIs(selected_control, control)
         self.assertEqual(applied, [(control, "2025", True)])
 
+    def test_current_single_select_rejects_an_unconfirmed_year(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        control = object()
+        portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], False)
+        portal_runner.year_filter_confirmation_timeout_ms = 1
+        portal_runner._set_select_value = lambda *_args, **_kwargs: True
+        portal_runner._read_select_text = lambda _control: "2026"
+
+        with self.assertRaisesRegex(RuntimeError, "Year filter selection was not confirmed.*2025"):
+            runner.CuracelPilesRunner._apply_year_filter(portal_runner, "2025")
+
+    def test_current_single_select_waits_for_a_delayed_year_label(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        control = object()
+        observed_labels = iter(["2026", "2025"])
+        portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], False)
+        portal_runner._set_select_value = lambda *_args, **_kwargs: True
+        portal_runner._read_select_text = lambda _control: next(observed_labels)
+
+        selected_control = runner.CuracelPilesRunner._apply_year_filter(portal_runner, "2025")
+
+        self.assertIs(selected_control, control)
+
     def test_legacy_multiselect_applies_every_visible_year_for_all(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         control = object()
         applied = []
         portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], True)
+        portal_runner._read_selected_multiselect_years = lambda _control: {"2026", "2025"}
         portal_runner._set_select_value = lambda *_args, **_kwargs: self.fail(
             "The legacy multiselect portal must retain its multiselect path."
         )
@@ -419,6 +479,93 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertIs(selected_control, control)
         self.assertEqual(applied, [(control, ["2026", "2025"], True)])
+
+    def test_legacy_multiselect_rejects_an_incomplete_selection(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        control = object()
+        portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], True)
+        portal_runner.year_filter_confirmation_timeout_ms = 1
+        portal_runner._set_multiselect_values = lambda *_args, **_kwargs: True
+        portal_runner._read_selected_multiselect_years = lambda _control: {"2026"}
+
+        with self.assertRaisesRegex(RuntimeError, "Year filter selection was not confirmed.*2025"):
+            runner.CuracelPilesRunner._apply_year_filter(portal_runner, "All")
+
+    def test_piles_response_must_contain_the_concrete_filter_year(self):
+        matches = getattr(runner, "piles_response_matches_filter_year", lambda *_args: False)
+
+        self.assertTrue(matches("https://api.health.curacel.co/api/piles?year%5B%5D=2025&page=1", "2025"))
+        self.assertFalse(matches("https://api.health.curacel.co/api/piles?year%5B%5D=2026&page=1", "2025"))
+        self.assertFalse(matches("https://api.health.curacel.co/api/piles?year=2026&submitted_from=2025-01-01", "2025"))
+        self.assertFalse(matches("https://api.health.curacel.co/api/providers?year=2025", "2025"))
+
+    def test_filter_response_marker_survives_history_truncation(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+
+        class Request:
+            method = "GET"
+
+        class Response:
+            request = Request()
+            status = 200
+            url = "https://api.health.curacel.co/api/piles?year=2025&page=1"
+
+            def finished(self):
+                return None
+
+        old_response = Response()
+        portal_runner._piles_response_events = [
+            (index, 200, f"https://api.health.curacel.co/api/piles?year=2026&page={index}", old_response)
+            for index in range(1, 101)
+        ]
+        portal_runner._piles_response_sequence = 100
+        marker = portal_runner._piles_response_sequence
+
+        runner.CuracelPilesRunner._capture_piles_response(portal_runner, Response())
+        runner.CuracelPilesRunner._wait_for_piles_filter_response(
+            portal_runner,
+            marker,
+            "2025",
+            timeout_ms=1,
+        )
+
+    def test_filter_wait_requires_and_finishes_the_matching_year_response(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+
+        class Response:
+            def __init__(self):
+                self.finished_calls = 0
+
+            def finished(self):
+                self.finished_calls += 1
+
+        response = Response()
+        portal_runner._piles_response_events = [
+            (1, 200, "https://api.health.curacel.co/api/piles?year=2025&page=1", response),
+        ]
+
+        runner.CuracelPilesRunner._wait_for_piles_filter_response(
+            portal_runner,
+            0,
+            "2025",
+            timeout_ms=1,
+        )
+
+        self.assertEqual(response.finished_calls, 1)
+
+    def test_filter_wait_rejects_a_response_for_the_previous_year(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_events = [
+            (1, 200, "https://api.health.curacel.co/api/piles?year=2026&page=1", object()),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "No completed Piles data request.*2025"):
+            runner.CuracelPilesRunner._wait_for_piles_filter_response(
+                portal_runner,
+                0,
+                "2025",
+                timeout_ms=1,
+            )
 
 
 if __name__ == "__main__":
