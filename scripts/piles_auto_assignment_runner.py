@@ -3253,10 +3253,13 @@ class CuracelPilesRunner:
             self._close_dropdown()
         return None
 
-    def _choose_option_from_open_dropdown(self, desired_text: str) -> str | None:
+    def _choose_option_from_open_dropdown(self, desired_text: str, control: Any | None = None) -> str | None:
         assert self.page
-        panels = self._visible_dropdown_panels()
-        option_root = panels[-1] if panels else self.page
+        if control is not None:
+            option_root = self._dropdown_root_for_control(control)
+        else:
+            panels = self._visible_dropdown_panels()
+            option_root = panels[-1] if panels else self.page
         options = option_root.locator("li.p-select-option, .p-select-option, [role='option']")
         option_texts: list[tuple[str, Any]] = []
         for idx in range(options.count()):
@@ -3315,9 +3318,9 @@ class CuracelPilesRunner:
         self._wait_for_dropdown_options()
         return True
 
-    def _dropdown_option_texts(self) -> list[str]:
+    def _dropdown_option_texts(self, control: Any | None = None) -> list[str]:
         assert self.page
-        option_root = self._active_dropdown_root()
+        option_root = self._dropdown_root_for_control(control) if control is not None else self._active_dropdown_root()
         options = option_root.locator("li.p-select-option, .p-select-option, [role='option']")
         texts: list[str] = []
         for idx in range(options.count()):
@@ -3532,7 +3535,7 @@ class CuracelPilesRunner:
         if not self._open_select(control):
             return set()
         try:
-            option_root = self._active_dropdown_root()
+            option_root = self._dropdown_root_for_control(control)
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
@@ -3612,9 +3615,9 @@ class CuracelPilesRunner:
         try:
             if not self._open_select(select):
                 raise RuntimeError(f"Could not open select for '{desired_text}'.")
-            selected_text = self._choose_option_from_open_dropdown(desired_text)
+            selected_text = self._choose_option_from_open_dropdown(desired_text, select)
             if not selected_text:
-                available_options = self._dropdown_option_texts()
+                available_options = self._dropdown_option_texts(select)
                 try:
                     self.page.keyboard.press("Escape")
                 except Exception:
@@ -3644,7 +3647,7 @@ class CuracelPilesRunner:
         try:
             if not self._open_select(select):
                 raise RuntimeError(f"Could not open multiselect for '{desired_values}'.")
-            option_root = self._active_dropdown_root()
+            option_root = self._dropdown_root_for_control(select)
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
