@@ -439,6 +439,86 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertIs(selected_control, control)
         self.assertEqual(applied, [(control, "2025", True)])
 
+    def test_year_inspection_uses_the_panel_owned_by_the_control(self):
+        class Locator:
+            def __init__(self, *, attributes=None, children=None, text=""):
+                self.attributes = attributes or {}
+                self.children = children or {}
+                self.text = text
+
+            def get_attribute(self, name):
+                return self.attributes.get(name)
+
+            def locator(self, selector):
+                return self.children.get(selector, LocatorList([]))
+
+            def count(self):
+                return 1
+
+            def nth(self, index):
+                if index != 0:
+                    raise IndexError(index)
+                return self
+
+            def is_visible(self):
+                return True
+
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return self.text
+
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+            def get_attribute(self, _name):
+                return None
+
+        year_options = LocatorList([Locator(text="2026"), Locator(text="2025")])
+        year_listbox = Locator(attributes={"aria-multiselectable": "false"})
+        year_panel = Locator(children={
+            ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']": year_options,
+            "[role='listbox']": year_listbox,
+        })
+        wrong_panel = Locator(children={
+            ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']": LocatorList([
+                Locator(text="Vetting Pending"),
+            ]),
+            "[role='listbox']": LocatorList([]),
+        })
+        combobox = Locator(attributes={"aria-controls": "year-options"})
+        control = Locator(
+            attributes={"class": "p-select p-component", "multiple": ""},
+            children={"[role='combobox']": combobox},
+        )
+        page = Locator(children={'[id="year-options"]': year_panel})
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = page
+        portal_runner._open_select = lambda _control: True
+        portal_runner._active_dropdown_root = lambda: wrong_panel
+        portal_runner._close_dropdown = lambda: None
+
+        available_years, supports_multiple = runner.CuracelPilesRunner._inspect_year_control(
+            portal_runner,
+            control,
+        )
+
+        self.assertEqual(available_years, ["2026", "2025"])
+        self.assertFalse(supports_multiple)
+
     def test_current_single_select_rejects_an_unconfirmed_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         control = object()

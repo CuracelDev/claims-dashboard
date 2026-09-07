@@ -3453,12 +3453,41 @@ class CuracelPilesRunner:
             self._append_unique_select(candidates, control)
         return candidates
 
+    def _dropdown_root_owned_by(self, control: Any) -> Any | None:
+        assert self.page
+        owners: list[Any] = [control]
+        for selector in ("[role='combobox']", "[aria-controls]", "[aria-owns]"):
+            try:
+                descendants = control.locator(selector)
+                for index in range(descendants.count()):
+                    owners.append(descendants.nth(index))
+            except Exception:
+                continue
+
+        for owner in owners:
+            for attribute in ("aria-controls", "aria-owns"):
+                try:
+                    referenced_ids = norm(owner.get_attribute(attribute)).split()
+                except Exception:
+                    continue
+                for referenced_id in referenced_ids:
+                    try:
+                        panel = self.page.locator(f"[id={json.dumps(referenced_id)}]").first
+                        if panel.count() and panel.is_visible():
+                            return panel
+                    except Exception:
+                        continue
+        return None
+
+    def _dropdown_root_for_control(self, control: Any) -> Any:
+        return self._dropdown_root_owned_by(control) or self._active_dropdown_root()
+
     def _inspect_year_control(self, control: Any) -> tuple[list[str], bool]:
         assert self.page
         if not self._open_select(control):
             return [], False
         try:
-            option_root = self._active_dropdown_root()
+            option_root = self._dropdown_root_for_control(control)
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
