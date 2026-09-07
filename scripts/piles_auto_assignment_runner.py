@@ -3650,6 +3650,27 @@ class CuracelPilesRunner:
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
+            try:
+                option_states = options.evaluate_all(
+                    """elements => elements.map(element => ({
+                        text: element.innerText.trim(),
+                        ariaSelected: element.getAttribute('aria-selected'),
+                        dataSelected: element.getAttribute('data-p-selected'),
+                    }))"""
+                )
+                return {
+                    norm(state.get("text"))
+                    for state in option_states
+                    if re.fullmatch(r"20\d{2}", norm(state.get("text")))
+                    if (
+                        norm(state.get("ariaSelected")).lower() == "true"
+                        or norm(state.get("dataSelected")).lower() == "true"
+                    )
+                }
+            except Exception:
+                # Lightweight test doubles and older Playwright versions may not
+                # expose evaluate_all; keep the stable-DOM fallback for them.
+                pass
             selected_years: set[str] = set()
             for index in range(options.count()):
                 option = options.nth(index)
@@ -3762,32 +3783,53 @@ class CuracelPilesRunner:
             options = option_root.locator(
                 ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
             )
-            available: list[tuple[str, Any, bool]] = []
+            available: list[tuple[str, bool]] = []
             for idx in range(options.count()):
                 option = options.nth(idx)
                 text = norm(option.inner_text())
                 if not text:
                     continue
                 selected = norm(option.get_attribute("aria-selected")).lower() == "true" or norm(option.get_attribute("data-p-selected")).lower() == "true"
-                available.append((text, option, selected))
+                available.append((text, selected))
 
             if not available:
                 raise RuntimeError("No year options were visible in the multiselect.")
 
-            available_keys = {label_key(text) for text, _, _ in available}
+            available_keys = {label_key(text) for text, _ in available}
             if not desired_keys.issubset(available_keys):
                 raise RuntimeError(
                     f"Requested multiselect values {desired_values} were not all visible. "
-                    f"Available options: {[text for text, _, _ in available]}"
+                    f"Available options: {[text for text, _ in available]}"
                 )
 
-            for text, option, selected in available:
-                should_select = label_key(text) in desired_keys
-                if should_select != selected:
-                    option.click(force=True)
-                    time.sleep(0.15)
-
             self._close_dropdown()
+            for text, selected in available:
+                should_select = label_key(text) in desired_keys
+                if should_select == selected:
+                    continue
+                if not self._open_select(select):
+                    raise RuntimeError(f"Could not reopen multiselect while setting '{text}'.")
+                try:
+                    fresh_root = self._dropdown_root_for_control(select)
+                    fresh_options = fresh_root.locator(
+                        ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                        "[data-pc-section='option']"
+                    )
+                    target = None
+                    for index in range(fresh_options.count()):
+                        candidate = fresh_options.nth(index)
+                        if label_key(candidate.inner_text()) == label_key(text):
+                            target = candidate
+                            break
+                    if target is None:
+                        raise RuntimeError(f"Year option '{text}' disappeared while updating the filter.")
+                    try:
+                        target.evaluate("element => element.click()")
+                    except Exception:
+                        target.click(force=True)
+                    time.sleep(0.4)
+                finally:
+                    self._close_dropdown()
             return True
         except Exception:
             try:
