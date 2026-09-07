@@ -407,6 +407,19 @@ def year_scan_labels(requested_year: str, available_years: list[str], *, support
     return [requested]
 
 
+def supports_multiple_year_selection(
+    *,
+    control_classes: str,
+    control_multiple_attribute: bool,
+    listbox_aria_multiselectable: str,
+) -> bool:
+    del control_multiple_attribute
+    return (
+        "p-multiselect" in norm(control_classes).lower().split()
+        or norm(listbox_aria_multiselectable).lower() == "true"
+    )
+
+
 def slack_mention(slack_user_id: str, fallback_name: str) -> str:
     return f"<@{slack_user_id}>" if norm(slack_user_id) else (fallback_name or "Team")
 
@@ -876,7 +889,12 @@ class PileRow:
     page_number: int
     assignment_type: str
     filter_month: str
+    filter_year: str
     legacy_tracking_key: str = ""
+
+
+def effective_filter_year(pile: "PileRow", requested_year: str) -> str:
+    return norm(pile.filter_year) or requested_year
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -909,6 +927,7 @@ class PlannedAssignment:
     current_status: str
     status_bucket: str
     filter_month: str
+    filter_year: str
     source_page_number: int
     legacy_tracking_key: str = ""
 
@@ -928,6 +947,22 @@ class AppliedAssignment:
     matched_planned_assignee: bool
     verified_on_table: bool
     observed_assigned_values: list[str]
+
+
+def assignment_filter_contexts(
+    month_labels: list[str],
+    requested_year: str,
+    plans: list[PlannedAssignment],
+) -> list[tuple[str, str]]:
+    contexts: list[tuple[str, str]] = []
+    for month_label in month_labels:
+        for plan in plans:
+            if plan.filter_month != month_label:
+                continue
+            context = (month_label, norm(plan.filter_year) or requested_year)
+            if context not in contexts:
+                contexts.append(context)
+    return contexts
 
 
 @dataclass
@@ -3343,6 +3378,74 @@ class CuracelPilesRunner:
         visible = self._visible_multiselects()
         return visible[0] if visible else None
 
+    def _year_control_candidates(self) -> list[Any]:
+        candidates: list[Any] = []
+        self._append_unique_select(candidates, self._select_following_label_text("Year"))
+        self._append_unique_select(candidates, self._select_in_container("Year"))
+        for control in [*self._visible_multiselects(), *self._visible_selects()]:
+            self._append_unique_select(candidates, control)
+        return candidates
+
+    def _inspect_year_control(self, control: Any) -> tuple[list[str], bool]:
+        assert self.page
+        if not self._open_select(control):
+            return [], False
+        try:
+            option_root = self._active_dropdown_root()
+            options = option_root.locator(
+                ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+            )
+            option_texts = [
+                norm(options.nth(index).inner_text())
+                for index in range(options.count())
+            ]
+            available_years = list(dict.fromkeys(
+                text for text in option_texts if re.fullmatch(r"20\d{2}", text)
+            ))
+            listbox = option_root.locator("[role='listbox']").first
+            listbox_aria = ""
+            if listbox.count():
+                listbox_aria = norm(listbox.get_attribute("aria-multiselectable"))
+            supports_multiple = supports_multiple_year_selection(
+                control_classes=norm(control.get_attribute("class")),
+                control_multiple_attribute=control.get_attribute("multiple") is not None,
+                listbox_aria_multiselectable=listbox_aria,
+            )
+            return available_years, supports_multiple
+        finally:
+            self._close_dropdown()
+
+    def _find_year_filter_control(self) -> tuple[Any, list[str], bool]:
+        for control in self._year_control_candidates():
+            try:
+                available_years, supports_multiple = self._inspect_year_control(control)
+                if available_years:
+                    return control, available_years, supports_multiple
+            except Exception:
+                continue
+        raise RuntimeError(
+            "Could not identify the Year filter from the visible controls. "
+            f"Visible top selects: {self._describe_visible_selects()}"
+        )
+
+    def year_filter_capabilities(self) -> tuple[bool, list[str]]:
+        _control, available_years, supports_multiple = self._find_year_filter_control()
+        return supports_multiple, available_years
+
+    def _apply_year_filter(self, year_label: str) -> Any:
+        year_select, available_years, supports_multiple = self._find_year_filter_control()
+        desired_year_values = year_scan_labels(
+            year_label,
+            available_years,
+            supports_multiple=supports_multiple,
+        )
+        if supports_multiple:
+            values_to_select = available_years if desired_year_values == ["All"] else desired_year_values
+            self._set_multiselect_values(year_select, values_to_select, required=True)
+        else:
+            self._set_select_value(year_select, desired_year_values[0], required=True)
+        return year_select
+
     def _set_select_value(self, select: Any | None, desired_text: str, required: bool = False) -> bool:
         assert self.page
         if select is None:
@@ -3384,8 +3487,10 @@ class CuracelPilesRunner:
         try:
             if not self._open_select(select):
                 raise RuntimeError(f"Could not open multiselect for '{desired_values}'.")
-            option_root = self._active_multiselect_root()
-            options = option_root.locator("li.p-multiselect-option, li[role='option'], [data-pc-section='option']")
+            option_root = self._active_dropdown_root()
+            options = option_root.locator(
+                ".p-select-option, li.p-multiselect-option, li[role='option'], [data-pc-section='option']"
+            )
             available: list[tuple[str, Any, bool]] = []
             for idx in range(options.count()):
                 option = options.nth(idx)
@@ -3576,49 +3681,8 @@ class CuracelPilesRunner:
                     self._set_select_value(month_select, month_label)
 
             year_select = None
-            desired_year_values: list[str] = []
-            year_select_all_applied = False
             if year_changed:
-                year_select = self._direct_year_control()
-                if norm_key(year_label) == "all":
-                    probe_candidates: list[Any] = []
-                    if year_select is not None:
-                        probe_candidates.append(year_select)
-                    for candidate in self._select_candidates_for_year(year_label):
-                        if candidate is year_select:
-                            continue
-                        probe_candidates.append(candidate)
-                    for candidate in probe_candidates:
-                        if not self._open_select(candidate):
-                            continue
-                        option_texts = [text for text in self._dropdown_option_texts() if re.match(r"^20\d{2}$", text)]
-                        panel_root = self._active_multiselect_root()
-                        if option_texts:
-                            desired_year_values = option_texts
-                            year_select = candidate
-                            if self._click_multiselect_select_all(panel_root):
-                                year_select_all_applied = True
-                                self._close_dropdown()
-                                break
-                        self._close_dropdown()
-                    if not desired_year_values:
-                        desired_year_values = [str(datetime.now().year)]
-                else:
-                    desired_year_values = [year_label]
-
-                year_candidates = self._select_candidates_for_year(year_label)
-                if year_select_all_applied:
-                    pass
-                elif year_select is not None:
-                    self._set_multiselect_values(year_select, desired_year_values, required=True)
-                else:
-                    for candidate in year_candidates:
-                        if self._set_multiselect_values(candidate, desired_year_values):
-                            year_select = candidate
-                            break
-                    if year_select is None and year_candidates:
-                        year_select = year_candidates[0]
-                        self._set_multiselect_values(year_select, desired_year_values, required=True)
+                year_select = self._apply_year_filter(year_label)
 
             status_select = None
             if month_changed or year_changed or status_changed:
@@ -3763,7 +3827,13 @@ class CuracelPilesRunner:
                 pass
             time.sleep(0.3)
 
-    def rows_on_current_page(self, status_bucket: str, page_number: int, filter_month: str) -> list[PileRow]:
+    def rows_on_current_page(
+        self,
+        status_bucket: str,
+        page_number: int,
+        filter_month: str,
+        filter_year: str = "",
+    ) -> list[PileRow]:
         assert self.page
         headers = self._table_headers()
         header_map = {norm_key(h): i for i, h in enumerate(headers)}
@@ -3820,6 +3890,7 @@ class CuracelPilesRunner:
                 page_number=page_number,
                 assignment_type=STATUS_ASSIGNMENT_TYPE[status_bucket],
                 filter_month=filter_month,
+                filter_year=filter_year,
                 legacy_tracking_key=legacy_tracking_key,
             ))
         return piles
@@ -3856,7 +3927,7 @@ class CuracelPilesRunner:
         piles: list[PileRow] = []
         page_number = 1
         while True:
-            page_rows = self.rows_on_current_page(status_label, page_number, month_label)
+            page_rows = self.rows_on_current_page(status_label, page_number, month_label, year_label)
             fingerprint = tuple(row.key for row in page_rows)
             if fingerprint in seen_pages:
                 break
@@ -3883,32 +3954,43 @@ class CuracelPilesRunner:
     def scan_all_rows(self, month_labels: list[str], year_label: str) -> list[PileRow]:
         all_rows: list[PileRow] = []
         seen = set()
-        for month_label in month_labels:
-            print(f"\nScanning month: {month_label}")
-            for status_label in TARGET_STATUSES:
-                print(f"\nScanning status: {status_label}")
-                rows = self.scan_status(month_label, year_label, status_label)
-                unassigned = [row for row in rows if not norm(row.assigned)]
-                print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
-                for row in rows:
-                    if row.key in seen:
-                        continue
-                    seen.add(row.key)
-                    all_rows.append(row)
+        supports_multiple, available_years = self.year_filter_capabilities()
+        scan_years = year_scan_labels(
+            year_label,
+            available_years,
+            supports_multiple=supports_multiple,
+        )
+        for scan_year in scan_years:
+            if len(scan_years) > 1:
+                print(f"\nScanning year: {scan_year}")
+            for month_label in month_labels:
+                print(f"\nScanning month: {month_label}")
+                for status_label in TARGET_STATUSES:
+                    print(f"\nScanning status: {status_label}")
+                    rows = self.scan_status(month_label, scan_year, status_label)
+                    unassigned = [row for row in rows if not norm(row.assigned)]
+                    print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
+                    for row in rows:
+                        row.filter_year = scan_year
+                        if row.key in seen:
+                            continue
+                        seen.add(row.key)
+                        all_rows.append(row)
         return all_rows
 
     def scan_selected_statuses(
         self,
-        month_status_pairs: list[tuple[str, str]],
+        filter_contexts: list[tuple[str, str, str]],
         year_label: str,
         *,
         only_unassigned: bool = False,
     ) -> list[PileRow]:
         all_rows: list[PileRow] = []
         seen: set[str] = set()
-        for month_label, status_label in month_status_pairs:
-            print(f"\nScanning follow-up context: {month_label} / {status_label}")
-            rows = self.scan_status(month_label, year_label, status_label, only_unassigned=only_unassigned)
+        for month_label, filter_year, status_label in filter_contexts:
+            active_year = norm(filter_year) or year_label
+            print(f"\nScanning follow-up context: {active_year} / {month_label} / {status_label}")
+            rows = self.scan_status(month_label, active_year, status_label, only_unassigned=only_unassigned)
             if only_unassigned:
                 print(f"  Found {len(rows)} unassigned rows")
             else:
@@ -3930,7 +4012,7 @@ class CuracelPilesRunner:
             if not self.goto_next_page():
                 break
             current_page += 1
-        return self.rows_on_current_page(status_label, current_page, month_label)
+        return self.rows_on_current_page(status_label, current_page, month_label, year_label)
 
     def find_filtered_row_by_key(
         self,
@@ -4589,6 +4671,7 @@ class CuracelPilesRunner:
 
     def discover_portal_assignees(self, month_label: str, year_label: str, sample_pile: PileRow) -> list[PortalAssignee]:
         active_month = sample_pile.filter_month or month_label
+        active_year = effective_filter_year(sample_pile, year_label)
         selected = 0
         current_rows: list[PileRow] = []
         page_candidates: list[int] = []
@@ -4597,7 +4680,7 @@ class CuracelPilesRunner:
                 page_candidates.append(page_number)
         for attempt in range(3):
             for page_number in page_candidates:
-                current_rows = self.reset_to_filtered_page(active_month, year_label, sample_pile.status_bucket, page_number)
+                current_rows = self.reset_to_filtered_page(active_month, active_year, sample_pile.status_bucket, page_number)
                 candidate_keys = [sample_pile.key]
                 candidate_keys.extend([
                     row.key for row in current_rows[:12]
@@ -4647,21 +4730,24 @@ class CuracelPilesRunner:
     def execute_assignment_plan(self, month_labels: list[str], year_label: str, plans: list[PlannedAssignment], execute: bool) -> tuple[dict[str, int], list[AppliedAssignment]]:
         results: dict[str, int] = {}
         applied: list[AppliedAssignment] = []
-        for filter_month in month_labels:
+        for filter_month, filter_year in assignment_filter_contexts(month_labels, year_label, plans):
             for status_label in TARGET_STATUSES:
                 pending_status_plans = [
-                    plan for plan in plans if plan.status_bucket == status_label and plan.filter_month == filter_month
+                    plan for plan in plans
+                    if plan.status_bucket == status_label
+                    and plan.filter_month == filter_month
+                    and (norm(plan.filter_year) or year_label) == filter_year
                 ]
                 if not pending_status_plans:
                     continue
-                print(f"\nApplying assignments for month/status: {filter_month} / {status_label}")
+                print(f"\nApplying assignments for year/month/status: {filter_year} / {filter_month} / {status_label}")
                 self.open_piles()
-                self.apply_filters(filter_month, year_label, status_label)
+                self.apply_filters(filter_month, filter_year, status_label)
                 self.try_set_page_size(100)
                 page_number = 1
                 seen_pages = set()
                 while True:
-                    current_rows = self.rows_on_current_page(status_label, page_number, filter_month)
+                    current_rows = self.rows_on_current_page(status_label, page_number, filter_month, filter_year)
                     fingerprint = tuple(row.key for row in current_rows)
                     if fingerprint in seen_pages:
                         break
@@ -4681,7 +4767,7 @@ class CuracelPilesRunner:
                             deferred_missing_keys: list[str] = []
 
                             if group_index > 0:
-                                current_rows = self.reset_to_filtered_page(filter_month, year_label, status_label, page_number)
+                                current_rows = self.reset_to_filtered_page(filter_month, filter_year, status_label, page_number)
 
                             selection = self._select_rows(requested_keys, current_rows)
                             if selection.selected_keys:
@@ -4706,7 +4792,7 @@ class CuracelPilesRunner:
                                         for retry in range(2):
                                             located_row = self.find_filtered_row_by_key(
                                                 filter_month,
-                                                year_label,
+                                                filter_year,
                                                 status_label,
                                                 missing_key,
                                                 preferred_page=next(
@@ -4719,7 +4805,7 @@ class CuracelPilesRunner:
                                                 break
                                             current_rows = self.reset_to_filtered_page(
                                                 filter_month,
-                                                year_label,
+                                                filter_year,
                                                 status_label,
                                                 located_row.page_number,
                                             )
@@ -4742,7 +4828,7 @@ class CuracelPilesRunner:
                             selected_group = [plan for plan in group if plan.pile_key in selected_keys]
                             selected_assignee, applied_group = self._apply_selected_group(
                                 filter_month,
-                                year_label,
+                                filter_year,
                                 status_label,
                                 assignee_name,
                                 assignment_type,
@@ -4786,7 +4872,7 @@ class CuracelPilesRunner:
                             break
                         current_rows = self.reset_to_filtered_page(
                             filter_month,
-                            year_label,
+                            filter_year,
                             status_label,
                             recovery_page,
                         )
@@ -4810,7 +4896,7 @@ class CuracelPilesRunner:
                             if group_index > 0:
                                 current_rows = self.reset_to_filtered_page(
                                     filter_month,
-                                    year_label,
+                                    filter_year,
                                     status_label,
                                     recovery_page,
                                 )
@@ -4821,7 +4907,7 @@ class CuracelPilesRunner:
                             selected_group = [plan for plan in group if plan.pile_key in selection.selected_keys]
                             selected_assignee, applied_group = self._apply_selected_group(
                                 filter_month,
-                                year_label,
+                                filter_year,
                                 status_label,
                                 assignee_name,
                                 assignment_type,
@@ -4838,7 +4924,7 @@ class CuracelPilesRunner:
                         time.sleep(0.5)
 
                 if pending_status_plans:
-                    final_unassigned = self.scan_status(filter_month, year_label, status_label, only_unassigned=True)
+                    final_unassigned = self.scan_status(filter_month, filter_year, status_label, only_unassigned=True)
                     unassigned_by_key = {row.key: row for row in final_unassigned}
                     unassigned_by_tracking = {row.tracking_key: row for row in final_unassigned}
                     still_visible: list[PlannedAssignment] = []
@@ -5385,6 +5471,7 @@ def build_stale_reassignment_plans(
             current_status=observed_row.status,
             status_bucket=observed_row.status_bucket,
             filter_month=observed_row.filter_month,
+            filter_year=observed_row.filter_year,
             source_page_number=observed_row.page_number,
         ))
 
@@ -5467,6 +5554,7 @@ def build_assignment_plan(
                 current_status=pile.status,
                 status_bucket=pile.status_bucket,
                 filter_month=pile.filter_month,
+                filter_year=pile.filter_year,
                 source_page_number=pile.page_number,
             ))
 
@@ -5492,6 +5580,7 @@ def build_assignment_plan(
             current_status=pile.status,
             status_bucket=pile.status_bucket,
             filter_month=pile.filter_month,
+            filter_year=pile.filter_year,
             source_page_number=pile.page_number,
         ))
 
@@ -5566,6 +5655,7 @@ def build_assignment_plan_from_portal_options(
                 current_status=pile.status,
                 status_bucket=pile.status_bucket,
                 filter_month=pile.filter_month,
+                filter_year=pile.filter_year,
                 source_page_number=pile.page_number,
             ))
 
@@ -5588,6 +5678,7 @@ def build_assignment_plan_from_portal_options(
             current_status=pile.status,
             status_bucket=pile.status_bucket,
             filter_month=pile.filter_month,
+            filter_year=pile.filter_year,
             source_page_number=pile.page_number,
         ))
 
@@ -6162,7 +6253,7 @@ def _run_for_insurer_once(
         unassigned = unique_unassigned_rows(scanned_rows)
         initial_unassigned_keys = {row.key for row in unassigned}
         follow_up_context_pairs = {
-            (row.filter_month, row.status_bucket)
+            (row.filter_month, effective_filter_year(row, year_label), row.status_bucket)
             for row in unassigned
             if norm(row.filter_month) and norm(row.status_bucket)
         }
@@ -6262,7 +6353,7 @@ def _run_for_insurer_once(
         applied: list[AppliedAssignment] = []
         if plans:
             follow_up_context_pairs.update(
-                (plan.filter_month, plan.status_bucket)
+                (plan.filter_month, norm(plan.filter_year) or year_label, plan.status_bucket)
                 for plan in plans
                 if norm(plan.filter_month) and norm(plan.status_bucket)
             )
@@ -6278,14 +6369,21 @@ def _run_for_insurer_once(
             metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
 
         follow_up_context_pairs.update(
-            (plan.filter_month, plan.status_bucket)
+            (plan.filter_month, norm(plan.filter_year) or year_label, plan.status_bucket)
             for plan in reassignment_plans
             if norm(plan.filter_month) and norm(plan.status_bucket)
         )
-        follow_up_contexts = sorted(follow_up_context_pairs, key=lambda item: (MONTH_OPTIONS.index(item[0]) if item[0] in MONTH_OPTIONS else 99, TARGET_STATUSES.index(item[1]) if item[1] in TARGET_STATUSES else 99))
+        follow_up_contexts = sorted(
+            follow_up_context_pairs,
+            key=lambda item: (
+                -safe_int(item[1], 0),
+                MONTH_OPTIONS.index(item[0]) if item[0] in MONTH_OPTIONS else 99,
+                TARGET_STATUSES.index(item[2]) if item[2] in TARGET_STATUSES else 99,
+            ),
+        )
         late_arrival_detection["contexts"] = [
-            {"month": month_label, "status": status_label}
-            for month_label, status_label in follow_up_contexts
+            {"month": month_label, "year": filter_year, "status": status_label}
+            for month_label, filter_year, status_label in follow_up_contexts
         ]
 
         if follow_up_contexts:

@@ -61,7 +61,7 @@ def make_bot(bot_id, role, *, ratio=1, active=True, available=True, load=0, prio
     )
 
 
-def make_pile(index, claims=100):
+def make_pile(index, claims=100, *, filter_year="2026"):
     key = f"pile-{index}"
     return runner.PileRow(
         key=key,
@@ -79,6 +79,7 @@ def make_pile(index, claims=100):
         page_number=1,
         assignment_type="Vetting",
         filter_month="Jul",
+        filter_year=filter_year,
     )
 
 
@@ -102,6 +103,29 @@ class AssignmentPlanningTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "Requested year '2023'.*2026, 2025"):
             runner.year_scan_labels("2023", ["2026", "2025"], supports_multiple=False)
+
+    def test_year_control_mode_ignores_unsupported_multiple_attribute(self):
+        self.assertFalse(
+            runner.supports_multiple_year_selection(
+                control_classes="p-select p-component",
+                control_multiple_attribute=True,
+                listbox_aria_multiselectable="",
+            )
+        )
+        self.assertTrue(
+            runner.supports_multiple_year_selection(
+                control_classes="p-multiselect p-component",
+                control_multiple_attribute=False,
+                listbox_aria_multiselectable="",
+            )
+        )
+        self.assertTrue(
+            runner.supports_multiple_year_selection(
+                control_classes="custom-year-picker",
+                control_multiple_attribute=False,
+                listbox_aria_multiselectable="true",
+            )
+        )
 
     def test_low_observed_speed_does_not_starve_support_bot(self):
         bots = [
@@ -159,6 +183,32 @@ class AssignmentPlanningTests(unittest.TestCase):
 
         self.assertEqual(summary["primary"]["assigned_claims"], 1000)
         self.assertEqual(summary["support"]["assigned_claims"], 0)
+
+    def test_assignment_plan_preserves_the_scanned_year(self):
+        plans, _summary = runner.build_assignment_plan(
+            "OLD MUTUAL",
+            [make_pile(1, filter_year="2025")],
+            [make_bot("primary", "primary", priority=1)],
+            {},
+        )
+
+        self.assertEqual(plans[0].filter_year, "2025")
+
+    def test_assignment_contexts_keep_plans_in_their_scanned_year(self):
+        plans, _summary = runner.build_assignment_plan(
+            "OLD MUTUAL",
+            [make_pile(1, filter_year="2026"), make_pile(2, filter_year="2025")],
+            [make_bot("primary", "primary", priority=1)],
+            {},
+        )
+
+        self.assertEqual(
+            runner.assignment_filter_contexts(["Jul"], "All", plans),
+            [("Jul", "2026"), ("Jul", "2025")],
+        )
+
+    def test_pile_year_overrides_the_broad_requested_year(self):
+        self.assertEqual(runner.effective_filter_year(make_pile(1, filter_year="2025"), "All"), "2025")
 
     def test_portal_fallback_uses_same_balancing_rules(self):
         assignees = [
@@ -220,6 +270,155 @@ class WeekendRestoreTests(unittest.TestCase):
         self.assertEqual(len(restored), 1)
         bot_update_sql, _params = executions[0]
         self.assertNotIn("is_active =", bot_update_sql)
+
+
+class YearFilterScanningTests(unittest.TestCase):
+    def make_runner(self, *, supports_multiple, available_years):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.year_filter_capabilities = lambda: (supports_multiple, available_years)
+        portal_runner.calls = []
+
+        def scan_status(month_label, year_label, status_label, **_kwargs):
+            portal_runner.calls.append((month_label, year_label, status_label))
+            pile = make_pile(len(portal_runner.calls))
+            pile.key = f"{year_label}-{status_label}"
+            pile.tracking_key = pile.key
+            pile.filter_year = ""
+            return [pile]
+
+        portal_runner.scan_status = scan_status
+        return portal_runner
+
+    def test_all_years_scan_each_year_for_single_select_portal(self):
+        portal_runner = self.make_runner(
+            supports_multiple=False,
+            available_years=["2026", "2025"],
+        )
+
+        rows = runner.CuracelPilesRunner.scan_all_rows(portal_runner, ["All"], "All")
+
+        self.assertEqual(len(rows), 10)
+        self.assertEqual({row.filter_year for row in rows}, {"2026", "2025"})
+        self.assertEqual(
+            portal_runner.calls,
+            [
+                ("All", "2026", "Vetting Pending"),
+                ("All", "2026", "Vetting Ongoing"),
+                ("All", "2026", "Audit Pending"),
+                ("All", "2026", "Audit Ongoing"),
+                ("All", "2026", "AI Audit"),
+                ("All", "2025", "Vetting Pending"),
+                ("All", "2025", "Vetting Ongoing"),
+                ("All", "2025", "Audit Pending"),
+                ("All", "2025", "Audit Ongoing"),
+                ("All", "2025", "AI Audit"),
+            ],
+        )
+
+    def test_all_years_scan_once_for_legacy_multiselect_portal(self):
+        portal_runner = self.make_runner(
+            supports_multiple=True,
+            available_years=["2026", "2025"],
+        )
+
+        runner.CuracelPilesRunner.scan_all_rows(portal_runner, ["All"], "All")
+
+        self.assertEqual(
+            portal_runner.calls,
+            [
+                ("All", "All", "Vetting Pending"),
+                ("All", "All", "Vetting Ongoing"),
+                ("All", "All", "Audit Pending"),
+                ("All", "All", "Audit Ongoing"),
+                ("All", "All", "AI Audit"),
+            ],
+        )
+
+    def test_reset_page_preserves_year_context_on_returned_rows(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.open_piles = lambda: None
+        portal_runner.apply_filters = lambda *_args: None
+        portal_runner.try_set_page_size = lambda *_args: None
+        portal_runner.goto_next_page = lambda: False
+        received = []
+
+        def rows_on_current_page(*args):
+            received.append(args)
+            return []
+
+        portal_runner.rows_on_current_page = rows_on_current_page
+
+        runner.CuracelPilesRunner.reset_to_filtered_page(
+            portal_runner,
+            "All",
+            "2025",
+            "Vetting Pending",
+            1,
+        )
+
+        self.assertEqual(received, [("Vetting Pending", 1, "All", "2025")])
+
+    def test_follow_up_scan_uses_each_context_year(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.calls = []
+
+        def scan_status(month_label, year_label, status_label, **_kwargs):
+            portal_runner.calls.append((month_label, year_label, status_label))
+            return []
+
+        portal_runner.scan_status = scan_status
+
+        runner.CuracelPilesRunner.scan_selected_statuses(
+            portal_runner,
+            [
+                ("All", "2026", "Vetting Pending"),
+                ("All", "2025", "Vetting Pending"),
+            ],
+            "All",
+            only_unassigned=True,
+        )
+
+        self.assertEqual(
+            portal_runner.calls,
+            [
+                ("All", "2026", "Vetting Pending"),
+                ("All", "2025", "Vetting Pending"),
+            ],
+        )
+
+    def test_current_single_select_applies_one_concrete_year(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        control = object()
+        applied = []
+        portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], False)
+        portal_runner._set_select_value = lambda selected, value, required=False: applied.append(
+            (selected, value, required)
+        )
+        portal_runner._set_multiselect_values = lambda *_args, **_kwargs: self.fail(
+            "The current single-select portal must not use the legacy multiselect path."
+        )
+
+        selected_control = runner.CuracelPilesRunner._apply_year_filter(portal_runner, "2025")
+
+        self.assertIs(selected_control, control)
+        self.assertEqual(applied, [(control, "2025", True)])
+
+    def test_legacy_multiselect_applies_every_visible_year_for_all(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        control = object()
+        applied = []
+        portal_runner._find_year_filter_control = lambda: (control, ["2026", "2025"], True)
+        portal_runner._set_select_value = lambda *_args, **_kwargs: self.fail(
+            "The legacy multiselect portal must retain its multiselect path."
+        )
+        portal_runner._set_multiselect_values = lambda selected, values, required=False: applied.append(
+            (selected, values, required)
+        )
+
+        selected_control = runner.CuracelPilesRunner._apply_year_filter(portal_runner, "All")
+
+        self.assertIs(selected_control, control)
+        self.assertEqual(applied, [(control, ["2026", "2025"], True)])
 
 
 if __name__ == "__main__":
