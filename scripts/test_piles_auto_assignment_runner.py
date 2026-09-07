@@ -272,6 +272,30 @@ class WeekendRestoreTests(unittest.TestCase):
         self.assertNotIn("is_active =", bot_update_sql)
 
 
+class RunnerConcurrencyTests(unittest.TestCase):
+    def test_database_lock_result_controls_whether_a_runner_may_start(self):
+        locked_store = object.__new__(runner.DataStore)
+        locked_store.mode = "postgres"
+        locked_store._fetchall_postgres = lambda *_args, **_kwargs: [{"acquired": True}]
+
+        competing_store = object.__new__(runner.DataStore)
+        competing_store.mode = "postgres"
+        competing_store._fetchall_postgres = lambda *_args, **_kwargs: [{"acquired": False}]
+
+        acquire_locked = getattr(locked_store, "try_acquire_runner_lock", lambda: False)
+        acquire_competing = getattr(competing_store, "try_acquire_runner_lock", lambda: True)
+
+        self.assertTrue(acquire_locked())
+        self.assertFalse(acquire_competing())
+
+    def test_runner_start_fails_closed_when_another_run_holds_the_lock(self):
+        store = type("Store", (), {"try_acquire_runner_lock": lambda _self: False})()
+        ensure_lock = getattr(runner, "ensure_runner_lock_available", lambda _store: None)
+
+        with self.assertRaisesRegex(RuntimeError, "already in progress"):
+            ensure_lock(store)
+
+
 class YearFilterScanningTests(unittest.TestCase):
     def make_runner(self, *, supports_multiple, available_years):
         portal_runner = object.__new__(runner.CuracelPilesRunner)

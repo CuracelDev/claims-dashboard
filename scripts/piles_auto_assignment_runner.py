@@ -70,6 +70,7 @@ PLANNING_SPEED_FLOOR_RATIO = min(
     1.0,
 )
 AVAILABLE_BOT_STATUSES = {"available", "", "weekend_added"}
+RUNNER_ADVISORY_LOCK_KEY = 564795289053896123
 
 
 class TeeCapture:
@@ -1136,6 +1137,17 @@ class DataStore:
     def close(self) -> None:
         if self.conn:
             self.conn.close()
+
+    def try_acquire_runner_lock(self) -> bool:
+        if self.mode != "postgres":
+            raise RuntimeError(
+                "Piles runner concurrency protection requires DATABASE_URL so all runner hosts share one lock."
+            )
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(%s) as acquired",
+            (RUNNER_ADVISORY_LOCK_KEY,),
+        )
+        return bool(rows and rows[0].get("acquired"))
 
     def _fetchall_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         assert self.conn
@@ -2790,6 +2802,14 @@ class DataStore:
             )
         else:
             self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot_id, payload)
+
+
+def ensure_runner_lock_available(store: DataStore) -> None:
+    if not store.try_acquire_runner_lock():
+        raise RuntimeError(
+            "Another Piles Auto-Assignment run is already in progress. "
+            "This run stopped before scanning or assigning claims."
+        )
 
 
 class CuracelPilesRunner:
@@ -6899,6 +6919,7 @@ def main() -> None:
             )
 
         store = DataStore()
+        ensure_runner_lock_available(store)
         restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args)) if args.execute else []
         if restored_weekend_rows:
             restored_by_insurer: dict[str, list[str]] = {}
