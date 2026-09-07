@@ -389,6 +389,24 @@ def parse_year_label(raw_value: str | None) -> str:
     return "All" if text.lower() == "all" else text
 
 
+def year_scan_labels(requested_year: str, available_years: list[str], *, supports_multiple: bool) -> list[str]:
+    normalized_years = list(dict.fromkeys(
+        norm(value) for value in available_years if re.fullmatch(r"20\d{2}", norm(value))
+    ))
+    if not normalized_years:
+        raise RuntimeError("The Year filter opened but exposed no four-digit year options.")
+
+    requested = parse_year_label(requested_year)
+    if norm_key(requested) == "all":
+        return ["All"] if supports_multiple else normalized_years
+    if requested not in normalized_years:
+        raise RuntimeError(
+            f"Requested year '{requested}' is not available. "
+            f"Visible years: {', '.join(normalized_years)}"
+        )
+    return [requested]
+
+
 def slack_mention(slack_user_id: str, fallback_name: str) -> str:
     return f"<@{slack_user_id}>" if norm(slack_user_id) else (fallback_name or "Team")
 

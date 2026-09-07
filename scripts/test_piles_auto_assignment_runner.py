@@ -83,6 +83,26 @@ def make_pile(index, claims=100):
 
 
 class AssignmentPlanningTests(unittest.TestCase):
+    def test_all_years_expand_for_single_select_portal(self):
+        self.assertEqual(
+            runner.year_scan_labels("All", ["2026", "2025", "2024"], supports_multiple=False),
+            ["2026", "2025", "2024"],
+        )
+
+    def test_all_years_remain_one_filter_for_multiselect_portal(self):
+        self.assertEqual(
+            runner.year_scan_labels("All", ["2026", "2025"], supports_multiple=True),
+            ["All"],
+        )
+
+    def test_specific_year_must_be_available(self):
+        self.assertEqual(
+            runner.year_scan_labels("2025", ["2026", "2025"], supports_multiple=False),
+            ["2025"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "Requested year '2023'.*2026, 2025"):
+            runner.year_scan_labels("2023", ["2026", "2025"], supports_multiple=False)
+
     def test_low_observed_speed_does_not_starve_support_bot(self):
         bots = [
             make_bot("primary", "primary", ratio=1, priority=1),
