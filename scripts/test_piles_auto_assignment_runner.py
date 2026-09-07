@@ -834,6 +834,7 @@ class YearFilterScanningTests(unittest.TestCase):
                 self.children = children or {}
                 self.text = text
                 self.clicked = False
+                self.dom_clicked = False
 
             def get_attribute(self, name):
                 return self.attributes.get(name)
@@ -849,6 +850,9 @@ class YearFilterScanningTests(unittest.TestCase):
 
             def click(self, **_kwargs):
                 self.clicked = True
+
+            def evaluate(self, expression):
+                self.dom_clicked = expression == "element => element.click()"
 
         class LocatorList:
             def __init__(self, items):
@@ -888,7 +892,8 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertTrue(selected)
         self.assertFalse(year_2026.clicked)
-        self.assertTrue(year_2025.clicked)
+        self.assertFalse(year_2025.clicked)
+        self.assertTrue(year_2025.dom_clicked)
 
     def test_year_candidates_include_primevue_combobox_without_legacy_root_class(self):
         class Control:
