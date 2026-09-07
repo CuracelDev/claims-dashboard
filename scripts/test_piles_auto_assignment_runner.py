@@ -936,6 +936,48 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertTrue(opened)
         self.assertGreaterEqual(panel.visibility_checks, 2)
 
+    def test_primevue_multiselect_uses_verified_dom_root_click(self):
+        class EmptyLocator:
+            def count(self):
+                return 0
+
+            @property
+            def first(self):
+                return self
+
+            def is_visible(self):
+                return False
+
+        class Control:
+            def __init__(self):
+                self.opened = False
+                self.standard_clicks = 0
+                self.dom_clicks = 0
+
+            def get_attribute(self, name):
+                return "p-multiselect p-component" if name == "class" else None
+
+            def click(self, **_kwargs):
+                self.standard_clicks += 1
+
+            def evaluate(self, _script):
+                self.dom_clicks += 1
+                self.opened = True
+
+            def locator(self, _selector):
+                return EmptyLocator()
+
+        control = Control()
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = object()
+        portal_runner._wait_for_dropdown_options = lambda selected, **_kwargs: selected.opened
+
+        opened = runner.CuracelPilesRunner._open_select(portal_runner, control)
+
+        self.assertTrue(opened)
+        self.assertEqual(control.dom_clicks, 1)
+        self.assertEqual(control.standard_clicks, 0)
+
     def test_dropdown_wait_uses_visible_panel_when_control_has_no_aria_owner(self):
         class Options:
             def count(self):
