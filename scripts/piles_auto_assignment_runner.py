@@ -3340,15 +3340,38 @@ class CuracelPilesRunner:
                 return text
         return None
 
-    def _wait_for_dropdown_options(self, timeout_ms: int = 4000) -> None:
+    def _wait_for_dropdown_options(self, control: Any | None = None, timeout_ms: int = 4000) -> None:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
             try:
-                if self.page.locator(".p-select-option, .p-select-list li, [role='option']").count() > 0:
-                    return
-                if self.page.locator("input[placeholder*='Search'], input[placeholder*='search']").count() > 0:
-                    return
+                if control is not None:
+                    option_root = self._dropdown_root_owned_by(control)
+                    if option_root is not None:
+                        options = option_root.locator(
+                            ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                            "[data-pc-section='option']"
+                        )
+                        if options.count() > 0:
+                            return
+                    elif not self._dropdown_reference_ids(control):
+                        panels = self._visible_dropdown_panels()
+                        if panels:
+                            options = panels[-1].locator(
+                                ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                                "[data-pc-section='option']"
+                            )
+                            if options.count() > 0:
+                                return
+                else:
+                    panels = self._visible_dropdown_panels()
+                    if panels:
+                        options = panels[-1].locator(
+                            ".p-select-option, li.p-multiselect-option, li[role='option'], "
+                            "[data-pc-section='option']"
+                        )
+                        if options.count() > 0:
+                            return
             except Exception:
                 pass
             time.sleep(0.2)
@@ -3373,7 +3396,7 @@ class CuracelPilesRunner:
                         raise
                 except Exception:
                     return False
-        self._wait_for_dropdown_options()
+        self._wait_for_dropdown_options(select)
         return True
 
     def _dropdown_option_texts(self, control: Any | None = None) -> list[str]:
@@ -3514,8 +3537,7 @@ class CuracelPilesRunner:
             self._append_unique_select(candidates, control)
         return candidates
 
-    def _dropdown_root_owned_by(self, control: Any) -> Any | None:
-        assert self.page
+    def _dropdown_reference_ids(self, control: Any) -> list[str]:
         owners: list[Any] = [control]
         for selector in ("[role='combobox']", "[aria-controls]", "[aria-owns]"):
             try:
@@ -3525,19 +3547,27 @@ class CuracelPilesRunner:
             except Exception:
                 continue
 
+        referenced_ids: list[str] = []
         for owner in owners:
             for attribute in ("aria-controls", "aria-owns"):
                 try:
-                    referenced_ids = norm(owner.get_attribute(attribute)).split()
+                    owner_ids = norm(owner.get_attribute(attribute)).split()
                 except Exception:
                     continue
-                for referenced_id in referenced_ids:
-                    try:
-                        panel = self.page.locator(f"[id={json.dumps(referenced_id)}]").first
-                        if panel.count() and panel.is_visible():
-                            return panel
-                    except Exception:
-                        continue
+                for referenced_id in owner_ids:
+                    if referenced_id not in referenced_ids:
+                        referenced_ids.append(referenced_id)
+        return referenced_ids
+
+    def _dropdown_root_owned_by(self, control: Any) -> Any | None:
+        assert self.page
+        for referenced_id in self._dropdown_reference_ids(control):
+            try:
+                panel = self.page.locator(f"[id={json.dumps(referenced_id)}]").first
+                if panel.count() and panel.is_visible():
+                    return panel
+            except Exception:
+                continue
         return None
 
     def _dropdown_root_for_control(self, control: Any) -> Any:

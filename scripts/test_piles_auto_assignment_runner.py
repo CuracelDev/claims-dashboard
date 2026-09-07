@@ -811,6 +811,102 @@ class YearFilterScanningTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "multiselect.*year-options"):
             runner.CuracelPilesRunner._find_year_filter_control(portal_runner)
 
+    def test_open_select_waits_for_its_owned_panel_not_hidden_global_options(self):
+        class LocatorList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def first(self):
+                return self.items[0] if self.items else self
+
+        class Panel:
+            def __init__(self):
+                self.visibility_checks = 0
+
+            def count(self):
+                return 1
+
+            @property
+            def first(self):
+                return self
+
+            def is_visible(self):
+                self.visibility_checks += 1
+                return self.visibility_checks >= 2
+
+            def locator(self, _selector):
+                return LocatorList([object()])
+
+        class Control:
+            def click(self):
+                return None
+
+            def get_attribute(self, name):
+                return "year-options" if name == "aria-controls" else None
+
+            def locator(self, _selector):
+                return LocatorList([])
+
+        panel = Panel()
+
+        class Page:
+            def locator(self, selector):
+                if selector == '[id="year-options"]':
+                    return panel
+                return LocatorList([object()])
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = Page()
+
+        opened = runner.CuracelPilesRunner._open_select(portal_runner, Control())
+
+        self.assertTrue(opened)
+        self.assertGreaterEqual(panel.visibility_checks, 2)
+
+    def test_dropdown_wait_uses_visible_panel_when_control_has_no_aria_owner(self):
+        class Options:
+            def count(self):
+                return 1
+
+        class Panel:
+            def __init__(self):
+                self.option_reads = 0
+
+            def locator(self, _selector):
+                self.option_reads += 1
+                return Options()
+
+        class EmptyLocator:
+            def count(self):
+                return 0
+
+        class Control:
+            def get_attribute(self, _name):
+                return None
+
+            def locator(self, _selector):
+                return EmptyLocator()
+
+        panel = Panel()
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = object()
+        portal_runner._visible_dropdown_panels = lambda: [panel]
+
+        runner.CuracelPilesRunner._wait_for_dropdown_options(
+            portal_runner,
+            Control(),
+            timeout_ms=1,
+        )
+
+        self.assertEqual(panel.option_reads, 1)
+
     def test_current_single_select_rejects_an_unconfirmed_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         control = object()
