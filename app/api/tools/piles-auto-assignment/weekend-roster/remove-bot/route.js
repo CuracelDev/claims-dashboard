@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getSupabase } from '../../../../../../lib/supabase';
+import { updateBotAccountWithHistory } from '../../../../../../lib/piles-auto-assignment-bot-history.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,15 +34,16 @@ function sortWeekendBots(bots) {
   });
 }
 
-async function updateBot(supabase, botId, patch) {
-  const { data, error } = await supabase
-    .from('piles_auto_assignment_bot_accounts')
-    .update(patch)
-    .eq('id', botId)
-    .select('*')
-    .single();
-  if (error) throw error;
-  return data;
+async function updateBot(supabase, botId, patch, body, reason) {
+  const { updated_at: _updatedAt, updated_by_name: _actorName, updated_by_member_id: _actorId, ...safePatch } = patch;
+  return updateBotAccountWithHistory(supabase, {
+    botId,
+    patch: safePatch,
+    actorName: body.updated_by_name,
+    actorMemberId: body.updated_by_member_id,
+    source: 'weekend_roster_remove_bot',
+    reason,
+  });
 }
 
 export async function PATCH(request) {
@@ -121,7 +123,7 @@ export async function PATCH(request) {
       availability_note: removedSnapshot?.previous_availability_note || `${noteBase}: extra weekend bot removed`,
       is_available: removedSnapshot?.previous_is_available ?? false,
       ...updater,
-    });
+    }, body, 'Removed extra weekend bot and restored previous state');
     items.push(restoredRemovedBot);
 
     const removedInsurerKey = canonicalInsurerKey(removedBot.insurer_name);
@@ -146,7 +148,7 @@ export async function PATCH(request) {
         availability_note: `${noteBase}: restored after extra weekend bot was removed`,
         is_available: true,
         ...updater,
-      });
+      }, body, `Restored after removing weekend bot ${removedBot.id}`);
       items.push(updatedBot);
     }
 

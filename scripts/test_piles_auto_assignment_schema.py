@@ -56,10 +56,24 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
 
     def test_new_tables_never_store_credentials_or_raw_html(self):
         lower_sql = self.sql.lower()
-        ledger = lower_sql[lower_sql.index(LEDGER_TABLES[0]):]
-        self.assertNotIn("login_password", ledger)
-        self.assertNotIn("bot_password", ledger)
-        self.assertNotIn("raw_html", ledger)
+        for table in LEDGER_TABLES:
+            definition = re.search(
+                rf"create table if not exists {table}\s*\((.*?)\n\);",
+                lower_sql,
+                re.DOTALL,
+            ).group(1)
+            with self.subTest(table=table):
+                self.assertNotIn("login_password", definition)
+                self.assertNotIn("bot_password", definition)
+                self.assertNotIn("raw_html", definition)
+
+    def test_bot_history_function_is_atomic_and_does_not_store_secret_values(self):
+        self.assertIn("CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history", self.sql)
+        self.assertIn("previous_values", self.sql)
+        self.assertIn("new_values", self.sql)
+        history_insert = self.sql.split("INSERT INTO piles_auto_assignment_bot_account_history", 1)[1]
+        self.assertNotIn("previous_row.bot_password,", history_insert)
+        self.assertNotIn("next_row.bot_password,", history_insert)
 
     def test_fresh_migration_knows_every_ledger_table(self):
         for table in LEDGER_TABLES:

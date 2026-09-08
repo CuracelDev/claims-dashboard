@@ -10,6 +10,10 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const PAGE_SIZE = Number(process.env.MIGRATION_PAGE_SIZE || 1000);
 const INSERT_CHUNK_SIZE = Number(process.env.MIGRATION_INSERT_CHUNK_SIZE || 150);
+const PILES_SCHEMA_SQL = readFileSync(new URL('./piles-auto-assignment-schema.sql', import.meta.url), 'utf8');
+const BOT_HISTORY_FUNCTION_SQL = PILES_SCHEMA_SQL.match(
+  /CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history[\s\S]*?REVOKE ALL ON FUNCTION piles_update_bot_account_with_history[\s\S]*?END \$\$;/,
+)?.[0] || '';
 
 const TABLES = [
   'audit_log',
@@ -215,6 +219,7 @@ const TABLE_COLUMNS = {
     ['shift_grace_minutes', 'integer'], ['is_active', 'boolean'], ['is_available', 'boolean'],
     ['priority_order', 'integer'], ['changed_by_name', 'text'], ['changed_by_member_id', 'text'],
     ['change_source', 'text'], ['change_reason', 'text'], ['effective_at', 'timestamptz'], ['created_at', 'timestamptz'],
+    ['previous_values', 'jsonb'], ['new_values', 'jsonb'],
   ],
   prism_logs: [
     ['id', 'bigint'], ['sent_by', 'text'], ['message', 'text'], ['category', 'text'],
@@ -713,7 +718,9 @@ const CREATE_TABLE_SQL = {
       change_source text NOT NULL DEFAULT 'dashboard',
       change_reason text,
       effective_at timestamptz NOT NULL DEFAULT now(),
-      created_at timestamptz NOT NULL DEFAULT now()
+      created_at timestamptz NOT NULL DEFAULT now(),
+      previous_values jsonb NOT NULL DEFAULT '{}'::jsonb,
+      new_values jsonb NOT NULL DEFAULT '{}'::jsonb
     )`,
   prism_logs: `
     CREATE TABLE prism_logs (
@@ -1016,6 +1023,8 @@ ${dropSql}
 ${createSql}
 
 ${indexes}
+
+${BOT_HISTORY_FUNCTION_SQL}
 `;
 }
 
@@ -1044,6 +1053,12 @@ async function supabaseFetchTable(table) {
 
     if (!res.ok) {
       const body = await res.text();
+      const additiveTables = new Set([
+        'piles_auto_assignment_insurer_runs', 'piles_auto_assignment_scan_contexts',
+        'piles_auto_assignment_batches', 'piles_auto_assignment_attempts',
+        'piles_auto_assignment_bot_account_history',
+      ]);
+      if (res.status === 404 && additiveTables.has(table)) return [];
       throw new Error(`Supabase fetch failed for ${table}: ${res.status} ${body}`);
     }
 
@@ -1214,3 +1229,4 @@ main().catch((err) => {
   console.error(err.message);
   process.exit(1);
 });
+import { readFileSync } from 'node:fs';

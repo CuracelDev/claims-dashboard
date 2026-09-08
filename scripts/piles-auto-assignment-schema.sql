@@ -466,6 +466,101 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_bot_account_history (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_account_history
+  ADD COLUMN IF NOT EXISTS previous_values jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE IF EXISTS piles_auto_assignment_bot_account_history
+  ADD COLUMN IF NOT EXISTS new_values jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history(
+  target_bot_id text,
+  patch jsonb,
+  actor_name text,
+  actor_member_id text,
+  change_source text,
+  change_reason text
+) RETURNS piles_auto_assignment_bot_accounts
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $$
+DECLARE previous_row piles_auto_assignment_bot_accounts;
+DECLARE next_row piles_auto_assignment_bot_accounts;
+DECLARE previous_safe jsonb;
+DECLARE next_safe jsonb;
+BEGIN
+  SELECT * INTO previous_row FROM piles_auto_assignment_bot_accounts
+    WHERE id = target_bot_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Bot account not found'; END IF;
+
+  UPDATE piles_auto_assignment_bot_accounts SET
+    master_account_id = CASE WHEN patch ? 'master_account_id' THEN nullif(patch->>'master_account_id', '') ELSE master_account_id END,
+    insurer_name = CASE WHEN patch ? 'insurer_name' THEN nullif(patch->>'insurer_name', '') ELSE insurer_name END,
+    owner_name = CASE WHEN patch ? 'owner_name' THEN nullif(patch->>'owner_name', '') ELSE owner_name END,
+    bot_name = CASE WHEN patch ? 'bot_name' THEN nullif(patch->>'bot_name', '') ELSE bot_name END,
+    bot_email = CASE WHEN patch ? 'bot_email' THEN patch->>'bot_email' ELSE bot_email END,
+    bot_password = CASE WHEN patch ? 'bot_password' THEN patch->>'bot_password' ELSE bot_password END,
+    assignment_role = CASE WHEN patch ? 'assignment_role' THEN patch->>'assignment_role' ELSE assignment_role END,
+    support_capacity_ratio = CASE WHEN patch ? 'support_capacity_ratio' THEN (patch->>'support_capacity_ratio')::numeric ELSE support_capacity_ratio END,
+    availability_status = CASE WHEN patch ? 'availability_status' THEN patch->>'availability_status' ELSE availability_status END,
+    availability_note = CASE WHEN patch ? 'availability_note' THEN nullif(patch->>'availability_note', '') ELSE availability_note END,
+    active_from_time = CASE WHEN patch ? 'active_from_time' THEN patch->>'active_from_time' ELSE active_from_time END,
+    active_to_time = CASE WHEN patch ? 'active_to_time' THEN nullif(patch->>'active_to_time', '') ELSE active_to_time END,
+    shift_grace_minutes = CASE WHEN patch ? 'shift_grace_minutes' THEN (patch->>'shift_grace_minutes')::integer ELSE shift_grace_minutes END,
+    notes = CASE WHEN patch ? 'notes' THEN nullif(patch->>'notes', '') ELSE notes END,
+    is_active = CASE WHEN patch ? 'is_active' THEN (patch->>'is_active')::boolean ELSE is_active END,
+    is_available = CASE WHEN patch ? 'is_available' THEN (patch->>'is_available')::boolean ELSE is_available END,
+    priority_order = CASE WHEN patch ? 'priority_order' THEN (patch->>'priority_order')::integer ELSE priority_order END,
+    current_claim_load = CASE WHEN patch ? 'current_claim_load' THEN (patch->>'current_claim_load')::integer ELSE current_claim_load END,
+    last_assigned_at = CASE WHEN patch ? 'last_assigned_at' THEN nullif(patch->>'last_assigned_at', '')::timestamptz ELSE last_assigned_at END,
+    last_completed_at = CASE WHEN patch ? 'last_completed_at' THEN nullif(patch->>'last_completed_at', '')::timestamptz ELSE last_completed_at END,
+    updated_by_name = actor_name,
+    updated_by_member_id = actor_member_id,
+    updated_at = now()
+  WHERE id = target_bot_id RETURNING * INTO next_row;
+
+  previous_safe := jsonb_build_object(
+    'assignment_role', previous_row.assignment_role, 'support_capacity_ratio', previous_row.support_capacity_ratio,
+    'availability_status', previous_row.availability_status, 'availability_note', previous_row.availability_note,
+    'active_from_time', previous_row.active_from_time, 'active_to_time', previous_row.active_to_time,
+    'shift_grace_minutes', previous_row.shift_grace_minutes, 'is_active', previous_row.is_active,
+    'is_available', previous_row.is_available, 'priority_order', previous_row.priority_order,
+    'current_claim_load', previous_row.current_claim_load, 'bot_name', previous_row.bot_name,
+    'owner_name', previous_row.owner_name, 'insurer_name', previous_row.insurer_name,
+    'email_configured', coalesce(previous_row.bot_email, '') <> '',
+    'password_configured', coalesce(previous_row.bot_password, '') <> ''
+  );
+  next_safe := jsonb_build_object(
+    'assignment_role', next_row.assignment_role, 'support_capacity_ratio', next_row.support_capacity_ratio,
+    'availability_status', next_row.availability_status, 'availability_note', next_row.availability_note,
+    'active_from_time', next_row.active_from_time, 'active_to_time', next_row.active_to_time,
+    'shift_grace_minutes', next_row.shift_grace_minutes, 'is_active', next_row.is_active,
+    'is_available', next_row.is_available, 'priority_order', next_row.priority_order,
+    'current_claim_load', next_row.current_claim_load, 'bot_name', next_row.bot_name,
+    'owner_name', next_row.owner_name, 'insurer_name', next_row.insurer_name,
+    'email_configured', coalesce(next_row.bot_email, '') <> '',
+    'password_configured', coalesce(next_row.bot_password, '') <> ''
+  );
+
+  INSERT INTO piles_auto_assignment_bot_account_history
+    (bot_account_id, insurer_name, owner_name, assignment_role, support_capacity_ratio,
+     availability_status, availability_note, active_from_time, active_to_time,
+     shift_grace_minutes, is_active, is_available, priority_order,
+     changed_by_name, changed_by_member_id, change_source, change_reason,
+     previous_values, new_values)
+  VALUES
+    (target_bot_id, next_row.insurer_name, next_row.owner_name, next_row.assignment_role,
+     next_row.support_capacity_ratio, next_row.availability_status, next_row.availability_note,
+     next_row.active_from_time, next_row.active_to_time, next_row.shift_grace_minutes,
+     next_row.is_active, next_row.is_available, next_row.priority_order,
+     actor_name, actor_member_id, coalesce(nullif(change_source, ''), 'dashboard'),
+     change_reason, previous_safe, next_safe);
+  RETURN next_row;
+END $$;
+
+REVOKE ALL ON FUNCTION piles_update_bot_account_with_history(text, jsonb, text, text, text, text) FROM PUBLIC;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT EXECUTE ON FUNCTION piles_update_bot_account_with_history(text, jsonb, text, text, text, text) TO service_role;
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_bot_account_history_bot_idx
   ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC);
 

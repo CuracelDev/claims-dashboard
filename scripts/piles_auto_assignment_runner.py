@@ -1240,6 +1240,46 @@ class DataStore:
         }, json=payload, timeout=30)
         res.raise_for_status()
 
+    def update_bot_with_history(
+        self,
+        bot_id: str,
+        patch: dict[str, Any],
+        *,
+        source: str,
+        reason: str,
+        actor_name: str = "Piles runner",
+        actor_member_id: str = "system",
+    ) -> None:
+        """Apply a bot mutation and its audit entry in one database transaction."""
+        params = (
+            bot_id,
+            json.dumps(patch),
+            actor_name,
+            actor_member_id,
+            source,
+            reason,
+        )
+        if self.mode == "postgres":
+            self._fetchall_postgres(
+                "select * from piles_update_bot_account_with_history(%s, %s::jsonb, %s, %s, %s, %s)",
+                params,
+            )
+            return
+        url = f"{self.supabase_url}/rest/v1/rpc/piles_update_bot_account_with_history"
+        response = requests.post(url, headers={
+            "apikey": self.supabase_key,
+            "Authorization": f"Bearer {self.supabase_key}",
+            "Content-Type": "application/json",
+        }, json={
+            "target_bot_id": bot_id,
+            "patch": patch,
+            "actor_name": actor_name,
+            "actor_member_id": actor_member_id,
+            "change_source": source,
+            "change_reason": reason,
+        }, timeout=30)
+        response.raise_for_status()
+
     def get_master_account(self, insurer_name: str) -> MasterAccount:
         aliases = insurer_aliases(insurer_name)
         if self.mode == "postgres":
@@ -1495,23 +1535,16 @@ class DataStore:
                         ),
                     )
                     inserted_count += cur.rowcount
-                self._execute_postgres(
-                    """
-                    update piles_auto_assignment_bot_accounts
-                    set assignment_role = %s,
-                        availability_status = %s,
-                        availability_note = %s,
-                        is_available = %s,
-                        updated_at = now()
-                    where id = %s
-                    """,
-                    (
-                        row["assignment_role"],
-                        row["availability_status"],
-                        row["availability_note"],
-                        row["is_available"],
-                        bot.id,
-                    ),
+                self.update_bot_with_history(
+                    bot.id,
+                    {
+                        "assignment_role": row["assignment_role"],
+                        "availability_status": row["availability_status"],
+                        "availability_note": row["availability_note"],
+                        "is_available": row["is_available"],
+                    },
+                    source="weekend_roster_automatic_apply",
+                    reason=f"Applied weekend roster {policy.roster_id}",
                 )
         else:
             existing = self._fetchall_supabase(
@@ -1540,13 +1573,17 @@ class DataStore:
                             "effective_date": policy.effective_date,
                         },
                     })
-                self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot.id, {
-                    "assignment_role": row["assignment_role"],
-                    "availability_status": row["availability_status"],
-                    "availability_note": row["availability_note"],
-                    "is_available": row["is_available"],
-                    "updated_at": now_iso,
-                })
+                self.update_bot_with_history(
+                    bot.id,
+                    {
+                        "assignment_role": row["assignment_role"],
+                        "availability_status": row["availability_status"],
+                        "availability_note": row["availability_note"],
+                        "is_available": row["is_available"],
+                    },
+                    source="weekend_roster_automatic_apply",
+                    reason=f"Applied weekend roster {policy.roster_id}",
+                )
 
         return policy.eligible_bots, paused_bots, inserted_count
 
@@ -1571,23 +1608,16 @@ class DataStore:
                 (effective_date,),
             )
             for row in snapshots:
-                self._execute_postgres(
-                    """
-                    update piles_auto_assignment_bot_accounts
-                    set assignment_role = %s,
-                        availability_status = %s,
-                        availability_note = %s,
-                        is_available = %s,
-                        updated_at = now()
-                    where id = %s
-                    """,
-                    (
-                        row.get("previous_assignment_role") or "primary",
-                        row.get("previous_availability_status") or "available",
-                        row.get("previous_availability_note"),
-                        bool(row.get("previous_is_available", True)),
-                        row["bot_account_id"],
-                    ),
+                self.update_bot_with_history(
+                    str(row["bot_account_id"]),
+                    {
+                        "assignment_role": row.get("previous_assignment_role") or "primary",
+                        "availability_status": row.get("previous_availability_status") or "available",
+                        "availability_note": row.get("previous_availability_note"),
+                        "is_available": bool(row.get("previous_is_available", True)),
+                    },
+                    source="weekend_roster_automatic_restore",
+                    reason=f"Weekend roster {row.get('roster_id')} ended",
                 )
                 self._execute_postgres(
                     """
@@ -1611,13 +1641,17 @@ class DataStore:
             if str(row.get("roster_id")) in roster_ids and not row.get("restored_at")
         ]
         for row in snapshots:
-            self._update_supabase("piles_auto_assignment_bot_accounts", "id", str(row["bot_account_id"]), {
-                "assignment_role": row.get("previous_assignment_role") or "primary",
-                "availability_status": row.get("previous_availability_status") or "available",
-                "availability_note": row.get("previous_availability_note"),
-                "is_available": bool(row.get("previous_is_available", True)),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            self.update_bot_with_history(
+                str(row["bot_account_id"]),
+                {
+                    "assignment_role": row.get("previous_assignment_role") or "primary",
+                    "availability_status": row.get("previous_availability_status") or "available",
+                    "availability_note": row.get("previous_availability_note"),
+                    "is_available": bool(row.get("previous_is_available", True)),
+                },
+                source="weekend_roster_automatic_restore",
+                reason=f"Weekend roster {row.get('roster_id')} ended",
+            )
             self._update_supabase("piles_auto_assignment_weekend_bot_state_snapshots", "id", str(row["id"]), {
                 "restored_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
