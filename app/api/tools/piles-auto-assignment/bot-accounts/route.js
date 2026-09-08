@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getSupabase } from '../../../../../lib/supabase';
 import { decryptCredentialFields, encryptCredential } from '../../../../../lib/piles-auto-assignment-credentials.mjs';
+import { updateBotAccountWithHistory } from '../../../../../lib/piles-auto-assignment-bot-history.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -113,7 +114,7 @@ export async function PATCH(request) {
       return NextResponse.json({ success: false, error: 'Bot account id is required.' }, { status: 400 });
     }
 
-    const updates = { updated_at: new Date().toISOString() };
+    const updates = {};
     if (body.insurer_name !== undefined && !String(body.insurer_name || '').trim()) {
       return NextResponse.json({ success: false, error: 'Insurer name cannot be empty.' }, { status: 400 });
     }
@@ -138,18 +139,15 @@ export async function PATCH(request) {
     if (body.current_claim_load !== undefined) updates.current_claim_load = toInt(body.current_claim_load, 0);
     if (body.last_assigned_at !== undefined) updates.last_assigned_at = body.last_assigned_at || null;
     if (body.last_completed_at !== undefined) updates.last_completed_at = body.last_completed_at || null;
-    if (body.updated_by_name !== undefined) updates.updated_by_name = body.updated_by_name?.trim() || null;
-    if (body.updated_by_member_id !== undefined) updates.updated_by_member_id = body.updated_by_member_id ? String(body.updated_by_member_id).trim() : null;
-
     const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from('piles_auto_assignment_bot_accounts')
-      .update(updates)
-      .eq('id', body.id)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const data = await updateBotAccountWithHistory(supabase, {
+      botId: body.id,
+      patch: updates,
+      actorName: body.updated_by_name,
+      actorMemberId: body.updated_by_member_id,
+      source: 'bot_accounts_api',
+      reason: body.change_reason || 'Bot account edited from Runner Control',
+    });
     return NextResponse.json({ success: true, item: presentBotAccount(data) });
   } catch (error) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });

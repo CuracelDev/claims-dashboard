@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 import { getSupabase } from '../../../../../../lib/supabase';
+import { updateBotAccountWithHistory } from '../../../../../../lib/piles-auto-assignment-bot-history.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -72,15 +73,16 @@ async function snapshotBotState(supabase, roster, bot, now, body, source) {
   if (error) throw error;
 }
 
-async function updateBot(supabase, botId, patch) {
-  const { data, error } = await supabase
-    .from('piles_auto_assignment_bot_accounts')
-    .update(patch)
-    .eq('id', botId)
-    .select('*')
-    .single();
-  if (error) throw error;
-  return data;
+async function updateBot(supabase, botId, patch, body, reason) {
+  const { updated_at: _updatedAt, updated_by_name: _actorName, updated_by_member_id: _actorId, ...safePatch } = patch;
+  return updateBotAccountWithHistory(supabase, {
+    botId,
+    patch: safePatch,
+    actorName: body.updated_by_name,
+    actorMemberId: body.updated_by_member_id,
+    source: 'weekend_roster_add_bot',
+    reason,
+  });
 }
 
 export async function PATCH(request) {
@@ -164,7 +166,7 @@ export async function PATCH(request) {
       availability_note: `${noteBase}: added as weekend primary`,
       is_available: true,
       ...updater,
-    });
+    }, body, 'Added as weekend primary');
     items.push(updatedAddedBot);
 
     if (previousPrimary) {
@@ -175,7 +177,7 @@ export async function PATCH(request) {
         availability_note: `${noteBase}: moved to support after extra weekend bot was added`,
         is_available: true,
         ...updater,
-      });
+      }, body, `Moved to support for weekend primary ${addedBot.id}`);
       items.push(updatedPreviousPrimary);
     }
 
@@ -187,7 +189,7 @@ export async function PATCH(request) {
         availability_note: `${noteBase}: paused after extra weekend primary was added`,
         is_available: false,
         ...updater,
-      });
+      }, body, `Paused for weekend primary ${addedBot.id}`);
       items.push(updatedSupportBot);
     }
 

@@ -358,6 +358,48 @@ class YearFilterScanningTests(unittest.TestCase):
             ],
         )
 
+    def test_scan_all_rows_accounts_for_every_expected_context(self):
+        portal_runner = self.make_runner(
+            supports_multiple=True,
+            available_years=["2026", "2025"],
+        )
+
+        class Ledger:
+            def __init__(self):
+                self.created = []
+                self.started = []
+                self.finished = []
+                self.failed = []
+
+            def create_scan_contexts(self, _run_id, contexts):
+                self.created = [{**item, "id": f"context-{index}"}
+                                for index, item in enumerate(contexts)]
+                return self.created
+
+            def start_scan_context(self, context_id):
+                self.started.append(context_id)
+
+            def finish_scan_context(self, context_id, result, evidence=None):
+                self.finished.append((context_id, result.status, evidence))
+
+            def fail_scan_context(self, context_id, **details):
+                self.failed.append((context_id, details))
+
+            def heartbeat(self, *_args, **_kwargs):
+                return None
+
+        ledger = Ledger()
+        portal_runner.execution_ledger = ledger
+        portal_runner.insurer_run_id = "insurer-run-1"
+        portal_runner.insurer_name = "Jubilee Uganda"
+
+        runner.CuracelPilesRunner.scan_all_rows(portal_runner, ["All"], "All")
+
+        self.assertEqual(len(ledger.created), 5)
+        self.assertEqual(len(ledger.started), 5)
+        self.assertEqual(len(ledger.finished), 5)
+        self.assertEqual(ledger.failed, [])
+
     def test_reset_page_preserves_year_context_on_returned_rows(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         portal_runner.open_piles = lambda: None
@@ -1280,6 +1322,201 @@ class YearFilterScanningTests(unittest.TestCase):
                 "2025",
                 timeout_ms=1,
             )
+
+    def test_matching_controls_and_stable_table_do_not_require_new_network_event(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = object()
+        portal_runner._filter_state = {
+            "month": "All",
+            "year": "2025",
+            "status": "Vetting Pending",
+            "page_size": None,
+        }
+        portal_runner._piles_response_sequence = 4
+        portal_runner._piles_response_events = []
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
+
+        evidence = runner.CuracelPilesRunner.apply_filters(
+            portal_runner,
+            "All",
+            "2025",
+            "Vetting Pending",
+        )
+
+        self.assertEqual(evidence.network_state, "not_observed")
+        self.assertEqual(evidence.table_state, "stable")
+
+    def test_filter_network_state_reports_explicit_http_failure(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_events = [
+            (7, 500, "https://api.health.curacel.co/api/piles?year=2025", object()),
+        ]
+
+        state, details = runner.CuracelPilesRunner._filter_network_state(
+            portal_runner,
+            6,
+            "2025",
+        )
+
+        self.assertEqual(state, "failed")
+        self.assertEqual(details["http_status"], 500)
+
+    def test_scan_status_rejects_conflicting_rows_with_same_tracking_key(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.apply_filters = lambda *_args: runner.FilterEvidence(
+            True, True, True, "stable", "not_observed"
+        )
+        portal_runner.try_set_page_size = lambda *_args: None
+        portal_runner.rows_on_current_page = lambda *_args: [
+            make_pile(1) if _args[1] == 1 else runner.replace(make_pile(1), provider="Changed Provider")
+        ]
+        pages = iter([True, False])
+        portal_runner.goto_next_page = lambda: next(pages)
+
+        with self.assertRaisesRegex(RuntimeError, "Conflicting rows shared tracking key"):
+            runner.CuracelPilesRunner.scan_status(
+                portal_runner,
+                "Jul",
+                "2026",
+                "Vetting Pending",
+            )
+
+    def test_pagination_does_not_treat_an_unreadable_next_page_as_finished(self):
+        class NextButton:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, _name):
+                return None
+
+            def click(self):
+                return None
+
+        class Page:
+            def locator(self, _selector):
+                return NextButton()
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = Page()
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: "unreadable"
+
+        with self.assertRaisesRegex(RuntimeError, "next Piles page did not settle"):
+            runner.CuracelPilesRunner.goto_next_page(portal_runner)
+
+
+class ExecutionLedgerIntegrationTests(unittest.TestCase):
+    def test_read_only_flag_uses_non_writing_ledger(self):
+        args = types.SimpleNamespace(read_only=True)
+        store = types.SimpleNamespace(mode="postgres", database_url="postgres://unused")
+
+        ledger = runner.build_execution_ledger(store, args)
+
+        self.assertEqual(type(ledger).__name__, "ReadOnlyExecutionLedger")
+        self.assertEqual(ledger.write_count, 0)
+
+    def test_disabled_ledger_does_not_open_another_connection(self):
+        args = types.SimpleNamespace(read_only=False)
+        store = types.SimpleNamespace(mode="postgres", database_url="postgres://unused")
+        previous = os.environ.pop("PILES_EXECUTION_LEDGER_ENABLED", None)
+        try:
+            self.assertIsNone(runner.build_execution_ledger(store, args))
+        finally:
+            if previous is not None:
+                os.environ["PILES_EXECUTION_LEDGER_ENABLED"] = previous
+
+
+class RunnerRunAdoptionTests(unittest.TestCase):
+    def test_read_only_store_blocks_all_low_level_mutation_adapters(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.read_only = True
+        store.mode = "postgres"
+        store.conn = None
+        store._execute_postgres("update anything set value = 1")
+        store._insert_supabase("anything", {"secret": "value"})
+        store._update_supabase("anything", "id", "1", {"secret": "value"})
+        store.update_bot_with_history("bot-1", {"is_available": False}, source="test", reason="test")
+        self.assertFalse(store.claim_coalesced_request("DEFMIS", "run-1"))
+
+    def test_precreated_run_id_is_updated_instead_of_inserted_again(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "supabase"
+        updates = []
+        inserts = []
+        store._fetchall_supabase = lambda *_args, **_kwargs: [{
+            "id": "queued-run", "details": {"idempotency_key": "key-1"},
+        }]
+        store._update_supabase = lambda *args: updates.append(args)
+        store._insert_supabase = lambda *args: inserts.append(args)
+
+        result = store.create_runner_run(
+            run_id="queued-run", insurer_name="DEFMIS", run_scope="single",
+            portal_environment="production", backend="local", run_source="manual",
+            months=["All"], year="All", mode="dry-run",
+            details={"insurers": ["DEFMIS"]},
+        )
+
+        self.assertEqual(result, "queued-run")
+        self.assertEqual(inserts, [])
+        self.assertEqual(updates[0][3]["details"]["idempotency_key"], "key-1")
+
+
+class AssignmentRuleLoadingTests(unittest.TestCase):
+    def test_inactive_rule_is_not_applied(self):
+        store = object.__new__(runner.DataStore)
+        store.mode = "postgres"
+        store._fetchall_postgres = lambda *_args, **_kwargs: [{
+            "insurer_name": "Jubilee Uganda",
+            "distribution_mode": "single_owner",
+            "minimum_claim_chunk": 25,
+            "reassignment_threshold_minutes": 120,
+            "stale_claim_threshold": 40,
+            "target_completion_gap_minutes": 30,
+            "is_active": False,
+        }]
+
+        self.assertIsNone(runner.DataStore.get_rule(store, "Jubilee Uganda"))
+
+
+class PerPileVerificationIntegrationTests(unittest.TestCase):
+    def test_uncertain_item_does_not_abort_the_batch(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.execution_ledger = None
+        portal_runner._open_assign_modal = lambda: None
+        portal_runner._apply_assignment_modal = lambda *_args: "Daniel"
+        pending = runner.classify_assignment_observations(
+            {"pile-1": {"attempt_id": "", "expected_assignee": "Daniel"}},
+            {},
+        )[0]
+        portal_runner.verify_assigned_rows = lambda *_args, **_kwargs: runner.AssignmentVerificationResult(
+            False, ["<missing>"], 0, 1, [], [pending]
+        )
+        plan = make_pile(1)
+        assignment = runner.PlannedAssignment(
+            pile_key=plan.key, tracking_key=plan.tracking_key,
+            assignee_id="daniel", assignee_name="Daniel", assignment_type="Vetting",
+            insurer_name="Jubilee Uganda", provider=plan.provider,
+            claim_month=plan.month, submitted_date=plan.submitted_date,
+            claims=plan.claims, synced_claims=0, remaining_claims=plan.remaining_claims,
+            current_status=plan.status, status_bucket=plan.status_bucket,
+            filter_month=plan.filter_month, filter_year=plan.filter_year,
+            source_page_number=1,
+        )
+
+        _assignee, applied = runner.CuracelPilesRunner._apply_selected_group(
+            portal_runner, "All", "2026", "Vetting Pending", "Daniel", "Vetting",
+            [assignment], True,
+        )
+
+        self.assertEqual(len(applied), 1)
+        self.assertFalse(applied[0].verified_on_table)
 
 
 if __name__ == "__main__":

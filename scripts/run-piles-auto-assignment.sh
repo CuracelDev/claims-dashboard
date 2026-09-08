@@ -21,25 +21,36 @@ INSURER_VALUE="${PILES_AUTO_ASSIGNMENT_SCHEDULE_INSURER:-}"
 
 RUN_SOURCE="${PILES_AUTO_ASSIGNMENT_RUN_SOURCE:-schedule}"
 INVOCATION_BACKEND="${PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND:-local}"
+MAX_CONCURRENCY="${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-1}"
 
-ARGS="-u scripts/piles_auto_assignment_runner.py --portal-environment ${PORTAL_ENVIRONMENT} --month ${MONTH_VALUE} --year ${YEAR_VALUE} --run-source ${RUN_SOURCE} --invocation-backend ${INVOCATION_BACKEND}"
+if [ "$MAX_CONCURRENCY" != "1" ] && [ "$MAX_CONCURRENCY" != "2" ]; then
+  echo "PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY must be 1 or 2." >&2
+  exit 1
+fi
+
+set -- -u scripts/piles_auto_assignment_runner.py \
+  --portal-environment "$PORTAL_ENVIRONMENT" \
+  --month "$MONTH_VALUE" \
+  --year "$YEAR_VALUE" \
+  --run-source "$RUN_SOURCE" \
+  --invocation-backend "$INVOCATION_BACKEND"
 
 if [ "$RUN_MODE" = "one-insurer" ]; then
   if [ -z "$INSURER_VALUE" ]; then
     echo "PILES_AUTO_ASSIGNMENT_SCHEDULE_INSURER is required when mode is one-insurer." >&2
     exit 1
   fi
-  ARGS="$ARGS --insurer $INSURER_VALUE"
+  set -- "$@" --insurer "$INSURER_VALUE"
 else
-  ARGS="$ARGS --all-active"
+  set -- "$@" --all-active
 fi
 
 if [ "$VISIBLE_FLAG" = "true" ]; then
-  ARGS="$ARGS --visible"
+  set -- "$@" --visible
 fi
 
 if [ "$EXECUTE_FLAG" = "true" ]; then
-  ARGS="$ARGS --execute"
+  set -- "$@" --execute
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Piles Auto-Assignment schedule"
@@ -47,4 +58,4 @@ echo "Portal environment: $PORTAL_ENVIRONMENT"
 echo "Mode: $RUN_MODE"
 echo "Month/Year: $MONTH_VALUE $YEAR_VALUE"
 
-exec "$PYTHON_BIN" $ARGS
+exec "$PYTHON_BIN" "$@"

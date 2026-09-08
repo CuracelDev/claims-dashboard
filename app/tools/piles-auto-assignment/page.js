@@ -24,7 +24,7 @@ const DISTRIBUTION_MODE_OPTIONS = [
   {
     value: 'manual_override',
     label: 'Manual override',
-    description: 'Use your manual owner/availability changes as the main guide and avoid automatic balancing decisions for that insurer.',
+    description: 'Do not auto-assign this insurer. Leave every discovered pile in a visible manual-action-required state.',
   },
 ];
 
@@ -150,7 +150,7 @@ function formatTrackedState(row) {
 function formatRunnerRunResult(run) {
   if (!run) return 'No run output yet.';
   const details = run.details || {};
-  const isRunning = run.status === 'started' && !run.finished_at;
+  const isRunning = ['queued', 'started', 'running'].includes(run.status) && !run.finished_at;
   const lines = [
     `Run scope: ${run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}`,
     `Portal: ${run.portal_environment || 'production'}`,
@@ -204,7 +204,7 @@ function buildRunnerOutputFallback(logs) {
 }
 
 function formatRunnerStatus(run) {
-  const isRunning = run?.status === 'started' && !run?.finished_at;
+  const isRunning = ['queued', 'started', 'running'].includes(run?.status) && !run?.finished_at;
   if (isRunning) return 'in progress';
   return run?.status || 'completed';
 }
@@ -214,7 +214,7 @@ function formatRunnerDuration(run, nowTs = Date.now()) {
   if (run.finished_at && Number(run.duration_ms) > 0) {
     return `${Math.max(1, Math.round(Number(run.duration_ms) / 1000))}s`;
   }
-  if (run.status === 'started' && run.started_at) {
+  if (['queued', 'started', 'running'].includes(run.status) && run.started_at) {
     const elapsedMs = Math.max(0, nowTs - new Date(run.started_at).getTime());
     const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
     return `${elapsedSec}s live`;
@@ -380,6 +380,57 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  useEffect(() => {
+    const runId = runnerState.activeRunId;
+    if (!runId) return undefined;
+    let active = true;
+    let timer;
+    const terminal = new Set(['completed', 'partial', 'failed', 'manual_action_required', 'skipped_overlap']);
+
+    async function refreshRun() {
+      try {
+        const response = await fetch(`/api/tools/piles-auto-assignment/runner-runs?id=${encodeURIComponent(runId)}`, { cache: 'no-store' });
+        const json = await response.json();
+        if (!response.ok || !json.success) throw new Error(json.error || 'Could not load run progress.');
+        const run = json.runs?.[0];
+        if (!run || !active) return;
+        const counts = run.counts || {};
+        const insurerLines = (run.insurers || []).map((item) => (
+          `${item.insurer_name}: ${item.status} (${item.phase})`
+          + (item.error_code ? ` — ${item.error_code}` : '')
+        ));
+        setRunnerState({
+          activeRunId: terminal.has(run.status) ? '' : runId,
+          runMeta: run,
+          runOutput: [
+            `Run ${run.id}`,
+            `Phase: ${run.phase}`,
+            `Contexts: ${counts.contexts_complete || 0}/${counts.contexts_total || 0}`,
+            `Discovered: ${counts.discovered_piles || 0} piles / ${counts.discovered_claims || 0} claims`,
+            `Planned: ${counts.planned_piles || 0}; confirmed: ${counts.confirmed_piles || 0}; pending reconciliation: ${counts.reconciliation_pending || 0}; conflicts: ${counts.conflicts || 0}; failed: ${counts.failed || 0}`,
+            ...insurerLines,
+          ].join('\n'),
+        });
+        if (terminal.has(run.status)) {
+          onRefresh();
+          onRunnerFinished?.();
+          return;
+        }
+        timer = window.setTimeout(refreshRun, 5000);
+      } catch (error) {
+        if (!active) return;
+        setNotice({ type: 'error', text: error.message });
+        timer = window.setTimeout(refreshRun, 10000);
+      }
+    }
+
+    void refreshRun();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [runnerState.activeRunId]);
+
   async function runFlow() {
     if (draft.target === 'single' && !draft.insurer_name) {
       setNotice({ type: 'error', text: 'Choose an insurer before starting the runner.' });
@@ -400,21 +451,24 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
       };
       const res = await fetch('/api/tools/piles-auto-assignment/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+        },
         body: JSON.stringify(payload),
       });
       const json = await res.json();
-      const combinedOutput = [json.stdout, json.stderr].filter(Boolean).join('\n').trim();
+      if (!res.ok || !json.success) throw new Error(json.error || 'Runner could not be queued.');
       setRunnerState({
         runMeta: json,
-        runOutput: combinedOutput || `Run finished with status: ${json.success ? 'Completed' : 'Failed'}`,
+        runOutput: `Run ${json.run_id} was queued. Progress will update here without holding the request open.`,
+        activeRunId: json.run_id,
       });
-      if (!json.success) throw new Error(json.error || json.stderr || 'Runner failed.');
       setNotice({
         type: 'success',
         text: draft.finalize_assignments
-          ? `Runner completed on the ${draft.portal_environment} portal with final assignment enabled.`
-          : `Runner completed on the ${draft.portal_environment} portal in preview mode, so it stopped before the final Assign Claims click.`,
+          ? `Assignment run queued for the ${draft.portal_environment} portal.`
+          : `Preview run queued for the ${draft.portal_environment} portal. It will not click Assign Claims.`,
       });
       onRefresh();
       onRunnerFinished?.();
@@ -574,9 +628,11 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
       </div>
       {runnerState.runMeta && (
         <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 12, color: C.sub, fontSize: 12 }}>
-          <div>Duration: <span style={{ color: C.text }}>{Math.round((runnerState.runMeta.duration_ms || 0) / 1000)}s</span></div>
-          <div>Status: <span style={{ color: runnerState.runMeta.success ? C.accent : C.danger }}>{runnerState.runMeta.success ? 'Completed' : 'Failed'}</span></div>
+          <div>Duration: <span style={{ color: C.text }}>{formatRunnerDuration(runnerState.runMeta)}</span></div>
+          <div>Status: <span style={{ color: runnerState.runMeta.status === 'failed' ? C.danger : C.accent }}>{formatRunnerStatus(runnerState.runMeta)}</span></div>
           <div>Backend: <span style={{ color: C.text }}>{formatBackendLabel(runnerState.runMeta.backend)}</span></div>
+          <div>Phase: <span style={{ color: C.text }}>{runnerState.runMeta.phase || 'configuration'}</span></div>
+          <div>Heartbeat: <span style={{ color: C.text }}>{runnerState.runMeta.heartbeat_at ? new Date(runnerState.runMeta.heartbeat_at).toLocaleString('en-GB') : 'waiting'}</span></div>
         </div>
       )}
       <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
@@ -1509,7 +1565,7 @@ function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
         <span style={{ color: C.text, fontWeight: 700 }}>{selectedMode.label}:</span> {selectedMode.description}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
-        <input type="number" value={draft.minimum_claim_chunk} onChange={(e) => setDraft((prev) => ({ ...prev, minimum_claim_chunk: e.target.value }))} placeholder="Minimum claims per batch" style={inputStyle(C)} />
+        <input type="number" min="1" step="1" value={draft.minimum_claim_chunk} onChange={(e) => setDraft((prev) => ({ ...prev, minimum_claim_chunk: e.target.value }))} placeholder="Target claims per assignment batch" title="Piles are kept whole. The final smaller remainder is always assigned." style={inputStyle(C)} />
         <input type="number" value={draft.reassignment_threshold_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, reassignment_threshold_minutes: e.target.value }))} placeholder="Reassign after idle mins" style={inputStyle(C)} />
         <input type="number" value={draft.stale_claim_threshold} onChange={(e) => setDraft((prev) => ({ ...prev, stale_claim_threshold: e.target.value }))} placeholder="Stale claims threshold" style={inputStyle(C)} />
         <input type="number" value={draft.target_completion_gap_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, target_completion_gap_minutes: e.target.value }))} placeholder="Target finish gap mins" style={inputStyle(C)} />

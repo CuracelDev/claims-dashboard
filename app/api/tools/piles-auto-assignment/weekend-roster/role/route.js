@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 import { getSupabase } from '../../../../../../lib/supabase';
+import { updateBotAccountWithHistory } from '../../../../../../lib/piles-auto-assignment-bot-history.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -90,19 +91,17 @@ export async function PATCH(request) {
     const now = new Date().toISOString();
     await snapshotBotState(supabase, roster, bot, now, body, assignmentRole);
 
-    const { data: updatedBot, error: updateError } = await supabase
-      .from('piles_auto_assignment_bot_accounts')
-      .update({
+    const updatedBot = await updateBotAccountWithHistory(supabase, {
+      botId: botAccountId,
+      patch: {
         assignment_role: assignmentRole,
         availability_note: `Weekend roster ${roster.weekend_start} to ${roster.weekend_end}: role override`,
-        updated_by_name: normalize(body.updated_by_name) || null,
-        updated_by_member_id: normalize(body.updated_by_member_id) || null,
-        updated_at: now,
-      })
-      .eq('id', botAccountId)
-      .select('*')
-      .single();
-    if (updateError) throw updateError;
+      },
+      actorName: body.updated_by_name,
+      actorMemberId: body.updated_by_member_id,
+      source: 'weekend_roster_role_editor',
+      reason: `Weekend assignment role changed to ${assignmentRole}`,
+    });
 
     const demotedItems = [];
     const supportBotIds = assignmentRole === 'primary' ? uniqueValues(body.support_bot_account_ids).filter((id) => id !== botAccountId) : [];
@@ -118,19 +117,17 @@ export async function PATCH(request) {
         continue;
       }
       await snapshotBotState(supabase, roster, supportBot, now, body, 'support');
-      const { data: demotedBot, error: demoteError } = await supabase
-        .from('piles_auto_assignment_bot_accounts')
-        .update({
+      const demotedBot = await updateBotAccountWithHistory(supabase, {
+        botId: supportBotId,
+        patch: {
           assignment_role: 'support',
           availability_note: `Weekend roster ${roster.weekend_start} to ${roster.weekend_end}: role override`,
-          updated_by_name: normalize(body.updated_by_name) || null,
-          updated_by_member_id: normalize(body.updated_by_member_id) || null,
-          updated_at: now,
-        })
-        .eq('id', supportBotId)
-        .select('*')
-        .single();
-      if (demoteError) throw demoteError;
+        },
+        actorName: body.updated_by_name,
+        actorMemberId: body.updated_by_member_id,
+        source: 'weekend_roster_role_editor',
+        reason: `Demoted to support for weekend primary ${botAccountId}`,
+      });
       demotedItems.push(demotedBot);
     }
 

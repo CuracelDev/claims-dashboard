@@ -21,7 +21,7 @@ import sys
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -34,6 +34,31 @@ import psycopg2
 import requests
 from dotenv import load_dotenv
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+
+try:
+    from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
+    from piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
+    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
+    from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from piles_auto_assignment.planning import (
+        eligible_bots as evaluate_eligible_bots,
+        plan_assignments,
+    )
+    from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
+    from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from piles_auto_assignment.scheduling import configured_max_concurrency
+except ModuleNotFoundError:  # Repository-level unittest import path.
+    from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
+    from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
+    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
+    from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from scripts.piles_auto_assignment.planning import (
+        eligible_bots as evaluate_eligible_bots,
+        plan_assignments,
+    )
+    from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
+    from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from scripts.piles_auto_assignment.scheduling import configured_max_concurrency
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -610,12 +635,12 @@ def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts
             insurer_group["statuses"].add(item.plan.status_bucket)
         if item.kind == "reassignment":
             insurer_group["reassigned_piles"] += 1
-            insurer_group["reassigned_claims"] += item.plan.claims
+            insurer_group["reassigned_claims"] += max(item.plan.remaining_claims, 0)
             if norm(item.previous_owner_name):
                 insurer_group["previous_owners"].add(item.previous_owner_name)
         else:
             insurer_group["assigned_piles"] += 1
-            insurer_group["assigned_claims"] += item.plan.claims
+            insurer_group["assigned_claims"] += max(item.plan.remaining_claims, 0)
 
     total_assigned_piles = sum(group["assigned_piles"] for group in grouped.values())
     total_assigned_claims = sum(group["assigned_claims"] for group in grouped.values())
@@ -989,6 +1014,26 @@ def assignment_filter_contexts(
     return contexts
 
 
+def chunk_planned_assignments(
+    plans: list["PlannedAssignment"],
+    target_claims: int,
+) -> list[list["PlannedAssignment"]]:
+    target = max(int(target_claims or 0), 1)
+    batches: list[list[PlannedAssignment]] = []
+    current: list[PlannedAssignment] = []
+    current_claims = 0
+    for plan in plans:
+        current.append(plan)
+        current_claims += max(plan.remaining_claims, 0)
+        if current_claims >= target:
+            batches.append(current)
+            current = []
+            current_claims = 0
+    if current:
+        batches.append(current)
+    return batches
+
+
 @dataclass
 class RowSelectionResult:
     count: int
@@ -1002,6 +1047,7 @@ class AssignmentVerificationResult:
     matched_count: int
     missing_count: int
     wrong_values: list[str]
+    decisions: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -1121,7 +1167,8 @@ def group_notification_items_by_owner(items: list[NotificationItem]) -> list[lis
 
 
 class DataStore:
-    def __init__(self) -> None:
+    def __init__(self, *, read_only: bool = False) -> None:
+        self.read_only = read_only
         self.database_url = norm(os.getenv("DATABASE_URL"))
         self.supabase_url = norm(os.getenv("NEXT_PUBLIC_SUPABASE_URL"))
         self.supabase_key = norm(os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
@@ -1149,6 +1196,77 @@ class DataStore:
         )
         return bool(rows and rows[0].get("acquired"))
 
+    def try_acquire_insurer_lock(self, insurer_name: str) -> bool:
+        if self.mode != "postgres":
+            raise RuntimeError("Insurer-scoped scheduling requires DATABASE_URL.")
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+            (f"piles-insurer:{canonical_insurer_key(insurer_name)}",),
+        )
+        return bool(rows and rows[0].get("acquired"))
+
+    def release_insurer_lock(self, insurer_name: str) -> None:
+        if self.mode == "postgres":
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-insurer:{canonical_insurer_key(insurer_name)}",),
+            )
+
+    def try_acquire_runner_slot(self, max_concurrency: int) -> int:
+        if self.mode != "postgres":
+            raise RuntimeError("Runner capacity protection requires DATABASE_URL.")
+        for slot in range(max_concurrency):
+            rows = self._fetchall_postgres(
+                "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+                (f"piles-capacity:{slot}",),
+            )
+            if rows and rows[0].get("acquired"):
+                return slot
+        return -1
+
+    def release_runner_slot(self, slot: int) -> None:
+        if self.mode == "postgres" and slot >= 0:
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-capacity:{slot}",),
+            )
+
+    def mark_coalesced_request(self, insurer_name: str, runner_run_id: str) -> str:
+        if getattr(self, "read_only", False):
+            return f"read-only-{uuid.uuid4()}"
+        rows = self._fetchall_postgres(
+            """
+            INSERT INTO piles_auto_assignment_schedule_requests
+                (id, insurer_name, requested_runner_run_id, status)
+            VALUES (%s, %s, %s, 'pending')
+            ON CONFLICT (lower(insurer_name)) WHERE status = 'pending'
+            DO UPDATE SET updated_at = piles_auto_assignment_schedule_requests.updated_at
+            RETURNING id
+            """,
+            (str(uuid.uuid4()), insurer_name, runner_run_id or None),
+        )
+        return str(rows[0]["id"])
+
+    def claim_coalesced_request(self, insurer_name: str, runner_run_id: str) -> bool:
+        if getattr(self, "read_only", False):
+            return False
+        rows = self._fetchall_postgres(
+            """
+            WITH candidate AS (
+              SELECT id FROM piles_auto_assignment_schedule_requests
+              WHERE lower(insurer_name) = lower(%s) AND status = 'pending'
+              ORDER BY requested_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+            )
+            UPDATE piles_auto_assignment_schedule_requests request
+            SET status = 'claimed', claimed_by_runner_run_id = %s,
+                claimed_at = now(), updated_at = now()
+            FROM candidate WHERE request.id = candidate.id
+            RETURNING request.id
+            """,
+            (insurer_name, runner_run_id or None),
+        )
+        return bool(rows)
+
     def _fetchall_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         assert self.conn
         with self.conn.cursor() as cur:
@@ -1157,6 +1275,8 @@ class DataStore:
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def _execute_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        if getattr(self, "read_only", False):
+            return
         assert self.conn
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
@@ -1177,6 +1297,8 @@ class DataStore:
         return res.json()
 
     def _insert_supabase(self, table: str, payload: dict[str, Any]) -> None:
+        if getattr(self, "read_only", False):
+            return
         url = f"{self.supabase_url}/rest/v1/{table}"
         res = requests.post(url, headers={
             "apikey": self.supabase_key,
@@ -1187,6 +1309,8 @@ class DataStore:
         res.raise_for_status()
 
     def _update_supabase(self, table: str, field: str, value: str, payload: dict[str, Any]) -> None:
+        if getattr(self, "read_only", False):
+            return
         url = f"{self.supabase_url}/rest/v1/{table}?{quote(field)}=eq.{quote(value)}"
         res = requests.patch(url, headers={
             "apikey": self.supabase_key,
@@ -1195,6 +1319,48 @@ class DataStore:
             "Prefer": "return=minimal",
         }, json=payload, timeout=30)
         res.raise_for_status()
+
+    def update_bot_with_history(
+        self,
+        bot_id: str,
+        patch: dict[str, Any],
+        *,
+        source: str,
+        reason: str,
+        actor_name: str = "Piles runner",
+        actor_member_id: str = "system",
+    ) -> None:
+        """Apply a bot mutation and its audit entry in one database transaction."""
+        if getattr(self, "read_only", False):
+            return
+        params = (
+            bot_id,
+            json.dumps(patch),
+            actor_name,
+            actor_member_id,
+            source,
+            reason,
+        )
+        if self.mode == "postgres":
+            self._fetchall_postgres(
+                "select * from piles_update_bot_account_with_history(%s, %s::jsonb, %s, %s, %s, %s)",
+                params,
+            )
+            return
+        url = f"{self.supabase_url}/rest/v1/rpc/piles_update_bot_account_with_history"
+        response = requests.post(url, headers={
+            "apikey": self.supabase_key,
+            "Authorization": f"Bearer {self.supabase_key}",
+            "Content-Type": "application/json",
+        }, json={
+            "target_bot_id": bot_id,
+            "patch": patch,
+            "actor_name": actor_name,
+            "actor_member_id": actor_member_id,
+            "change_source": source,
+            "change_reason": reason,
+        }, timeout=30)
+        response.raise_for_status()
 
     def get_master_account(self, insurer_name: str) -> MasterAccount:
         aliases = insurer_aliases(insurer_name)
@@ -1205,7 +1371,10 @@ class DataStore:
                 from piles_auto_assignment_master_accounts
                 """
             )
-            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
+            rows = [
+                row for row in rows
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         else:
             rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_master_accounts")
@@ -1448,23 +1617,16 @@ class DataStore:
                         ),
                     )
                     inserted_count += cur.rowcount
-                self._execute_postgres(
-                    """
-                    update piles_auto_assignment_bot_accounts
-                    set assignment_role = %s,
-                        availability_status = %s,
-                        availability_note = %s,
-                        is_available = %s,
-                        updated_at = now()
-                    where id = %s
-                    """,
-                    (
-                        row["assignment_role"],
-                        row["availability_status"],
-                        row["availability_note"],
-                        row["is_available"],
-                        bot.id,
-                    ),
+                self.update_bot_with_history(
+                    bot.id,
+                    {
+                        "assignment_role": row["assignment_role"],
+                        "availability_status": row["availability_status"],
+                        "availability_note": row["availability_note"],
+                        "is_available": row["is_available"],
+                    },
+                    source="weekend_roster_automatic_apply",
+                    reason=f"Applied weekend roster {policy.roster_id}",
                 )
         else:
             existing = self._fetchall_supabase(
@@ -1493,13 +1655,17 @@ class DataStore:
                             "effective_date": policy.effective_date,
                         },
                     })
-                self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot.id, {
-                    "assignment_role": row["assignment_role"],
-                    "availability_status": row["availability_status"],
-                    "availability_note": row["availability_note"],
-                    "is_available": row["is_available"],
-                    "updated_at": now_iso,
-                })
+                self.update_bot_with_history(
+                    bot.id,
+                    {
+                        "assignment_role": row["assignment_role"],
+                        "availability_status": row["availability_status"],
+                        "availability_note": row["availability_note"],
+                        "is_available": row["is_available"],
+                    },
+                    source="weekend_roster_automatic_apply",
+                    reason=f"Applied weekend roster {policy.roster_id}",
+                )
 
         return policy.eligible_bots, paused_bots, inserted_count
 
@@ -1524,23 +1690,16 @@ class DataStore:
                 (effective_date,),
             )
             for row in snapshots:
-                self._execute_postgres(
-                    """
-                    update piles_auto_assignment_bot_accounts
-                    set assignment_role = %s,
-                        availability_status = %s,
-                        availability_note = %s,
-                        is_available = %s,
-                        updated_at = now()
-                    where id = %s
-                    """,
-                    (
-                        row.get("previous_assignment_role") or "primary",
-                        row.get("previous_availability_status") or "available",
-                        row.get("previous_availability_note"),
-                        bool(row.get("previous_is_available", True)),
-                        row["bot_account_id"],
-                    ),
+                self.update_bot_with_history(
+                    str(row["bot_account_id"]),
+                    {
+                        "assignment_role": row.get("previous_assignment_role") or "primary",
+                        "availability_status": row.get("previous_availability_status") or "available",
+                        "availability_note": row.get("previous_availability_note"),
+                        "is_available": bool(row.get("previous_is_available", True)),
+                    },
+                    source="weekend_roster_automatic_restore",
+                    reason=f"Weekend roster {row.get('roster_id')} ended",
                 )
                 self._execute_postgres(
                     """
@@ -1564,13 +1723,17 @@ class DataStore:
             if str(row.get("roster_id")) in roster_ids and not row.get("restored_at")
         ]
         for row in snapshots:
-            self._update_supabase("piles_auto_assignment_bot_accounts", "id", str(row["bot_account_id"]), {
-                "assignment_role": row.get("previous_assignment_role") or "primary",
-                "availability_status": row.get("previous_availability_status") or "available",
-                "availability_note": row.get("previous_availability_note"),
-                "is_available": bool(row.get("previous_is_available", True)),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            self.update_bot_with_history(
+                str(row["bot_account_id"]),
+                {
+                    "assignment_role": row.get("previous_assignment_role") or "primary",
+                    "availability_status": row.get("previous_availability_status") or "available",
+                    "availability_note": row.get("previous_availability_note"),
+                    "is_available": bool(row.get("previous_is_available", True)),
+                },
+                source="weekend_roster_automatic_restore",
+                reason=f"Weekend roster {row.get('roster_id')} ended",
+            )
             self._update_supabase("piles_auto_assignment_weekend_bot_state_snapshots", "id", str(row["id"]), {
                 "restored_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1668,11 +1831,16 @@ class DataStore:
                 from piles_auto_assignment_rules
                 """
             )
-            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
+            rows = [
+                row for row in rows
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+                and enabled_by_default(row.get("is_active"))
+            ][:1]
         else:
             rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_rules")
                 if canonical_insurer_key(row.get("insurer_name")) in aliases
+                and enabled_by_default(row.get("is_active"))
             ][:1]
         if not rows:
             return None
@@ -2667,6 +2835,7 @@ class DataStore:
     def create_runner_run(
         self,
         *,
+        run_id: str = "",
         insurer_name: str,
         run_scope: str,
         portal_environment: str,
@@ -2677,7 +2846,7 @@ class DataStore:
         mode: str,
         details: dict[str, Any],
     ) -> str:
-        run_id = str(uuid.uuid4())
+        run_id = norm(run_id) or str(uuid.uuid4())
         payload = {
             "id": run_id,
             "insurer_name": insurer_name or None,
@@ -2692,12 +2861,25 @@ class DataStore:
             "started_at": datetime.now(timezone.utc).isoformat(),
             "details": details,
         }
-        if self.mode == "postgres":
+        if self.mode == "postgres" and norm(run_id):
             self._execute_postgres(
                 """
                 insert into piles_auto_assignment_runner_runs
                 (id, insurer_name, run_scope, portal_environment, backend, run_source, months, year, mode, status, started_at, details)
                 values (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
+                on conflict (id) do update set
+                  insurer_name = excluded.insurer_name,
+                  run_scope = excluded.run_scope,
+                  portal_environment = excluded.portal_environment,
+                  backend = excluded.backend,
+                  run_source = excluded.run_source,
+                  months = excluded.months,
+                  year = excluded.year,
+                  mode = excluded.mode,
+                  status = 'started',
+                  started_at = excluded.started_at,
+                  details = coalesce(piles_auto_assignment_runner_runs.details, '{}'::jsonb) || excluded.details,
+                  updated_at = now()
                 """,
                 (
                     payload["id"],
@@ -2715,7 +2897,15 @@ class DataStore:
                 ),
             )
         else:
-            self._insert_supabase("piles_auto_assignment_runner_runs", payload)
+            existing = self._fetchall_supabase(
+                "piles_auto_assignment_runner_runs",
+                filters=[("id", "eq", run_id)],
+            )
+            if existing:
+                payload["details"] = {**dict(existing[0].get("details") or {}), **details}
+                self._update_supabase("piles_auto_assignment_runner_runs", "id", run_id, payload)
+            else:
+                self._insert_supabase("piles_auto_assignment_runner_runs", payload)
         return run_id
 
     def finalize_runner_run(
@@ -2804,6 +2994,21 @@ class DataStore:
             self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot_id, payload)
 
 
+def build_execution_ledger(store: DataStore, args: argparse.Namespace) -> Any:
+    """Build the optional durable ledger without sharing DataStore autocommit state."""
+    if bool(getattr(args, "read_only", False)):
+        return ReadOnlyExecutionLedger()
+    if not env_bool("PILES_EXECUTION_LEDGER_ENABLED", False):
+        return None
+    if store.mode != "postgres" or not store.database_url:
+        raise RuntimeError(
+            "PILES_EXECUTION_LEDGER_ENABLED requires DATABASE_URL for transactional writes."
+        )
+    connection = psycopg2.connect(store.database_url)
+    connection.autocommit = False
+    return ExecutionLedger(connection)
+
+
 def ensure_runner_lock_available(store: DataStore) -> None:
     if not store.try_acquire_runner_lock():
         raise RuntimeError(
@@ -2830,6 +3035,14 @@ class CuracelPilesRunner:
         self._piles_response_events: list[tuple[int, int, str, Any]] = []
         self._piles_response_sequence = 0
         self.year_filter_confirmation_timeout_ms = 5000
+        self.execution_ledger: Any = None
+        self.insurer_run_id = ""
+        self.insurer_name = ""
+        self._last_scan_result: Any = None
+        self._last_filter_evidence: FilterEvidence | None = None
+        self.scan_context_ids: dict[tuple[str, str, str], str] = {}
+        self.assignment_attempt_ids: dict[str, str] = {}
+        self.retry_attempt_numbers: dict[str, int] = {}
 
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
@@ -2908,6 +3121,24 @@ class CuracelPilesRunner:
         raise RuntimeError(
             f"No completed Piles data request confirmed the year '{year_label}' within {timeout_ms}ms."
         )
+
+    def _filter_network_state(self, marker: int, year_label: str) -> tuple[str, dict[str, Any]]:
+        matching_events = [
+            (sequence, status, response)
+            for sequence, status, url, response in self._piles_response_events
+            if sequence > marker and piles_response_matches_filter_year(url, year_label)
+        ]
+        if not matching_events:
+            return "not_observed", {}
+        sequence, status, response = matching_events[-1]
+        details = {"sequence": sequence, "http_status": status}
+        if not 200 <= status < 400:
+            return "failed", details
+        try:
+            response.finished()
+        except Exception as error:
+            return "failed", {**details, "completion_error": type(error).__name__}
+        return "succeeded", details
 
     def _dismiss_popup(self) -> None:
         assert self.page
@@ -3905,21 +4136,36 @@ class CuracelPilesRunner:
                 continue
         return ""
 
-    def apply_filters(self, month_label: str, year_label: str, status_label: str) -> None:
+    def apply_filters(self, month_label: str, year_label: str, status_label: str) -> FilterEvidence:
         assert self.page
         last_error: Exception | None = None
         final_month_select = None
         final_year_select = None
         final_status_select = None
-        year_response_marker: int | None = None
+        filter_response_marker = self._piles_response_sequence
         desired_year_state = "All" if norm_key(year_label) == "all" else year_label
         month_changed = self._filter_state["month"] != month_label
         year_changed = self._filter_state["year"] != desired_year_state
         status_changed = self._filter_state["status"] != status_label
 
         if not month_changed and not year_changed and not status_changed:
-            self.wait_for_table_ready(timeout_ms=6000)
-            return
+            table_state = self.wait_for_table_ready(timeout_ms=6000)
+            network_state, network_details = self._filter_network_state(
+                filter_response_marker,
+                year_label,
+            )
+            evidence = FilterEvidence(
+                month_matches=True,
+                year_matches=True,
+                status_matches=True,
+                table_state=table_state,
+                network_state=network_state,
+                details={"network": network_details, "selection_changed": False},
+            )
+            decision = evaluate_filter_evidence(evidence)
+            if not decision.accepted:
+                raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
+            return evidence
 
         for attempt in range(1, 4):
             if attempt > 1:
@@ -3948,7 +4194,6 @@ class CuracelPilesRunner:
 
             year_select = None
             if year_changed:
-                year_response_marker = self._piles_response_sequence
                 year_select = self._apply_year_filter(year_label)
 
             status_select = None
@@ -3988,9 +4233,6 @@ class CuracelPilesRunner:
         if final_status_select is None:
             raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
 
-        if year_changed and year_response_marker is not None:
-            self._wait_for_piles_filter_response(year_response_marker, year_label)
-
         self._filter_state["month"] = month_label
         self._filter_state["year"] = desired_year_state
         self._filter_state["status"] = status_label
@@ -4015,7 +4257,25 @@ class CuracelPilesRunner:
             except Exception:
                 continue
         time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
-        self.wait_for_table_ready(timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000)
+        table_state = self.wait_for_table_ready(
+            timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000
+        )
+        network_state, network_details = self._filter_network_state(
+            filter_response_marker,
+            year_label,
+        )
+        evidence = FilterEvidence(
+            month_matches=(not month_changed or final_month_select is not None),
+            year_matches=(not year_changed or final_year_select is not None),
+            status_matches=final_status_select is not None,
+            table_state=table_state,
+            network_state=network_state,
+            details={"network": network_details, "selection_changed": True},
+        )
+        decision = evaluate_filter_evidence(evidence)
+        if not decision.accepted:
+            raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
+        return evidence
 
     def try_set_page_size(self, page_size: int = 100) -> None:
         assert self.page
@@ -4074,7 +4334,7 @@ class CuracelPilesRunner:
             print("  Warning: table headers were not fully readable; falling back to default column positions.")
         return []
 
-    def wait_for_table_ready(self, timeout_ms: int = 12000) -> None:
+    def wait_for_table_ready(self, timeout_ms: int = 12000) -> str:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         last_fingerprint = None
@@ -4092,10 +4352,11 @@ class CuracelPilesRunner:
                     stable_ticks = 0
                     last_fingerprint = fingerprint
                 if stable_ticks >= 1 and (texts or no_data):
-                    return
+                    return "stable" if texts else "empty"
             except Exception:
                 pass
             time.sleep(0.3)
+        return "unreadable"
 
     def rows_on_current_page(
         self,
@@ -4184,17 +4445,20 @@ class CuracelPilesRunner:
                     return False
                 loc.click()
                 time.sleep(0.45)
-                self.wait_for_table_ready()
+                if self.wait_for_table_ready() == "unreadable":
+                    raise IncompleteScan("The next Piles page did not settle into a readable state.")
                 return True
+            except IncompleteScan:
+                raise
             except Exception:
                 continue
         return False
 
     def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
-        self.apply_filters(month_label, year_label, status_label)
+        filter_evidence = self.apply_filters(month_label, year_label, status_label)
+        self._last_filter_evidence = filter_evidence
         self.try_set_page_size(100)
-        seen_pages = set()
-        piles: list[PileRow] = []
+        scan = ScanAccumulator()
         page_number = 1
         while True:
             page_rows = self.rows_on_current_page(status_label, page_number, month_label, year_label)
@@ -4208,15 +4472,19 @@ class CuracelPilesRunner:
                     f"Piles table did not settle on expected year '{year_label}'. "
                     f"Rendered month values: {', '.join(rendered_months[:5])}"
                 )
-            fingerprint = tuple(row.key for row in page_rows)
-            if fingerprint in seen_pages:
+            if scan.observe_page(page_number, page_rows):
                 break
-            seen_pages.add(fingerprint)
-            piles.extend([row for row in page_rows if not only_unassigned or not norm(row.assigned)])
             if not self.goto_next_page():
                 break
             page_number += 1
-        return piles
+        result = scan.finish(
+            explicit_empty=bool(filter_evidence and filter_evidence.table_state == "empty")
+        )
+        self._last_scan_result = result
+        return [
+            row for row in result.rows
+            if not only_unassigned or not norm(row.assigned)
+        ]
 
     def scan_all_unassigned(self, month_labels: list[str], year_label: str) -> list[PileRow]:
         all_rows = self.scan_all_rows(month_labels, year_label)
@@ -4240,6 +4508,30 @@ class CuracelPilesRunner:
             available_years,
             supports_multiple=supports_multiple,
         )
+        ledger = getattr(self, "execution_ledger", None)
+        insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
+        context_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        if ledger and insurer_run_id:
+            expected_contexts = [
+                {
+                    "insurer_name": norm(getattr(self, "insurer_name", "")),
+                    "filter_month": month_label,
+                    "requested_year": scan_year,
+                    "effective_years": available_years if scan_year == "All" else [scan_year],
+                    "status_bucket": status_label,
+                }
+                for scan_year in scan_years
+                for month_label in month_labels
+                for status_label in TARGET_STATUSES
+            ]
+            contexts = ledger.create_scan_contexts(insurer_run_id, expected_contexts)
+            context_by_key = {
+                (item["filter_month"], item["requested_year"], item["status_bucket"]): item
+                for item in contexts
+            }
+            scan_context_ids = getattr(self, "scan_context_ids", {})
+            scan_context_ids.update({key: item["id"] for key, item in context_by_key.items()})
+            self.scan_context_ids = scan_context_ids
         for scan_year in scan_years:
             if len(scan_years) > 1:
                 print(f"\nScanning year: {scan_year}")
@@ -4247,7 +4539,33 @@ class CuracelPilesRunner:
                 print(f"\nScanning month: {month_label}")
                 for status_label in TARGET_STATUSES:
                     print(f"\nScanning status: {status_label}")
-                    rows = self.scan_status(month_label, scan_year, status_label)
+                    context = context_by_key.get((month_label, scan_year, status_label))
+                    if context:
+                        ledger.heartbeat(insurer_run_id, phase="scan")
+                        ledger.start_scan_context(context["id"])
+                    self._last_scan_result = None
+                    self._last_filter_evidence = None
+                    try:
+                        rows = self.scan_status(month_label, scan_year, status_label)
+                        scan_result = self._last_scan_result
+                        if scan_result is None:
+                            accumulator = ScanAccumulator()
+                            accumulator.observe_page(1, rows)
+                            scan_result = accumulator.finish(explicit_empty=not rows)
+                        if context:
+                            ledger.finish_scan_context(
+                                context["id"],
+                                scan_result,
+                                self._last_filter_evidence,
+                            )
+                    except Exception as error:
+                        if context:
+                            ledger.fail_scan_context(
+                                context["id"],
+                                error_code=type(error).__name__.lower(),
+                                error_message=str(error)[:2000],
+                            )
+                        raise
                     unassigned = [row for row in rows if not norm(row.assigned)]
                     print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
                     for row in rows:
@@ -4358,6 +4676,14 @@ class CuracelPilesRunner:
         verified_on_table = False
         observed_assigned_values: list[str] = []
         if execute:
+            self._transition_assignment_attempts(
+                selected_group,
+                AttemptStatus.SUBMITTED,
+                {AttemptStatus.SELECTED},
+                {"code": "portal_submit_returned", "details": {
+                    "selected_assignee": selected_assignee,
+                }},
+            )
             source_pages: list[int] = []
             for plan in selected_group:
                 for page_number in self._page_candidates_for_plan(plan):
@@ -4374,28 +4700,44 @@ class CuracelPilesRunner:
             )
             verified_on_table = verification.ok
             observed_assigned_values = verification.observed_values
-            if not verified_on_table:
-                raise RuntimeError(
-                    f"Assigned column did not update to '{selected_assignee}' for "
-                    f"{len(selected_group)} verified pile(s) in status '{status_label}'. "
-                    f"Observed: {observed_assigned_values or ['<blank>']}. "
-                    f"Matched={verification.matched_count}, missing={verification.missing_count}, "
-                    f"wrong={verification.wrong_values or []}"
-                )
-            if verification.missing_count:
+            ledger = getattr(self, "execution_ledger", None)
+            if ledger:
+                for decision in verification.decisions:
+                    if not decision.attempt_id:
+                        continue
+                    ledger.transition_attempt(
+                        decision.attempt_id,
+                        decision.status,
+                        expected={AttemptStatus.SUBMITTED},
+                        evidence=decision.evidence,
+                    )
+            if verification.missing_count or verification.wrong_values:
                 print(
-                    f"  Verification accepted {verification.matched_count}/{len(selected_group)} "
-                    f"visible row(s) for '{selected_assignee}'; "
-                    f"{verification.missing_count} row(s) moved out of the filtered table after assignment."
+                    f"  Per-pile verification for '{selected_assignee}': "
+                    f"confirmed={verification.matched_count}, "
+                    f"reconciliation_pending={verification.missing_count}, "
+                    f"conflict={len(verification.wrong_values)}."
                 )
 
+        decisions_by_tracking = {
+            decision.tracking_key: decision
+            for decision in verification.decisions
+        } if execute else {}
         applied = [
             AppliedAssignment(
                 plan=plan,
                 actual_assignee_name=selected_assignee,
                 matched_planned_assignee=norm_key(selected_assignee) == norm_key(assignee_name),
-                verified_on_table=verified_on_table if execute else False,
-                observed_assigned_values=observed_assigned_values[:] if execute else [],
+                verified_on_table=(
+                    decisions_by_tracking.get(canonical_pile_tracking_key(plan.tracking_key)) is not None
+                    and decisions_by_tracking[canonical_pile_tracking_key(plan.tracking_key)].status
+                    == AttemptStatus.CONFIRMED_VISIBLE
+                ) if execute else False,
+                observed_assigned_values=(
+                    [decisions_by_tracking[canonical_pile_tracking_key(plan.tracking_key)].evidence.details.get("observed_assignee", "")]
+                    if canonical_pile_tracking_key(plan.tracking_key) in decisions_by_tracking
+                    else ["<missing>"]
+                ) if execute else [],
             )
             for plan in selected_group
         ]
@@ -4505,6 +4847,7 @@ class CuracelPilesRunner:
         matched_count = 0
         missing_count = len(target_keys)
         wrong_values: list[str] = []
+        decisions: list[Any] = []
         page_candidates = list(dict.fromkeys(page for page in (source_pages or []) if page > 0))
         target_key_set = set(target_keys)
         while time.time() < deadline:
@@ -4560,17 +4903,63 @@ class CuracelPilesRunner:
                 for key in target_keys
                 if key in row_map and not self._assignee_matches_assigned_text(expected_assignee, row_map[key].assigned)
             ]
-            if len(row_map) == len(target_keys) and matched_count == len(target_keys):
-                return AssignmentVerificationResult(True, last_observed, matched_count, missing_count, wrong_values)
-
-            # The portal can remove or reshuffle a row from the current status table immediately
-            # after a successful group assignment. Treat a tiny number of missing rows as verified
-            # only when every still-visible target row has the expected assignee.
-            allowed_missing = 0 if len(target_keys) < 10 else max(1, math.floor(len(target_keys) * 0.05))
-            if wrong_values == [] and matched_count > 0 and missing_count <= allowed_missing:
-                return AssignmentVerificationResult(True, last_observed, matched_count, missing_count, wrong_values)
+            expected_observations = {}
+            observed_assignments = {}
+            for key in target_keys:
+                tracking_key = target_tracking_by_key.get(key) or key
+                expected_observations[tracking_key] = {
+                    "attempt_id": getattr(self, "assignment_attempt_ids", {}).get(tracking_key, ""),
+                    "expected_assignee": expected_assignee,
+                }
+                if key in row_map:
+                    observed_assignments[tracking_key] = row_map[key].assigned
+            decisions = list(classify_assignment_observations(
+                expected_observations,
+                observed_assignments,
+            ))
+            matched_count = sum(
+                decision.status == AttemptStatus.CONFIRMED_VISIBLE
+                for decision in decisions
+            )
+            missing_count = sum(
+                decision.status == AttemptStatus.RECONCILIATION_PENDING
+                for decision in decisions
+            )
+            wrong_values = [
+                str(decision.evidence.details.get("observed_assignee") or "")
+                for decision in decisions
+                if decision.status == AttemptStatus.CONFLICT
+            ]
+            if decisions and all(
+                decision.status == AttemptStatus.CONFIRMED_VISIBLE
+                for decision in decisions
+            ):
+                return AssignmentVerificationResult(
+                    True,
+                    last_observed,
+                    matched_count,
+                    missing_count,
+                    wrong_values,
+                    decisions,
+                )
+            if any(decision.status == AttemptStatus.CONFLICT for decision in decisions):
+                return AssignmentVerificationResult(
+                    False,
+                    last_observed,
+                    matched_count,
+                    missing_count,
+                    wrong_values,
+                    decisions,
+                )
             time.sleep(1)
-        return AssignmentVerificationResult(False, last_observed, matched_count, missing_count, wrong_values)
+        return AssignmentVerificationResult(
+            False,
+            last_observed,
+            matched_count,
+            missing_count,
+            wrong_values,
+            decisions,
+        )
 
     def _open_assign_modal(self) -> None:
         assert self.page
@@ -5007,7 +5396,111 @@ class CuracelPilesRunner:
             ))
         return assignees
 
-    def execute_assignment_plan(self, month_labels: list[str], year_label: str, plans: list[PlannedAssignment], execute: bool) -> tuple[dict[str, int], list[AppliedAssignment]]:
+    def persist_assignment_plans(
+        self,
+        plans: list[PlannedAssignment],
+        minimum_claim_chunk: int,
+    ) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
+        if not ledger or not insurer_run_id:
+            return
+        attempt_ids = getattr(self, "assignment_attempt_ids", {})
+        self.assignment_attempt_ids = attempt_ids
+        unpersisted = [
+            plan for plan in plans
+            if plan.tracking_key not in attempt_ids
+        ]
+        grouped: dict[tuple[str, str, str, str, str, int], list[PlannedAssignment]] = {}
+        for plan in unpersisted:
+            key = (
+                plan.assignee_id,
+                plan.assignment_type,
+                plan.status_bucket,
+                plan.filter_month,
+                norm(plan.filter_year),
+                plan.source_page_number,
+            )
+            grouped.setdefault(key, []).append(plan)
+        for grouped_plans in grouped.values():
+            for plan_batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk):
+                sample = plan_batch[0]
+                batch_id = str(uuid.uuid4())
+                attempts = []
+                for plan in plan_batch:
+                    attempt_id = str(uuid.uuid4())
+                    attempts.append({
+                        "id": attempt_id,
+                        "tracking_key": plan.tracking_key,
+                        "last_pile_key": plan.pile_key,
+                        "claim_count": max(plan.remaining_claims, 0),
+                        "attempt_number": getattr(self, "retry_attempt_numbers", {}).get(
+                            canonical_pile_tracking_key(plan.tracking_key),
+                            1,
+                        ),
+                        "filter_context": {
+                            "month": plan.filter_month,
+                            "year": norm(plan.filter_year),
+                            "status": plan.status_bucket,
+                            "source_page": plan.source_page_number,
+                        },
+                    })
+                ledger.create_batch_with_attempts(
+                    {
+                        "id": batch_id,
+                        "insurer_run_id": insurer_run_id,
+                        "scan_context_id": self.scan_context_ids.get((
+                            sample.filter_month,
+                            norm(sample.filter_year),
+                            sample.status_bucket,
+                        )),
+                        "insurer_name": sample.insurer_name,
+                        "bot_account_id": sample.assignee_id,
+                        "intended_owner_name": sample.assignee_name,
+                        "intended_portal_assignee": sample.assignee_name,
+                        "assignment_type": sample.assignment_type,
+                        "status_bucket": sample.status_bucket,
+                        "planned_claim_count": sum(max(plan.remaining_claims, 0) for plan in plan_batch),
+                        "details": {"source_page": sample.source_page_number},
+                    },
+                    attempts,
+                )
+                for attempt in attempts:
+                    attempt_ids[attempt["tracking_key"]] = attempt["id"]
+
+    def _transition_assignment_attempts(
+        self,
+        plans: list[PlannedAssignment],
+        target: Any,
+        expected: set[Any],
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        if not ledger:
+            return
+        for plan in plans:
+            attempt_id = self.assignment_attempt_ids.get(plan.tracking_key)
+            if not attempt_id:
+                raise RuntimeError(
+                    f"Assignment attempt for tracking key '{plan.tracking_key}' was not persisted."
+                )
+            ledger.transition_attempt(
+                attempt_id,
+                target,
+                expected=expected,
+                evidence=evidence,
+            )
+
+    def execute_assignment_plan(
+        self,
+        month_labels: list[str],
+        year_label: str,
+        plans: list[PlannedAssignment],
+        execute: bool,
+        minimum_claim_chunk: int = 25,
+    ) -> tuple[dict[str, int], list[AppliedAssignment]]:
+        if execute:
+            self.persist_assignment_plans(plans, minimum_claim_chunk)
         results: dict[str, int] = {}
         applied: list[AppliedAssignment] = []
         for filter_month, filter_year in assignment_filter_contexts(month_labels, year_label, plans):
@@ -5038,7 +5531,11 @@ class CuracelPilesRunner:
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
                         for plan in page_plans:
                             grouped.setdefault((plan.assignee_name, plan.assignment_type), []).append(plan)
-                        grouped_items = list(grouped.items())
+                        grouped_items = [
+                            (group_key, batch)
+                            for group_key, grouped_plans in grouped.items()
+                            for batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk)
+                        ]
                         for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped_items):
                             requested_keys = [plan.pile_key for plan in group]
                             selected_keys: list[str] = []
@@ -5106,6 +5603,12 @@ class CuracelPilesRunner:
                                 continue
 
                             selected_group = [plan for plan in group if plan.pile_key in selected_keys]
+                            if execute:
+                                self._transition_assignment_attempts(
+                                    selected_group,
+                                    AttemptStatus.SELECTED,
+                                    {AttemptStatus.PLANNED},
+                                )
                             selected_assignee, applied_group = self._apply_selected_group(
                                 filter_month,
                                 filter_year,
@@ -5172,7 +5675,12 @@ class CuracelPilesRunner:
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
                         for plan in page_plans:
                             grouped.setdefault((plan.assignee_name, plan.assignment_type), []).append(plan)
-                        for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped.items()):
+                        grouped_items = [
+                            (group_key, batch)
+                            for group_key, grouped_plans in grouped.items()
+                            for batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk)
+                        ]
+                        for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped_items):
                             if group_index > 0:
                                 current_rows = self.reset_to_filtered_page(
                                     filter_month,
@@ -5185,6 +5693,12 @@ class CuracelPilesRunner:
                             if not selection.selected_keys:
                                 continue
                             selected_group = [plan for plan in group if plan.pile_key in selection.selected_keys]
+                            if execute:
+                                self._transition_assignment_attempts(
+                                    selected_group,
+                                    AttemptStatus.SELECTED,
+                                    {AttemptStatus.PLANNED},
+                                )
                             selected_assignee, applied_group = self._apply_selected_group(
                                 filter_month,
                                 filter_year,
@@ -5777,107 +6291,83 @@ def build_assignment_plan(
     piles: list[PileRow],
     bots: list[BotAccount],
     metrics: dict[str, BotMetric],
+    rule: AssignmentRule | None = None,
+    effective_at: datetime | None = None,
 ) -> tuple[list[PlannedAssignment], dict[str, dict[str, Any]]]:
-    eligible = []
-    for bot in bots:
-        if not bot.is_active:
-            continue
-        if bot.availability_status not in AVAILABLE_BOT_STATUSES or not bot.is_available:
-            continue
-        metric = metrics.get(bot.id)
+    active_rule = rule or AssignmentRule(
+        insurer_name=insurer_name,
+        distribution_mode="balanced_finish",
+        minimum_claim_chunk=25,
+        reassignment_threshold_minutes=120,
+        stale_claim_threshold=40,
+        target_completion_gap_minutes=30,
+    )
+
+    def resolve_speed(bot: BotAccount, metric: BotMetric | None) -> float:
         observed_speed = metric.claims_per_hour if metric and metric.claims_per_hour > 0 else 0
         base_speed = assignment_planning_speed(bot.assignment_role, observed_speed, 0.0)
-        role_weight = role_capacity_weight(bot.assignment_role, bot.support_capacity_ratio)
-        effective_speed = max(base_speed * role_weight, 1)
-        current_load = metric.active_claim_load if metric else bot.current_claim_load
-        eligible.append({
-            "bot": bot,
-            "effective_speed": effective_speed,
-            "projected_hours": current_load / effective_speed if effective_speed else math.inf,
-            "selection_penalty_hours": role_selection_penalty_hours(bot.assignment_role, bot.support_capacity_ratio),
-            "selection_score": (current_load / effective_speed if effective_speed else math.inf) + role_selection_penalty_hours(bot.assignment_role, bot.support_capacity_ratio),
-            "current_load": current_load,
-            "starting_claim_load": current_load,
-            "assigned_claims": 0,
-            "assigned_piles": 0,
-        })
+        return max(
+            base_speed * role_capacity_weight(bot.assignment_role, bot.support_capacity_ratio),
+            1,
+        )
 
-    if not eligible:
-        raise RuntimeError(f"No available bot accounts found for insurer '{insurer_name}'.")
-
-    plans: list[PlannedAssignment] = []
-    sorted_piles = sorted(piles, key=lambda item: item.claims, reverse=True)
-    remaining_piles = list(sorted_piles)
-    primary_entries = [entry for entry in eligible if assignment_entry_role(entry).lower() == "primary"]
-
-    if primary_entries and len(primary_entries) < len(eligible):
-        primary_floor_claims = max(1, math.ceil(sum(pile.claims for pile in sorted_piles) * PRIMARY_ASSIGNMENT_FLOOR_RATIO))
-        primary_claims_assigned = 0
-        while remaining_piles and primary_claims_assigned < primary_floor_claims:
-            pile = remaining_piles.pop(0)
-            chosen = choose_assignment_entry(primary_entries)
-            apply_assignment_entry(chosen, pile)
-            primary_claims_assigned += pile.claims
-            plans.append(PlannedAssignment(
-                pile_key=pile.key,
-                tracking_key=pile.tracking_key,
-                assignee_id=chosen["bot"].id,
-                assignee_name=chosen["bot"].portal_name,
-                assignment_type=pile.assignment_type,
-                insurer_name=insurer_name,
-                provider=pile.provider,
-                claim_month=pile.month,
-                submitted_date=pile.submitted_date,
-                claims=pile.claims,
-                synced_claims=pile.synced_claims,
-                remaining_claims=pile.remaining_claims,
-                current_status=pile.status,
-                status_bucket=pile.status_bucket,
-                filter_month=pile.filter_month,
-                filter_year=pile.filter_year,
-                source_page_number=pile.page_number,
-            ))
-
-    for pile in remaining_piles:
-        # The primary floor is a minimum, not a separate allocation pool. Continue
-        # balancing by projected finish time so current load and completed floor work
-        # are accounted for and support bots are not starved.
-        chosen = choose_assignment_entry(eligible)
-        apply_assignment_entry(chosen, pile)
-        plans.append(PlannedAssignment(
-            pile_key=pile.key,
-            tracking_key=pile.tracking_key,
-            assignee_id=chosen["bot"].id,
-            assignee_name=chosen["bot"].portal_name,
-            assignment_type=pile.assignment_type,
+    planning = plan_assignments(
+        active_rule.distribution_mode,
+        piles,
+        bots,
+        metrics,
+        active_rule,
+        effective_at=effective_at,
+        primary_min_share=PRIMARY_ASSIGNMENT_FLOOR_RATIO,
+        speed_resolver=resolve_speed,
+    )
+    plans = [
+        PlannedAssignment(
+            pile_key=decision.pile.key,
+            tracking_key=decision.pile.tracking_key,
+            assignee_id=decision.bot.id,
+            assignee_name=decision.bot.portal_name,
+            assignment_type=decision.pile.assignment_type,
             insurer_name=insurer_name,
-            provider=pile.provider,
-            claim_month=pile.month,
-            submitted_date=pile.submitted_date,
-            claims=pile.claims,
-            synced_claims=pile.synced_claims,
-            remaining_claims=pile.remaining_claims,
-            current_status=pile.status,
-            status_bucket=pile.status_bucket,
-            filter_month=pile.filter_month,
-            filter_year=pile.filter_year,
-            source_page_number=pile.page_number,
-        ))
+            provider=decision.pile.provider,
+            claim_month=decision.pile.month,
+            submitted_date=decision.pile.submitted_date,
+            claims=decision.pile.claims,
+            synced_claims=decision.pile.synced_claims,
+            remaining_claims=decision.work_claims,
+            current_status=decision.pile.status,
+            status_bucket=decision.pile.status_bucket,
+            filter_month=decision.pile.filter_month,
+            filter_year=decision.pile.filter_year,
+            source_page_number=decision.pile.page_number,
+            legacy_tracking_key=decision.pile.legacy_tracking_key,
+        )
+        for decision in planning.plans
+    ]
 
-    summary = {
-        entry["bot"].id: {
-            "assignee_name": entry["bot"].portal_name,
-            "assignment_role": entry["bot"].assignment_role,
-            "effective_speed": round(entry["effective_speed"], 2),
-            "starting_claim_load": entry["starting_claim_load"],
-            "starting_load": entry["starting_claim_load"],
-            "assigned_piles": entry["assigned_piles"],
-            "assigned_claims": entry["assigned_claims"],
-            "projected_finish_hours": round(entry["projected_hours"], 2),
-            "projected_finish_minutes": projected_finish_minutes(entry["projected_hours"]),
-        }
-        for entry in eligible
+    eligible = evaluate_eligible_bots(bots, effective_at=effective_at).eligible
+    assigned_by_bot = {
+        bot.id: [decision for decision in planning.plans if decision.bot.id == bot.id]
+        for bot in eligible
     }
+    summary = {}
+    for bot in eligible:
+        metric = metrics.get(bot.id)
+        speed = resolve_speed(bot, metric)
+        starting_load = metric.active_claim_load if metric else bot.current_claim_load
+        assigned_claims = sum(item.work_claims for item in assigned_by_bot[bot.id])
+        projected_hours = (starting_load + assigned_claims) / speed
+        summary[bot.id] = {
+            "assignee_name": bot.portal_name,
+            "assignment_role": bot.assignment_role,
+            "effective_speed": round(speed, 2),
+            "starting_claim_load": starting_load,
+            "starting_load": starting_load,
+            "assigned_piles": len(assigned_by_bot[bot.id]),
+            "assigned_claims": assigned_claims,
+            "projected_finish_hours": round(projected_hours, 2),
+            "projected_finish_minutes": projected_finish_minutes(projected_hours),
+        }
     return plans, summary
 
 
@@ -6127,6 +6617,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--year", help="Year label to filter, e.g. 'All' or '2026'. Default is All")
     parser.add_argument("--visible", action="store_true", help="Run with a visible browser")
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
+    parser.add_argument("--read-only", action="store_true", help="Use an in-memory execution ledger instead of writing new reliability state.")
+    parser.add_argument("--run-id", default="", help="Adopt a runner run record pre-created by an asynchronous launcher.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
     parser.add_argument("--run-source", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUN_SOURCE")) or "manual", help="How this run was triggered, e.g. manual or schedule.")
@@ -6178,6 +6670,8 @@ def _run_for_insurer_once(
     month_labels: list[str],
     year_label: str,
     visible: bool,
+    execution_ledger: Any = None,
+    insurer_run_id: str = "",
 ) -> dict[str, Any]:
     captured_at = datetime.now(timezone.utc).isoformat()
     master = store.get_master_account(insurer_name)
@@ -6332,6 +6826,8 @@ def _run_for_insurer_once(
     reassignment_source_by_tracking: dict[str, ReassignmentCandidate] = {}
     slack_thread_ts = ""
     slack_replies_sent = 0
+    reconciliation_manual_count = 0
+    reconciliation_manual_keys: set[str] = set()
 
     print("=" * 72)
     print("Piles Auto-Assignment Runner")
@@ -6373,6 +6869,9 @@ def _run_for_insurer_once(
 
     with CuracelPilesRunner(visible=visible, slow_mo=args.slow_mo) as runner:
         runner.allow_test_any_assignee = False
+        runner.execution_ledger = execution_ledger
+        runner.insurer_run_id = insurer_run_id
+        runner.insurer_name = insurer_name
 
         def ensure_portal_mapping(sample_pile: PileRow) -> None:
             nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots, portal_mapping_warnings
@@ -6411,6 +6910,64 @@ def _run_for_insurer_once(
 
         print("\nScanning pages...")
         scanned_rows = runner.scan_all_rows(month_labels, year_label)
+
+        if execution_ledger and insurer_run_id:
+            for old_plan in execution_ledger.unsubmitted_plans(insurer_name):
+                execution_ledger.transition_attempt(
+                    old_plan["id"],
+                    AttemptStatus.FAILED,
+                    expected={AttemptStatus.PLANNED},
+                    evidence={"code": "superseded_unsubmitted_plan", "details": {}},
+                )
+
+            rows_by_tracking: dict[str, PileRow] = {}
+            for row in scanned_rows:
+                for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key]):
+                    rows_by_tracking[key] = row
+
+            class ScannedRowsPortal:
+                def observe_attempt(self, attempt: dict[str, Any]) -> list[Observation]:
+                    key = canonical_pile_tracking_key(attempt.get("tracking_key"))
+                    observed = rows_by_tracking.get(key)
+                    if observed is None:
+                        return []
+                    return [Observation(
+                        assignable=not norm(observed.assigned),
+                        assignee=norm(observed.assigned),
+                        source="complete_initial_scan",
+                    )]
+
+            pending_attempts = execution_ledger.pending_attempts(insurer_name)
+            if pending_attempts:
+                reconcile_pending_for_insurer(
+                    ScannedRowsPortal(),
+                    execution_ledger,
+                    pending_attempts,
+                )
+
+            for retryable in execution_ledger.retryable_attempts(insurer_name, max_attempts=2):
+                key = canonical_pile_tracking_key(retryable.get("tracking_key"))
+                runner.retry_attempt_numbers[key] = safe_int(retryable.get("attempt_number"), 1) + 1
+                execution_ledger.transition_attempt(
+                    retryable["id"],
+                    AttemptStatus.FAILED,
+                    expected={AttemptStatus.STILL_UNASSIGNED},
+                    evidence={"code": "released_for_bounded_retry", "details": {
+                        "next_attempt_number": runner.retry_attempt_numbers[key],
+                    }},
+                )
+
+            exhausted = execution_ledger.exhausted_attempts(insurer_name, max_attempts=2)
+            for attempt in exhausted:
+                key = canonical_pile_tracking_key(attempt.get("tracking_key"))
+                reconciliation_manual_keys.add(key)
+                execution_ledger.transition_attempt(
+                    attempt["id"],
+                    AttemptStatus.MANUAL_ACTION_REQUIRED,
+                    expected={AttemptStatus.STILL_UNASSIGNED},
+                    evidence={"code": "retry_limit_exhausted", "details": {"max_attempts": 2}},
+                )
+            reconciliation_manual_count = len(reconciliation_manual_keys)
 
         if bots:
             tracked_reconcile = reconcile_tracked_assignments(
@@ -6488,6 +7045,7 @@ def _run_for_insurer_once(
                     year_label,
                     reassignment_plans,
                     execute=args.execute,
+                    minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
                 )
                 print("\nReassignment groups touched:")
                 for assignee_name, count in reassignment_results.items():
@@ -6530,7 +7088,10 @@ def _run_for_insurer_once(
 
                 if args.execute:
                     metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
-        unassigned = unique_unassigned_rows(scanned_rows)
+        unassigned = [
+            row for row in unique_unassigned_rows(scanned_rows)
+            if canonical_pile_tracking_key(row.tracking_key) not in reconciliation_manual_keys
+        ]
         initial_unassigned_keys = {row.key for row in unassigned}
         follow_up_context_pairs = {
             (row.filter_month, effective_filter_year(row, year_label), row.status_bucket)
@@ -6542,11 +7103,33 @@ def _run_for_insurer_once(
         plans: list[PlannedAssignment] = []
         summary: dict[str, dict[str, Any]] = {}
         if unassigned:
-            ensure_portal_mapping(unassigned[0])
-            if not bots:
+            manual_mode = bool(rule and rule.distribution_mode == "manual_override")
+            if not manual_mode:
+                ensure_portal_mapping(unassigned[0])
+            if manual_mode:
+                plans, summary = build_assignment_plan(
+                    insurer_name,
+                    unassigned,
+                    resolved_bots,
+                    metrics,
+                    rule=rule,
+                    effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
+                print(
+                    f"\nManual override is active: {len(unassigned)} pile(s) require manual action; "
+                    "no automatic assignment will be attempted."
+                )
+            elif not bots:
                 plans, summary = build_assignment_plan_from_portal_options(insurer_name, unassigned, portal_assignees)
             else:
-                plans, summary = build_assignment_plan(insurer_name, unassigned, resolved_bots, metrics)
+                plans, summary = build_assignment_plan(
+                    insurer_name,
+                    unassigned,
+                    resolved_bots,
+                    metrics,
+                    rule=rule,
+                    effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
 
         if summary:
             print("\nAssignment summary:")
@@ -6594,13 +7177,24 @@ def _run_for_insurer_once(
         }
         output_path.write_text(json.dumps(payload, indent=2))
 
+        manual_action_count = reconciliation_manual_count + (
+            len(unassigned)
+            if rule and rule.distribution_mode == "manual_override"
+            else 0
+        )
         planned_scan_count = len(reassignment_plans) + len(plans)
-        planned_scan_claims = sum(plan.claims for plan in reassignment_plans) + sum(plan.claims for plan in plans)
+        planned_scan_claims = sum(
+            max(plan.remaining_claims, 0) for plan in [*reassignment_plans, *plans]
+        )
 
         store.log_runner_event(
             insurer_name=insurer_name,
             event_type="runner_scan",
-            status="planned" if not args.execute else "ready",
+            status=(
+                "manual_action_required"
+                if manual_action_count
+                else "planned" if not args.execute else "ready"
+            ),
             pile_count=planned_scan_count,
             claim_count=planned_scan_claims,
             details={
@@ -6615,6 +7209,7 @@ def _run_for_insurer_once(
                 "months": month_labels,
                 "year": year_label,
                 "statuses": TARGET_STATUSES,
+                "manual_action_required_count": manual_action_count,
                 "tracked_reconcile": {
                     "tracked_count": tracked_reconcile["tracked_count"],
                     "completed_count": tracked_reconcile["completed_count"],
@@ -6638,7 +7233,13 @@ def _run_for_insurer_once(
                 if norm(plan.filter_month) and norm(plan.status_bucket)
             )
             print("\nApplying assignment flow...")
-            results, applied = runner.execute_assignment_plan(month_labels, year_label, plans, execute=args.execute)
+            results, applied = runner.execute_assignment_plan(
+                month_labels,
+                year_label,
+                plans,
+                execute=args.execute,
+                minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+            )
             print("\nUI assignment groups touched:")
             for assignee_name, count in results.items():
                 print(f"  - {assignee_name}: {count} pile(s)")
@@ -6689,7 +7290,14 @@ def _run_for_insurer_once(
             if not bots:
                 late_plans, late_summary = build_assignment_plan_from_portal_options(insurer_name, follow_up_unassigned, portal_assignees)
             else:
-                late_plans, late_summary = build_assignment_plan(insurer_name, follow_up_unassigned, resolved_bots, metrics)
+                late_plans, late_summary = build_assignment_plan(
+                    insurer_name,
+                    follow_up_unassigned,
+                    resolved_bots,
+                    metrics,
+                    rule=rule,
+                    effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
             late_arrival_detection["summary"] = late_summary
             summary = merge_assignment_summaries(summary, late_summary)
             plans.extend(late_plans)
@@ -6723,7 +7331,13 @@ def _run_for_insurer_once(
                     )
             if late_plans:
                 late_month_labels = list(dict.fromkeys(plan.filter_month for plan in late_plans if norm(plan.filter_month))) or month_labels
-                late_results, late_applied = runner.execute_assignment_plan(late_month_labels, year_label, late_plans, execute=args.execute)
+                late_results, late_applied = runner.execute_assignment_plan(
+                    late_month_labels,
+                    year_label,
+                    late_plans,
+                    execute=args.execute,
+                    minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+                )
                 late_arrival_detection["results"] = late_results
                 if late_results:
                     print("\nLate-arrival follow-up groups touched:")
@@ -6809,15 +7423,19 @@ def _run_for_insurer_once(
 
     finished_at = datetime.now(timezone.utc).isoformat()
     total_planned = len(reassignment_plans) + len(plans)
-    total_claims = sum(plan.claims for plan in reassignment_plans) + sum(plan.claims for plan in plans)
+    total_claims = sum(max(plan.remaining_claims, 0) for plan in [*reassignment_plans, *plans])
     total_completed = len(reassignment_applied) + len(applied)
-    total_completed_claims = sum(item.plan.claims for item in reassignment_applied) + sum(item.plan.claims for item in applied)
+    total_completed_claims = sum(
+        max(item.plan.remaining_claims, 0) for item in [*reassignment_applied, *applied]
+    )
 
     store.log_runner_event(
         insurer_name=insurer_name,
         event_type="runner_complete",
         status=(
-            "assigned"
+            "manual_action_required"
+            if manual_action_count
+            else "assigned"
             if args.execute and total_completed
             else "dry_run_complete"
             if total_planned
@@ -6835,8 +7453,13 @@ def _run_for_insurer_once(
                 "primary_min_share_ratio": PRIMARY_ASSIGNMENT_FLOOR_RATIO,
             },
             "months": month_labels,
-            "no_work": total_planned == 0,
-            "message": "No unassigned piles found. Nothing to assign." if total_planned == 0 else "",
+            "no_work": total_planned == 0 and manual_action_count == 0,
+            "manual_action_required_count": manual_action_count,
+            "message": (
+                f"{manual_action_count} pile(s) require manual action."
+                if manual_action_count
+                else "No unassigned piles found. Nothing to assign." if total_planned == 0 else ""
+            ),
                 "tracked_reconcile": {
                     "tracked_count": tracked_reconcile["tracked_count"],
                     "completed_count": tracked_reconcile["completed_count"],
@@ -6915,11 +7538,22 @@ def run_for_insurer(
     month_labels: list[str],
     year_label: str,
     visible: bool,
+    execution_ledger: Any = None,
+    insurer_run_id: str = "",
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(1, 3):
         try:
-            return _run_for_insurer_once(store, args, insurer_name, month_labels, year_label, visible)
+            return _run_for_insurer_once(
+                store,
+                args,
+                insurer_name,
+                month_labels,
+                year_label,
+                visible,
+                execution_ledger,
+                insurer_run_id,
+            )
         except Exception as exc:
             last_error = exc
             if attempt >= 2 or not is_retryable_runner_browser_error(exc):
@@ -6932,6 +7566,44 @@ def run_for_insurer(
     raise last_error or RuntimeError(f"Insurer run failed for {insurer_name}.")
 
 
+def run_insurer_recorded(
+    store: DataStore,
+    args: argparse.Namespace,
+    insurer_name: str,
+    month_labels: list[str],
+    year_label: str,
+    visible: bool,
+    execution_ledger: Any,
+    runner_run_id: str,
+) -> dict[str, Any]:
+    """Run one insurer and keep ledger-finalization failures from masking portal errors."""
+    insurer_run_id = ""
+    try:
+        if execution_ledger:
+            master = store.get_master_account(insurer_name)
+            insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
+            execution_ledger.heartbeat(insurer_run_id, phase="login")
+        result = run_for_insurer(
+            store, args, insurer_name, month_labels, year_label, visible,
+            execution_ledger, insurer_run_id,
+        )
+        if insurer_run_id:
+            execution_ledger.finalize_insurer_run(insurer_run_id, status="completed")
+        return result
+    except Exception as exc:
+        if insurer_run_id:
+            try:
+                execution_ledger.finalize_insurer_run(
+                    insurer_run_id,
+                    status="failed",
+                    error_code=classify_runner_error(exc),
+                    error_message=str(exc)[:500],
+                )
+            except Exception as ledger_error:
+                print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
+        raise
+
+
 def main() -> None:
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -6942,10 +7614,13 @@ def main() -> None:
 
     started_at = datetime.now(timezone.utc)
     store: DataStore | None = None
+    execution_ledger: Any = None
     run_id = ""
     run_details: dict[str, Any] = {}
     insurers: list[str] = []
     failures: list[tuple[str, str]] = []
+    insurer_statuses: list[InsurerRunStatus] = []
+    notification_failures: list[dict[str, str]] = []
     final_error: Exception | None = None
     args: argparse.Namespace | None = None
     all_notification_items: list[NotificationItem] = []
@@ -6954,6 +7629,8 @@ def main() -> None:
     slack_replies_sent = 0
     try:
         args = parse_args()
+        if args.read_only and args.execute:
+            raise RuntimeError("--read-only cannot be combined with --execute.")
         configure_portal_environment(args.portal_environment)
         month_labels = parse_month_labels(args.month)
         year_label = parse_year_label(args.year)
@@ -6965,9 +7642,14 @@ def main() -> None:
                 "Use the dev portal, or set ALLOW_PRODUCTION_ASSIGNMENTS=true only when you intentionally want live assignments."
             )
 
-        store = DataStore()
-        ensure_runner_lock_available(store)
-        restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args)) if args.execute else []
+        store = DataStore(read_only=bool(args.read_only))
+        max_concurrency = configured_max_concurrency()
+        restored_weekend_rows = []
+        if args.execute and store.try_acquire_insurer_lock("__weekend_state__"):
+            try:
+                restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args))
+            finally:
+                store.release_insurer_lock("__weekend_state__")
         if restored_weekend_rows:
             restored_by_insurer: dict[str, list[str]] = {}
             for row in restored_weekend_rows:
@@ -6999,6 +7681,7 @@ def main() -> None:
             "effective_date": runner_effective_date(args),
         }
         run_id = store.create_runner_run(
+            run_id=args.run_id,
             insurer_name=args.insurer or "",
             run_scope="all-active" if args.all_active else "single",
             portal_environment=PORTAL_ENVIRONMENT,
@@ -7009,16 +7692,44 @@ def main() -> None:
             mode="execute" if args.execute else "dry-run",
             details=run_details,
         )
+        execution_ledger = build_execution_ledger(store, args)
 
         for index, insurer_name in enumerate(insurers, start=1):
             if args.all_active:
                 print(f"\n\n===== Running insurer {index}/{len(insurers)}: {insurer_name} =====")
+            slot = store.try_acquire_runner_slot(max_concurrency)
+            insurer_locked = slot >= 0 and store.try_acquire_insurer_lock(insurer_name)
+            if not insurer_locked:
+                if slot >= 0:
+                    store.release_runner_slot(slot)
+                request_id = store.mark_coalesced_request(insurer_name, run_id)
+                insurer_statuses.append(InsurerRunStatus.SKIPPED_OVERLAP)
+                store.log_runner_event(
+                    insurer_name=insurer_name,
+                    event_type="runner_overlap",
+                    status="skipped_overlap",
+                    details={"coalesced_request_id": request_id, "runner_run_id": run_id},
+                )
+                print(f"\nSKIPPED overlap for {insurer_name}; one follow-up request is queued.")
+                continue
             try:
-                insurer_result = run_for_insurer(store, args, insurer_name, month_labels, year_label, visible)
-                all_notification_items.extend(insurer_result.get("notification_items", []))
-                all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
+                followup_completed = False
+                while True:
+                    insurer_result = run_insurer_recorded(
+                        store, args, insurer_name, month_labels, year_label, visible,
+                        execution_ledger, run_id,
+                    )
+                    all_notification_items.extend(insurer_result.get("notification_items", []))
+                    all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
+                    insurer_statuses.append(InsurerRunStatus.COMPLETED)
+                    if followup_completed or not store.claim_coalesced_request(insurer_name, run_id):
+                        break
+                    followup_completed = True
+                    print(f"\nRunning one coalesced follow-up for {insurer_name}...")
             except Exception as exc:
+                error_code = classify_runner_error(exc)
                 failures.append((insurer_name, str(exc)))
+                insurer_statuses.append(InsurerRunStatus.FAILED)
                 store.log_runner_event(
                     insurer_name=insurer_name,
                     event_type="runner_complete",
@@ -7027,37 +7738,49 @@ def main() -> None:
                         "insurer_name": insurer_name,
                         "mode": "execute" if args.execute else "dry-run",
                         "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "error_code": error_code,
                         "error": str(exc),
                     },
                 )
                 print(f"\nERROR for {insurer_name}: {exc}")
                 if not args.all_active:
                     raise
+            finally:
+                store.release_insurer_lock(insurer_name)
+                store.release_runner_slot(slot)
 
         if args and all_external_notification_items:
-            send_external_assignment_alert(
-                all_external_notification_items,
-                portal_environment=PORTAL_ENVIRONMENT,
-                run_source=norm(args.run_source) or "manual",
-            )
+            try:
+                send_external_assignment_alert(
+                    all_external_notification_items,
+                    portal_environment=PORTAL_ENVIRONMENT,
+                    run_source=norm(args.run_source) or "manual",
+                )
+            except Exception as exc:
+                notification_failures.append({"type": "external_assignment_alert", "error": str(exc)[:500]})
+                print(f"\nWARNING: external assignment notification failed: {exc}")
 
         if args and args.execute and all_notification_items:
             assigned_items = [item for item in all_notification_items if item.kind == "assignment"]
             reassigned_items = [item for item in all_notification_items if item.kind == "reassignment"]
             scope_label = args.insurer or "All active insurers"
-            slack_thread_ts = create_assignment_thread(
-                scope_label=scope_label,
-                portal_environment=PORTAL_ENVIRONMENT,
-                assigned_piles=len(assigned_items),
-                assigned_claims=sum(item.plan.claims for item in assigned_items),
-                reassigned_piles=len(reassigned_items),
-                reassigned_claims=sum(item.plan.claims for item in reassigned_items),
-                insurer_names=[item.plan.insurer_name for item in all_notification_items],
-            ) or ""
-            if slack_thread_ts:
-                for owner_items in group_notification_items_by_owner(all_notification_items):
-                    if send_assignment_owner_reply(owner_items, slack_thread_ts):
-                        slack_replies_sent += 1
+            try:
+                slack_thread_ts = create_assignment_thread(
+                    scope_label=scope_label,
+                    portal_environment=PORTAL_ENVIRONMENT,
+                    assigned_piles=len(assigned_items),
+                    assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned_items),
+                    reassigned_piles=len(reassigned_items),
+                    reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned_items),
+                    insurer_names=[item.plan.insurer_name for item in all_notification_items],
+                ) or ""
+                if slack_thread_ts:
+                    for owner_items in group_notification_items_by_owner(all_notification_items):
+                        if send_assignment_owner_reply(owner_items, slack_thread_ts):
+                            slack_replies_sent += 1
+            except Exception as exc:
+                notification_failures.append({"type": "assignment_summary", "error": str(exc)[:500]})
+                print(f"\nWARNING: assignment notification failed: {exc}")
 
         if failures:
             raise RuntimeError(
@@ -7079,12 +7802,17 @@ def main() -> None:
                 "slack_replies_sent": slack_replies_sent,
                 "slack_notification_owner_count": len(group_notification_items_by_owner(all_notification_items)),
                 "external_assignment_alert_count": len(all_external_notification_items),
+                "notification_failures": notification_failures,
             }
             if final_error:
                 final_details["error"] = str(final_error)
             store.finalize_runner_run(
                 run_id,
-                status="failed" if final_error else "completed",
+                status=(
+                    derive_overall_run_status(insurer_statuses).value
+                    if insurer_statuses
+                    else "failed" if final_error else "completed"
+                ),
                 started_at=started_at,
                 stdout=stdout_capture.getvalue(),
                 stderr=stderr_capture.getvalue(),
@@ -7092,6 +7820,8 @@ def main() -> None:
             )
         if store:
             store.close()
+        if execution_ledger:
+            execution_ledger.close()
         sys.stdout = original_stdout
         sys.stderr = original_stderr
 

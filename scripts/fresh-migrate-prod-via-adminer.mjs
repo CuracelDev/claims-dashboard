@@ -10,6 +10,10 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const PAGE_SIZE = Number(process.env.MIGRATION_PAGE_SIZE || 1000);
 const INSERT_CHUNK_SIZE = Number(process.env.MIGRATION_INSERT_CHUNK_SIZE || 150);
+const PILES_SCHEMA_SQL = readFileSync(new URL('./piles-auto-assignment-schema.sql', import.meta.url), 'utf8');
+const BOT_HISTORY_FUNCTION_SQL = PILES_SCHEMA_SQL.match(
+  /CREATE OR REPLACE FUNCTION piles_audit_bot_account_insert[\s\S]*?REVOKE ALL ON FUNCTION piles_update_bot_account_with_history[\s\S]*?END \$\$;/,
+)?.[0] || '';
 
 const TABLES = [
   'audit_log',
@@ -23,10 +27,16 @@ const TABLES = [
   'piles_auto_assignment_bot_accounts',
   'piles_auto_assignment_bot_metrics',
   'piles_auto_assignment_external_assignments',
-  'piles_auto_assignment_logs',
   'piles_auto_assignment_master_accounts',
   'piles_auto_assignment_pile_snapshots',
   'piles_auto_assignment_runner_runs',
+  'piles_auto_assignment_schedule_requests',
+  'piles_auto_assignment_insurer_runs',
+  'piles_auto_assignment_scan_contexts',
+  'piles_auto_assignment_batches',
+  'piles_auto_assignment_attempts',
+  'piles_auto_assignment_bot_account_history',
+  'piles_auto_assignment_logs',
   'piles_auto_assignment_rules',
   'piles_auto_assignment_tracked_piles',
   'prism_conversations',
@@ -141,6 +151,7 @@ const TABLE_COLUMNS = {
     ['id', 'text'], ['master_account_id', 'text'], ['bot_account_id', 'text'], ['insurer_name', 'text'],
     ['event_type', 'text'], ['source', 'text'], ['status', 'text'], ['assigned_by', 'text'],
     ['pile_count', 'integer'], ['claim_count', 'integer'], ['details', 'jsonb'], ['created_at', 'timestamptz'],
+    ['insurer_run_id', 'text'], ['batch_id', 'text'],
   ],
   piles_auto_assignment_tracked_piles: [
     ['id', 'text'], ['master_account_id', 'text'], ['bot_account_id', 'text'], ['insurer_name', 'text'],
@@ -165,6 +176,56 @@ const TABLE_COLUMNS = {
     ['mode', 'text'], ['status', 'text'], ['started_at', 'timestamptz'], ['finished_at', 'timestamptz'],
     ['duration_ms', 'integer'], ['stdout', 'text'], ['stderr', 'text'], ['details', 'jsonb'],
     ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_insurer_runs: [
+    ['id', 'text'], ['runner_run_id', 'text'], ['master_account_id', 'text'], ['insurer_name', 'text'],
+    ['status', 'text'], ['phase', 'text'], ['discovered_pile_count', 'integer'], ['discovered_claim_count', 'integer'],
+    ['planned_pile_count', 'integer'], ['planned_claim_count', 'integer'], ['submitted_pile_count', 'integer'],
+    ['submitted_claim_count', 'integer'], ['confirmed_pile_count', 'integer'], ['confirmed_claim_count', 'integer'],
+    ['reconciliation_pending_pile_count', 'integer'], ['reconciliation_pending_claim_count', 'integer'],
+    ['conflict_pile_count', 'integer'], ['failed_pile_count', 'integer'], ['error_code', 'text'], ['error_message', 'text'],
+    ['heartbeat_at', 'timestamptz'], ['started_at', 'timestamptz'], ['finished_at', 'timestamptz'],
+    ['details', 'jsonb'], ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_schedule_requests: [
+    ['id', 'text'], ['insurer_name', 'text'], ['requested_runner_run_id', 'text'], ['status', 'text'],
+    ['claimed_by_runner_run_id', 'text'], ['requested_at', 'timestamptz'], ['claimed_at', 'timestamptz'],
+    ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_scan_contexts: [
+    ['id', 'text'], ['insurer_run_id', 'text'], ['insurer_name', 'text'], ['filter_month', 'text'],
+    ['requested_year', 'text'], ['effective_years', 'jsonb'], ['status_bucket', 'text'], ['status', 'text'],
+    ['page_count', 'integer'], ['distinct_pile_count', 'integer'], ['unassigned_pile_count', 'integer'],
+    ['claim_count', 'integer'], ['ui_evidence', 'jsonb'], ['network_evidence', 'jsonb'], ['table_evidence', 'jsonb'],
+    ['error_code', 'text'], ['error_message', 'text'], ['started_at', 'timestamptz'], ['settled_at', 'timestamptz'],
+    ['finished_at', 'timestamptz'], ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_batches: [
+    ['id', 'text'], ['insurer_run_id', 'text'], ['scan_context_id', 'text'], ['insurer_name', 'text'],
+    ['bot_account_id', 'text'], ['intended_owner_name', 'text'], ['intended_portal_assignee', 'text'],
+    ['assignment_type', 'text'], ['status_bucket', 'text'], ['status', 'text'], ['planned_pile_count', 'integer'],
+    ['planned_claim_count', 'integer'], ['selected_pile_count', 'integer'], ['confirmed_pile_count', 'integer'],
+    ['pending_pile_count', 'integer'], ['conflict_pile_count', 'integer'], ['failed_pile_count', 'integer'],
+    ['attempt_count', 'integer'], ['submitted_at', 'timestamptz'], ['finished_at', 'timestamptz'],
+    ['details', 'jsonb'], ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_attempts: [
+    ['id', 'text'], ['batch_id', 'text'], ['insurer_run_id', 'text'], ['tracked_pile_id', 'text'],
+    ['insurer_name', 'text'], ['tracking_key', 'text'], ['last_pile_key', 'text'], ['bot_account_id', 'text'],
+    ['intended_owner_name', 'text'], ['intended_portal_assignee', 'text'], ['observed_assignee', 'text'],
+    ['status', 'text'], ['claim_count', 'integer'], ['filter_context', 'jsonb'], ['attempt_number', 'integer'],
+    ['evidence_code', 'text'], ['evidence_details', 'jsonb'], ['selected_at', 'timestamptz'],
+    ['submitted_at', 'timestamptz'], ['confirmed_at', 'timestamptz'], ['created_at', 'timestamptz'],
+    ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_bot_account_history: [
+    ['id', 'text'], ['bot_account_id', 'text'], ['insurer_name', 'text'], ['owner_name', 'text'],
+    ['assignment_role', 'text'], ['support_capacity_ratio', 'numeric'], ['availability_status', 'text'],
+    ['availability_note', 'text'], ['active_from_time', 'text'], ['active_to_time', 'text'],
+    ['shift_grace_minutes', 'integer'], ['is_active', 'boolean'], ['is_available', 'boolean'],
+    ['priority_order', 'integer'], ['changed_by_name', 'text'], ['changed_by_member_id', 'text'],
+    ['change_source', 'text'], ['change_reason', 'text'], ['effective_at', 'timestamptz'], ['created_at', 'timestamptz'],
+    ['previous_values', 'jsonb'], ['new_values', 'jsonb'],
   ],
   prism_logs: [
     ['id', 'bigint'], ['sent_by', 'text'], ['message', 'text'], ['category', 'text'],
@@ -456,6 +517,8 @@ const CREATE_TABLE_SQL = {
       pile_count integer DEFAULT 0,
       claim_count integer DEFAULT 0,
       details jsonb DEFAULT '{}'::jsonb,
+      insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL,
+      batch_id text REFERENCES piles_auto_assignment_batches(id) ON DELETE SET NULL,
       created_at timestamptz DEFAULT now()
     )`,
   piles_auto_assignment_tracked_piles: `
@@ -532,6 +595,150 @@ const CREATE_TABLE_SQL = {
       details jsonb DEFAULT '{}'::jsonb,
       created_at timestamptz DEFAULT now(),
       updated_at timestamptz DEFAULT now()
+    )`,
+  piles_auto_assignment_insurer_runs: `
+    CREATE TABLE piles_auto_assignment_insurer_runs (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+      master_account_id text REFERENCES piles_auto_assignment_master_accounts(id) ON DELETE SET NULL,
+      insurer_name text NOT NULL,
+      status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','partial','failed','manual_action_required','skipped_inactive','skipped_overlap')),
+      phase text NOT NULL DEFAULT 'configuration' CHECK (phase IN ('configuration','login','scan','plan','apply','reconcile','complete')),
+      discovered_pile_count integer NOT NULL DEFAULT 0 CHECK (discovered_pile_count >= 0),
+      discovered_claim_count integer NOT NULL DEFAULT 0 CHECK (discovered_claim_count >= 0),
+      planned_pile_count integer NOT NULL DEFAULT 0 CHECK (planned_pile_count >= 0),
+      planned_claim_count integer NOT NULL DEFAULT 0 CHECK (planned_claim_count >= 0),
+      submitted_pile_count integer NOT NULL DEFAULT 0 CHECK (submitted_pile_count >= 0),
+      submitted_claim_count integer NOT NULL DEFAULT 0 CHECK (submitted_claim_count >= 0),
+      confirmed_pile_count integer NOT NULL DEFAULT 0 CHECK (confirmed_pile_count >= 0),
+      confirmed_claim_count integer NOT NULL DEFAULT 0 CHECK (confirmed_claim_count >= 0),
+      reconciliation_pending_pile_count integer NOT NULL DEFAULT 0 CHECK (reconciliation_pending_pile_count >= 0),
+      reconciliation_pending_claim_count integer NOT NULL DEFAULT 0 CHECK (reconciliation_pending_claim_count >= 0),
+      conflict_pile_count integer NOT NULL DEFAULT 0 CHECK (conflict_pile_count >= 0),
+      failed_pile_count integer NOT NULL DEFAULT 0 CHECK (failed_pile_count >= 0),
+      error_code text,
+      error_message text,
+      heartbeat_at timestamptz,
+      started_at timestamptz,
+      finished_at timestamptz,
+      details jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
+  piles_auto_assignment_scan_contexts: `
+    CREATE TABLE piles_auto_assignment_scan_contexts (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      insurer_run_id text NOT NULL REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE CASCADE,
+      insurer_name text NOT NULL,
+      filter_month text NOT NULL,
+      requested_year text NOT NULL,
+      effective_years jsonb NOT NULL DEFAULT '[]'::jsonb,
+      status_bucket text NOT NULL,
+      status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','scanning','complete','empty','failed')),
+      page_count integer NOT NULL DEFAULT 0 CHECK (page_count >= 0),
+      distinct_pile_count integer NOT NULL DEFAULT 0 CHECK (distinct_pile_count >= 0),
+      unassigned_pile_count integer NOT NULL DEFAULT 0 CHECK (unassigned_pile_count >= 0),
+      claim_count integer NOT NULL DEFAULT 0 CHECK (claim_count >= 0),
+      ui_evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+      network_evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+      table_evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+      error_code text,
+      error_message text,
+      started_at timestamptz,
+      settled_at timestamptz,
+      finished_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT piles_auto_assignment_scan_contexts_unique UNIQUE (insurer_run_id, filter_month, requested_year, status_bucket)
+    )`,
+  piles_auto_assignment_batches: `
+    CREATE TABLE piles_auto_assignment_batches (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      insurer_run_id text NOT NULL REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE CASCADE,
+      scan_context_id text REFERENCES piles_auto_assignment_scan_contexts(id) ON DELETE SET NULL,
+      insurer_name text NOT NULL,
+      bot_account_id text REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE SET NULL,
+      intended_owner_name text NOT NULL,
+      intended_portal_assignee text NOT NULL,
+      assignment_type text NOT NULL,
+      status_bucket text NOT NULL,
+      status text NOT NULL DEFAULT 'planned' CHECK (status IN ('planned','selecting','selected','submitted','partially_confirmed','confirmed','reconciliation_pending','conflict','failed')),
+      planned_pile_count integer NOT NULL DEFAULT 0 CHECK (planned_pile_count >= 0),
+      planned_claim_count integer NOT NULL DEFAULT 0 CHECK (planned_claim_count >= 0),
+      selected_pile_count integer NOT NULL DEFAULT 0 CHECK (selected_pile_count >= 0),
+      confirmed_pile_count integer NOT NULL DEFAULT 0 CHECK (confirmed_pile_count >= 0),
+      pending_pile_count integer NOT NULL DEFAULT 0 CHECK (pending_pile_count >= 0),
+      conflict_pile_count integer NOT NULL DEFAULT 0 CHECK (conflict_pile_count >= 0),
+      failed_pile_count integer NOT NULL DEFAULT 0 CHECK (failed_pile_count >= 0),
+      attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      submitted_at timestamptz,
+      finished_at timestamptz,
+      details jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
+  piles_auto_assignment_attempts: `
+    CREATE TABLE piles_auto_assignment_attempts (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      batch_id text NOT NULL REFERENCES piles_auto_assignment_batches(id) ON DELETE CASCADE,
+      insurer_run_id text NOT NULL REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE CASCADE,
+      tracked_pile_id text REFERENCES piles_auto_assignment_tracked_piles(id) ON DELETE SET NULL,
+      insurer_name text NOT NULL,
+      tracking_key text NOT NULL,
+      last_pile_key text,
+      bot_account_id text REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE SET NULL,
+      intended_owner_name text NOT NULL,
+      intended_portal_assignee text NOT NULL,
+      observed_assignee text,
+      status text NOT NULL DEFAULT 'planned' CHECK (status IN ('planned','selected','submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')),
+      claim_count integer NOT NULL DEFAULT 0 CHECK (claim_count >= 0),
+      filter_context jsonb NOT NULL DEFAULT '{}'::jsonb,
+      attempt_number integer NOT NULL DEFAULT 1 CHECK (attempt_number > 0),
+      evidence_code text,
+      evidence_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+      selected_at timestamptz,
+      submitted_at timestamptz,
+      confirmed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT piles_auto_assignment_attempts_unique UNIQUE (batch_id, tracking_key)
+    )`,
+  piles_auto_assignment_bot_account_history: `
+    CREATE TABLE piles_auto_assignment_bot_account_history (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      bot_account_id text NOT NULL REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE CASCADE,
+      insurer_name text NOT NULL,
+      owner_name text NOT NULL,
+      assignment_role text,
+      support_capacity_ratio numeric,
+      availability_status text,
+      availability_note text,
+      active_from_time text,
+      active_to_time text,
+      shift_grace_minutes integer,
+      is_active boolean,
+      is_available boolean,
+      priority_order integer,
+      changed_by_name text,
+      changed_by_member_id text,
+      change_source text NOT NULL DEFAULT 'dashboard',
+      change_reason text,
+      effective_at timestamptz NOT NULL DEFAULT now(),
+      created_at timestamptz NOT NULL DEFAULT now(),
+      previous_values jsonb NOT NULL DEFAULT '{}'::jsonb,
+      new_values jsonb NOT NULL DEFAULT '{}'::jsonb
+    )`,
+  piles_auto_assignment_schedule_requests: `
+    CREATE TABLE piles_auto_assignment_schedule_requests (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      insurer_name text NOT NULL,
+      requested_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+      status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed')),
+      claimed_by_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+      requested_at timestamptz NOT NULL DEFAULT now(),
+      claimed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
     )`,
   prism_logs: `
     CREATE TABLE prism_logs (
@@ -691,6 +898,14 @@ const INDEX_SQL = [
   'CREATE INDEX piles_auto_assignment_pile_snapshots_tracked_idx ON piles_auto_assignment_pile_snapshots (tracked_pile_id, observed_at DESC)',
   'CREATE INDEX piles_auto_assignment_pile_snapshots_bot_idx ON piles_auto_assignment_pile_snapshots (bot_account_id, observed_at DESC)',
   'CREATE INDEX piles_auto_assignment_runner_runs_started_idx ON piles_auto_assignment_runner_runs (started_at DESC)',
+  'CREATE INDEX piles_auto_assignment_insurer_runs_runner_idx ON piles_auto_assignment_insurer_runs (runner_run_id, created_at)',
+  "CREATE INDEX piles_auto_assignment_insurer_runs_active_idx ON piles_auto_assignment_insurer_runs (insurer_name, heartbeat_at DESC) WHERE status IN ('queued', 'running')",
+  'CREATE INDEX piles_auto_assignment_scan_contexts_run_idx ON piles_auto_assignment_scan_contexts (insurer_run_id, status, created_at)',
+  'CREATE INDEX piles_auto_assignment_batches_run_idx ON piles_auto_assignment_batches (insurer_run_id, status, created_at)',
+  "CREATE UNIQUE INDEX piles_auto_assignment_attempts_active_key_idx ON piles_auto_assignment_attempts (insurer_name, tracking_key) WHERE status IN ('planned', 'selected', 'submitted', 'reconciliation_pending', 'still_unassigned')",
+  'CREATE INDEX piles_auto_assignment_attempts_run_idx ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at)',
+  'CREATE INDEX piles_auto_assignment_bot_account_history_bot_idx ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC)',
+  "CREATE UNIQUE INDEX piles_auto_assignment_schedule_requests_pending_idx ON piles_auto_assignment_schedule_requests (lower(insurer_name)) WHERE status = 'pending'",
   'CREATE INDEX tasks_assigned_to_idx ON tasks (assigned_to)',
   'CREATE INDEX target_logs_target_id_idx ON target_logs (target_id)',
   'CREATE INDEX team_leave_member_dates_idx ON team_leave (team_member_id, start_date, end_date)',
@@ -855,6 +1070,12 @@ async function supabaseFetchTable(table) {
 
     if (!res.ok) {
       const body = await res.text();
+      const additiveTables = new Set([
+        'piles_auto_assignment_insurer_runs', 'piles_auto_assignment_scan_contexts',
+        'piles_auto_assignment_batches', 'piles_auto_assignment_attempts',
+        'piles_auto_assignment_bot_account_history', 'piles_auto_assignment_schedule_requests',
+      ]);
+      if (res.status === 404 && additiveTables.has(table)) return [];
       throw new Error(`Supabase fetch failed for ${table}: ${res.status} ${body}`);
     }
 
@@ -1011,6 +1232,9 @@ async function main() {
     }
   }
 
+  if (!BOT_HISTORY_FUNCTION_SQL) throw new Error('Bot history function SQL could not be loaded.');
+  await execSql(cookies, BOT_HISTORY_FUNCTION_SQL, 'install bot history functions');
+
   console.log('Resetting sequences...');
   await execSql(cookies, sequenceSql(), 'reset sequences');
 
@@ -1025,3 +1249,4 @@ main().catch((err) => {
   console.error(err.message);
   process.exit(1);
 });
+import { readFileSync } from 'node:fs';

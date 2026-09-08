@@ -25,6 +25,7 @@ Internal health operations platform for managing insurance claims, team performa
 - **Task Management** — Assignment and status tracking
 - **Prism AI** — Slack-integrated AI assistant for operations queries
 - **Tools Suite** — Batch splitter, insurer feedback, UAPOM matcher, report converter
+- **Piles Auto-Assignment** — Evidence-checked, per-insurer claim-pile planning and assignment with durable reconciliation. See the [operator runbook](docs/piles-auto-assignment-runbook.md).
 
 ## Getting Started
 
