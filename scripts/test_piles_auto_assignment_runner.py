@@ -1281,6 +1281,44 @@ class YearFilterScanningTests(unittest.TestCase):
                 timeout_ms=1,
             )
 
+    def test_matching_controls_and_stable_table_do_not_require_new_network_event(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = object()
+        portal_runner._filter_state = {
+            "month": "All",
+            "year": "2025",
+            "status": "Vetting Pending",
+            "page_size": None,
+        }
+        portal_runner._piles_response_sequence = 4
+        portal_runner._piles_response_events = []
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
+
+        evidence = runner.CuracelPilesRunner.apply_filters(
+            portal_runner,
+            "All",
+            "2025",
+            "Vetting Pending",
+        )
+
+        self.assertEqual(evidence.network_state, "not_observed")
+        self.assertEqual(evidence.table_state, "stable")
+
+    def test_filter_network_state_reports_explicit_http_failure(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_events = [
+            (7, 500, "https://api.health.curacel.co/api/piles?year=2025", object()),
+        ]
+
+        state, details = runner.CuracelPilesRunner._filter_network_state(
+            portal_runner,
+            6,
+            "2025",
+        )
+
+        self.assertEqual(state, "failed")
+        self.assertEqual(details["http_status"], 500)
+
 
 class ExecutionLedgerIntegrationTests(unittest.TestCase):
     def test_read_only_flag_uses_non_writing_ledger(self):

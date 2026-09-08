@@ -37,8 +37,12 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 
 try:
     from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
+    from piles_auto_assignment.domain import FilterEvidence
+    from piles_auto_assignment.evidence import evaluate_filter_evidence
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
+    from scripts.piles_auto_assignment.domain import FilterEvidence
+    from scripts.piles_auto_assignment.evidence import evaluate_filter_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2929,6 +2933,24 @@ class CuracelPilesRunner:
             f"No completed Piles data request confirmed the year '{year_label}' within {timeout_ms}ms."
         )
 
+    def _filter_network_state(self, marker: int, year_label: str) -> tuple[str, dict[str, Any]]:
+        matching_events = [
+            (sequence, status, response)
+            for sequence, status, url, response in self._piles_response_events
+            if sequence > marker and piles_response_matches_filter_year(url, year_label)
+        ]
+        if not matching_events:
+            return "not_observed", {}
+        sequence, status, response = matching_events[-1]
+        details = {"sequence": sequence, "http_status": status}
+        if not 200 <= status < 400:
+            return "failed", details
+        try:
+            response.finished()
+        except Exception as error:
+            return "failed", {**details, "completion_error": type(error).__name__}
+        return "succeeded", details
+
     def _dismiss_popup(self) -> None:
         assert self.page
         for _ in range(2):
@@ -3925,21 +3947,36 @@ class CuracelPilesRunner:
                 continue
         return ""
 
-    def apply_filters(self, month_label: str, year_label: str, status_label: str) -> None:
+    def apply_filters(self, month_label: str, year_label: str, status_label: str) -> FilterEvidence:
         assert self.page
         last_error: Exception | None = None
         final_month_select = None
         final_year_select = None
         final_status_select = None
-        year_response_marker: int | None = None
+        filter_response_marker = self._piles_response_sequence
         desired_year_state = "All" if norm_key(year_label) == "all" else year_label
         month_changed = self._filter_state["month"] != month_label
         year_changed = self._filter_state["year"] != desired_year_state
         status_changed = self._filter_state["status"] != status_label
 
         if not month_changed and not year_changed and not status_changed:
-            self.wait_for_table_ready(timeout_ms=6000)
-            return
+            table_state = self.wait_for_table_ready(timeout_ms=6000)
+            network_state, network_details = self._filter_network_state(
+                filter_response_marker,
+                year_label,
+            )
+            evidence = FilterEvidence(
+                month_matches=True,
+                year_matches=True,
+                status_matches=True,
+                table_state=table_state,
+                network_state=network_state,
+                details={"network": network_details, "selection_changed": False},
+            )
+            decision = evaluate_filter_evidence(evidence)
+            if not decision.accepted:
+                raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
+            return evidence
 
         for attempt in range(1, 4):
             if attempt > 1:
@@ -3968,7 +4005,6 @@ class CuracelPilesRunner:
 
             year_select = None
             if year_changed:
-                year_response_marker = self._piles_response_sequence
                 year_select = self._apply_year_filter(year_label)
 
             status_select = None
@@ -4008,9 +4044,6 @@ class CuracelPilesRunner:
         if final_status_select is None:
             raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
 
-        if year_changed and year_response_marker is not None:
-            self._wait_for_piles_filter_response(year_response_marker, year_label)
-
         self._filter_state["month"] = month_label
         self._filter_state["year"] = desired_year_state
         self._filter_state["status"] = status_label
@@ -4035,7 +4068,25 @@ class CuracelPilesRunner:
             except Exception:
                 continue
         time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
-        self.wait_for_table_ready(timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000)
+        table_state = self.wait_for_table_ready(
+            timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000
+        )
+        network_state, network_details = self._filter_network_state(
+            filter_response_marker,
+            year_label,
+        )
+        evidence = FilterEvidence(
+            month_matches=(not month_changed or final_month_select is not None),
+            year_matches=(not year_changed or final_year_select is not None),
+            status_matches=final_status_select is not None,
+            table_state=table_state,
+            network_state=network_state,
+            details={"network": network_details, "selection_changed": True},
+        )
+        decision = evaluate_filter_evidence(evidence)
+        if not decision.accepted:
+            raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
+        return evidence
 
     def try_set_page_size(self, page_size: int = 100) -> None:
         assert self.page
@@ -4094,7 +4145,7 @@ class CuracelPilesRunner:
             print("  Warning: table headers were not fully readable; falling back to default column positions.")
         return []
 
-    def wait_for_table_ready(self, timeout_ms: int = 12000) -> None:
+    def wait_for_table_ready(self, timeout_ms: int = 12000) -> str:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         last_fingerprint = None
@@ -4112,10 +4163,11 @@ class CuracelPilesRunner:
                     stable_ticks = 0
                     last_fingerprint = fingerprint
                 if stable_ticks >= 1 and (texts or no_data):
-                    return
+                    return "stable" if texts else "empty"
             except Exception:
                 pass
             time.sleep(0.3)
+        return "unreadable"
 
     def rows_on_current_page(
         self,
