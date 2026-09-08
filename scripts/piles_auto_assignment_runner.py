@@ -37,7 +37,7 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 
 try:
     from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from piles_auto_assignment.domain import AttemptStatus, FilterEvidence
+    from piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
     from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from piles_auto_assignment.planning import (
@@ -45,9 +45,10 @@ try:
         plan_assignments,
     )
     from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
+    from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence
+    from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
     from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from scripts.piles_auto_assignment.planning import (
@@ -55,6 +56,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         plan_assignments,
     )
     from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
+    from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -7440,6 +7442,8 @@ def main() -> None:
     run_details: dict[str, Any] = {}
     insurers: list[str] = []
     failures: list[tuple[str, str]] = []
+    insurer_statuses: list[InsurerRunStatus] = []
+    notification_failures: list[dict[str, str]] = []
     final_error: Exception | None = None
     args: argparse.Namespace | None = None
     all_notification_items: list[NotificationItem] = []
@@ -7531,15 +7535,21 @@ def main() -> None:
                         insurer_run_id,
                         status="completed",
                     )
+                insurer_statuses.append(InsurerRunStatus.COMPLETED)
             except Exception as exc:
+                error_code = classify_runner_error(exc)
                 if insurer_run_id:
-                    execution_ledger.finalize_insurer_run(
-                        insurer_run_id,
-                        status="failed",
-                        error_code="insurer_run_failed",
-                        error_message=str(exc)[:2000],
-                    )
+                    try:
+                        execution_ledger.finalize_insurer_run(
+                            insurer_run_id,
+                            status="failed",
+                            error_code=error_code,
+                            error_message=str(exc)[:500],
+                        )
+                    except Exception as ledger_error:
+                        print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
                 failures.append((insurer_name, str(exc)))
+                insurer_statuses.append(InsurerRunStatus.FAILED)
                 store.log_runner_event(
                     insurer_name=insurer_name,
                     event_type="runner_complete",
@@ -7548,6 +7558,7 @@ def main() -> None:
                         "insurer_name": insurer_name,
                         "mode": "execute" if args.execute else "dry-run",
                         "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "error_code": error_code,
                         "error": str(exc),
                     },
                 )
@@ -7556,29 +7567,37 @@ def main() -> None:
                     raise
 
         if args and all_external_notification_items:
-            send_external_assignment_alert(
-                all_external_notification_items,
-                portal_environment=PORTAL_ENVIRONMENT,
-                run_source=norm(args.run_source) or "manual",
-            )
+            try:
+                send_external_assignment_alert(
+                    all_external_notification_items,
+                    portal_environment=PORTAL_ENVIRONMENT,
+                    run_source=norm(args.run_source) or "manual",
+                )
+            except Exception as exc:
+                notification_failures.append({"type": "external_assignment_alert", "error": str(exc)[:500]})
+                print(f"\nWARNING: external assignment notification failed: {exc}")
 
         if args and args.execute and all_notification_items:
             assigned_items = [item for item in all_notification_items if item.kind == "assignment"]
             reassigned_items = [item for item in all_notification_items if item.kind == "reassignment"]
             scope_label = args.insurer or "All active insurers"
-            slack_thread_ts = create_assignment_thread(
-                scope_label=scope_label,
-                portal_environment=PORTAL_ENVIRONMENT,
-                assigned_piles=len(assigned_items),
-                assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned_items),
-                reassigned_piles=len(reassigned_items),
-                reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned_items),
-                insurer_names=[item.plan.insurer_name for item in all_notification_items],
-            ) or ""
-            if slack_thread_ts:
-                for owner_items in group_notification_items_by_owner(all_notification_items):
-                    if send_assignment_owner_reply(owner_items, slack_thread_ts):
-                        slack_replies_sent += 1
+            try:
+                slack_thread_ts = create_assignment_thread(
+                    scope_label=scope_label,
+                    portal_environment=PORTAL_ENVIRONMENT,
+                    assigned_piles=len(assigned_items),
+                    assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned_items),
+                    reassigned_piles=len(reassigned_items),
+                    reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned_items),
+                    insurer_names=[item.plan.insurer_name for item in all_notification_items],
+                ) or ""
+                if slack_thread_ts:
+                    for owner_items in group_notification_items_by_owner(all_notification_items):
+                        if send_assignment_owner_reply(owner_items, slack_thread_ts):
+                            slack_replies_sent += 1
+            except Exception as exc:
+                notification_failures.append({"type": "assignment_summary", "error": str(exc)[:500]})
+                print(f"\nWARNING: assignment notification failed: {exc}")
 
         if failures:
             raise RuntimeError(
@@ -7600,12 +7619,17 @@ def main() -> None:
                 "slack_replies_sent": slack_replies_sent,
                 "slack_notification_owner_count": len(group_notification_items_by_owner(all_notification_items)),
                 "external_assignment_alert_count": len(all_external_notification_items),
+                "notification_failures": notification_failures,
             }
             if final_error:
                 final_details["error"] = str(final_error)
             store.finalize_runner_run(
                 run_id,
-                status="failed" if final_error else "completed",
+                status=(
+                    derive_overall_run_status(insurer_statuses).value
+                    if insurer_statuses
+                    else "failed" if final_error else "completed"
+                ),
                 started_at=started_at,
                 stdout=stdout_capture.getvalue(),
                 stderr=stderr_capture.getvalue(),
