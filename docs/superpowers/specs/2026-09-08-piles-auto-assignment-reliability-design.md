@@ -106,7 +106,7 @@ Add `piles_auto_assignment_attempts`:
 - `id`, `batch_id`, `insurer_run_id`, and optional existing tracked-pile reference
 - stable tracking key and last observed pile key
 - intended bot, intended portal assignee, and observed assignee
-- `status`: `planned`, `selected`, `submitted`, `confirmed_visible`, `confirmed_reconciled`, `reconciliation_pending`, `still_unassigned`, `conflict`, or `failed`
+- `status`: `planned`, `selected`, `submitted`, `confirmed_visible`, `confirmed_reconciled`, `reconciliation_pending`, `still_unassigned`, `manual_action_required`, `conflict`, or `failed`
 - claim totals and filter context
 - attempt number, evidence code, sanitized evidence details, and timestamps
 
@@ -141,6 +141,8 @@ discovered -> planned -> selected -> submitted -> confirmed_visible
                                                         |-> confirmed_reconciled
                                                         |-> conflict
                                                         -> failed
+
+manual override: discovered -> manual_action_required
 ```
 
 The runner persists `planned` before selecting rows and `submitted` immediately after the portal reports a successful action. A submitted or reconciliation-pending attempt is never blindly resubmitted.
@@ -152,6 +154,7 @@ Terminal definitions:
 - `still_unassigned`: a targeted scan conclusively found the same stable pile unassigned; retry is allowed within the configured attempt limit.
 - `conflict`: a targeted scan found another assignee; no automatic overwrite is permitted.
 - `failed`: the system has definitive failure evidence or exhausted safe recovery while the item remains assignable.
+- `manual_action_required`: the insurer rule intentionally delegates assignment to an operator; the item remains visible and is never passed to the portal assignment flow.
 
 An indeterminate observation remains pending and is surfaced operationally; it is never silently counted as completed.
 
@@ -201,7 +204,7 @@ All planning functions are pure and operate on a persisted configuration snapsho
 
 ### Eligibility
 
-A bot is eligible only when its insurer, assignment rule, and bot row are active; the bot is available; its availability status is accepted; its portal name resolves uniquely; and any weekend policy permits it.
+A bot is eligible only when its insurer, assignment rule, and bot row are active; the bot is available; its availability status is accepted; the effective local time falls within its configured active window; its portal name resolves uniquely; and any weekend policy permits it.
 
 Every excluded bot receives one or more explicit reason codes in the insurer-run record. An insurer with no valid eligible target fails before any portal side effect.
 
@@ -220,6 +223,8 @@ Every excluded bot receives one or more explicit reason codes in the insurer-run
 ### Minimum claim chunk
 
 `minimum_claim_chunk` is a target assignment-batch size, not a threshold for skipping work. Piles are indivisible. The batching algorithm accumulates whole piles until the target is met or exceeded, submits the batch, and always submits a final smaller remainder. A single pile larger than the target forms its own batch.
+
+Planning weight uses remaining unsynced claims rather than total historical claims. A pile with no remaining claims is recorded as already complete and is not assigned.
 
 The API validates supported modes, positive thresholds, capacity ranges, schedules, and role constraints before saving.
 
