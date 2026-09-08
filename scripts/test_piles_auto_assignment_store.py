@@ -59,9 +59,10 @@ class ExecutionLedgerTests(unittest.TestCase):
             AttemptStatus.SUBMITTED,
             expected={AttemptStatus.SELECTED},
         )
-        sql, params = self.connection.statements[-1]
+        sql, params = self.connection.statements[-2]
         self.assertIn("status = ANY", sql)
         self.assertEqual(params[-1], "attempt-1")
+        self.assertIn("confirmed_pile_count", self.connection.statements[-1][0])
         self.assertEqual(self.connection.commit_count, 1)
 
     def test_transition_rejects_an_illegal_state_edge_before_writing(self):
@@ -106,6 +107,8 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertEqual(batch_id, "batch-1")
         self.assertEqual(self.connection.commit_count, 1)
         self.assertEqual(len(self.connection.statements), 2)
+        batch_params = self.connection.statements[0][1]
+        self.assertEqual(batch_params[-2], 1)
 
     def test_read_only_ledger_performs_no_database_writes(self):
         ledger = ReadOnlyExecutionLedger()

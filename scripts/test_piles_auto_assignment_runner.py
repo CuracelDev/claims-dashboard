@@ -1434,6 +1434,17 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
 
 
 class RunnerRunAdoptionTests(unittest.TestCase):
+    def test_read_only_store_blocks_all_low_level_mutation_adapters(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.read_only = True
+        store.mode = "postgres"
+        store.conn = None
+        store._execute_postgres("update anything set value = 1")
+        store._insert_supabase("anything", {"secret": "value"})
+        store._update_supabase("anything", "id", "1", {"secret": "value"})
+        store.update_bot_with_history("bot-1", {"is_available": False}, source="test", reason="test")
+        self.assertFalse(store.claim_coalesced_request("DEFMIS", "run-1"))
+
     def test_precreated_run_id_is_updated_instead_of_inserted_again(self):
         store = runner.DataStore.__new__(runner.DataStore)
         store.mode = "supabase"

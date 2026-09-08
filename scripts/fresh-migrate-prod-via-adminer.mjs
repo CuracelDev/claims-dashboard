@@ -12,7 +12,7 @@ const PAGE_SIZE = Number(process.env.MIGRATION_PAGE_SIZE || 1000);
 const INSERT_CHUNK_SIZE = Number(process.env.MIGRATION_INSERT_CHUNK_SIZE || 150);
 const PILES_SCHEMA_SQL = readFileSync(new URL('./piles-auto-assignment-schema.sql', import.meta.url), 'utf8');
 const BOT_HISTORY_FUNCTION_SQL = PILES_SCHEMA_SQL.match(
-  /CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history[\s\S]*?REVOKE ALL ON FUNCTION piles_update_bot_account_with_history[\s\S]*?END \$\$;/,
+  /CREATE OR REPLACE FUNCTION piles_audit_bot_account_insert[\s\S]*?REVOKE ALL ON FUNCTION piles_update_bot_account_with_history[\s\S]*?END \$\$;/,
 )?.[0] || '';
 
 const TABLES = [
@@ -1042,8 +1042,6 @@ ${dropSql}
 ${createSql}
 
 ${indexes}
-
-${BOT_HISTORY_FUNCTION_SQL}
 `;
 }
 
@@ -1233,6 +1231,9 @@ async function main() {
       }
     }
   }
+
+  if (!BOT_HISTORY_FUNCTION_SQL) throw new Error('Bot history function SQL could not be loaded.');
+  await execSql(cookies, BOT_HISTORY_FUNCTION_SQL, 'install bot history functions');
 
   console.log('Resetting sequences...');
   await execSql(cookies, sequenceSql(), 'reset sequences');

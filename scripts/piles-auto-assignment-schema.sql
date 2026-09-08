@@ -471,6 +471,40 @@ ALTER TABLE IF EXISTS piles_auto_assignment_bot_account_history
 ALTER TABLE IF EXISTS piles_auto_assignment_bot_account_history
   ADD COLUMN IF NOT EXISTS new_values jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+CREATE OR REPLACE FUNCTION piles_audit_bot_account_insert()
+RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $$
+BEGIN
+  INSERT INTO piles_auto_assignment_bot_account_history
+    (bot_account_id, insurer_name, owner_name, assignment_role, support_capacity_ratio,
+     availability_status, availability_note, active_from_time, active_to_time,
+     shift_grace_minutes, is_active, is_available, priority_order,
+     changed_by_name, changed_by_member_id, change_source, change_reason,
+     previous_values, new_values)
+  VALUES
+    (NEW.id, NEW.insurer_name, NEW.owner_name, NEW.assignment_role, NEW.support_capacity_ratio,
+     NEW.availability_status, NEW.availability_note, NEW.active_from_time, NEW.active_to_time,
+     NEW.shift_grace_minutes, NEW.is_active, NEW.is_available, NEW.priority_order,
+     NEW.updated_by_name, NEW.updated_by_member_id, 'bot_accounts_api_create',
+     'Bot account created', '{}'::jsonb,
+     jsonb_build_object(
+       'assignment_role', NEW.assignment_role, 'support_capacity_ratio', NEW.support_capacity_ratio,
+       'availability_status', NEW.availability_status, 'availability_note', NEW.availability_note,
+       'active_from_time', NEW.active_from_time, 'active_to_time', NEW.active_to_time,
+       'shift_grace_minutes', NEW.shift_grace_minutes, 'is_active', NEW.is_active,
+       'is_available', NEW.is_available, 'priority_order', NEW.priority_order,
+       'current_claim_load', NEW.current_claim_load, 'bot_name', NEW.bot_name,
+       'owner_name', NEW.owner_name, 'insurer_name', NEW.insurer_name,
+       'email_configured', coalesce(NEW.bot_email, '') <> '',
+       'password_configured', coalesce(NEW.bot_password, '') <> ''
+     ));
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS piles_audit_bot_account_insert_trigger ON piles_auto_assignment_bot_accounts;
+CREATE TRIGGER piles_audit_bot_account_insert_trigger
+AFTER INSERT ON piles_auto_assignment_bot_accounts
+FOR EACH ROW EXECUTE FUNCTION piles_audit_bot_account_insert();
+
 CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history(
   target_bot_id text,
   patch jsonb,

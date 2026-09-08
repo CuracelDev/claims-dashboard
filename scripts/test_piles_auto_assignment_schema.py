@@ -72,8 +72,9 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
         self.assertIn("previous_values", self.sql)
         self.assertIn("new_values", self.sql)
         history_insert = self.sql.split("INSERT INTO piles_auto_assignment_bot_account_history", 1)[1]
-        self.assertNotIn("previous_row.bot_password,", history_insert)
-        self.assertNotIn("next_row.bot_password,", history_insert)
+        self.assertNotIn("'bot_password',", history_insert)
+        self.assertNotIn("'bot_email',", history_insert)
+        self.assertIn("'password_configured'", history_insert)
 
     def test_fresh_migration_knows_every_ledger_table(self):
         for table in LEDGER_TABLES:

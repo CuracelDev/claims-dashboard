@@ -267,7 +267,7 @@ class ExecutionLedger:
                         batch["status_bucket"],
                         len(attempt_rows),
                         int(batch.get("planned_claim_count") or 0),
-                        0,
+                        len(attempt_rows),
                         _json(batch.get("details")),
                     ),
                 )
@@ -333,21 +333,62 @@ class ExecutionLedger:
                     SET status = %s,
                         evidence_code = %s,
                         evidence_details = %s::jsonb,
+                        selected_at = CASE WHEN %s = 'selected' THEN now() ELSE selected_at END,
+                        submitted_at = CASE WHEN %s = 'submitted' THEN now() ELSE submitted_at END,
+                        confirmed_at = CASE WHEN %s IN ('confirmed_visible','confirmed_reconciled') THEN now() ELSE confirmed_at END,
                         updated_at = now()
                     WHERE status = ANY(%s) AND id = %s
-                    RETURNING status
+                    RETURNING batch_id, status
                     """,
                     (
                         target_status.value,
                         evidence_code,
                         _json(evidence_details),
+                        target_status.value,
+                        target_status.value,
+                        target_status.value,
                         [status.value for status in sorted(expected_statuses, key=lambda item: item.value)],
                         attempt_id,
                     ),
                 )
                 row = cursor.fetchone()
-            if not row:
-                raise ConcurrentStateChange(attempt_id)
+                if not row:
+                    raise ConcurrentStateChange(attempt_id)
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_batches batch SET
+                      selected_pile_count = summary.selected_count,
+                      confirmed_pile_count = summary.confirmed_count,
+                      pending_pile_count = summary.pending_count,
+                      conflict_pile_count = summary.conflict_count,
+                      failed_pile_count = summary.failed_count,
+                      status = CASE
+                        WHEN summary.conflict_count > 0 OR summary.failed_count > 0 THEN 'failed'
+                        WHEN summary.confirmed_count = summary.total_count THEN 'confirmed'
+                        WHEN summary.confirmed_count > 0 THEN 'partially_confirmed'
+                        WHEN summary.pending_count > 0 THEN 'reconciliation_pending'
+                        WHEN summary.submitted_count > 0 THEN 'submitted'
+                        WHEN summary.selected_count > 0 THEN 'selected'
+                        ELSE 'planned'
+                      END,
+                      submitted_at = CASE WHEN summary.submitted_count > 0 THEN coalesce(batch.submitted_at, now()) ELSE batch.submitted_at END,
+                      finished_at = CASE WHEN summary.terminal_count = summary.total_count THEN now() ELSE NULL END,
+                      updated_at = now()
+                    FROM (
+                      SELECT batch_id, count(*) total_count,
+                        count(*) FILTER (WHERE status <> 'planned') selected_count,
+                        count(*) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')) submitted_count,
+                        count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_count,
+                        count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_count,
+                        count(*) FILTER (WHERE status = 'conflict') conflict_count,
+                        count(*) FILTER (WHERE status = 'failed') failed_count,
+                        count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled','manual_action_required','conflict','failed')) terminal_count
+                      FROM piles_auto_assignment_attempts WHERE batch_id = %s GROUP BY batch_id
+                    ) summary
+                    WHERE batch.id = summary.batch_id
+                    """,
+                    (row[0],),
+                )
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -437,6 +478,41 @@ class ExecutionLedger:
         error_message: Optional[str] = None,
     ) -> None:
         with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH context_summary AS (
+                  SELECT coalesce(sum(distinct_pile_count), 0) discovered_piles,
+                         coalesce(sum(claim_count), 0) discovered_claims
+                  FROM piles_auto_assignment_scan_contexts WHERE insurer_run_id = %s
+                ), attempt_summary AS (
+                  SELECT count(*) planned_piles, coalesce(sum(claim_count), 0) planned_claims,
+                    count(*) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')) submitted_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')), 0) submitted_claims,
+                    count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')), 0) confirmed_claims,
+                    count(*) FILTER (WHERE status = 'reconciliation_pending') pending_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status = 'reconciliation_pending'), 0) pending_claims,
+                    count(*) FILTER (WHERE status = 'conflict') conflicts,
+                    count(*) FILTER (WHERE status = 'failed') failures
+                  FROM piles_auto_assignment_attempts WHERE insurer_run_id = %s
+                )
+                UPDATE piles_auto_assignment_insurer_runs run SET
+                  discovered_pile_count = context_summary.discovered_piles,
+                  discovered_claim_count = context_summary.discovered_claims,
+                  planned_pile_count = attempt_summary.planned_piles,
+                  planned_claim_count = attempt_summary.planned_claims,
+                  submitted_pile_count = attempt_summary.submitted_piles,
+                  submitted_claim_count = attempt_summary.submitted_claims,
+                  confirmed_pile_count = attempt_summary.confirmed_piles,
+                  confirmed_claim_count = attempt_summary.confirmed_claims,
+                  reconciliation_pending_pile_count = attempt_summary.pending_piles,
+                  reconciliation_pending_claim_count = attempt_summary.pending_claims,
+                  conflict_pile_count = attempt_summary.conflicts,
+                  failed_pile_count = attempt_summary.failures
+                FROM context_summary, attempt_summary WHERE run.id = %s
+                """,
+                (insurer_run_id, insurer_run_id, insurer_run_id),
+            )
             cursor.execute(
                 """
                 UPDATE piles_auto_assignment_insurer_runs

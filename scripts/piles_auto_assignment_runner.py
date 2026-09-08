@@ -1167,7 +1167,8 @@ def group_notification_items_by_owner(items: list[NotificationItem]) -> list[lis
 
 
 class DataStore:
-    def __init__(self) -> None:
+    def __init__(self, *, read_only: bool = False) -> None:
+        self.read_only = read_only
         self.database_url = norm(os.getenv("DATABASE_URL"))
         self.supabase_url = norm(os.getenv("NEXT_PUBLIC_SUPABASE_URL"))
         self.supabase_key = norm(os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
@@ -1231,6 +1232,8 @@ class DataStore:
             )
 
     def mark_coalesced_request(self, insurer_name: str, runner_run_id: str) -> str:
+        if getattr(self, "read_only", False):
+            return f"read-only-{uuid.uuid4()}"
         rows = self._fetchall_postgres(
             """
             INSERT INTO piles_auto_assignment_schedule_requests
@@ -1245,6 +1248,8 @@ class DataStore:
         return str(rows[0]["id"])
 
     def claim_coalesced_request(self, insurer_name: str, runner_run_id: str) -> bool:
+        if getattr(self, "read_only", False):
+            return False
         rows = self._fetchall_postgres(
             """
             WITH candidate AS (
@@ -1270,6 +1275,8 @@ class DataStore:
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def _execute_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        if getattr(self, "read_only", False):
+            return
         assert self.conn
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
@@ -1290,6 +1297,8 @@ class DataStore:
         return res.json()
 
     def _insert_supabase(self, table: str, payload: dict[str, Any]) -> None:
+        if getattr(self, "read_only", False):
+            return
         url = f"{self.supabase_url}/rest/v1/{table}"
         res = requests.post(url, headers={
             "apikey": self.supabase_key,
@@ -1300,6 +1309,8 @@ class DataStore:
         res.raise_for_status()
 
     def _update_supabase(self, table: str, field: str, value: str, payload: dict[str, Any]) -> None:
+        if getattr(self, "read_only", False):
+            return
         url = f"{self.supabase_url}/rest/v1/{table}?{quote(field)}=eq.{quote(value)}"
         res = requests.patch(url, headers={
             "apikey": self.supabase_key,
@@ -1320,6 +1331,8 @@ class DataStore:
         actor_member_id: str = "system",
     ) -> None:
         """Apply a bot mutation and its audit entry in one database transaction."""
+        if getattr(self, "read_only", False):
+            return
         params = (
             bot_id,
             json.dumps(patch),
@@ -7616,6 +7629,8 @@ def main() -> None:
     slack_replies_sent = 0
     try:
         args = parse_args()
+        if args.read_only and args.execute:
+            raise RuntimeError("--read-only cannot be combined with --execute.")
         configure_portal_environment(args.portal_environment)
         month_labels = parse_month_labels(args.month)
         year_label = parse_year_label(args.year)
@@ -7627,9 +7642,14 @@ def main() -> None:
                 "Use the dev portal, or set ALLOW_PRODUCTION_ASSIGNMENTS=true only when you intentionally want live assignments."
             )
 
-        store = DataStore()
+        store = DataStore(read_only=bool(args.read_only))
         max_concurrency = configured_max_concurrency()
-        restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args)) if args.execute else []
+        restored_weekend_rows = []
+        if args.execute and store.try_acquire_insurer_lock("__weekend_state__"):
+            try:
+                restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args))
+            finally:
+                store.release_insurer_lock("__weekend_state__")
         if restored_weekend_rows:
             restored_by_insurer: dict[str, list[str]] = {}
             for row in restored_weekend_rows:
