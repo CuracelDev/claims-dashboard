@@ -90,4 +90,3 @@ For every run, verify this invariant: submitted attempts equal confirmed-visible
 ## Rollback
 
 Remove `ALLOW_PRODUCTION_ASSIGNMENTS` immediately to stop live portal mutation. Disable scheduled/manual launch at the deployment layer if necessary. `PILES_EXECUTION_LEDGER_ENABLED=false` returns the worker to legacy persistence, but should be used only as a temporary rollback because it removes per-pile reconciliation protection. Additive tables can remain in place. Roll back application and worker together; never drop ledger tables during an incident.
-
