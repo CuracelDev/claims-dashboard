@@ -1433,6 +1433,30 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
                 os.environ["PILES_EXECUTION_LEDGER_ENABLED"] = previous
 
 
+class RunnerRunAdoptionTests(unittest.TestCase):
+    def test_precreated_run_id_is_updated_instead_of_inserted_again(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "supabase"
+        updates = []
+        inserts = []
+        store._fetchall_supabase = lambda *_args, **_kwargs: [{
+            "id": "queued-run", "details": {"idempotency_key": "key-1"},
+        }]
+        store._update_supabase = lambda *args: updates.append(args)
+        store._insert_supabase = lambda *args: inserts.append(args)
+
+        result = store.create_runner_run(
+            run_id="queued-run", insurer_name="DEFMIS", run_scope="single",
+            portal_environment="production", backend="local", run_source="manual",
+            months=["All"], year="All", mode="dry-run",
+            details={"insurers": ["DEFMIS"]},
+        )
+
+        self.assertEqual(result, "queued-run")
+        self.assertEqual(inserts, [])
+        self.assertEqual(updates[0][3]["details"]["idempotency_key"], "key-1")
+
+
 class AssignmentRuleLoadingTests(unittest.TestCase):
     def test_inactive_rule_is_not_applied(self):
         store = object.__new__(runner.DataStore)

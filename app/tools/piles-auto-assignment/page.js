@@ -400,21 +400,24 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
       };
       const res = await fetch('/api/tools/piles-auto-assignment/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+        },
         body: JSON.stringify(payload),
       });
       const json = await res.json();
-      const combinedOutput = [json.stdout, json.stderr].filter(Boolean).join('\n').trim();
+      if (!res.ok || !json.success) throw new Error(json.error || 'Runner could not be queued.');
       setRunnerState({
         runMeta: json,
-        runOutput: combinedOutput || `Run finished with status: ${json.success ? 'Completed' : 'Failed'}`,
+        runOutput: `Run ${json.run_id} was queued. Progress will update here without holding the request open.`,
+        activeRunId: json.run_id,
       });
-      if (!json.success) throw new Error(json.error || json.stderr || 'Runner failed.');
       setNotice({
         type: 'success',
         text: draft.finalize_assignments
-          ? `Runner completed on the ${draft.portal_environment} portal with final assignment enabled.`
-          : `Runner completed on the ${draft.portal_environment} portal in preview mode, so it stopped before the final Assign Claims click.`,
+          ? `Assignment run queued for the ${draft.portal_environment} portal.`
+          : `Preview run queued for the ${draft.portal_environment} portal. It will not click Assign Claims.`,
       });
       onRefresh();
       onRunnerFinished?.();
@@ -574,8 +577,8 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
       </div>
       {runnerState.runMeta && (
         <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 12, color: C.sub, fontSize: 12 }}>
-          <div>Duration: <span style={{ color: C.text }}>{Math.round((runnerState.runMeta.duration_ms || 0) / 1000)}s</span></div>
-          <div>Status: <span style={{ color: runnerState.runMeta.success ? C.accent : C.danger }}>{runnerState.runMeta.success ? 'Completed' : 'Failed'}</span></div>
+          <div>Duration: <span style={{ color: C.text }}>{formatRunnerDuration(runnerState.runMeta)}</span></div>
+          <div>Status: <span style={{ color: runnerState.runMeta.status === 'failed' ? C.danger : C.accent }}>{formatRunnerStatus(runnerState.runMeta)}</span></div>
           <div>Backend: <span style={{ color: C.text }}>{formatBackendLabel(runnerState.runMeta.backend)}</span></div>
         </div>
       )}

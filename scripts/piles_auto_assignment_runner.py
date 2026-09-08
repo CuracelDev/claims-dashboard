@@ -2753,6 +2753,7 @@ class DataStore:
     def create_runner_run(
         self,
         *,
+        run_id: str = "",
         insurer_name: str,
         run_scope: str,
         portal_environment: str,
@@ -2763,7 +2764,7 @@ class DataStore:
         mode: str,
         details: dict[str, Any],
     ) -> str:
-        run_id = str(uuid.uuid4())
+        run_id = norm(run_id) or str(uuid.uuid4())
         payload = {
             "id": run_id,
             "insurer_name": insurer_name or None,
@@ -2778,12 +2779,25 @@ class DataStore:
             "started_at": datetime.now(timezone.utc).isoformat(),
             "details": details,
         }
-        if self.mode == "postgres":
+        if self.mode == "postgres" and norm(run_id):
             self._execute_postgres(
                 """
                 insert into piles_auto_assignment_runner_runs
                 (id, insurer_name, run_scope, portal_environment, backend, run_source, months, year, mode, status, started_at, details)
                 values (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
+                on conflict (id) do update set
+                  insurer_name = excluded.insurer_name,
+                  run_scope = excluded.run_scope,
+                  portal_environment = excluded.portal_environment,
+                  backend = excluded.backend,
+                  run_source = excluded.run_source,
+                  months = excluded.months,
+                  year = excluded.year,
+                  mode = excluded.mode,
+                  status = 'started',
+                  started_at = excluded.started_at,
+                  details = coalesce(piles_auto_assignment_runner_runs.details, '{}'::jsonb) || excluded.details,
+                  updated_at = now()
                 """,
                 (
                     payload["id"],
@@ -2801,7 +2815,15 @@ class DataStore:
                 ),
             )
         else:
-            self._insert_supabase("piles_auto_assignment_runner_runs", payload)
+            existing = self._fetchall_supabase(
+                "piles_auto_assignment_runner_runs",
+                filters=[("id", "eq", run_id)],
+            )
+            if existing:
+                payload["details"] = {**dict(existing[0].get("details") or {}), **details}
+                self._update_supabase("piles_auto_assignment_runner_runs", "id", run_id, payload)
+            else:
+                self._insert_supabase("piles_auto_assignment_runner_runs", payload)
         return run_id
 
     def finalize_runner_run(
@@ -6514,6 +6536,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visible", action="store_true", help="Run with a visible browser")
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
     parser.add_argument("--read-only", action="store_true", help="Use an in-memory execution ledger instead of writing new reliability state.")
+    parser.add_argument("--run-id", default="", help="Adopt a runner run record pre-created by an asynchronous launcher.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
     parser.add_argument("--run-source", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUN_SOURCE")) or "manual", help="How this run was triggered, e.g. manual or schedule.")
@@ -7531,6 +7554,7 @@ def main() -> None:
             "effective_date": runner_effective_date(args),
         }
         run_id = store.create_runner_run(
+            run_id=args.run_id,
             insurer_name=args.insurer or "",
             run_scope="all-active" if args.all_active else "single",
             portal_environment=PORTAL_ENVIRONMENT,
