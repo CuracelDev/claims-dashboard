@@ -358,6 +358,48 @@ class YearFilterScanningTests(unittest.TestCase):
             ],
         )
 
+    def test_scan_all_rows_accounts_for_every_expected_context(self):
+        portal_runner = self.make_runner(
+            supports_multiple=True,
+            available_years=["2026", "2025"],
+        )
+
+        class Ledger:
+            def __init__(self):
+                self.created = []
+                self.started = []
+                self.finished = []
+                self.failed = []
+
+            def create_scan_contexts(self, _run_id, contexts):
+                self.created = [{**item, "id": f"context-{index}"}
+                                for index, item in enumerate(contexts)]
+                return self.created
+
+            def start_scan_context(self, context_id):
+                self.started.append(context_id)
+
+            def finish_scan_context(self, context_id, result, evidence=None):
+                self.finished.append((context_id, result.status, evidence))
+
+            def fail_scan_context(self, context_id, **details):
+                self.failed.append((context_id, details))
+
+            def heartbeat(self, *_args, **_kwargs):
+                return None
+
+        ledger = Ledger()
+        portal_runner.execution_ledger = ledger
+        portal_runner.insurer_run_id = "insurer-run-1"
+        portal_runner.insurer_name = "Jubilee Uganda"
+
+        runner.CuracelPilesRunner.scan_all_rows(portal_runner, ["All"], "All")
+
+        self.assertEqual(len(ledger.created), 5)
+        self.assertEqual(len(ledger.started), 5)
+        self.assertEqual(len(ledger.finished), 5)
+        self.assertEqual(ledger.failed, [])
+
     def test_reset_page_preserves_year_context_on_returned_rows(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         portal_runner.open_piles = lambda: None
@@ -1318,6 +1360,56 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertEqual(state, "failed")
         self.assertEqual(details["http_status"], 500)
+
+    def test_scan_status_rejects_conflicting_rows_with_same_tracking_key(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.apply_filters = lambda *_args: runner.FilterEvidence(
+            True, True, True, "stable", "not_observed"
+        )
+        portal_runner.try_set_page_size = lambda *_args: None
+        portal_runner.rows_on_current_page = lambda *_args: [
+            make_pile(1) if _args[1] == 1 else runner.replace(make_pile(1), provider="Changed Provider")
+        ]
+        pages = iter([True, False])
+        portal_runner.goto_next_page = lambda: next(pages)
+
+        with self.assertRaisesRegex(RuntimeError, "Conflicting rows shared tracking key"):
+            runner.CuracelPilesRunner.scan_status(
+                portal_runner,
+                "Jul",
+                "2026",
+                "Vetting Pending",
+            )
+
+    def test_pagination_does_not_treat_an_unreadable_next_page_as_finished(self):
+        class NextButton:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, _name):
+                return None
+
+            def click(self):
+                return None
+
+        class Page:
+            def locator(self, _selector):
+                return NextButton()
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = Page()
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: "unreadable"
+
+        with self.assertRaisesRegex(RuntimeError, "next Piles page did not settle"):
+            runner.CuracelPilesRunner.goto_next_page(portal_runner)
 
 
 class ExecutionLedgerIntegrationTests(unittest.TestCase):

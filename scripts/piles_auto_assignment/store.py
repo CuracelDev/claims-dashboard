@@ -76,7 +76,8 @@ class ExecutionLedger:
                              requested_year, effective_years, status_bucket)
                         VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
                         ON CONFLICT (insurer_run_id, filter_month, requested_year, status_bucket)
-                        DO NOTHING
+                        DO UPDATE SET updated_at = piles_auto_assignment_scan_contexts.updated_at
+                        RETURNING id
                         """,
                         (
                             item["id"],
@@ -88,12 +89,96 @@ class ExecutionLedger:
                             item["status_bucket"],
                         ),
                     )
+                    existing = cursor.fetchone()
+                    if existing:
+                        item["id"] = existing[0]
                     created.append(item)
             self.connection.commit()
         except Exception:
             self.connection.rollback()
             raise
         return created
+
+    def start_scan_context(self, context_id: str) -> None:
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_scan_contexts
+                    SET status = 'scanning', started_at = now(), updated_at = now()
+                    WHERE id = %s AND status = 'pending'
+                    """,
+                    (context_id,),
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def finish_scan_context(self, context_id: str, result: Any, evidence: Any = None) -> None:
+        status = _value(result, "status")
+        status_value = _value(status, "value", status)
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_scan_contexts
+                    SET status = %s,
+                        page_count = %s,
+                        distinct_pile_count = %s,
+                        unassigned_pile_count = %s,
+                        claim_count = %s,
+                        ui_evidence = %s::jsonb,
+                        network_evidence = %s::jsonb,
+                        table_evidence = %s::jsonb,
+                        settled_at = now(), finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (
+                        status_value,
+                        int(_value(result, "page_count", 0) or 0),
+                        int(_value(result, "distinct_pile_count", 0) or 0),
+                        int(_value(result, "unassigned_pile_count", 0) or 0),
+                        int(_value(result, "claim_count", 0) or 0),
+                        _json({
+                            "month_matches": _value(evidence, "month_matches"),
+                            "year_matches": _value(evidence, "year_matches"),
+                            "status_matches": _value(evidence, "status_matches"),
+                        }),
+                        _json({
+                            "state": _value(evidence, "network_state"),
+                            "details": _value(evidence, "details", {}).get("network", {})
+                            if isinstance(_value(evidence, "details", {}), Mapping)
+                            else {},
+                        }),
+                        _json({
+                            "state": _value(evidence, "table_state"),
+                            "page_fingerprints": _value(result, "page_fingerprints", ()),
+                        }),
+                        context_id,
+                    ),
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def fail_scan_context(self, context_id: str, *, error_code: str, error_message: str) -> None:
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_scan_contexts
+                    SET status = 'failed', error_code = %s, error_message = %s,
+                        finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (error_code, str(error_message)[:2000], context_id),
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def create_batch_with_attempts(
         self,
@@ -284,6 +369,15 @@ class ReadOnlyExecutionLedger:
 
     def create_batch_with_attempts(self, batch: Mapping[str, Any], _attempts: Iterable[Mapping[str, Any]]) -> str:
         return str(batch.get("id") or uuid.uuid4())
+
+    def start_scan_context(self, _context_id: str) -> None:
+        return None
+
+    def finish_scan_context(self, _context_id: str, _result: Any, _evidence: Any = None) -> None:
+        return None
+
+    def fail_scan_context(self, _context_id: str, *, error_code: str, error_message: str) -> None:
+        del error_code, error_message
 
     def transition_attempt(self, _attempt_id: str, _target: AttemptStatus, *, expected: Iterable[AttemptStatus], evidence: Optional[Any] = None) -> None:
         del expected, evidence

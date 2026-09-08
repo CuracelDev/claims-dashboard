@@ -39,10 +39,12 @@ try:
     from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from piles_auto_assignment.domain import FilterEvidence
     from piles_auto_assignment.evidence import evaluate_filter_evidence
+    from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from scripts.piles_auto_assignment.domain import FilterEvidence
     from scripts.piles_auto_assignment.evidence import evaluate_filter_evidence
+    from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2854,6 +2856,11 @@ class CuracelPilesRunner:
         self._piles_response_events: list[tuple[int, int, str, Any]] = []
         self._piles_response_sequence = 0
         self.year_filter_confirmation_timeout_ms = 5000
+        self.execution_ledger: Any = None
+        self.insurer_run_id = ""
+        self.insurer_name = ""
+        self._last_scan_result: Any = None
+        self._last_filter_evidence: FilterEvidence | None = None
 
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
@@ -4256,17 +4263,20 @@ class CuracelPilesRunner:
                     return False
                 loc.click()
                 time.sleep(0.45)
-                self.wait_for_table_ready()
+                if self.wait_for_table_ready() == "unreadable":
+                    raise IncompleteScan("The next Piles page did not settle into a readable state.")
                 return True
+            except IncompleteScan:
+                raise
             except Exception:
                 continue
         return False
 
     def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
-        self.apply_filters(month_label, year_label, status_label)
+        filter_evidence = self.apply_filters(month_label, year_label, status_label)
+        self._last_filter_evidence = filter_evidence
         self.try_set_page_size(100)
-        seen_pages = set()
-        piles: list[PileRow] = []
+        scan = ScanAccumulator()
         page_number = 1
         while True:
             page_rows = self.rows_on_current_page(status_label, page_number, month_label, year_label)
@@ -4280,15 +4290,19 @@ class CuracelPilesRunner:
                     f"Piles table did not settle on expected year '{year_label}'. "
                     f"Rendered month values: {', '.join(rendered_months[:5])}"
                 )
-            fingerprint = tuple(row.key for row in page_rows)
-            if fingerprint in seen_pages:
+            if scan.observe_page(page_number, page_rows):
                 break
-            seen_pages.add(fingerprint)
-            piles.extend([row for row in page_rows if not only_unassigned or not norm(row.assigned)])
             if not self.goto_next_page():
                 break
             page_number += 1
-        return piles
+        result = scan.finish(
+            explicit_empty=bool(filter_evidence and filter_evidence.table_state == "empty")
+        )
+        self._last_scan_result = result
+        return [
+            row for row in result.rows
+            if not only_unassigned or not norm(row.assigned)
+        ]
 
     def scan_all_unassigned(self, month_labels: list[str], year_label: str) -> list[PileRow]:
         all_rows = self.scan_all_rows(month_labels, year_label)
@@ -4312,6 +4326,27 @@ class CuracelPilesRunner:
             available_years,
             supports_multiple=supports_multiple,
         )
+        ledger = getattr(self, "execution_ledger", None)
+        insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
+        context_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        if ledger and insurer_run_id:
+            expected_contexts = [
+                {
+                    "insurer_name": norm(getattr(self, "insurer_name", "")),
+                    "filter_month": month_label,
+                    "requested_year": scan_year,
+                    "effective_years": available_years if scan_year == "All" else [scan_year],
+                    "status_bucket": status_label,
+                }
+                for scan_year in scan_years
+                for month_label in month_labels
+                for status_label in TARGET_STATUSES
+            ]
+            contexts = ledger.create_scan_contexts(insurer_run_id, expected_contexts)
+            context_by_key = {
+                (item["filter_month"], item["requested_year"], item["status_bucket"]): item
+                for item in contexts
+            }
         for scan_year in scan_years:
             if len(scan_years) > 1:
                 print(f"\nScanning year: {scan_year}")
@@ -4319,7 +4354,33 @@ class CuracelPilesRunner:
                 print(f"\nScanning month: {month_label}")
                 for status_label in TARGET_STATUSES:
                     print(f"\nScanning status: {status_label}")
-                    rows = self.scan_status(month_label, scan_year, status_label)
+                    context = context_by_key.get((month_label, scan_year, status_label))
+                    if context:
+                        ledger.heartbeat(insurer_run_id, phase="scan")
+                        ledger.start_scan_context(context["id"])
+                    self._last_scan_result = None
+                    self._last_filter_evidence = None
+                    try:
+                        rows = self.scan_status(month_label, scan_year, status_label)
+                        scan_result = self._last_scan_result
+                        if scan_result is None:
+                            accumulator = ScanAccumulator()
+                            accumulator.observe_page(1, rows)
+                            scan_result = accumulator.finish(explicit_empty=not rows)
+                        if context:
+                            ledger.finish_scan_context(
+                                context["id"],
+                                scan_result,
+                                self._last_filter_evidence,
+                            )
+                    except Exception as error:
+                        if context:
+                            ledger.fail_scan_context(
+                                context["id"],
+                                error_code=type(error).__name__.lower(),
+                                error_message=str(error)[:2000],
+                            )
+                        raise
                     unassigned = [row for row in rows if not norm(row.assigned)]
                     print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
                     for row in rows:
@@ -6251,6 +6312,8 @@ def _run_for_insurer_once(
     month_labels: list[str],
     year_label: str,
     visible: bool,
+    execution_ledger: Any = None,
+    insurer_run_id: str = "",
 ) -> dict[str, Any]:
     captured_at = datetime.now(timezone.utc).isoformat()
     master = store.get_master_account(insurer_name)
@@ -6446,6 +6509,9 @@ def _run_for_insurer_once(
 
     with CuracelPilesRunner(visible=visible, slow_mo=args.slow_mo) as runner:
         runner.allow_test_any_assignee = False
+        runner.execution_ledger = execution_ledger
+        runner.insurer_run_id = insurer_run_id
+        runner.insurer_name = insurer_name
 
         def ensure_portal_mapping(sample_pile: PileRow) -> None:
             nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots, portal_mapping_warnings
@@ -6988,11 +7054,22 @@ def run_for_insurer(
     month_labels: list[str],
     year_label: str,
     visible: bool,
+    execution_ledger: Any = None,
+    insurer_run_id: str = "",
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(1, 3):
         try:
-            return _run_for_insurer_once(store, args, insurer_name, month_labels, year_label, visible)
+            return _run_for_insurer_once(
+                store,
+                args,
+                insurer_name,
+                month_labels,
+                year_label,
+                visible,
+                execution_ledger,
+                insurer_run_id,
+            )
         except Exception as exc:
             last_error = exc
             if attempt >= 2 or not is_retryable_runner_browser_error(exc):
@@ -7094,7 +7171,16 @@ def main() -> None:
                     master = store.get_master_account(insurer_name)
                     insurer_run_id = execution_ledger.create_insurer_run(run_id, master)
                     execution_ledger.heartbeat(insurer_run_id, phase="login")
-                insurer_result = run_for_insurer(store, args, insurer_name, month_labels, year_label, visible)
+                insurer_result = run_for_insurer(
+                    store,
+                    args,
+                    insurer_name,
+                    month_labels,
+                    year_label,
+                    visible,
+                    execution_ledger,
+                    insurer_run_id,
+                )
                 all_notification_items.extend(insurer_result.get("notification_items", []))
                 all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
                 if insurer_run_id:

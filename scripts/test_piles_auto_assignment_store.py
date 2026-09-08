@@ -1,6 +1,7 @@
 import unittest
 
 from scripts.piles_auto_assignment.domain import AttemptStatus
+from scripts.piles_auto_assignment.scanning import ScanAccumulator
 from scripts.piles_auto_assignment.store import (
     ConcurrentStateChange,
     ExecutionLedger,
@@ -120,6 +121,33 @@ class ExecutionLedgerTests(unittest.TestCase):
         ledger.heartbeat(run_id, phase="scan")
         self.assertTrue(run_id)
         self.assertEqual(ledger.write_count, 0)
+
+    def test_scan_context_lifecycle_persists_completion_counts(self):
+        scan = ScanAccumulator()
+        scan.observe_page(1, [{
+            "tracking_key": "pile-1",
+            "provider": "Provider",
+            "claims": 7,
+            "submitted_date": "2026-09-08",
+            "assigned": "",
+        }])
+        self.ledger.start_scan_context("context-1")
+        self.ledger.finish_scan_context("context-1", scan.finish())
+
+        sql, params = self.connection.statements[-1]
+        self.assertIn("distinct_pile_count", sql)
+        self.assertEqual(params[-1], "context-1")
+        self.assertEqual(self.connection.commit_count, 2)
+
+    def test_scan_context_failure_is_recorded_without_raw_exception_details(self):
+        self.ledger.fail_scan_context(
+            "context-1",
+            error_code="table_unreadable",
+            error_message="unable to read rows",
+        )
+        sql, params = self.connection.statements[-1]
+        self.assertIn("status = 'failed'", sql)
+        self.assertEqual(params[-1], "context-1")
 
 
 if __name__ == "__main__":
