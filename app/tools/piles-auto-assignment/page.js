@@ -150,7 +150,7 @@ function formatTrackedState(row) {
 function formatRunnerRunResult(run) {
   if (!run) return 'No run output yet.';
   const details = run.details || {};
-  const isRunning = run.status === 'started' && !run.finished_at;
+  const isRunning = ['queued', 'started', 'running'].includes(run.status) && !run.finished_at;
   const lines = [
     `Run scope: ${run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}`,
     `Portal: ${run.portal_environment || 'production'}`,
@@ -204,7 +204,7 @@ function buildRunnerOutputFallback(logs) {
 }
 
 function formatRunnerStatus(run) {
-  const isRunning = run?.status === 'started' && !run?.finished_at;
+  const isRunning = ['queued', 'started', 'running'].includes(run?.status) && !run?.finished_at;
   if (isRunning) return 'in progress';
   return run?.status || 'completed';
 }
@@ -214,7 +214,7 @@ function formatRunnerDuration(run, nowTs = Date.now()) {
   if (run.finished_at && Number(run.duration_ms) > 0) {
     return `${Math.max(1, Math.round(Number(run.duration_ms) / 1000))}s`;
   }
-  if (run.status === 'started' && run.started_at) {
+  if (['queued', 'started', 'running'].includes(run.status) && run.started_at) {
     const elapsedMs = Math.max(0, nowTs - new Date(run.started_at).getTime());
     const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
     return `${elapsedSec}s live`;
@@ -379,6 +379,57 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  useEffect(() => {
+    const runId = runnerState.activeRunId;
+    if (!runId) return undefined;
+    let active = true;
+    let timer;
+    const terminal = new Set(['completed', 'partial', 'failed', 'manual_action_required']);
+
+    async function refreshRun() {
+      try {
+        const response = await fetch(`/api/tools/piles-auto-assignment/runner-runs?id=${encodeURIComponent(runId)}`, { cache: 'no-store' });
+        const json = await response.json();
+        if (!response.ok || !json.success) throw new Error(json.error || 'Could not load run progress.');
+        const run = json.runs?.[0];
+        if (!run || !active) return;
+        const counts = run.counts || {};
+        const insurerLines = (run.insurers || []).map((item) => (
+          `${item.insurer_name}: ${item.status} (${item.phase})`
+          + (item.error_code ? ` — ${item.error_code}` : '')
+        ));
+        setRunnerState({
+          activeRunId: terminal.has(run.status) ? '' : runId,
+          runMeta: run,
+          runOutput: [
+            `Run ${run.id}`,
+            `Phase: ${run.phase}`,
+            `Contexts: ${counts.contexts_complete || 0}/${counts.contexts_total || 0}`,
+            `Discovered: ${counts.discovered_piles || 0} piles / ${counts.discovered_claims || 0} claims`,
+            `Planned: ${counts.planned_piles || 0}; confirmed: ${counts.confirmed_piles || 0}; pending reconciliation: ${counts.reconciliation_pending || 0}; conflicts: ${counts.conflicts || 0}; failed: ${counts.failed || 0}`,
+            ...insurerLines,
+          ].join('\n'),
+        });
+        if (terminal.has(run.status)) {
+          onRefresh();
+          onRunnerFinished?.();
+          return;
+        }
+        timer = window.setTimeout(refreshRun, 5000);
+      } catch (error) {
+        if (!active) return;
+        setNotice({ type: 'error', text: error.message });
+        timer = window.setTimeout(refreshRun, 10000);
+      }
+    }
+
+    void refreshRun();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [runnerState.activeRunId]);
 
   async function runFlow() {
     if (draft.target === 'single' && !draft.insurer_name) {
@@ -580,6 +631,8 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
           <div>Duration: <span style={{ color: C.text }}>{formatRunnerDuration(runnerState.runMeta)}</span></div>
           <div>Status: <span style={{ color: runnerState.runMeta.status === 'failed' ? C.danger : C.accent }}>{formatRunnerStatus(runnerState.runMeta)}</span></div>
           <div>Backend: <span style={{ color: C.text }}>{formatBackendLabel(runnerState.runMeta.backend)}</span></div>
+          <div>Phase: <span style={{ color: C.text }}>{runnerState.runMeta.phase || 'configuration'}</span></div>
+          <div>Heartbeat: <span style={{ color: C.text }}>{runnerState.runMeta.heartbeat_at ? new Date(runnerState.runMeta.heartbeat_at).toLocaleString('en-GB') : 'waiting'}</span></div>
         </div>
       )}
       <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
