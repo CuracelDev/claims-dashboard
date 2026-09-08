@@ -297,6 +297,69 @@ class ExecutionLedger:
             self.connection.rollback()
             raise
 
+    def pending_attempts(self, insurer_name: str) -> list[dict[str, Any]]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, insurer_run_id, batch_id, tracking_key, last_pile_key,
+                       intended_portal_assignee, status, attempt_number, filter_context
+                FROM piles_auto_assignment_attempts
+                WHERE insurer_name = %s
+                  AND status IN ('selected','submitted','reconciliation_pending')
+                ORDER BY updated_at, id
+                """,
+                (insurer_name,),
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def retryable_attempts(self, insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, insurer_run_id, batch_id, tracking_key, last_pile_key,
+                       intended_portal_assignee, status, attempt_number, filter_context
+                FROM piles_auto_assignment_attempts
+                WHERE insurer_name = %s
+                  AND status = 'still_unassigned'
+                  AND attempt_number < %s
+                ORDER BY updated_at, id
+                """,
+                (insurer_name, max_attempts),
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def exhausted_attempts(self, insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, tracking_key, status, attempt_number, filter_context
+                FROM piles_auto_assignment_attempts
+                WHERE insurer_name = %s
+                  AND status = 'still_unassigned'
+                  AND attempt_number >= %s
+                ORDER BY updated_at, id
+                """,
+                (insurer_name, max_attempts),
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def unsubmitted_plans(self, insurer_name: str) -> list[dict[str, Any]]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, tracking_key, status, attempt_number, filter_context
+                FROM piles_auto_assignment_attempts
+                WHERE insurer_name = %s AND status = 'planned'
+                ORDER BY updated_at, id
+                """,
+                (insurer_name,),
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
     def heartbeat(self, insurer_run_id: str, *, phase: str) -> None:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -381,6 +444,20 @@ class ReadOnlyExecutionLedger:
 
     def transition_attempt(self, _attempt_id: str, _target: AttemptStatus, *, expected: Iterable[AttemptStatus], evidence: Optional[Any] = None) -> None:
         del expected, evidence
+
+    def pending_attempts(self, _insurer_name: str) -> list[dict[str, Any]]:
+        return []
+
+    def retryable_attempts(self, _insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
+        del max_attempts
+        return []
+
+    def exhausted_attempts(self, _insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
+        del max_attempts
+        return []
+
+    def unsubmitted_plans(self, _insurer_name: str) -> list[dict[str, Any]]:
+        return []
 
     def heartbeat(self, _insurer_run_id: str, *, phase: str) -> None:
         del phase

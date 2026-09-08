@@ -44,6 +44,7 @@ try:
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
     )
+    from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence
@@ -53,6 +54,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
     )
+    from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2900,6 +2902,7 @@ class CuracelPilesRunner:
         self._last_filter_evidence: FilterEvidence | None = None
         self.scan_context_ids: dict[tuple[str, str, str], str] = {}
         self.assignment_attempt_ids: dict[str, str] = {}
+        self.retry_attempt_numbers: dict[str, int] = {}
 
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
@@ -5291,6 +5294,10 @@ class CuracelPilesRunner:
                         "tracking_key": plan.tracking_key,
                         "last_pile_key": plan.pile_key,
                         "claim_count": max(plan.remaining_claims, 0),
+                        "attempt_number": getattr(self, "retry_attempt_numbers", {}).get(
+                            canonical_pile_tracking_key(plan.tracking_key),
+                            1,
+                        ),
                         "filter_context": {
                             "month": plan.filter_month,
                             "year": norm(plan.filter_year),
@@ -6678,6 +6685,8 @@ def _run_for_insurer_once(
     reassignment_source_by_tracking: dict[str, ReassignmentCandidate] = {}
     slack_thread_ts = ""
     slack_replies_sent = 0
+    reconciliation_manual_count = 0
+    reconciliation_manual_keys: set[str] = set()
 
     print("=" * 72)
     print("Piles Auto-Assignment Runner")
@@ -6760,6 +6769,64 @@ def _run_for_insurer_once(
 
         print("\nScanning pages...")
         scanned_rows = runner.scan_all_rows(month_labels, year_label)
+
+        if execution_ledger and insurer_run_id:
+            for old_plan in execution_ledger.unsubmitted_plans(insurer_name):
+                execution_ledger.transition_attempt(
+                    old_plan["id"],
+                    AttemptStatus.FAILED,
+                    expected={AttemptStatus.PLANNED},
+                    evidence={"code": "superseded_unsubmitted_plan", "details": {}},
+                )
+
+            rows_by_tracking: dict[str, PileRow] = {}
+            for row in scanned_rows:
+                for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key]):
+                    rows_by_tracking[key] = row
+
+            class ScannedRowsPortal:
+                def observe_attempt(self, attempt: dict[str, Any]) -> list[Observation]:
+                    key = canonical_pile_tracking_key(attempt.get("tracking_key"))
+                    observed = rows_by_tracking.get(key)
+                    if observed is None:
+                        return []
+                    return [Observation(
+                        assignable=not norm(observed.assigned),
+                        assignee=norm(observed.assigned),
+                        source="complete_initial_scan",
+                    )]
+
+            pending_attempts = execution_ledger.pending_attempts(insurer_name)
+            if pending_attempts:
+                reconcile_pending_for_insurer(
+                    ScannedRowsPortal(),
+                    execution_ledger,
+                    pending_attempts,
+                )
+
+            for retryable in execution_ledger.retryable_attempts(insurer_name, max_attempts=2):
+                key = canonical_pile_tracking_key(retryable.get("tracking_key"))
+                runner.retry_attempt_numbers[key] = safe_int(retryable.get("attempt_number"), 1) + 1
+                execution_ledger.transition_attempt(
+                    retryable["id"],
+                    AttemptStatus.FAILED,
+                    expected={AttemptStatus.STILL_UNASSIGNED},
+                    evidence={"code": "released_for_bounded_retry", "details": {
+                        "next_attempt_number": runner.retry_attempt_numbers[key],
+                    }},
+                )
+
+            exhausted = execution_ledger.exhausted_attempts(insurer_name, max_attempts=2)
+            for attempt in exhausted:
+                key = canonical_pile_tracking_key(attempt.get("tracking_key"))
+                reconciliation_manual_keys.add(key)
+                execution_ledger.transition_attempt(
+                    attempt["id"],
+                    AttemptStatus.MANUAL_ACTION_REQUIRED,
+                    expected={AttemptStatus.STILL_UNASSIGNED},
+                    evidence={"code": "retry_limit_exhausted", "details": {"max_attempts": 2}},
+                )
+            reconciliation_manual_count = len(reconciliation_manual_keys)
 
         if bots:
             tracked_reconcile = reconcile_tracked_assignments(
@@ -6880,7 +6947,10 @@ def _run_for_insurer_once(
 
                 if args.execute:
                     metrics = store.refresh_bot_metrics_from_tracking(insurer_name, resolved_bots, metrics)
-        unassigned = unique_unassigned_rows(scanned_rows)
+        unassigned = [
+            row for row in unique_unassigned_rows(scanned_rows)
+            if canonical_pile_tracking_key(row.tracking_key) not in reconciliation_manual_keys
+        ]
         initial_unassigned_keys = {row.key for row in unassigned}
         follow_up_context_pairs = {
             (row.filter_month, effective_filter_year(row, year_label), row.status_bucket)
@@ -6966,7 +7036,7 @@ def _run_for_insurer_once(
         }
         output_path.write_text(json.dumps(payload, indent=2))
 
-        manual_action_count = (
+        manual_action_count = reconciliation_manual_count + (
             len(unassigned)
             if rule and rule.distribution_mode == "manual_override"
             else 0

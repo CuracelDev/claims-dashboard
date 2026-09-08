@@ -149,6 +149,27 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertIn("status = 'failed'", sql)
         self.assertEqual(params[-1], "context-1")
 
+    def test_pending_attempts_include_crash_window_states(self):
+        self.ledger.pending_attempts("Jubilee Uganda")
+        sql, params = self.connection.statements[-1]
+        self.assertIn("'selected','submitted','reconciliation_pending'", sql)
+        self.assertEqual(params, ("Jubilee Uganda",))
+
+    def test_retryable_attempts_are_bounded_by_attempt_number(self):
+        self.ledger.retryable_attempts("Jubilee Uganda", max_attempts=2)
+        sql, params = self.connection.statements[-1]
+        self.assertIn("status = 'still_unassigned'", sql)
+        self.assertIn("attempt_number < %s", sql)
+        self.assertEqual(params, ("Jubilee Uganda", 2))
+
+    def test_exhausted_and_unsubmitted_attempts_are_queryable_for_safe_cleanup(self):
+        self.ledger.exhausted_attempts("Jubilee Uganda", max_attempts=2)
+        exhausted_sql, _params = self.connection.statements[-1]
+        self.assertIn("attempt_number >= %s", exhausted_sql)
+        self.ledger.unsubmitted_plans("Jubilee Uganda")
+        planned_sql, _params = self.connection.statements[-1]
+        self.assertIn("status = 'planned'", planned_sql)
+
 
 if __name__ == "__main__":
     unittest.main()

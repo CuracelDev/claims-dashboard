@@ -79,6 +79,7 @@ ATTEMPT_TRANSITIONS = {
     },
     AttemptStatus.SELECTED: {
         AttemptStatus.SUBMITTED,
+        AttemptStatus.RECONCILIATION_PENDING,
         AttemptStatus.FAILED,
     },
     AttemptStatus.SUBMITTED: {

@@ -26,6 +26,14 @@ class AttemptTransitionTests(unittest.TestCase):
             )
         )
 
+    def test_selected_attempt_can_enter_reconciliation_after_worker_crash(self):
+        self.assertTrue(
+            can_transition_attempt(
+                AttemptStatus.SELECTED,
+                AttemptStatus.RECONCILIATION_PENDING,
+            )
+        )
+
     def test_retry_is_allowed_only_after_positive_still_unassigned_evidence(self):
         self.assertTrue(
             can_transition_attempt(
