@@ -35,6 +35,11 @@ import requests
 from dotenv import load_dotenv
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+try:
+    from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
+except ModuleNotFoundError:  # Repository-level unittest import path.
+    from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
+
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -2802,6 +2807,21 @@ class DataStore:
             )
         else:
             self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot_id, payload)
+
+
+def build_execution_ledger(store: DataStore, args: argparse.Namespace) -> Any:
+    """Build the optional durable ledger without sharing DataStore autocommit state."""
+    if bool(getattr(args, "read_only", False)):
+        return ReadOnlyExecutionLedger()
+    if not env_bool("PILES_EXECUTION_LEDGER_ENABLED", False):
+        return None
+    if store.mode != "postgres" or not store.database_url:
+        raise RuntimeError(
+            "PILES_EXECUTION_LEDGER_ENABLED requires DATABASE_URL for transactional writes."
+        )
+    connection = psycopg2.connect(store.database_url)
+    connection.autocommit = False
+    return ExecutionLedger(connection)
 
 
 def ensure_runner_lock_available(store: DataStore) -> None:
@@ -6127,6 +6147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--year", help="Year label to filter, e.g. 'All' or '2026'. Default is All")
     parser.add_argument("--visible", action="store_true", help="Run with a visible browser")
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
+    parser.add_argument("--read-only", action="store_true", help="Use an in-memory execution ledger instead of writing new reliability state.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
     parser.add_argument("--run-source", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUN_SOURCE")) or "manual", help="How this run was triggered, e.g. manual or schedule.")
@@ -6942,6 +6963,7 @@ def main() -> None:
 
     started_at = datetime.now(timezone.utc)
     store: DataStore | None = None
+    execution_ledger: Any = None
     run_id = ""
     run_details: dict[str, Any] = {}
     insurers: list[str] = []
@@ -7009,15 +7031,33 @@ def main() -> None:
             mode="execute" if args.execute else "dry-run",
             details=run_details,
         )
+        execution_ledger = build_execution_ledger(store, args)
 
         for index, insurer_name in enumerate(insurers, start=1):
             if args.all_active:
                 print(f"\n\n===== Running insurer {index}/{len(insurers)}: {insurer_name} =====")
+            insurer_run_id = ""
             try:
+                if execution_ledger:
+                    master = store.get_master_account(insurer_name)
+                    insurer_run_id = execution_ledger.create_insurer_run(run_id, master)
+                    execution_ledger.heartbeat(insurer_run_id, phase="login")
                 insurer_result = run_for_insurer(store, args, insurer_name, month_labels, year_label, visible)
                 all_notification_items.extend(insurer_result.get("notification_items", []))
                 all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
+                if insurer_run_id:
+                    execution_ledger.finalize_insurer_run(
+                        insurer_run_id,
+                        status="completed",
+                    )
             except Exception as exc:
+                if insurer_run_id:
+                    execution_ledger.finalize_insurer_run(
+                        insurer_run_id,
+                        status="failed",
+                        error_code="insurer_run_failed",
+                        error_message=str(exc)[:2000],
+                    )
                 failures.append((insurer_name, str(exc)))
                 store.log_runner_event(
                     insurer_name=insurer_name,
@@ -7092,6 +7132,8 @@ def main() -> None:
             )
         if store:
             store.close()
+        if execution_ledger:
+            execution_ledger.close()
         sys.stdout = original_stdout
         sys.stderr = original_stderr
 

@@ -1282,5 +1282,26 @@ class YearFilterScanningTests(unittest.TestCase):
             )
 
 
+class ExecutionLedgerIntegrationTests(unittest.TestCase):
+    def test_read_only_flag_uses_non_writing_ledger(self):
+        args = types.SimpleNamespace(read_only=True)
+        store = types.SimpleNamespace(mode="postgres", database_url="postgres://unused")
+
+        ledger = runner.build_execution_ledger(store, args)
+
+        self.assertEqual(type(ledger).__name__, "ReadOnlyExecutionLedger")
+        self.assertEqual(ledger.write_count, 0)
+
+    def test_disabled_ledger_does_not_open_another_connection(self):
+        args = types.SimpleNamespace(read_only=False)
+        store = types.SimpleNamespace(mode="postgres", database_url="postgres://unused")
+        previous = os.environ.pop("PILES_EXECUTION_LEDGER_ENABLED", None)
+        try:
+            self.assertIsNone(runner.build_execution_ledger(store, args))
+        finally:
+            if previous is not None:
+                os.environ["PILES_EXECUTION_LEDGER_ENABLED"] = previous
+
+
 if __name__ == "__main__":
     unittest.main()

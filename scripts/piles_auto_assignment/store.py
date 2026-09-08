@@ -1,0 +1,301 @@
+"""Transactional persistence for durable Piles execution state."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import asdict, is_dataclass
+from typing import Any, Iterable, Mapping, Optional
+
+from .domain import AttemptStatus, can_transition_attempt
+
+
+class ConcurrentStateChange(RuntimeError):
+    """Raised when another worker changed an attempt before our CAS update."""
+
+
+def _value(record: Any, name: str, default: Any = None) -> Any:
+    if isinstance(record, Mapping):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def _json(value: Any) -> str:
+    if is_dataclass(value):
+        value = asdict(value)
+    return json.dumps(value or {}, default=str, sort_keys=True)
+
+
+class ExecutionLedger:
+    """Owns a non-autocommit PostgreSQL connection for ledger transactions."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+
+    def close(self) -> None:
+        close = getattr(self.connection, "close", None)
+        if callable(close):
+            close()
+
+    def create_insurer_run(self, runner_run_id: str, master: Any) -> str:
+        insurer_run_id = str(uuid.uuid4())
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO piles_auto_assignment_insurer_runs
+                    (id, runner_run_id, master_account_id, insurer_name,
+                     status, phase, heartbeat_at, started_at)
+                VALUES (%s, %s, %s, %s, 'running', 'configuration', now(), now())
+                """,
+                (
+                    insurer_run_id,
+                    runner_run_id or None,
+                    _value(master, "id"),
+                    _value(master, "insurer_name", ""),
+                ),
+            )
+        self.connection.commit()
+        return insurer_run_id
+
+    def create_scan_contexts(
+        self,
+        insurer_run_id: str,
+        contexts: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        created = []
+        try:
+            with self.connection.cursor() as cursor:
+                for context in contexts:
+                    item = dict(context)
+                    item.setdefault("id", str(uuid.uuid4()))
+                    item["insurer_run_id"] = insurer_run_id
+                    cursor.execute(
+                        """
+                        INSERT INTO piles_auto_assignment_scan_contexts
+                            (id, insurer_run_id, insurer_name, filter_month,
+                             requested_year, effective_years, status_bucket)
+                        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                        ON CONFLICT (insurer_run_id, filter_month, requested_year, status_bucket)
+                        DO NOTHING
+                        """,
+                        (
+                            item["id"],
+                            insurer_run_id,
+                            item["insurer_name"],
+                            item["filter_month"],
+                            item["requested_year"],
+                            _json(item.get("effective_years", [])),
+                            item["status_bucket"],
+                        ),
+                    )
+                    created.append(item)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return created
+
+    def create_batch_with_attempts(
+        self,
+        batch: Mapping[str, Any],
+        attempts: Iterable[Mapping[str, Any]],
+    ) -> str:
+        batch_id = str(batch.get("id") or uuid.uuid4())
+        attempt_rows = list(attempts)
+        insurer_run_id = str(batch["insurer_run_id"])
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO piles_auto_assignment_batches
+                        (id, insurer_run_id, scan_context_id, insurer_name,
+                         bot_account_id, intended_owner_name,
+                         intended_portal_assignee, assignment_type, status_bucket,
+                         planned_pile_count, planned_claim_count, attempt_count, details)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        batch_id,
+                        insurer_run_id,
+                        batch.get("scan_context_id"),
+                        batch["insurer_name"],
+                        batch.get("bot_account_id"),
+                        batch["intended_owner_name"],
+                        batch["intended_portal_assignee"],
+                        batch["assignment_type"],
+                        batch["status_bucket"],
+                        len(attempt_rows),
+                        int(batch.get("planned_claim_count") or 0),
+                        0,
+                        _json(batch.get("details")),
+                    ),
+                )
+                for attempt in attempt_rows:
+                    cursor.execute(
+                        """
+                        INSERT INTO piles_auto_assignment_attempts
+                            (id, batch_id, insurer_run_id, tracked_pile_id,
+                             insurer_name, tracking_key, last_pile_key,
+                             bot_account_id, intended_owner_name,
+                             intended_portal_assignee, claim_count,
+                             filter_context, attempt_number, evidence_details)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s::jsonb, %s, %s::jsonb)
+                        """,
+                        (
+                            attempt.get("id") or str(uuid.uuid4()),
+                            batch_id,
+                            insurer_run_id,
+                            attempt.get("tracked_pile_id"),
+                            batch["insurer_name"],
+                            attempt["tracking_key"],
+                            attempt.get("last_pile_key"),
+                            batch.get("bot_account_id"),
+                            batch["intended_owner_name"],
+                            batch["intended_portal_assignee"],
+                            int(attempt.get("claim_count") or 0),
+                            _json(attempt.get("filter_context")),
+                            int(attempt.get("attempt_number") or 1),
+                            _json(attempt.get("evidence_details")),
+                        ),
+                    )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return batch_id
+
+    def transition_attempt(
+        self,
+        attempt_id: str,
+        target: AttemptStatus,
+        *,
+        expected: Iterable[AttemptStatus],
+        evidence: Optional[Any] = None,
+    ) -> None:
+        target_status = AttemptStatus(target)
+        expected_statuses = {AttemptStatus(status) for status in expected}
+        if not expected_statuses or not all(
+            can_transition_attempt(status, target_status) for status in expected_statuses
+        ):
+            raise ValueError(
+                f"Illegal attempt transition to {target_status.value} from "
+                f"{sorted(status.value for status in expected_statuses)}"
+            )
+        evidence_code = _value(evidence, "code")
+        evidence_details = _value(evidence, "details", {})
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_attempts
+                    SET status = %s,
+                        evidence_code = %s,
+                        evidence_details = %s::jsonb,
+                        updated_at = now()
+                    WHERE status = ANY(%s) AND id = %s
+                    RETURNING status
+                    """,
+                    (
+                        target_status.value,
+                        evidence_code,
+                        _json(evidence_details),
+                        [status.value for status in sorted(expected_statuses, key=lambda item: item.value)],
+                        attempt_id,
+                    ),
+                )
+                row = cursor.fetchone()
+            if not row:
+                raise ConcurrentStateChange(attempt_id)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def heartbeat(self, insurer_run_id: str, *, phase: str) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_insurer_runs
+                SET phase = %s, heartbeat_at = now(), updated_at = now()
+                WHERE id = %s AND status = 'running'
+                """,
+                (phase, insurer_run_id),
+            )
+        self.connection.commit()
+
+    def finalize_insurer_run(
+        self,
+        insurer_run_id: str,
+        *,
+        status: str,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_insurer_runs
+                SET status = %s, phase = 'complete', error_code = %s,
+                    error_message = %s, heartbeat_at = now(), finished_at = now(),
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (status, error_code, error_message, insurer_run_id),
+            )
+        self.connection.commit()
+
+    def summarize_insurer_run(self, insurer_run_id: str) -> dict[str, int]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) AS confirmed,
+                    count(*) FILTER (WHERE status = 'reconciliation_pending') AS reconciliation_pending,
+                    count(*) FILTER (WHERE status = 'conflict') AS conflict,
+                    count(*) FILTER (WHERE status = 'failed') AS failed
+                FROM piles_auto_assignment_attempts
+                WHERE insurer_run_id = %s
+                """,
+                (insurer_run_id,),
+            )
+            row = cursor.fetchone() or (0, 0, 0, 0)
+        return {
+            "confirmed": int(row[0] or 0),
+            "reconciliation_pending": int(row[1] or 0),
+            "conflict": int(row[2] or 0),
+            "failed": int(row[3] or 0),
+        }
+
+
+class ReadOnlyExecutionLedger:
+    """Interface-compatible ledger that intentionally performs no writes."""
+
+    write_count = 0
+
+    def create_insurer_run(self, _runner_run_id: str, _master: Any) -> str:
+        return str(uuid.uuid4())
+
+    def create_scan_contexts(self, insurer_run_id: str, contexts: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {**dict(context), "id": str(context.get("id") or uuid.uuid4()), "insurer_run_id": insurer_run_id}
+            for context in contexts
+        ]
+
+    def create_batch_with_attempts(self, batch: Mapping[str, Any], _attempts: Iterable[Mapping[str, Any]]) -> str:
+        return str(batch.get("id") or uuid.uuid4())
+
+    def transition_attempt(self, _attempt_id: str, _target: AttemptStatus, *, expected: Iterable[AttemptStatus], evidence: Optional[Any] = None) -> None:
+        del expected, evidence
+
+    def heartbeat(self, _insurer_run_id: str, *, phase: str) -> None:
+        del phase
+
+    def finalize_insurer_run(self, _insurer_run_id: str, *, status: str, error_code: Optional[str] = None, error_message: Optional[str] = None) -> None:
+        del status, error_code, error_message
+
+    def summarize_insurer_run(self, _insurer_run_id: str) -> dict[str, int]:
+        return {"confirmed": 0, "reconciliation_pending": 0, "conflict": 0, "failed": 0}
+
+    def close(self) -> None:
+        return None
