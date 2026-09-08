@@ -24,7 +24,7 @@ const DISTRIBUTION_MODE_OPTIONS = [
   {
     value: 'manual_override',
     label: 'Manual override',
-    description: 'Use your manual owner/availability changes as the main guide and avoid automatic balancing decisions for that insurer.',
+    description: 'Do not auto-assign this insurer. Leave every discovered pile in a visible manual-action-required state.',
   },
 ];
 
@@ -1509,7 +1509,7 @@ function RulesSection({ C, rules, masterAccounts, onRefresh, setNotice }) {
         <span style={{ color: C.text, fontWeight: 700 }}>{selectedMode.label}:</span> {selectedMode.description}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
-        <input type="number" value={draft.minimum_claim_chunk} onChange={(e) => setDraft((prev) => ({ ...prev, minimum_claim_chunk: e.target.value }))} placeholder="Minimum claims per batch" style={inputStyle(C)} />
+        <input type="number" min="1" step="1" value={draft.minimum_claim_chunk} onChange={(e) => setDraft((prev) => ({ ...prev, minimum_claim_chunk: e.target.value }))} placeholder="Target claims per assignment batch" title="Piles are kept whole. The final smaller remainder is always assigned." style={inputStyle(C)} />
         <input type="number" value={draft.reassignment_threshold_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, reassignment_threshold_minutes: e.target.value }))} placeholder="Reassign after idle mins" style={inputStyle(C)} />
         <input type="number" value={draft.stale_claim_threshold} onChange={(e) => setDraft((prev) => ({ ...prev, stale_claim_threshold: e.target.value }))} placeholder="Stale claims threshold" style={inputStyle(C)} />
         <input type="number" value={draft.target_completion_gap_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, target_completion_gap_minutes: e.target.value }))} placeholder="Target finish gap mins" style={inputStyle(C)} />

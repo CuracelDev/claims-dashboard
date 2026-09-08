@@ -1433,5 +1433,22 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
                 os.environ["PILES_EXECUTION_LEDGER_ENABLED"] = previous
 
 
+class AssignmentRuleLoadingTests(unittest.TestCase):
+    def test_inactive_rule_is_not_applied(self):
+        store = object.__new__(runner.DataStore)
+        store.mode = "postgres"
+        store._fetchall_postgres = lambda *_args, **_kwargs: [{
+            "insurer_name": "Jubilee Uganda",
+            "distribution_mode": "single_owner",
+            "minimum_claim_chunk": 25,
+            "reassignment_threshold_minutes": 120,
+            "stale_claim_threshold": 40,
+            "target_completion_gap_minutes": 30,
+            "is_active": False,
+        }]
+
+        self.assertIsNone(runner.DataStore.get_rule(store, "Jubilee Uganda"))
+
+
 if __name__ == "__main__":
     unittest.main()

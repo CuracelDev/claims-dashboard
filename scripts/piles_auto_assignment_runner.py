@@ -40,11 +40,19 @@ try:
     from piles_auto_assignment.domain import FilterEvidence
     from piles_auto_assignment.evidence import evaluate_filter_evidence
     from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from piles_auto_assignment.planning import (
+        eligible_bots as evaluate_eligible_bots,
+        plan_assignments,
+    )
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from scripts.piles_auto_assignment.domain import FilterEvidence
     from scripts.piles_auto_assignment.evidence import evaluate_filter_evidence
     from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from scripts.piles_auto_assignment.planning import (
+        eligible_bots as evaluate_eligible_bots,
+        plan_assignments,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -621,12 +629,12 @@ def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts
             insurer_group["statuses"].add(item.plan.status_bucket)
         if item.kind == "reassignment":
             insurer_group["reassigned_piles"] += 1
-            insurer_group["reassigned_claims"] += item.plan.claims
+            insurer_group["reassigned_claims"] += max(item.plan.remaining_claims, 0)
             if norm(item.previous_owner_name):
                 insurer_group["previous_owners"].add(item.previous_owner_name)
         else:
             insurer_group["assigned_piles"] += 1
-            insurer_group["assigned_claims"] += item.plan.claims
+            insurer_group["assigned_claims"] += max(item.plan.remaining_claims, 0)
 
     total_assigned_piles = sum(group["assigned_piles"] for group in grouped.values())
     total_assigned_claims = sum(group["assigned_claims"] for group in grouped.values())
@@ -1000,6 +1008,26 @@ def assignment_filter_contexts(
     return contexts
 
 
+def chunk_planned_assignments(
+    plans: list["PlannedAssignment"],
+    target_claims: int,
+) -> list[list["PlannedAssignment"]]:
+    target = max(int(target_claims or 0), 1)
+    batches: list[list[PlannedAssignment]] = []
+    current: list[PlannedAssignment] = []
+    current_claims = 0
+    for plan in plans:
+        current.append(plan)
+        current_claims += max(plan.remaining_claims, 0)
+        if current_claims >= target:
+            batches.append(current)
+            current = []
+            current_claims = 0
+    if current:
+        batches.append(current)
+    return batches
+
+
 @dataclass
 class RowSelectionResult:
     count: int
@@ -1216,7 +1244,10 @@ class DataStore:
                 from piles_auto_assignment_master_accounts
                 """
             )
-            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
+            rows = [
+                row for row in rows
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+            ][:1]
         else:
             rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_master_accounts")
@@ -1679,11 +1710,16 @@ class DataStore:
                 from piles_auto_assignment_rules
                 """
             )
-            rows = [row for row in rows if canonical_insurer_key(row.get("insurer_name")) in aliases][:1]
+            rows = [
+                row for row in rows
+                if canonical_insurer_key(row.get("insurer_name")) in aliases
+                and enabled_by_default(row.get("is_active"))
+            ][:1]
         else:
             rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_rules")
                 if canonical_insurer_key(row.get("insurer_name")) in aliases
+                and enabled_by_default(row.get("is_active"))
             ][:1]
         if not rows:
             return None
@@ -5140,7 +5176,14 @@ class CuracelPilesRunner:
             ))
         return assignees
 
-    def execute_assignment_plan(self, month_labels: list[str], year_label: str, plans: list[PlannedAssignment], execute: bool) -> tuple[dict[str, int], list[AppliedAssignment]]:
+    def execute_assignment_plan(
+        self,
+        month_labels: list[str],
+        year_label: str,
+        plans: list[PlannedAssignment],
+        execute: bool,
+        minimum_claim_chunk: int = 25,
+    ) -> tuple[dict[str, int], list[AppliedAssignment]]:
         results: dict[str, int] = {}
         applied: list[AppliedAssignment] = []
         for filter_month, filter_year in assignment_filter_contexts(month_labels, year_label, plans):
@@ -5171,7 +5214,11 @@ class CuracelPilesRunner:
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
                         for plan in page_plans:
                             grouped.setdefault((plan.assignee_name, plan.assignment_type), []).append(plan)
-                        grouped_items = list(grouped.items())
+                        grouped_items = [
+                            (group_key, batch)
+                            for group_key, grouped_plans in grouped.items()
+                            for batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk)
+                        ]
                         for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped_items):
                             requested_keys = [plan.pile_key for plan in group]
                             selected_keys: list[str] = []
@@ -5305,7 +5352,12 @@ class CuracelPilesRunner:
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
                         for plan in page_plans:
                             grouped.setdefault((plan.assignee_name, plan.assignment_type), []).append(plan)
-                        for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped.items()):
+                        grouped_items = [
+                            (group_key, batch)
+                            for group_key, grouped_plans in grouped.items()
+                            for batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk)
+                        ]
+                        for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped_items):
                             if group_index > 0:
                                 current_rows = self.reset_to_filtered_page(
                                     filter_month,
@@ -5910,107 +5962,83 @@ def build_assignment_plan(
     piles: list[PileRow],
     bots: list[BotAccount],
     metrics: dict[str, BotMetric],
+    rule: AssignmentRule | None = None,
+    effective_at: datetime | None = None,
 ) -> tuple[list[PlannedAssignment], dict[str, dict[str, Any]]]:
-    eligible = []
-    for bot in bots:
-        if not bot.is_active:
-            continue
-        if bot.availability_status not in AVAILABLE_BOT_STATUSES or not bot.is_available:
-            continue
-        metric = metrics.get(bot.id)
+    active_rule = rule or AssignmentRule(
+        insurer_name=insurer_name,
+        distribution_mode="balanced_finish",
+        minimum_claim_chunk=25,
+        reassignment_threshold_minutes=120,
+        stale_claim_threshold=40,
+        target_completion_gap_minutes=30,
+    )
+
+    def resolve_speed(bot: BotAccount, metric: BotMetric | None) -> float:
         observed_speed = metric.claims_per_hour if metric and metric.claims_per_hour > 0 else 0
         base_speed = assignment_planning_speed(bot.assignment_role, observed_speed, 0.0)
-        role_weight = role_capacity_weight(bot.assignment_role, bot.support_capacity_ratio)
-        effective_speed = max(base_speed * role_weight, 1)
-        current_load = metric.active_claim_load if metric else bot.current_claim_load
-        eligible.append({
-            "bot": bot,
-            "effective_speed": effective_speed,
-            "projected_hours": current_load / effective_speed if effective_speed else math.inf,
-            "selection_penalty_hours": role_selection_penalty_hours(bot.assignment_role, bot.support_capacity_ratio),
-            "selection_score": (current_load / effective_speed if effective_speed else math.inf) + role_selection_penalty_hours(bot.assignment_role, bot.support_capacity_ratio),
-            "current_load": current_load,
-            "starting_claim_load": current_load,
-            "assigned_claims": 0,
-            "assigned_piles": 0,
-        })
+        return max(
+            base_speed * role_capacity_weight(bot.assignment_role, bot.support_capacity_ratio),
+            1,
+        )
 
-    if not eligible:
-        raise RuntimeError(f"No available bot accounts found for insurer '{insurer_name}'.")
-
-    plans: list[PlannedAssignment] = []
-    sorted_piles = sorted(piles, key=lambda item: item.claims, reverse=True)
-    remaining_piles = list(sorted_piles)
-    primary_entries = [entry for entry in eligible if assignment_entry_role(entry).lower() == "primary"]
-
-    if primary_entries and len(primary_entries) < len(eligible):
-        primary_floor_claims = max(1, math.ceil(sum(pile.claims for pile in sorted_piles) * PRIMARY_ASSIGNMENT_FLOOR_RATIO))
-        primary_claims_assigned = 0
-        while remaining_piles and primary_claims_assigned < primary_floor_claims:
-            pile = remaining_piles.pop(0)
-            chosen = choose_assignment_entry(primary_entries)
-            apply_assignment_entry(chosen, pile)
-            primary_claims_assigned += pile.claims
-            plans.append(PlannedAssignment(
-                pile_key=pile.key,
-                tracking_key=pile.tracking_key,
-                assignee_id=chosen["bot"].id,
-                assignee_name=chosen["bot"].portal_name,
-                assignment_type=pile.assignment_type,
-                insurer_name=insurer_name,
-                provider=pile.provider,
-                claim_month=pile.month,
-                submitted_date=pile.submitted_date,
-                claims=pile.claims,
-                synced_claims=pile.synced_claims,
-                remaining_claims=pile.remaining_claims,
-                current_status=pile.status,
-                status_bucket=pile.status_bucket,
-                filter_month=pile.filter_month,
-                filter_year=pile.filter_year,
-                source_page_number=pile.page_number,
-            ))
-
-    for pile in remaining_piles:
-        # The primary floor is a minimum, not a separate allocation pool. Continue
-        # balancing by projected finish time so current load and completed floor work
-        # are accounted for and support bots are not starved.
-        chosen = choose_assignment_entry(eligible)
-        apply_assignment_entry(chosen, pile)
-        plans.append(PlannedAssignment(
-            pile_key=pile.key,
-            tracking_key=pile.tracking_key,
-            assignee_id=chosen["bot"].id,
-            assignee_name=chosen["bot"].portal_name,
-            assignment_type=pile.assignment_type,
+    planning = plan_assignments(
+        active_rule.distribution_mode,
+        piles,
+        bots,
+        metrics,
+        active_rule,
+        effective_at=effective_at,
+        primary_min_share=PRIMARY_ASSIGNMENT_FLOOR_RATIO,
+        speed_resolver=resolve_speed,
+    )
+    plans = [
+        PlannedAssignment(
+            pile_key=decision.pile.key,
+            tracking_key=decision.pile.tracking_key,
+            assignee_id=decision.bot.id,
+            assignee_name=decision.bot.portal_name,
+            assignment_type=decision.pile.assignment_type,
             insurer_name=insurer_name,
-            provider=pile.provider,
-            claim_month=pile.month,
-            submitted_date=pile.submitted_date,
-            claims=pile.claims,
-            synced_claims=pile.synced_claims,
-            remaining_claims=pile.remaining_claims,
-            current_status=pile.status,
-            status_bucket=pile.status_bucket,
-            filter_month=pile.filter_month,
-            filter_year=pile.filter_year,
-            source_page_number=pile.page_number,
-        ))
+            provider=decision.pile.provider,
+            claim_month=decision.pile.month,
+            submitted_date=decision.pile.submitted_date,
+            claims=decision.pile.claims,
+            synced_claims=decision.pile.synced_claims,
+            remaining_claims=decision.work_claims,
+            current_status=decision.pile.status,
+            status_bucket=decision.pile.status_bucket,
+            filter_month=decision.pile.filter_month,
+            filter_year=decision.pile.filter_year,
+            source_page_number=decision.pile.page_number,
+            legacy_tracking_key=decision.pile.legacy_tracking_key,
+        )
+        for decision in planning.plans
+    ]
 
-    summary = {
-        entry["bot"].id: {
-            "assignee_name": entry["bot"].portal_name,
-            "assignment_role": entry["bot"].assignment_role,
-            "effective_speed": round(entry["effective_speed"], 2),
-            "starting_claim_load": entry["starting_claim_load"],
-            "starting_load": entry["starting_claim_load"],
-            "assigned_piles": entry["assigned_piles"],
-            "assigned_claims": entry["assigned_claims"],
-            "projected_finish_hours": round(entry["projected_hours"], 2),
-            "projected_finish_minutes": projected_finish_minutes(entry["projected_hours"]),
-        }
-        for entry in eligible
+    eligible = evaluate_eligible_bots(bots, effective_at=effective_at).eligible
+    assigned_by_bot = {
+        bot.id: [decision for decision in planning.plans if decision.bot.id == bot.id]
+        for bot in eligible
     }
+    summary = {}
+    for bot in eligible:
+        metric = metrics.get(bot.id)
+        speed = resolve_speed(bot, metric)
+        starting_load = metric.active_claim_load if metric else bot.current_claim_load
+        assigned_claims = sum(item.work_claims for item in assigned_by_bot[bot.id])
+        projected_hours = (starting_load + assigned_claims) / speed
+        summary[bot.id] = {
+            "assignee_name": bot.portal_name,
+            "assignment_role": bot.assignment_role,
+            "effective_speed": round(speed, 2),
+            "starting_claim_load": starting_load,
+            "starting_load": starting_load,
+            "assigned_piles": len(assigned_by_bot[bot.id]),
+            "assigned_claims": assigned_claims,
+            "projected_finish_hours": round(projected_hours, 2),
+            "projected_finish_minutes": projected_finish_minutes(projected_hours),
+        }
     return plans, summary
 
 
@@ -6627,6 +6655,7 @@ def _run_for_insurer_once(
                     year_label,
                     reassignment_plans,
                     execute=args.execute,
+                    minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
                 )
                 print("\nReassignment groups touched:")
                 for assignee_name, count in reassignment_results.items():
@@ -6681,11 +6710,33 @@ def _run_for_insurer_once(
         plans: list[PlannedAssignment] = []
         summary: dict[str, dict[str, Any]] = {}
         if unassigned:
-            ensure_portal_mapping(unassigned[0])
-            if not bots:
+            manual_mode = bool(rule and rule.distribution_mode == "manual_override")
+            if not manual_mode:
+                ensure_portal_mapping(unassigned[0])
+            if manual_mode:
+                plans, summary = build_assignment_plan(
+                    insurer_name,
+                    unassigned,
+                    resolved_bots,
+                    metrics,
+                    rule=rule,
+                    effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
+                print(
+                    f"\nManual override is active: {len(unassigned)} pile(s) require manual action; "
+                    "no automatic assignment will be attempted."
+                )
+            elif not bots:
                 plans, summary = build_assignment_plan_from_portal_options(insurer_name, unassigned, portal_assignees)
             else:
-                plans, summary = build_assignment_plan(insurer_name, unassigned, resolved_bots, metrics)
+                plans, summary = build_assignment_plan(
+                    insurer_name,
+                    unassigned,
+                    resolved_bots,
+                    metrics,
+                    rule=rule,
+                    effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
 
         if summary:
             print("\nAssignment summary:")
@@ -6733,13 +6784,24 @@ def _run_for_insurer_once(
         }
         output_path.write_text(json.dumps(payload, indent=2))
 
+        manual_action_count = (
+            len(unassigned)
+            if rule and rule.distribution_mode == "manual_override"
+            else 0
+        )
         planned_scan_count = len(reassignment_plans) + len(plans)
-        planned_scan_claims = sum(plan.claims for plan in reassignment_plans) + sum(plan.claims for plan in plans)
+        planned_scan_claims = sum(
+            max(plan.remaining_claims, 0) for plan in [*reassignment_plans, *plans]
+        )
 
         store.log_runner_event(
             insurer_name=insurer_name,
             event_type="runner_scan",
-            status="planned" if not args.execute else "ready",
+            status=(
+                "manual_action_required"
+                if manual_action_count
+                else "planned" if not args.execute else "ready"
+            ),
             pile_count=planned_scan_count,
             claim_count=planned_scan_claims,
             details={
@@ -6754,6 +6816,7 @@ def _run_for_insurer_once(
                 "months": month_labels,
                 "year": year_label,
                 "statuses": TARGET_STATUSES,
+                "manual_action_required_count": manual_action_count,
                 "tracked_reconcile": {
                     "tracked_count": tracked_reconcile["tracked_count"],
                     "completed_count": tracked_reconcile["completed_count"],
@@ -6777,7 +6840,13 @@ def _run_for_insurer_once(
                 if norm(plan.filter_month) and norm(plan.status_bucket)
             )
             print("\nApplying assignment flow...")
-            results, applied = runner.execute_assignment_plan(month_labels, year_label, plans, execute=args.execute)
+            results, applied = runner.execute_assignment_plan(
+                month_labels,
+                year_label,
+                plans,
+                execute=args.execute,
+                minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+            )
             print("\nUI assignment groups touched:")
             for assignee_name, count in results.items():
                 print(f"  - {assignee_name}: {count} pile(s)")
@@ -6828,7 +6897,14 @@ def _run_for_insurer_once(
             if not bots:
                 late_plans, late_summary = build_assignment_plan_from_portal_options(insurer_name, follow_up_unassigned, portal_assignees)
             else:
-                late_plans, late_summary = build_assignment_plan(insurer_name, follow_up_unassigned, resolved_bots, metrics)
+                late_plans, late_summary = build_assignment_plan(
+                    insurer_name,
+                    follow_up_unassigned,
+                    resolved_bots,
+                    metrics,
+                    rule=rule,
+                    effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
             late_arrival_detection["summary"] = late_summary
             summary = merge_assignment_summaries(summary, late_summary)
             plans.extend(late_plans)
@@ -6862,7 +6938,13 @@ def _run_for_insurer_once(
                     )
             if late_plans:
                 late_month_labels = list(dict.fromkeys(plan.filter_month for plan in late_plans if norm(plan.filter_month))) or month_labels
-                late_results, late_applied = runner.execute_assignment_plan(late_month_labels, year_label, late_plans, execute=args.execute)
+                late_results, late_applied = runner.execute_assignment_plan(
+                    late_month_labels,
+                    year_label,
+                    late_plans,
+                    execute=args.execute,
+                    minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+                )
                 late_arrival_detection["results"] = late_results
                 if late_results:
                     print("\nLate-arrival follow-up groups touched:")
@@ -6948,15 +7030,19 @@ def _run_for_insurer_once(
 
     finished_at = datetime.now(timezone.utc).isoformat()
     total_planned = len(reassignment_plans) + len(plans)
-    total_claims = sum(plan.claims for plan in reassignment_plans) + sum(plan.claims for plan in plans)
+    total_claims = sum(max(plan.remaining_claims, 0) for plan in [*reassignment_plans, *plans])
     total_completed = len(reassignment_applied) + len(applied)
-    total_completed_claims = sum(item.plan.claims for item in reassignment_applied) + sum(item.plan.claims for item in applied)
+    total_completed_claims = sum(
+        max(item.plan.remaining_claims, 0) for item in [*reassignment_applied, *applied]
+    )
 
     store.log_runner_event(
         insurer_name=insurer_name,
         event_type="runner_complete",
         status=(
-            "assigned"
+            "manual_action_required"
+            if manual_action_count
+            else "assigned"
             if args.execute and total_completed
             else "dry_run_complete"
             if total_planned
@@ -6974,8 +7060,13 @@ def _run_for_insurer_once(
                 "primary_min_share_ratio": PRIMARY_ASSIGNMENT_FLOOR_RATIO,
             },
             "months": month_labels,
-            "no_work": total_planned == 0,
-            "message": "No unassigned piles found. Nothing to assign." if total_planned == 0 else "",
+            "no_work": total_planned == 0 and manual_action_count == 0,
+            "manual_action_required_count": manual_action_count,
+            "message": (
+                f"{manual_action_count} pile(s) require manual action."
+                if manual_action_count
+                else "No unassigned piles found. Nothing to assign." if total_planned == 0 else ""
+            ),
                 "tracked_reconcile": {
                     "tracked_count": tracked_reconcile["tracked_count"],
                     "completed_count": tracked_reconcile["completed_count"],
@@ -7227,9 +7318,9 @@ def main() -> None:
                 scope_label=scope_label,
                 portal_environment=PORTAL_ENVIRONMENT,
                 assigned_piles=len(assigned_items),
-                assigned_claims=sum(item.plan.claims for item in assigned_items),
+                assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned_items),
                 reassigned_piles=len(reassigned_items),
-                reassigned_claims=sum(item.plan.claims for item in reassigned_items),
+                reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned_items),
                 insurer_names=[item.plan.insurer_name for item in all_notification_items],
             ) or ""
             if slack_thread_ts:
