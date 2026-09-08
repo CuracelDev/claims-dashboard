@@ -1450,5 +1450,39 @@ class AssignmentRuleLoadingTests(unittest.TestCase):
         self.assertIsNone(runner.DataStore.get_rule(store, "Jubilee Uganda"))
 
 
+class PerPileVerificationIntegrationTests(unittest.TestCase):
+    def test_uncertain_item_does_not_abort_the_batch(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.execution_ledger = None
+        portal_runner._open_assign_modal = lambda: None
+        portal_runner._apply_assignment_modal = lambda *_args: "Daniel"
+        pending = runner.classify_assignment_observations(
+            {"pile-1": {"attempt_id": "", "expected_assignee": "Daniel"}},
+            {},
+        )[0]
+        portal_runner.verify_assigned_rows = lambda *_args, **_kwargs: runner.AssignmentVerificationResult(
+            False, ["<missing>"], 0, 1, [], [pending]
+        )
+        plan = make_pile(1)
+        assignment = runner.PlannedAssignment(
+            pile_key=plan.key, tracking_key=plan.tracking_key,
+            assignee_id="daniel", assignee_name="Daniel", assignment_type="Vetting",
+            insurer_name="Jubilee Uganda", provider=plan.provider,
+            claim_month=plan.month, submitted_date=plan.submitted_date,
+            claims=plan.claims, synced_claims=0, remaining_claims=plan.remaining_claims,
+            current_status=plan.status, status_bucket=plan.status_bucket,
+            filter_month=plan.filter_month, filter_year=plan.filter_year,
+            source_page_number=1,
+        )
+
+        _assignee, applied = runner.CuracelPilesRunner._apply_selected_group(
+            portal_runner, "All", "2026", "Vetting Pending", "Daniel", "Vetting",
+            [assignment], True,
+        )
+
+        self.assertEqual(len(applied), 1)
+        self.assertFalse(applied[0].verified_on_table)
+
+
 if __name__ == "__main__":
     unittest.main()

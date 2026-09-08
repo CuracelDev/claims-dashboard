@@ -1,7 +1,11 @@
 import unittest
 
 from scripts.piles_auto_assignment.domain import FilterEvidence
-from scripts.piles_auto_assignment.evidence import evaluate_filter_evidence
+from scripts.piles_auto_assignment.domain import AttemptStatus
+from scripts.piles_auto_assignment.evidence import (
+    classify_assignment_observations,
+    evaluate_filter_evidence,
+)
 
 
 class FilterEvidenceTests(unittest.TestCase):
@@ -44,6 +48,42 @@ class FilterEvidenceTests(unittest.TestCase):
         )
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.code, "controls_not_confirmed")
+
+
+class AssignmentEvidenceTests(unittest.TestCase):
+    def test_missing_rows_are_pending_not_failed_or_confirmed(self):
+        decisions = classify_assignment_observations(
+            {
+                "pile-1": {"attempt_id": "attempt-1", "expected_assignee": "CVEBOT3"},
+                "pile-2": {"attempt_id": "attempt-2", "expected_assignee": "CVEBOT3"},
+            },
+            observed={},
+        )
+        self.assertTrue(all(
+            item.status == AttemptStatus.RECONCILIATION_PENDING
+            for item in decisions
+        ))
+
+    def test_visible_wrong_assignee_is_conflict(self):
+        decision = classify_assignment_observations(
+            {"pile-1": {"attempt_id": "attempt-1", "expected_assignee": "CVEBOT3"}},
+            {"pile-1": "Other Bot"},
+        )[0]
+        self.assertEqual(decision.status, AttemptStatus.CONFLICT)
+
+    def test_visible_blank_assignee_remains_pending_during_initial_verification(self):
+        decision = classify_assignment_observations(
+            {"pile-1": {"attempt_id": "attempt-1", "expected_assignee": "CVEBOT3"}},
+            {"pile-1": ""},
+        )[0]
+        self.assertEqual(decision.status, AttemptStatus.RECONCILIATION_PENDING)
+
+    def test_visible_expected_assignee_is_confirmed(self):
+        decision = classify_assignment_observations(
+            {"pile-1": {"attempt_id": "attempt-1", "expected_assignee": "CVEBOT3"}},
+            {"pile-1": "CVEBOT3"},
+        )[0]
+        self.assertEqual(decision.status, AttemptStatus.CONFIRMED_VISIBLE)
 
 
 if __name__ == "__main__":

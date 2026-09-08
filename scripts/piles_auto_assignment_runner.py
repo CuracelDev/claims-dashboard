@@ -21,7 +21,7 @@ import sys
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -38,7 +38,7 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 try:
     from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from piles_auto_assignment.domain import AttemptStatus, FilterEvidence
-    from piles_auto_assignment.evidence import evaluate_filter_evidence
+    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
     from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
@@ -47,7 +47,7 @@ try:
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence
-    from scripts.piles_auto_assignment.evidence import evaluate_filter_evidence
+    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
     from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from scripts.piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
@@ -1041,6 +1041,7 @@ class AssignmentVerificationResult:
     matched_count: int
     missing_count: int
     wrong_values: list[str]
+    decisions: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -4532,6 +4533,14 @@ class CuracelPilesRunner:
         verified_on_table = False
         observed_assigned_values: list[str] = []
         if execute:
+            self._transition_assignment_attempts(
+                selected_group,
+                AttemptStatus.SUBMITTED,
+                {AttemptStatus.SELECTED},
+                {"code": "portal_submit_returned", "details": {
+                    "selected_assignee": selected_assignee,
+                }},
+            )
             source_pages: list[int] = []
             for plan in selected_group:
                 for page_number in self._page_candidates_for_plan(plan):
@@ -4548,28 +4557,44 @@ class CuracelPilesRunner:
             )
             verified_on_table = verification.ok
             observed_assigned_values = verification.observed_values
-            if not verified_on_table:
-                raise RuntimeError(
-                    f"Assigned column did not update to '{selected_assignee}' for "
-                    f"{len(selected_group)} verified pile(s) in status '{status_label}'. "
-                    f"Observed: {observed_assigned_values or ['<blank>']}. "
-                    f"Matched={verification.matched_count}, missing={verification.missing_count}, "
-                    f"wrong={verification.wrong_values or []}"
-                )
-            if verification.missing_count:
+            ledger = getattr(self, "execution_ledger", None)
+            if ledger:
+                for decision in verification.decisions:
+                    if not decision.attempt_id:
+                        continue
+                    ledger.transition_attempt(
+                        decision.attempt_id,
+                        decision.status,
+                        expected={AttemptStatus.SUBMITTED},
+                        evidence=decision.evidence,
+                    )
+            if verification.missing_count or verification.wrong_values:
                 print(
-                    f"  Verification accepted {verification.matched_count}/{len(selected_group)} "
-                    f"visible row(s) for '{selected_assignee}'; "
-                    f"{verification.missing_count} row(s) moved out of the filtered table after assignment."
+                    f"  Per-pile verification for '{selected_assignee}': "
+                    f"confirmed={verification.matched_count}, "
+                    f"reconciliation_pending={verification.missing_count}, "
+                    f"conflict={len(verification.wrong_values)}."
                 )
 
+        decisions_by_tracking = {
+            decision.tracking_key: decision
+            for decision in verification.decisions
+        } if execute else {}
         applied = [
             AppliedAssignment(
                 plan=plan,
                 actual_assignee_name=selected_assignee,
                 matched_planned_assignee=norm_key(selected_assignee) == norm_key(assignee_name),
-                verified_on_table=verified_on_table if execute else False,
-                observed_assigned_values=observed_assigned_values[:] if execute else [],
+                verified_on_table=(
+                    decisions_by_tracking.get(canonical_pile_tracking_key(plan.tracking_key)) is not None
+                    and decisions_by_tracking[canonical_pile_tracking_key(plan.tracking_key)].status
+                    == AttemptStatus.CONFIRMED_VISIBLE
+                ) if execute else False,
+                observed_assigned_values=(
+                    [decisions_by_tracking[canonical_pile_tracking_key(plan.tracking_key)].evidence.details.get("observed_assignee", "")]
+                    if canonical_pile_tracking_key(plan.tracking_key) in decisions_by_tracking
+                    else ["<missing>"]
+                ) if execute else [],
             )
             for plan in selected_group
         ]
@@ -4679,6 +4704,7 @@ class CuracelPilesRunner:
         matched_count = 0
         missing_count = len(target_keys)
         wrong_values: list[str] = []
+        decisions: list[Any] = []
         page_candidates = list(dict.fromkeys(page for page in (source_pages or []) if page > 0))
         target_key_set = set(target_keys)
         while time.time() < deadline:
@@ -4734,17 +4760,63 @@ class CuracelPilesRunner:
                 for key in target_keys
                 if key in row_map and not self._assignee_matches_assigned_text(expected_assignee, row_map[key].assigned)
             ]
-            if len(row_map) == len(target_keys) and matched_count == len(target_keys):
-                return AssignmentVerificationResult(True, last_observed, matched_count, missing_count, wrong_values)
-
-            # The portal can remove or reshuffle a row from the current status table immediately
-            # after a successful group assignment. Treat a tiny number of missing rows as verified
-            # only when every still-visible target row has the expected assignee.
-            allowed_missing = 0 if len(target_keys) < 10 else max(1, math.floor(len(target_keys) * 0.05))
-            if wrong_values == [] and matched_count > 0 and missing_count <= allowed_missing:
-                return AssignmentVerificationResult(True, last_observed, matched_count, missing_count, wrong_values)
+            expected_observations = {}
+            observed_assignments = {}
+            for key in target_keys:
+                tracking_key = target_tracking_by_key.get(key) or key
+                expected_observations[tracking_key] = {
+                    "attempt_id": getattr(self, "assignment_attempt_ids", {}).get(tracking_key, ""),
+                    "expected_assignee": expected_assignee,
+                }
+                if key in row_map:
+                    observed_assignments[tracking_key] = row_map[key].assigned
+            decisions = list(classify_assignment_observations(
+                expected_observations,
+                observed_assignments,
+            ))
+            matched_count = sum(
+                decision.status == AttemptStatus.CONFIRMED_VISIBLE
+                for decision in decisions
+            )
+            missing_count = sum(
+                decision.status == AttemptStatus.RECONCILIATION_PENDING
+                for decision in decisions
+            )
+            wrong_values = [
+                str(decision.evidence.details.get("observed_assignee") or "")
+                for decision in decisions
+                if decision.status == AttemptStatus.CONFLICT
+            ]
+            if decisions and all(
+                decision.status == AttemptStatus.CONFIRMED_VISIBLE
+                for decision in decisions
+            ):
+                return AssignmentVerificationResult(
+                    True,
+                    last_observed,
+                    matched_count,
+                    missing_count,
+                    wrong_values,
+                    decisions,
+                )
+            if any(decision.status == AttemptStatus.CONFLICT for decision in decisions):
+                return AssignmentVerificationResult(
+                    False,
+                    last_observed,
+                    matched_count,
+                    missing_count,
+                    wrong_values,
+                    decisions,
+                )
             time.sleep(1)
-        return AssignmentVerificationResult(False, last_observed, matched_count, missing_count, wrong_values)
+        return AssignmentVerificationResult(
+            False,
+            last_observed,
+            matched_count,
+            missing_count,
+            wrong_values,
+            decisions,
+        )
 
     def _open_assign_modal(self) -> None:
         assert self.page
@@ -5399,15 +5471,6 @@ class CuracelPilesRunner:
                                 selected_group,
                                 execute,
                             )
-                            if execute:
-                                self._transition_assignment_attempts(
-                                    selected_group,
-                                    AttemptStatus.SUBMITTED,
-                                    {AttemptStatus.SELECTED},
-                                    {"code": "portal_submit_returned", "details": {
-                                        "selected_assignee": selected_assignee,
-                                    }},
-                                )
                             if partial_selection_detected:
                                 print(
                                     f"  Recovered all {len(selected_group)} planned pile(s) for '{assignee_name}' "
@@ -5498,15 +5561,6 @@ class CuracelPilesRunner:
                                 selected_group,
                                 execute,
                             )
-                            if execute:
-                                self._transition_assignment_attempts(
-                                    selected_group,
-                                    AttemptStatus.SUBMITTED,
-                                    {AttemptStatus.SELECTED},
-                                    {"code": "portal_submit_returned", "details": {
-                                        "selected_assignee": selected_assignee,
-                                    }},
-                                )
                             results[selected_assignee] = results.get(selected_assignee, 0) + len(selected_group)
                             applied.extend(applied_group)
                             selected_keys = {plan.pile_key for plan in selected_group}
