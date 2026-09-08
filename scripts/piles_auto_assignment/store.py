@@ -37,6 +37,62 @@ class ExecutionLedger:
         if callable(close):
             close()
 
+    def try_acquire_insurer_lock(self, insurer_name: str) -> bool:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                (f"piles-insurer:{str(insurer_name).strip().lower()}",),
+            )
+            row = cursor.fetchone()
+        return bool(row and row[0])
+
+    def mark_coalesced_request(self, insurer_name: str, runner_run_id: str) -> str:
+        request_id = str(uuid.uuid4())
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO piles_auto_assignment_schedule_requests
+                        (id, insurer_name, requested_runner_run_id, status)
+                    VALUES (%s, %s, %s, 'pending')
+                    ON CONFLICT (lower(insurer_name)) WHERE status = 'pending'
+                    DO UPDATE SET updated_at = piles_auto_assignment_schedule_requests.updated_at
+                    RETURNING id
+                    """,
+                    (request_id, insurer_name, runner_run_id or None),
+                )
+                row = cursor.fetchone()
+            self.connection.commit()
+            return str(row[0])
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def claim_coalesced_request(self, insurer_name: str, runner_run_id: str) -> bool:
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH candidate AS (
+                      SELECT id FROM piles_auto_assignment_schedule_requests
+                      WHERE lower(insurer_name) = lower(%s) AND status = 'pending'
+                      ORDER BY requested_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE piles_auto_assignment_schedule_requests request
+                    SET status = 'claimed', claimed_by_runner_run_id = %s,
+                        claimed_at = now(), updated_at = now()
+                    FROM candidate WHERE request.id = candidate.id
+                    RETURNING request.id
+                    """,
+                    (insurer_name, runner_run_id or None),
+                )
+                row = cursor.fetchone()
+            self.connection.commit()
+            return bool(row)
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def create_insurer_run(self, runner_run_id: str, master: Any) -> str:
         insurer_run_id = str(uuid.uuid4())
         with self.connection.cursor() as cursor:
@@ -420,6 +476,15 @@ class ReadOnlyExecutionLedger:
     """Interface-compatible ledger that intentionally performs no writes."""
 
     write_count = 0
+
+    def try_acquire_insurer_lock(self, _insurer_name: str) -> bool:
+        return True
+
+    def mark_coalesced_request(self, _insurer_name: str, _runner_run_id: str) -> str:
+        return ""
+
+    def claim_coalesced_request(self, _insurer_name: str, _runner_run_id: str) -> bool:
+        return False
 
     def create_insurer_run(self, _runner_run_id: str, _master: Any) -> str:
         return str(uuid.uuid4())

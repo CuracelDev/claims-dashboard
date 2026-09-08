@@ -55,6 +55,8 @@ def derive_overall_run_status(statuses: Iterable[InsurerRunStatus]) -> InsurerRu
         return InsurerRunStatus.PARTIAL
     if failed:
         return InsurerRunStatus.FAILED
+    if values and all(value == InsurerRunStatus.SKIPPED_OVERLAP for value in values):
+        return InsurerRunStatus.SKIPPED_OVERLAP
     if any(value == InsurerRunStatus.MANUAL_ACTION_REQUIRED for value in values):
         return InsurerRunStatus.MANUAL_ACTION_REQUIRED
     return InsurerRunStatus.COMPLETED

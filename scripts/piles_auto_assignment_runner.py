@@ -46,6 +46,7 @@ try:
     )
     from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
     from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from piles_auto_assignment.scheduling import configured_max_concurrency
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
@@ -57,6 +58,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
     )
     from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
     from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from scripts.piles_auto_assignment.scheduling import configured_max_concurrency
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1192,6 +1194,73 @@ class DataStore:
             (RUNNER_ADVISORY_LOCK_KEY,),
         )
         return bool(rows and rows[0].get("acquired"))
+
+    def try_acquire_insurer_lock(self, insurer_name: str) -> bool:
+        if self.mode != "postgres":
+            raise RuntimeError("Insurer-scoped scheduling requires DATABASE_URL.")
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+            (f"piles-insurer:{canonical_insurer_key(insurer_name)}",),
+        )
+        return bool(rows and rows[0].get("acquired"))
+
+    def release_insurer_lock(self, insurer_name: str) -> None:
+        if self.mode == "postgres":
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-insurer:{canonical_insurer_key(insurer_name)}",),
+            )
+
+    def try_acquire_runner_slot(self, max_concurrency: int) -> int:
+        if self.mode != "postgres":
+            raise RuntimeError("Runner capacity protection requires DATABASE_URL.")
+        for slot in range(max_concurrency):
+            rows = self._fetchall_postgres(
+                "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+                (f"piles-capacity:{slot}",),
+            )
+            if rows and rows[0].get("acquired"):
+                return slot
+        return -1
+
+    def release_runner_slot(self, slot: int) -> None:
+        if self.mode == "postgres" and slot >= 0:
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-capacity:{slot}",),
+            )
+
+    def mark_coalesced_request(self, insurer_name: str, runner_run_id: str) -> str:
+        rows = self._fetchall_postgres(
+            """
+            INSERT INTO piles_auto_assignment_schedule_requests
+                (id, insurer_name, requested_runner_run_id, status)
+            VALUES (%s, %s, %s, 'pending')
+            ON CONFLICT (lower(insurer_name)) WHERE status = 'pending'
+            DO UPDATE SET updated_at = piles_auto_assignment_schedule_requests.updated_at
+            RETURNING id
+            """,
+            (str(uuid.uuid4()), insurer_name, runner_run_id or None),
+        )
+        return str(rows[0]["id"])
+
+    def claim_coalesced_request(self, insurer_name: str, runner_run_id: str) -> bool:
+        rows = self._fetchall_postgres(
+            """
+            WITH candidate AS (
+              SELECT id FROM piles_auto_assignment_schedule_requests
+              WHERE lower(insurer_name) = lower(%s) AND status = 'pending'
+              ORDER BY requested_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+            )
+            UPDATE piles_auto_assignment_schedule_requests request
+            SET status = 'claimed', claimed_by_runner_run_id = %s,
+                claimed_at = now(), updated_at = now()
+            FROM candidate WHERE request.id = candidate.id
+            RETURNING request.id
+            """,
+            (insurer_name, runner_run_id or None),
+        )
+        return bool(rows)
 
     def _fetchall_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         assert self.conn
@@ -7484,6 +7553,44 @@ def run_for_insurer(
     raise last_error or RuntimeError(f"Insurer run failed for {insurer_name}.")
 
 
+def run_insurer_recorded(
+    store: DataStore,
+    args: argparse.Namespace,
+    insurer_name: str,
+    month_labels: list[str],
+    year_label: str,
+    visible: bool,
+    execution_ledger: Any,
+    runner_run_id: str,
+) -> dict[str, Any]:
+    """Run one insurer and keep ledger-finalization failures from masking portal errors."""
+    insurer_run_id = ""
+    try:
+        if execution_ledger:
+            master = store.get_master_account(insurer_name)
+            insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
+            execution_ledger.heartbeat(insurer_run_id, phase="login")
+        result = run_for_insurer(
+            store, args, insurer_name, month_labels, year_label, visible,
+            execution_ledger, insurer_run_id,
+        )
+        if insurer_run_id:
+            execution_ledger.finalize_insurer_run(insurer_run_id, status="completed")
+        return result
+    except Exception as exc:
+        if insurer_run_id:
+            try:
+                execution_ledger.finalize_insurer_run(
+                    insurer_run_id,
+                    status="failed",
+                    error_code=classify_runner_error(exc),
+                    error_message=str(exc)[:500],
+                )
+            except Exception as ledger_error:
+                print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
+        raise
+
+
 def main() -> None:
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -7521,7 +7628,7 @@ def main() -> None:
             )
 
         store = DataStore()
-        ensure_runner_lock_available(store)
+        max_concurrency = configured_max_concurrency()
         restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args)) if args.execute else []
         if restored_weekend_rows:
             restored_by_insurer: dict[str, list[str]] = {}
@@ -7570,42 +7677,37 @@ def main() -> None:
         for index, insurer_name in enumerate(insurers, start=1):
             if args.all_active:
                 print(f"\n\n===== Running insurer {index}/{len(insurers)}: {insurer_name} =====")
-            insurer_run_id = ""
-            try:
-                if execution_ledger:
-                    master = store.get_master_account(insurer_name)
-                    insurer_run_id = execution_ledger.create_insurer_run(run_id, master)
-                    execution_ledger.heartbeat(insurer_run_id, phase="login")
-                insurer_result = run_for_insurer(
-                    store,
-                    args,
-                    insurer_name,
-                    month_labels,
-                    year_label,
-                    visible,
-                    execution_ledger,
-                    insurer_run_id,
+            slot = store.try_acquire_runner_slot(max_concurrency)
+            insurer_locked = slot >= 0 and store.try_acquire_insurer_lock(insurer_name)
+            if not insurer_locked:
+                if slot >= 0:
+                    store.release_runner_slot(slot)
+                request_id = store.mark_coalesced_request(insurer_name, run_id)
+                insurer_statuses.append(InsurerRunStatus.SKIPPED_OVERLAP)
+                store.log_runner_event(
+                    insurer_name=insurer_name,
+                    event_type="runner_overlap",
+                    status="skipped_overlap",
+                    details={"coalesced_request_id": request_id, "runner_run_id": run_id},
                 )
-                all_notification_items.extend(insurer_result.get("notification_items", []))
-                all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
-                if insurer_run_id:
-                    execution_ledger.finalize_insurer_run(
-                        insurer_run_id,
-                        status="completed",
+                print(f"\nSKIPPED overlap for {insurer_name}; one follow-up request is queued.")
+                continue
+            try:
+                followup_completed = False
+                while True:
+                    insurer_result = run_insurer_recorded(
+                        store, args, insurer_name, month_labels, year_label, visible,
+                        execution_ledger, run_id,
                     )
-                insurer_statuses.append(InsurerRunStatus.COMPLETED)
+                    all_notification_items.extend(insurer_result.get("notification_items", []))
+                    all_external_notification_items.extend(insurer_result.get("external_notification_items", []))
+                    insurer_statuses.append(InsurerRunStatus.COMPLETED)
+                    if followup_completed or not store.claim_coalesced_request(insurer_name, run_id):
+                        break
+                    followup_completed = True
+                    print(f"\nRunning one coalesced follow-up for {insurer_name}...")
             except Exception as exc:
                 error_code = classify_runner_error(exc)
-                if insurer_run_id:
-                    try:
-                        execution_ledger.finalize_insurer_run(
-                            insurer_run_id,
-                            status="failed",
-                            error_code=error_code,
-                            error_message=str(exc)[:500],
-                        )
-                    except Exception as ledger_error:
-                        print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
                 failures.append((insurer_name, str(exc)))
                 insurer_statuses.append(InsurerRunStatus.FAILED)
                 store.log_runner_event(
@@ -7623,6 +7725,9 @@ def main() -> None:
                 print(f"\nERROR for {insurer_name}: {exc}")
                 if not args.all_active:
                     raise
+            finally:
+                store.release_insurer_lock(insurer_name)
+                store.release_runner_slot(slot)
 
         if args and all_external_notification_items:
             try:

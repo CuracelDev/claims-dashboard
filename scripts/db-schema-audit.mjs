@@ -86,6 +86,13 @@ const EXPECTED = {
       change_source: ['text'], effective_at: ['timestamp with time zone'], created_at: ['timestamp with time zone'],
     },
   },
+  piles_auto_assignment_schedule_requests: {
+    requiredColumns: {
+      id: ['text'], insurer_name: ['text'], requested_runner_run_id: ['text'], status: ['text'],
+      claimed_by_runner_run_id: ['text'], requested_at: ['timestamp with time zone'],
+      created_at: ['timestamp with time zone'], updated_at: ['timestamp with time zone'],
+    },
+  },
 };
 
 const TABLES = [
@@ -106,6 +113,7 @@ const TABLES = [
   'piles_auto_assignment_master_accounts',
   'piles_auto_assignment_rules',
   'piles_auto_assignment_scan_contexts',
+  'piles_auto_assignment_schedule_requests',
   'prism_conversations',
   'prism_logs',
   'prism_messages',

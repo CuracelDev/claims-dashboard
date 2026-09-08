@@ -564,6 +564,22 @@ END $$;
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_bot_account_history_bot_idx
   ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC);
 
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_schedule_requests (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  insurer_name text NOT NULL,
+  requested_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed')),
+  claimed_by_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  claimed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_schedule_requests_pending_idx
+  ON piles_auto_assignment_schedule_requests (lower(insurer_name))
+  WHERE status = 'pending';
+
 ALTER TABLE IF EXISTS piles_auto_assignment_logs
   ADD COLUMN IF NOT EXISTS insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL;
 

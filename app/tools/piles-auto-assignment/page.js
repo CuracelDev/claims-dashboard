@@ -385,7 +385,7 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
     if (!runId) return undefined;
     let active = true;
     let timer;
-    const terminal = new Set(['completed', 'partial', 'failed', 'manual_action_required']);
+    const terminal = new Set(['completed', 'partial', 'failed', 'manual_action_required', 'skipped_overlap']);
 
     async function refreshRun() {
       try {

@@ -30,6 +30,7 @@ const TABLES = [
   'piles_auto_assignment_master_accounts',
   'piles_auto_assignment_pile_snapshots',
   'piles_auto_assignment_runner_runs',
+  'piles_auto_assignment_schedule_requests',
   'piles_auto_assignment_insurer_runs',
   'piles_auto_assignment_scan_contexts',
   'piles_auto_assignment_batches',
@@ -185,6 +186,11 @@ const TABLE_COLUMNS = {
     ['conflict_pile_count', 'integer'], ['failed_pile_count', 'integer'], ['error_code', 'text'], ['error_message', 'text'],
     ['heartbeat_at', 'timestamptz'], ['started_at', 'timestamptz'], ['finished_at', 'timestamptz'],
     ['details', 'jsonb'], ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_schedule_requests: [
+    ['id', 'text'], ['insurer_name', 'text'], ['requested_runner_run_id', 'text'], ['status', 'text'],
+    ['claimed_by_runner_run_id', 'text'], ['requested_at', 'timestamptz'], ['claimed_at', 'timestamptz'],
+    ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
   ],
   piles_auto_assignment_scan_contexts: [
     ['id', 'text'], ['insurer_run_id', 'text'], ['insurer_name', 'text'], ['filter_month', 'text'],
@@ -722,6 +728,18 @@ const CREATE_TABLE_SQL = {
       previous_values jsonb NOT NULL DEFAULT '{}'::jsonb,
       new_values jsonb NOT NULL DEFAULT '{}'::jsonb
     )`,
+  piles_auto_assignment_schedule_requests: `
+    CREATE TABLE piles_auto_assignment_schedule_requests (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      insurer_name text NOT NULL,
+      requested_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+      status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed')),
+      claimed_by_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+      requested_at timestamptz NOT NULL DEFAULT now(),
+      claimed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
   prism_logs: `
     CREATE TABLE prism_logs (
       id bigserial PRIMARY KEY,
@@ -887,6 +905,7 @@ const INDEX_SQL = [
   "CREATE UNIQUE INDEX piles_auto_assignment_attempts_active_key_idx ON piles_auto_assignment_attempts (insurer_name, tracking_key) WHERE status IN ('planned', 'selected', 'submitted', 'reconciliation_pending', 'still_unassigned')",
   'CREATE INDEX piles_auto_assignment_attempts_run_idx ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at)',
   'CREATE INDEX piles_auto_assignment_bot_account_history_bot_idx ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC)',
+  "CREATE UNIQUE INDEX piles_auto_assignment_schedule_requests_pending_idx ON piles_auto_assignment_schedule_requests (lower(insurer_name)) WHERE status = 'pending'",
   'CREATE INDEX tasks_assigned_to_idx ON tasks (assigned_to)',
   'CREATE INDEX target_logs_target_id_idx ON target_logs (target_id)',
   'CREATE INDEX team_leave_member_dates_idx ON team_leave (team_member_id, start_date, end_date)',
@@ -1056,7 +1075,7 @@ async function supabaseFetchTable(table) {
       const additiveTables = new Set([
         'piles_auto_assignment_insurer_runs', 'piles_auto_assignment_scan_contexts',
         'piles_auto_assignment_batches', 'piles_auto_assignment_attempts',
-        'piles_auto_assignment_bot_account_history',
+        'piles_auto_assignment_bot_account_history', 'piles_auto_assignment_schedule_requests',
       ]);
       if (res.status === 404 && additiveTables.has(table)) return [];
       throw new Error(`Supabase fetch failed for ${table}: ${res.status} ${body}`);
