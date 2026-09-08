@@ -46,6 +46,46 @@ const EXPECTED = {
       created_at: ['timestamp with time zone', 'timestamp without time zone'],
     },
   },
+  piles_auto_assignment_insurer_runs: {
+    requiredColumns: {
+      id: ['text'], runner_run_id: ['text'], insurer_name: ['text'],
+      status: ['text'], phase: ['text'], heartbeat_at: ['timestamp with time zone'],
+      details: ['jsonb'], created_at: ['timestamp with time zone'], updated_at: ['timestamp with time zone'],
+    },
+    preferredTypes: { details: ['jsonb'] },
+  },
+  piles_auto_assignment_scan_contexts: {
+    requiredColumns: {
+      id: ['text'], insurer_run_id: ['text'], insurer_name: ['text'], filter_month: ['text'],
+      requested_year: ['text'], effective_years: ['jsonb'], status_bucket: ['text'], status: ['text'],
+      ui_evidence: ['jsonb'], network_evidence: ['jsonb'], table_evidence: ['jsonb'],
+    },
+    preferredTypes: { effective_years: ['jsonb'], ui_evidence: ['jsonb'], network_evidence: ['jsonb'], table_evidence: ['jsonb'] },
+    uniqueGroups: [['insurer_run_id', 'filter_month', 'requested_year', 'status_bucket']],
+  },
+  piles_auto_assignment_batches: {
+    requiredColumns: {
+      id: ['text'], insurer_run_id: ['text'], scan_context_id: ['text'], insurer_name: ['text'],
+      intended_owner_name: ['text'], intended_portal_assignee: ['text'], status: ['text'], details: ['jsonb'],
+    },
+    preferredTypes: { details: ['jsonb'] },
+  },
+  piles_auto_assignment_attempts: {
+    requiredColumns: {
+      id: ['text'], batch_id: ['text'], insurer_run_id: ['text'], insurer_name: ['text'],
+      tracking_key: ['text'], intended_owner_name: ['text'], intended_portal_assignee: ['text'],
+      status: ['text'], attempt_number: ['integer'], evidence_details: ['jsonb'],
+    },
+    preferredTypes: { evidence_details: ['jsonb'] },
+    uniqueGroups: [['batch_id', 'tracking_key']],
+  },
+  piles_auto_assignment_bot_account_history: {
+    requiredColumns: {
+      id: ['text'], bot_account_id: ['text'], insurer_name: ['text'], owner_name: ['text'],
+      availability_status: ['text'], is_active: ['boolean'], is_available: ['boolean'],
+      change_source: ['text'], effective_at: ['timestamp with time zone'], created_at: ['timestamp with time zone'],
+    },
+  },
 };
 
 const TABLES = [
@@ -58,9 +98,14 @@ const TABLES = [
   'platform_settings',
   'piles_auto_assignment_bot_accounts',
   'piles_auto_assignment_bot_metrics',
+  'piles_auto_assignment_bot_account_history',
+  'piles_auto_assignment_batches',
+  'piles_auto_assignment_attempts',
+  'piles_auto_assignment_insurer_runs',
   'piles_auto_assignment_logs',
   'piles_auto_assignment_master_accounts',
   'piles_auto_assignment_rules',
+  'piles_auto_assignment_scan_contexts',
   'prism_conversations',
   'prism_logs',
   'prism_messages',

@@ -302,3 +302,175 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_runner_runs (
 
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_runner_runs_started_idx
   ON piles_auto_assignment_runner_runs (started_at DESC);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_insurer_runs (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+  master_account_id text REFERENCES piles_auto_assignment_master_accounts(id) ON DELETE SET NULL,
+  insurer_name text NOT NULL,
+  status text NOT NULL DEFAULT 'queued' CHECK (status IN (
+    'queued', 'running', 'completed', 'partial', 'failed',
+    'manual_action_required', 'skipped_inactive', 'skipped_overlap'
+  )),
+  phase text NOT NULL DEFAULT 'configuration' CHECK (phase IN (
+    'configuration', 'login', 'scan', 'plan', 'apply', 'reconcile', 'complete'
+  )),
+  discovered_pile_count integer NOT NULL DEFAULT 0 CHECK (discovered_pile_count >= 0),
+  discovered_claim_count integer NOT NULL DEFAULT 0 CHECK (discovered_claim_count >= 0),
+  planned_pile_count integer NOT NULL DEFAULT 0 CHECK (planned_pile_count >= 0),
+  planned_claim_count integer NOT NULL DEFAULT 0 CHECK (planned_claim_count >= 0),
+  submitted_pile_count integer NOT NULL DEFAULT 0 CHECK (submitted_pile_count >= 0),
+  submitted_claim_count integer NOT NULL DEFAULT 0 CHECK (submitted_claim_count >= 0),
+  confirmed_pile_count integer NOT NULL DEFAULT 0 CHECK (confirmed_pile_count >= 0),
+  confirmed_claim_count integer NOT NULL DEFAULT 0 CHECK (confirmed_claim_count >= 0),
+  reconciliation_pending_pile_count integer NOT NULL DEFAULT 0 CHECK (reconciliation_pending_pile_count >= 0),
+  reconciliation_pending_claim_count integer NOT NULL DEFAULT 0 CHECK (reconciliation_pending_claim_count >= 0),
+  conflict_pile_count integer NOT NULL DEFAULT 0 CHECK (conflict_pile_count >= 0),
+  failed_pile_count integer NOT NULL DEFAULT 0 CHECK (failed_pile_count >= 0),
+  error_code text,
+  error_message text,
+  heartbeat_at timestamptz,
+  started_at timestamptz,
+  finished_at timestamptz,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_insurer_runs_runner_idx
+  ON piles_auto_assignment_insurer_runs (runner_run_id, created_at);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_insurer_runs_active_idx
+  ON piles_auto_assignment_insurer_runs (insurer_name, heartbeat_at DESC)
+  WHERE status IN ('queued', 'running');
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_scan_contexts (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  insurer_run_id text NOT NULL REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE CASCADE,
+  insurer_name text NOT NULL,
+  filter_month text NOT NULL,
+  requested_year text NOT NULL,
+  effective_years jsonb NOT NULL DEFAULT '[]'::jsonb,
+  status_bucket text NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN (
+    'pending', 'scanning', 'complete', 'empty', 'failed'
+  )),
+  page_count integer NOT NULL DEFAULT 0 CHECK (page_count >= 0),
+  distinct_pile_count integer NOT NULL DEFAULT 0 CHECK (distinct_pile_count >= 0),
+  unassigned_pile_count integer NOT NULL DEFAULT 0 CHECK (unassigned_pile_count >= 0),
+  claim_count integer NOT NULL DEFAULT 0 CHECK (claim_count >= 0),
+  ui_evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+  network_evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+  table_evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+  error_code text,
+  error_message text,
+  started_at timestamptz,
+  settled_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (insurer_run_id, filter_month, requested_year, status_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_scan_contexts_run_idx
+  ON piles_auto_assignment_scan_contexts (insurer_run_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_batches (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  insurer_run_id text NOT NULL REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE CASCADE,
+  scan_context_id text REFERENCES piles_auto_assignment_scan_contexts(id) ON DELETE SET NULL,
+  insurer_name text NOT NULL,
+  bot_account_id text REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE SET NULL,
+  intended_owner_name text NOT NULL,
+  intended_portal_assignee text NOT NULL,
+  assignment_type text NOT NULL,
+  status_bucket text NOT NULL,
+  status text NOT NULL DEFAULT 'planned' CHECK (status IN (
+    'planned', 'selecting', 'selected', 'submitted', 'partially_confirmed',
+    'confirmed', 'reconciliation_pending', 'conflict', 'failed'
+  )),
+  planned_pile_count integer NOT NULL DEFAULT 0 CHECK (planned_pile_count >= 0),
+  planned_claim_count integer NOT NULL DEFAULT 0 CHECK (planned_claim_count >= 0),
+  selected_pile_count integer NOT NULL DEFAULT 0 CHECK (selected_pile_count >= 0),
+  confirmed_pile_count integer NOT NULL DEFAULT 0 CHECK (confirmed_pile_count >= 0),
+  pending_pile_count integer NOT NULL DEFAULT 0 CHECK (pending_pile_count >= 0),
+  conflict_pile_count integer NOT NULL DEFAULT 0 CHECK (conflict_pile_count >= 0),
+  failed_pile_count integer NOT NULL DEFAULT 0 CHECK (failed_pile_count >= 0),
+  attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  submitted_at timestamptz,
+  finished_at timestamptz,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_batches_run_idx
+  ON piles_auto_assignment_batches (insurer_run_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_attempts (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  batch_id text NOT NULL REFERENCES piles_auto_assignment_batches(id) ON DELETE CASCADE,
+  insurer_run_id text NOT NULL REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE CASCADE,
+  tracked_pile_id text REFERENCES piles_auto_assignment_tracked_piles(id) ON DELETE SET NULL,
+  insurer_name text NOT NULL,
+  tracking_key text NOT NULL,
+  last_pile_key text,
+  bot_account_id text REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE SET NULL,
+  intended_owner_name text NOT NULL,
+  intended_portal_assignee text NOT NULL,
+  observed_assignee text,
+  status text NOT NULL DEFAULT 'planned' CHECK (status IN (
+    'planned', 'selected', 'submitted', 'confirmed_visible', 'confirmed_reconciled',
+    'reconciliation_pending', 'still_unassigned', 'manual_action_required', 'conflict', 'failed'
+  )),
+  claim_count integer NOT NULL DEFAULT 0 CHECK (claim_count >= 0),
+  filter_context jsonb NOT NULL DEFAULT '{}'::jsonb,
+  attempt_number integer NOT NULL DEFAULT 1 CHECK (attempt_number > 0),
+  evidence_code text,
+  evidence_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  selected_at timestamptz,
+  submitted_at timestamptz,
+  confirmed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (batch_id, tracking_key)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_attempts_active_key_idx
+  ON piles_auto_assignment_attempts (insurer_name, tracking_key)
+  WHERE status IN ('planned', 'selected', 'submitted', 'reconciliation_pending', 'still_unassigned');
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_attempts_run_idx
+  ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_bot_account_history (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  bot_account_id text NOT NULL REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE CASCADE,
+  insurer_name text NOT NULL,
+  owner_name text NOT NULL,
+  assignment_role text,
+  support_capacity_ratio numeric,
+  availability_status text,
+  availability_note text,
+  active_from_time text,
+  active_to_time text,
+  shift_grace_minutes integer,
+  is_active boolean,
+  is_available boolean,
+  priority_order integer,
+  changed_by_name text,
+  changed_by_member_id text,
+  change_source text NOT NULL DEFAULT 'dashboard',
+  change_reason text,
+  effective_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_bot_account_history_bot_idx
+  ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC);
+
+ALTER TABLE IF EXISTS piles_auto_assignment_logs
+  ADD COLUMN IF NOT EXISTS insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL;
+
+ALTER TABLE IF EXISTS piles_auto_assignment_logs
+  ADD COLUMN IF NOT EXISTS batch_id text REFERENCES piles_auto_assignment_batches(id) ON DELETE SET NULL;
