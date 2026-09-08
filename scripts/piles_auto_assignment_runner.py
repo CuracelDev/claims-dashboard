@@ -37,7 +37,7 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 
 try:
     from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from piles_auto_assignment.domain import FilterEvidence
+    from piles_auto_assignment.domain import AttemptStatus, FilterEvidence
     from piles_auto_assignment.evidence import evaluate_filter_evidence
     from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from piles_auto_assignment.planning import (
@@ -46,7 +46,7 @@ try:
     )
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from scripts.piles_auto_assignment.domain import FilterEvidence
+    from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence
     from scripts.piles_auto_assignment.evidence import evaluate_filter_evidence
     from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from scripts.piles_auto_assignment.planning import (
@@ -2897,6 +2897,8 @@ class CuracelPilesRunner:
         self.insurer_name = ""
         self._last_scan_result: Any = None
         self._last_filter_evidence: FilterEvidence | None = None
+        self.scan_context_ids: dict[tuple[str, str, str], str] = {}
+        self.assignment_attempt_ids: dict[str, str] = {}
 
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
@@ -4383,6 +4385,9 @@ class CuracelPilesRunner:
                 (item["filter_month"], item["requested_year"], item["status_bucket"]): item
                 for item in contexts
             }
+            scan_context_ids = getattr(self, "scan_context_ids", {})
+            scan_context_ids.update({key: item["id"] for key, item in context_by_key.items()})
+            self.scan_context_ids = scan_context_ids
         for scan_year in scan_years:
             if len(scan_years) > 1:
                 print(f"\nScanning year: {scan_year}")
@@ -5176,6 +5181,97 @@ class CuracelPilesRunner:
             ))
         return assignees
 
+    def persist_assignment_plans(
+        self,
+        plans: list[PlannedAssignment],
+        minimum_claim_chunk: int,
+    ) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
+        if not ledger or not insurer_run_id:
+            return
+        attempt_ids = getattr(self, "assignment_attempt_ids", {})
+        self.assignment_attempt_ids = attempt_ids
+        unpersisted = [
+            plan for plan in plans
+            if plan.tracking_key not in attempt_ids
+        ]
+        grouped: dict[tuple[str, str, str, str, str, int], list[PlannedAssignment]] = {}
+        for plan in unpersisted:
+            key = (
+                plan.assignee_id,
+                plan.assignment_type,
+                plan.status_bucket,
+                plan.filter_month,
+                norm(plan.filter_year),
+                plan.source_page_number,
+            )
+            grouped.setdefault(key, []).append(plan)
+        for grouped_plans in grouped.values():
+            for plan_batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk):
+                sample = plan_batch[0]
+                batch_id = str(uuid.uuid4())
+                attempts = []
+                for plan in plan_batch:
+                    attempt_id = str(uuid.uuid4())
+                    attempts.append({
+                        "id": attempt_id,
+                        "tracking_key": plan.tracking_key,
+                        "last_pile_key": plan.pile_key,
+                        "claim_count": max(plan.remaining_claims, 0),
+                        "filter_context": {
+                            "month": plan.filter_month,
+                            "year": norm(plan.filter_year),
+                            "status": plan.status_bucket,
+                            "source_page": plan.source_page_number,
+                        },
+                    })
+                ledger.create_batch_with_attempts(
+                    {
+                        "id": batch_id,
+                        "insurer_run_id": insurer_run_id,
+                        "scan_context_id": self.scan_context_ids.get((
+                            sample.filter_month,
+                            norm(sample.filter_year),
+                            sample.status_bucket,
+                        )),
+                        "insurer_name": sample.insurer_name,
+                        "bot_account_id": sample.assignee_id,
+                        "intended_owner_name": sample.assignee_name,
+                        "intended_portal_assignee": sample.assignee_name,
+                        "assignment_type": sample.assignment_type,
+                        "status_bucket": sample.status_bucket,
+                        "planned_claim_count": sum(max(plan.remaining_claims, 0) for plan in plan_batch),
+                        "details": {"source_page": sample.source_page_number},
+                    },
+                    attempts,
+                )
+                for attempt in attempts:
+                    attempt_ids[attempt["tracking_key"]] = attempt["id"]
+
+    def _transition_assignment_attempts(
+        self,
+        plans: list[PlannedAssignment],
+        target: Any,
+        expected: set[Any],
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        if not ledger:
+            return
+        for plan in plans:
+            attempt_id = self.assignment_attempt_ids.get(plan.tracking_key)
+            if not attempt_id:
+                raise RuntimeError(
+                    f"Assignment attempt for tracking key '{plan.tracking_key}' was not persisted."
+                )
+            ledger.transition_attempt(
+                attempt_id,
+                target,
+                expected=expected,
+                evidence=evidence,
+            )
+
     def execute_assignment_plan(
         self,
         month_labels: list[str],
@@ -5184,6 +5280,8 @@ class CuracelPilesRunner:
         execute: bool,
         minimum_claim_chunk: int = 25,
     ) -> tuple[dict[str, int], list[AppliedAssignment]]:
+        if execute:
+            self.persist_assignment_plans(plans, minimum_claim_chunk)
         results: dict[str, int] = {}
         applied: list[AppliedAssignment] = []
         for filter_month, filter_year in assignment_filter_contexts(month_labels, year_label, plans):
@@ -5286,6 +5384,12 @@ class CuracelPilesRunner:
                                 continue
 
                             selected_group = [plan for plan in group if plan.pile_key in selected_keys]
+                            if execute:
+                                self._transition_assignment_attempts(
+                                    selected_group,
+                                    AttemptStatus.SELECTED,
+                                    {AttemptStatus.PLANNED},
+                                )
                             selected_assignee, applied_group = self._apply_selected_group(
                                 filter_month,
                                 filter_year,
@@ -5295,6 +5399,15 @@ class CuracelPilesRunner:
                                 selected_group,
                                 execute,
                             )
+                            if execute:
+                                self._transition_assignment_attempts(
+                                    selected_group,
+                                    AttemptStatus.SUBMITTED,
+                                    {AttemptStatus.SELECTED},
+                                    {"code": "portal_submit_returned", "details": {
+                                        "selected_assignee": selected_assignee,
+                                    }},
+                                )
                             if partial_selection_detected:
                                 print(
                                     f"  Recovered all {len(selected_group)} planned pile(s) for '{assignee_name}' "
@@ -5370,6 +5483,12 @@ class CuracelPilesRunner:
                             if not selection.selected_keys:
                                 continue
                             selected_group = [plan for plan in group if plan.pile_key in selection.selected_keys]
+                            if execute:
+                                self._transition_assignment_attempts(
+                                    selected_group,
+                                    AttemptStatus.SELECTED,
+                                    {AttemptStatus.PLANNED},
+                                )
                             selected_assignee, applied_group = self._apply_selected_group(
                                 filter_month,
                                 filter_year,
@@ -5379,6 +5498,15 @@ class CuracelPilesRunner:
                                 selected_group,
                                 execute,
                             )
+                            if execute:
+                                self._transition_assignment_attempts(
+                                    selected_group,
+                                    AttemptStatus.SUBMITTED,
+                                    {AttemptStatus.SELECTED},
+                                    {"code": "portal_submit_returned", "details": {
+                                        "selected_assignee": selected_assignee,
+                                    }},
+                                )
                             results[selected_assignee] = results.get(selected_assignee, 0) + len(selected_group)
                             applied.extend(applied_group)
                             selected_keys = {plan.pile_key for plan in selected_group}
