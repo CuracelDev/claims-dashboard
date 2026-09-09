@@ -3164,6 +3164,23 @@ class CuracelPilesRunner:
         self.assignment_attempt_ids: dict[str, str] = {}
         self.retry_attempt_numbers: dict[str, int] = {}
 
+    def _heartbeat(self, phase: str) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
+        if not ledger or not insurer_run_id:
+            return
+        now = time.monotonic()
+        if now - float(getattr(self, "_last_heartbeat_monotonic", 0.0) or 0.0) < 10:
+            return
+        self._last_heartbeat_monotonic = now
+        try:
+            ledger.heartbeat(insurer_run_id, phase=phase)
+        except Exception as error:
+            last_warning = float(getattr(self, "_last_heartbeat_warning_monotonic", 0.0) or 0.0)
+            if now - last_warning >= 60:
+                print(f"  Warning: runner heartbeat update failed ({type(error).__name__}).")
+                self._last_heartbeat_warning_monotonic = now
+
     def _ensure_playwright_browsers(self) -> None:
         print("Playwright browser binary is missing. Installing chromium runtime into the configured browser path...")
         env = os.environ.copy()
@@ -3233,6 +3250,7 @@ class CuracelPilesRunner:
     ) -> None:
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
+            self._heartbeat("scan")
             matching_events = [
                 (status, url, response)
                 for sequence, status, url, response in self._piles_response_events
@@ -4165,6 +4183,7 @@ class CuracelPilesRunner:
             deadline = time.time() + (timeout_ms / 1000)
             observed_text = ""
             while time.time() < deadline:
+                self._heartbeat("scan")
                 observed_text = self._read_select_text(select)
                 if label_key(observed_text) == label_key(selected_text):
                     return True
@@ -4772,6 +4791,7 @@ class CuracelPilesRunner:
         deadline = time.time() + (timeout_ms / 1000)
         last_state = "unreadable"
         while time.time() < deadline:
+            self._heartbeat("scan")
             remaining_ms = max(int((deadline - time.time()) * 1000), 1)
             last_state = self.wait_for_table_ready(timeout_ms=min(2500, remaining_ms))
             visible_count = self._visible_table_row_count()
@@ -4910,6 +4930,7 @@ class CuracelPilesRunner:
         return False
 
     def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
+        self._heartbeat("scan")
         filter_evidence = self.apply_filters(month_label, year_label, status_label)
         filter_decision = evaluate_filter_evidence(filter_evidence)
         if not filter_decision.accepted:
@@ -4930,6 +4951,7 @@ class CuracelPilesRunner:
         scan = ScanAccumulator()
         page_number = 1
         while True:
+            self._heartbeat("scan")
             page_rows = self.rows_on_current_page(status_label, page_number, month_label, year_label)
             mismatched_rows = [
                 row for row in page_rows
@@ -5104,6 +5126,7 @@ class CuracelPilesRunner:
         return all_rows
 
     def reset_to_filtered_page(self, month_label: str, year_label: str, status_label: str, page_number: int) -> list[PileRow]:
+        self._heartbeat("reconcile")
         self.open_piles()
         self.apply_filters(month_label, year_label, status_label)
         self.try_set_page_size(100)
@@ -5144,6 +5167,7 @@ class CuracelPilesRunner:
             if page_number not in page_candidates and page_number > 0:
                 page_candidates.append(page_number)
         for page_number in page_candidates:
+            self._heartbeat("reconcile")
             current_rows = self.reset_to_filtered_page(month_label, year_label, status_label, page_number)
             for row in current_rows:
                 if row.key == pile_key:
@@ -5178,6 +5202,7 @@ class CuracelPilesRunner:
         execute: bool,
     ) -> tuple[str, list[AppliedAssignment]]:
         selected_keys = [plan.pile_key for plan in selected_group]
+        self._heartbeat("apply")
         self._open_assign_modal()
         selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
         verified_on_table = False
@@ -5191,6 +5216,7 @@ class CuracelPilesRunner:
                     "selected_assignee": selected_assignee,
                 }},
             )
+            self._heartbeat("apply")
             source_pages: list[int] = []
             for plan in selected_group:
                 for page_number in self._page_candidates_for_plan(plan):
@@ -5205,6 +5231,7 @@ class CuracelPilesRunner:
                 tracking_keys=[plan.tracking_key for plan in selected_group],
                 source_pages=source_pages,
             )
+            self._heartbeat("reconcile")
             verified_on_table = verification.ok
             observed_assigned_values = verification.observed_values
             ledger = getattr(self, "execution_ledger", None)
@@ -5358,12 +5385,14 @@ class CuracelPilesRunner:
         page_candidates = list(dict.fromkeys(page for page in (source_pages or []) if page > 0))
         target_key_set = set(target_keys)
         while time.time() < deadline:
+            self._heartbeat("reconcile")
             if page_candidates:
                 current_rows: list[PileRow] = []
                 seen_keys: set[str] = set()
                 target_seen: set[str] = set()
                 target_tracking_seen: set[str] = set()
                 for page_number in page_candidates:
+                    self._heartbeat("reconcile")
                     page_rows = self.reset_to_filtered_page(month_label, year_label, status_label, page_number)
                     for row in page_rows:
                         if row.key in seen_keys:
@@ -5646,6 +5675,7 @@ class CuracelPilesRunner:
         last_wrapper_count = 0
         last_label_count = 0
         while time.time() < deadline:
+            self._heartbeat("apply")
             control = self._find_assign_user_control()
             if control is not None:
                 return control
@@ -5846,6 +5876,7 @@ class CuracelPilesRunner:
         return selected_assignee or assignee_name
 
     def discover_portal_assignees(self, month_label: str, year_label: str, sample_pile: PileRow) -> list[PortalAssignee]:
+        self._heartbeat("plan")
         active_month = sample_pile.filter_month or month_label
         active_year = effective_filter_year(sample_pile, year_label)
         selected = 0
@@ -5908,6 +5939,7 @@ class CuracelPilesRunner:
         plans: list[PlannedAssignment],
         minimum_claim_chunk: int,
     ) -> None:
+        self._heartbeat("plan")
         ledger = getattr(self, "execution_ledger", None)
         insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
         if not ledger or not insurer_run_id:
@@ -6020,6 +6052,7 @@ class CuracelPilesRunner:
                 ]
                 if not pending_status_plans:
                     continue
+                self._heartbeat("apply")
                 print(f"\nApplying assignments for year/month/status: {filter_year} / {filter_month} / {status_label}")
                 self.open_piles()
                 self.apply_filters(filter_month, filter_year, status_label)
@@ -6027,6 +6060,7 @@ class CuracelPilesRunner:
                 page_number = 1
                 seen_pages = set()
                 while True:
+                    self._heartbeat("apply")
                     current_rows = self.rows_on_current_page(status_label, page_number, filter_month, filter_year)
                     fingerprint = tuple(row.key for row in current_rows)
                     if fingerprint in seen_pages:
@@ -6044,6 +6078,7 @@ class CuracelPilesRunner:
                             for batch in chunk_planned_assignments(grouped_plans, minimum_claim_chunk)
                         ]
                         for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped_items):
+                            self._heartbeat("apply")
                             requested_keys = [plan.pile_key for plan in group]
                             selected_keys: list[str] = []
                             missing_keys = requested_keys[:]
@@ -6155,6 +6190,7 @@ class CuracelPilesRunner:
                         f"in {filter_month} / {status_label}..."
                     )
                 for recovery_round in range(2):
+                    self._heartbeat("reconcile")
                     if not pending_status_plans:
                         break
                     page_candidates: list[int] = []
@@ -6163,6 +6199,7 @@ class CuracelPilesRunner:
                             if page_candidate not in page_candidates:
                                 page_candidates.append(page_candidate)
                     for recovery_page in page_candidates:
+                        self._heartbeat("reconcile")
                         if not pending_status_plans:
                             break
                         current_rows = self.reset_to_filtered_page(

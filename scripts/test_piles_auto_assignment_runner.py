@@ -1856,6 +1856,43 @@ class YearFilterScanningTests(unittest.TestCase):
 
 
 class ExecutionLedgerIntegrationTests(unittest.TestCase):
+    def test_runner_heartbeat_phases_match_database_constraint(self):
+        source = Path(runner.__file__).read_text()
+        phases = set(__import__("re").findall(r'_heartbeat\("([^\"]+)"', source))
+
+        self.assertTrue(phases)
+        self.assertTrue(phases.issubset({
+            "configuration", "login", "scan", "plan", "apply", "reconcile", "complete",
+        }))
+
+    def test_runner_heartbeat_updates_long_running_phase(self):
+        phases = []
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.execution_ledger = types.SimpleNamespace(
+            heartbeat=lambda run_id, phase: phases.append((run_id, phase)),
+        )
+        portal.insurer_run_id = "insurer-run-1"
+
+        portal._heartbeat("apply")
+
+        self.assertEqual(phases, [("insurer-run-1", "apply")])
+
+    def test_runner_heartbeat_is_a_noop_without_a_durable_run(self):
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.execution_ledger = None
+        portal.insurer_run_id = ""
+
+        portal._heartbeat("scan")
+
+    def test_runner_heartbeat_failure_never_interrupts_portal_work(self):
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.execution_ledger = types.SimpleNamespace(
+            heartbeat=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+        )
+        portal.insurer_run_id = "insurer-run-1"
+
+        portal._heartbeat("apply")
+
     def test_read_only_flag_uses_non_writing_ledger(self):
         args = types.SimpleNamespace(read_only=True)
         store = types.SimpleNamespace(mode="postgres", database_url="postgres://unused")
