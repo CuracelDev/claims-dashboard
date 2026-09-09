@@ -1389,7 +1389,12 @@ class YearFilterScanningTests(unittest.TestCase):
         unrelated = runner.summarize_piles_response({"success": True})
 
         self.assertEqual(empty, {"authoritative": True, "item_count": 0, "total": 0})
-        self.assertEqual(populated, {"authoritative": True, "item_count": 1, "total": 1})
+        self.assertEqual(populated, {
+            "authoritative": True,
+            "item_count": 1,
+            "total": 1,
+            "row_fields": ["id"],
+        })
         self.assertEqual(unrelated, {"authoritative": False})
 
     def test_filter_response_marker_survives_history_truncation(self):

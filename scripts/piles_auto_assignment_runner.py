@@ -541,6 +541,10 @@ def summarize_piles_response(payload: Any) -> dict[str, Any]:
     }
     if isinstance(total, (int, float)) and not isinstance(total, bool):
         summary["total"] = int(total)
+    if isinstance(rows, list):
+        first_row = next((row for row in rows if isinstance(row, dict)), None)
+        if first_row is not None:
+            summary["row_fields"] = sorted(str(key) for key in first_row.keys())[:50]
     return summary
 
 
@@ -4521,7 +4525,9 @@ class CuracelPilesRunner:
                 f"expected_rows={network_details.get('item_count', 'unknown')}, "
                 f"visible_rows={self._visible_table_row_count()}, "
                 f"http_status={network_details.get('http_status', 'not_observed')}, "
-                f"dom_matches_response={dom_matches_response}."
+                f"dom_matches_response={dom_matches_response}, "
+                f"response_fields={network_details.get('row_fields', [])}, "
+                f"table_headers={self._table_headers()}."
             )
         return evidence
 
