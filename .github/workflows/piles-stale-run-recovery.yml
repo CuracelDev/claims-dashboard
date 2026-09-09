@@ -1,0 +1,51 @@
+name: Piles Stale Run Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Inspect is read-only; recover finalizes only stale runs whose insurer lock is free
+        required: true
+        default: inspect
+        type: choice
+        options:
+          - inspect
+          - recover
+      confirmation:
+        description: Type RECOVER_STALE_RUNS when action is recover
+        required: false
+        type: string
+
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect or recover stale Piles runs
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          RECOVERY_ACTION: ${{ inputs.action }}
+          RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: RECOVERY_ACTION,RECOVERY_CONFIRMATION
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+            if [ "$RECOVERY_ACTION" = "recover" ]; then
+              if [ "$RECOVERY_CONFIRMATION" != "RECOVER_STALE_RUNS" ]; then
+                echo "Exact recovery confirmation is required." >&2
+                exit 1
+              fi
+              node scripts/recover-piles-stale-runs.mjs --apply
+            else
+              node scripts/recover-piles-stale-runs.mjs
+            fi

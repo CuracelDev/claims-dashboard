@@ -60,7 +60,7 @@ async function databaseChecks() {
     const [linkage, owners, stale, pending, unsupported] = await Promise.all([
       pool.query(`select count(*)::int count from piles_auto_assignment_master_accounts m left join piles_auto_assignment_rules r on lower(r.insurer_name)=lower(m.insurer_name) and r.is_active=true where m.is_active=true and r.id is null`),
       pool.query(`select count(*)::int count from piles_auto_assignment_master_accounts m where m.is_active=true and not exists (select 1 from piles_auto_assignment_bot_accounts b where lower(b.insurer_name)=lower(m.insurer_name) and b.is_active=true and b.is_available=true)`),
-      pool.query(`select count(*)::int count from piles_auto_assignment_insurer_runs where status='running' and heartbeat_at < now() - interval '15 minutes'`),
+      pool.query(`select count(*)::int count from piles_auto_assignment_insurer_runs where status='running' and coalesce(heartbeat_at, started_at, created_at) < now() - interval '15 minutes'`),
       pool.query(`select count(*)::int count from piles_auto_assignment_attempts where status='reconciliation_pending' and updated_at < now() - interval '30 minutes'`),
       pool.query(`select count(*)::int count from piles_auto_assignment_rules where distribution_mode not in ('balanced_finish','single_owner','manual_override') or minimum_claim_chunk < 1`),
     ]);
