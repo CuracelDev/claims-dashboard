@@ -1365,6 +1365,28 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertEqual(portal_runner._page_open_response_marker, 7)
 
+    def test_open_piles_reloads_when_same_url_navigation_emits_no_piles_response(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_sequence = 7
+        portal_runner._filter_state = {}
+        portal_runner._table_headers_cache = []
+        reloads = []
+
+        class Page:
+            def reload(self, **_kwargs):
+                reloads.append(True)
+                portal_runner._piles_response_sequence = 8
+
+        portal_runner.page = Page()
+        portal_runner._goto_with_soft_readiness = lambda _url: None
+        portal_runner._wait_for_piles_page_ready = lambda: None
+        portal_runner._dismiss_popup = lambda: None
+
+        runner.CuracelPilesRunner.open_piles(portal_runner)
+
+        self.assertEqual(reloads, [True])
+        self.assertEqual(portal_runner._page_open_response_marker, 7)
+
     def test_page_open_marker_rejects_a_pre_navigation_matching_response(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         portal_runner._piles_response_events = [
@@ -1686,6 +1708,24 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertEqual(state, "structurally_empty")
         self.assertTrue(coherent)
+
+    def test_empty_placeholder_row_is_not_counted_as_a_pile(self):
+        class Row:
+            def inner_text(self):
+                return "No Data Found"
+
+        class Rows:
+            def count(self):
+                return 1
+
+            def nth(self, _index):
+                return Row()
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = type("Page", (), {"locator": lambda _self, _selector: Rows()})()
+
+        self.assertEqual(runner.CuracelPilesRunner._visible_table_row_count(portal_runner), 0)
+        self.assertEqual(runner.CuracelPilesRunner._table_preview_fingerprint(portal_runner), ())
 
     def test_page_size_change_waits_for_exact_response_and_dom_count(self):
         class Target:

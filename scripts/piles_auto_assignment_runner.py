@@ -3520,6 +3520,9 @@ class CuracelPilesRunner:
             try:
                 self._goto_with_soft_readiness(f"{CURACEL_BASE_URL}/hmo/piles")
                 self._wait_for_piles_page_ready()
+                if self._piles_response_sequence == navigation_marker:
+                    self.page.reload(wait_until="domcontentloaded", timeout=45000)
+                    self._wait_for_piles_page_ready()
                 time.sleep(1)
                 self._dismiss_popup()
                 self._page_open_response_marker = navigation_marker
@@ -4720,7 +4723,7 @@ class CuracelPilesRunner:
                 text
                 for index in range(min(rows.count(), 3))
                 if (text := norm(rows.nth(index).inner_text()))
-                and norm_key(text) != "no data found"
+                and norm_key(text) != "nodatafound"
             )
         except Exception:
             return ()
@@ -4733,7 +4736,7 @@ class CuracelPilesRunner:
                 1
                 for index in range(rows.count())
                 if (text := norm(rows.nth(index).inner_text()))
-                and norm_key(text) != "no data found"
+                and norm_key(text) != "nodatafound"
             )
         except Exception:
             return -1
