@@ -323,6 +323,18 @@ class ReadOnlyProbeTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual(len(reloads), 1)
 
+    def test_read_only_probe_never_sends_external_assignment_alerts(self):
+        items = [object()]
+        self.assertFalse(runner.should_send_external_assignment_alert(
+            types.SimpleNamespace(read_only=True), items,
+        ))
+        self.assertTrue(runner.should_send_external_assignment_alert(
+            types.SimpleNamespace(read_only=False), items,
+        ))
+        self.assertFalse(runner.should_send_external_assignment_alert(
+            types.SimpleNamespace(read_only=False), [],
+        ))
+
 
 class WeekendRestoreTests(unittest.TestCase):
     def test_restore_does_not_overwrite_manual_active_state(self):

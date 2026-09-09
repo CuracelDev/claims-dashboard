@@ -7222,6 +7222,13 @@ def overlap_probe_failure(read_only: bool, insurer_name: str) -> str | None:
     return f"Read-only probe skipped {insurer_name} because another runner held its lock."
 
 
+def should_send_external_assignment_alert(
+    args: argparse.Namespace,
+    notification_items: list[Any],
+) -> bool:
+    return bool(notification_items) and not bool(getattr(args, "read_only", False))
+
+
 def _run_for_insurer_once(
     store: DataStore,
     args: argparse.Namespace,
@@ -8313,7 +8320,7 @@ def main() -> None:
                 store.release_insurer_lock(insurer_name)
                 store.release_runner_slot(slot)
 
-        if args and all_external_notification_items:
+        if args and should_send_external_assignment_alert(args, all_external_notification_items):
             try:
                 send_external_assignment_alert(
                     all_external_notification_items,
