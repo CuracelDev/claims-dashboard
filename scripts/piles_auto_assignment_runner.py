@@ -6823,6 +6823,23 @@ def build_assignment_plan(
             1,
         )
 
+    eligibility = evaluate_eligible_bots(bots, effective_at=effective_at)
+    if active_rule.distribution_mode != "manual_override" and not eligibility.eligible:
+        bots_by_id = {bot.id: bot for bot in bots}
+        exclusions = []
+        for exclusion in eligibility.exclusions:
+            bot = bots_by_id.get(exclusion.subject_id)
+            owner = norm(bot.owner_name if bot else "") or norm(bot.portal_name if bot else "") or exclusion.subject_id
+            reason = exclusion.reason_code
+            if bot and reason == "outside_active_window":
+                reason += f": {norm(bot.active_from_time) or 'start'}-{norm(bot.active_to_time) or 'end'}"
+            exclusions.append(f"{owner} ({reason})")
+        detail = ", ".join(exclusions) or "no bot accounts were configured"
+        raise RuntimeError(
+            "No eligible bot accounts are available for assignment. "
+            f"Safe exclusions: {detail}."
+        )
+
     planning = plan_assignments(
         active_rule.distribution_mode,
         piles,
@@ -6857,7 +6874,7 @@ def build_assignment_plan(
         for decision in planning.plans
     ]
 
-    eligible = evaluate_eligible_bots(bots, effective_at=effective_at).eligible
+    eligible = eligibility.eligible
     assigned_by_bot = {
         bot.id: [decision for decision in planning.plans if decision.bot.id == bot.id]
         for bot in eligible

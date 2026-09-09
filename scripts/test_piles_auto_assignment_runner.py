@@ -164,6 +164,18 @@ class AssignmentPlanningTests(unittest.TestCase):
         self.assertEqual({plan.assignee_id for plan in plans}, {"primary"})
         self.assertNotIn("support", summary)
 
+    def test_no_eligible_bot_error_explains_safe_exclusion_reasons(self):
+        bot = make_bot("primary", "primary", available=False, priority=1)
+        bot.owner_name = "Daniel"
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"No eligible bot accounts.*Daniel \(unavailable\)",
+        ):
+            runner.build_assignment_plan(
+                "OLD MUTUAL", [make_pile(1)], [bot], {},
+            )
+
     def test_existing_load_is_respected_after_primary_floor(self):
         bots = [
             make_bot("primary", "primary", priority=1),
