@@ -24,16 +24,17 @@ let recovered = 0;
 let locked = 0;
 
 try {
-  const stale = await client.query(`
-    select id, runner_run_id, insurer_name, phase, heartbeat_at, started_at
+  const active = await client.query(`
+    select id, runner_run_id, insurer_name, phase, heartbeat_at, started_at,
+           coalesce(heartbeat_at, started_at, created_at) < now() - interval '15 minutes' as is_stale
     from piles_auto_assignment_insurer_runs
     where status = 'running'
-      and coalesce(heartbeat_at, started_at, created_at) < now() - interval '15 minutes'
     order by coalesce(heartbeat_at, started_at, created_at)
   `);
-  console.log(`Stale insurer runs: ${stale.rowCount}`);
+  const staleCount = active.rows.filter((run) => run.is_stale).length;
+  console.log(`Active insurer runs: ${active.rowCount}; stale: ${staleCount}`);
 
-  for (const run of stale.rows) {
+  for (const run of active.rows) {
     const lockName = insurerAdvisoryLockName(run.insurer_name);
     const lockResult = await client.query(
       'select pg_try_advisory_lock(hashtextextended($1, 0)) as acquired',
@@ -42,8 +43,16 @@ try {
     const acquired = Boolean(lockResult.rows[0]?.acquired);
     console.log(
       `${run.insurer_name}: phase=${run.phase} heartbeat=${run.heartbeat_at?.toISOString?.() || run.heartbeat_at} `
-      + `insurer_lock=${acquired ? 'free' : 'held'} action=${apply ? 'recover' : 'inspect'}`,
+      + `freshness=${run.is_stale ? 'stale' : 'fresh'} insurer_lock=${acquired ? 'free' : 'held'} `
+      + `action=${apply && run.is_stale ? 'recover' : 'inspect'}`,
     );
+
+    if (!run.is_stale) {
+      if (acquired) {
+        await client.query('select pg_advisory_unlock(hashtextextended($1, 0))', [lockName]);
+      }
+      continue;
+    }
     if (!acquired) {
       locked += 1;
       continue;
