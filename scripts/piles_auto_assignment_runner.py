@@ -12,6 +12,7 @@ Default mode is dry-run: it scans, plans, and shows the browser flow without cli
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -22,6 +23,7 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -545,7 +547,91 @@ def summarize_piles_response(payload: Any) -> dict[str, Any]:
         first_row = next((row for row in rows if isinstance(row, dict)), None)
         if first_row is not None:
             summary["row_fields"] = sorted(str(key) for key in first_row.keys())[:50]
+        identity_candidates = response_identity_candidates(rows)
+        if rows and len(identity_candidates) == len(rows) and all(identity_candidates):
+            summary["row_identity_candidates"] = identity_candidates
     return summary
+
+
+def _nested_display_value(value: Any) -> str:
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return norm(value)
+    if not isinstance(value, dict):
+        return ""
+    for key in ("name", "provider_name", "business_name", "display_name", "title"):
+        candidate = value.get(key)
+        if isinstance(candidate, (str, int, float)) and not isinstance(candidate, bool):
+            return norm(candidate)
+    for key in ("provider", "user", "profile"):
+        candidate = _nested_display_value(value.get(key))
+        if candidate:
+            return candidate
+    return ""
+
+
+def _canonical_amount(value: Any) -> str:
+    cleaned = re.sub(r"[^0-9.\-]", "", norm(value).replace(",", ""))
+    if not cleaned:
+        return ""
+    try:
+        decimal = Decimal(cleaned)
+    except InvalidOperation:
+        return ""
+    return format(decimal.normalize(), "f")
+
+
+def _canonical_date(value: Any) -> str:
+    text = norm(value)
+    if not text:
+        return ""
+    iso_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})(?!\d)", text)
+    if iso_match:
+        return f"{iso_match.group(1)}-{int(iso_match.group(2)):02d}-{int(iso_match.group(3)):02d}"
+    day_first = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](20\d{2})(?!\d)", text)
+    if day_first:
+        return f"{day_first.group(3)}-{int(day_first.group(2)):02d}-{int(day_first.group(1)):02d}"
+    for date_format in ("%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"):
+        try:
+            parsed = datetime.strptime(re.sub(r"[,]+", "", text), date_format)
+            return parsed.date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
+def _row_identity_hash(provider: Any, claims: Any, month: Any, amount: Any, submitted_date: Any) -> str:
+    identity = "|".join([
+        norm_key(provider),
+        str(safe_int(claims, -1)),
+        norm_key(month),
+        _canonical_amount(amount),
+        _canonical_date(submitted_date),
+    ])
+    if any(part in {"", "-1"} for part in identity.split("|")):
+        return ""
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def response_identity_candidates(rows: list[Any]) -> list[list[str]]:
+    """Hash candidate renderings without retaining provider or claim values."""
+    result: list[list[str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            result.append([])
+            continue
+        provider = _nested_display_value(row.get("provider"))
+        claims_values = [row.get("submitted_claims_count"), row.get("pending_claims_count")]
+        amount_values = [row.get("amount_requested"), row.get("amount_created"), row.get("amount_outstanding")]
+        date_values = [row.get("last_claim_submitted_at"), row.get("created_at")]
+        candidates = {
+            candidate
+            for claims in claims_values
+            for amount in amount_values
+            for submitted_date in date_values
+            if (candidate := _row_identity_hash(provider, claims, row.get("month"), amount, submitted_date))
+        }
+        result.append(sorted(candidates))
+    return result
 
 
 def supports_multiple_year_selection(
@@ -574,6 +660,95 @@ def classify_table_snapshot(
     if table_structure_visible and not loading_visible:
         return "structurally_empty"
     return "pending"
+
+
+def table_snapshot_matches_filter_context(
+    snapshot: dict[str, Any],
+    expected_item_count: int,
+    month_label: str,
+    year_label: str,
+    status_label: str,
+    response_identity_candidates: list[list[str]],
+) -> bool:
+    """Validate an atomic DOM snapshot against the requested filter context."""
+    if snapshot.get("loading") is not False:
+        return False
+    headers = [norm_key(value) for value in snapshot.get("headers") or []]
+    rows = snapshot.get("rows") or []
+    if not isinstance(rows, list) or len(rows) != expected_item_count or expected_item_count <= 0:
+        return False
+
+    def column_index(label: str) -> int:
+        key = norm_key(label)
+        return next((index for index, header in enumerate(headers) if header == key), -1)
+
+    status_index = column_index("status")
+    if status_index < 0 or norm_key(status_label) == "all":
+        return False
+    expected_status = norm_key(status_label)
+    month_index = column_index("month")
+    provider_index = column_index("provider")
+    claims_index = column_index("claims")
+    provider_bill_index = column_index("provider bill")
+    submitted_date_index = column_index("submitted date")
+    expected_month = norm_key(month_label)
+    expected_year = norm(year_label)
+
+    visible_identity_hashes: list[str] = []
+    for row in rows:
+        if not isinstance(row, list) or status_index >= len(row):
+            return False
+        visible_status = norm_key(row[status_index])
+        if not visible_status or expected_status not in visible_status:
+            return False
+        if expected_month != "all":
+            if month_index < 0 or month_index >= len(row) or norm_key(row[month_index]) != expected_month:
+                return False
+        if norm_key(expected_year) != "all":
+            if (
+                submitted_date_index < 0
+                or submitted_date_index >= len(row)
+                or expected_year not in norm(row[submitted_date_index])
+            ):
+                return False
+        identity_indexes = (
+            provider_index,
+            claims_index,
+            month_index,
+            provider_bill_index,
+            submitted_date_index,
+        )
+        if any(index < 0 or index >= len(row) for index in identity_indexes):
+            return False
+        identity_hash = _row_identity_hash(
+            row[provider_index],
+            row[claims_index],
+            row[month_index],
+            row[provider_bill_index],
+            row[submitted_date_index],
+        )
+        if not identity_hash:
+            return False
+        visible_identity_hashes.append(identity_hash)
+
+    if len(response_identity_candidates) != len(visible_identity_hashes):
+        return False
+    candidate_sets = [set(candidates) for candidates in response_identity_candidates]
+    matched_response_rows: dict[int, int] = {}
+
+    def match_visible_row(visible_index: int, seen: set[int]) -> bool:
+        identity_hash = visible_identity_hashes[visible_index]
+        for response_index, candidates in enumerate(candidate_sets):
+            if response_index in seen or identity_hash not in candidates:
+                continue
+            seen.add(response_index)
+            prior_visible = matched_response_rows.get(response_index)
+            if prior_visible is None or match_visible_row(prior_visible, seen):
+                matched_response_rows[response_index] = visible_index
+                return True
+        return False
+
+    return all(match_visible_row(index, set()) for index in range(len(visible_identity_hashes)))
 
 
 def slack_mention(slack_user_id: str, fallback_name: str) -> str:
@@ -4353,7 +4528,14 @@ class CuracelPilesRunner:
                 status_matches=True,
                 table_state=table_state,
                 network_state=network_state,
-                details={"network": network_details, "selection_changed": False},
+                details={
+                    "network": {
+                        key: value
+                        for key, value in network_details.items()
+                        if key != "row_identity_candidates"
+                    },
+                    "selection_changed": False,
+                },
             )
             decision = evaluate_filter_evidence(evidence)
             if not decision.accepted:
@@ -4498,6 +4680,10 @@ class CuracelPilesRunner:
                 previous_fingerprint,
                 timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000,
                 require_transition=response_requires_dom_transition,
+                month_label=month_label,
+                year_label=year_label,
+                status_label=status_label,
+                response_identity_candidates=network_details.get("row_identity_candidates") or [],
             )
         else:
             table_state = self.wait_for_table_ready(
@@ -4511,7 +4697,11 @@ class CuracelPilesRunner:
             table_state=table_state,
             network_state=network_state,
             details={
-                "network": network_details,
+                "network": {
+                    key: value
+                    for key, value in network_details.items()
+                    if key != "row_identity_candidates"
+                },
                 "selection_changed": True,
                 "dom_matches_response": dom_matches_response,
             },
@@ -4772,6 +4962,42 @@ class CuracelPilesRunner:
         except Exception:
             return -1
 
+    def _table_context_snapshot(self) -> dict[str, Any]:
+        """Read headers, row cells, and loading state in one browser evaluation."""
+        try:
+            assert self.page
+            snapshot = self.page.evaluate(
+                r"""() => {
+                  const visible = (node) => {
+                    if (!node) return false;
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0 && rect.height > 0
+                      && style.display !== 'none' && style.visibility !== 'hidden';
+                  };
+                  const table = Array.from(document.querySelectorAll('table')).find(
+                    (candidate) => visible(candidate) && candidate.querySelector('tbody')
+                  );
+                  const loading = Array.from(document.querySelectorAll(
+                    "[aria-busy='true'], [role='progressbar'], .p-datatable-loading-overlay, .p-progressspinner"
+                  )).some(visible);
+                  if (!table) return { headers: [], rows: [], loading };
+                  const headers = Array.from(table.querySelectorAll('thead tr th'))
+                    .map((cell) => (cell.innerText || '').trim());
+                  const rows = Array.from(table.querySelectorAll('tbody tr'))
+                    .map((row) => Array.from(row.querySelectorAll('td'))
+                      .map((cell) => (cell.innerText || '').trim()))
+                    .filter((cells) => {
+                      const text = cells.join(' ').replace(/\s+/g, '').toLowerCase();
+                      return text && text !== 'nodatafound';
+                    });
+                  return { headers, rows, loading };
+                }"""
+            )
+            return snapshot if isinstance(snapshot, dict) else {"headers": [], "rows": [], "loading": True}
+        except Exception:
+            return {"headers": [], "rows": [], "loading": True}
+
     def _table_loading_visible(self) -> bool:
         assert self.page
         try:
@@ -4792,15 +5018,47 @@ class CuracelPilesRunner:
         *,
         timeout_ms: int,
         require_transition: bool = True,
+        month_label: str = "",
+        year_label: str = "",
+        status_label: str = "",
+        response_identity_candidates: list[list[str]] | None = None,
     ) -> tuple[str, bool]:
         deadline = time.time() + (timeout_ms / 1000)
         last_state = "unreadable"
+        previous_context_snapshot: tuple[Any, ...] | None = None
+        matching_context_ticks = 0
+        context_validation_required = bool(
+            month_label and year_label and status_label and expected_item_count > 0
+        )
         while time.time() < deadline:
             self._heartbeat("scan")
             remaining_ms = max(int((deadline - time.time()) * 1000), 1)
             last_state = self.wait_for_table_ready(timeout_ms=min(2500, remaining_ms))
             visible_count = self._visible_table_row_count()
             current_fingerprint = self._table_preview_fingerprint()
+            context_snapshot = self._table_context_snapshot()
+            if table_snapshot_matches_filter_context(
+                context_snapshot,
+                expected_item_count,
+                month_label,
+                year_label,
+                status_label,
+                response_identity_candidates or [],
+            ):
+                context_fingerprint = (
+                    tuple(context_snapshot.get("headers") or []),
+                    tuple(tuple(row) for row in context_snapshot.get("rows") or []),
+                )
+                if context_fingerprint == previous_context_snapshot:
+                    matching_context_ticks += 1
+                else:
+                    previous_context_snapshot = context_fingerprint
+                    matching_context_ticks = 0
+                if matching_context_ticks >= 1:
+                    return "stable", True
+            else:
+                previous_context_snapshot = None
+                matching_context_ticks = 0
             if expected_item_count == 0:
                 if visible_count == 0 and not self._table_loading_visible():
                     return (
@@ -4808,7 +5066,8 @@ class CuracelPilesRunner:
                         True,
                     )
             elif (
-                expected_item_count > 0
+                not context_validation_required
+                and expected_item_count > 0
                 and visible_count == expected_item_count
                 and last_state == "stable"
                 and (

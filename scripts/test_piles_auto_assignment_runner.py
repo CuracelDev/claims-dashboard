@@ -1774,6 +1774,163 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertEqual(state, "stable")
         self.assertTrue(coherent)
 
+    def test_filter_dom_coherence_accepts_two_identical_context_matching_snapshots(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._heartbeat = lambda *_args: None
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "unreadable"
+        portal_runner._visible_table_row_count = lambda: 2
+        portal_runner._table_preview_fingerprint = lambda: ("unchanged preview",)
+        portal_runner._table_loading_visible = lambda: False
+        samples = []
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [
+                ["A", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Ongoing"],
+                ["B", "12", "Sep", "KES 2,000.00", "09/09/2026", "Vetting Ongoing"],
+            ],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([
+            {"provider": {"name": "A"}, "submitted_claims_count": 10, "month": "Sep", "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+            {"provider": {"name": "B"}, "submitted_claims_count": 12, "month": "Sep", "amount_requested": 2000, "last_claim_submitted_at": "2026-09-09T11:00:00Z"},
+        ])
+
+        def read_snapshot():
+            samples.append(True)
+            return snapshot
+
+        portal_runner._table_context_snapshot = read_snapshot
+        state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
+            portal_runner,
+            2,
+            ("unchanged preview",),
+            timeout_ms=500,
+            month_label="All",
+            year_label="All",
+            status_label="Vetting Ongoing",
+            response_identity_candidates=identities,
+        )
+
+        self.assertEqual(state, "stable")
+        self.assertTrue(coherent)
+        self.assertGreaterEqual(len(samples), 2)
+
+    def test_table_context_snapshot_rejects_wrong_status_and_loading_state(self):
+        base = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["A", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Pending"]],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([
+            {"provider": {"name": "A"}, "submitted_claims_count": 10, "month": "Sep", "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+        ])
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            base, 1, "All", "All", "Vetting Ongoing", identities,
+        ))
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            {**base, "loading": True}, 1, "All", "All", "Vetting Pending", identities,
+        ))
+
+    def test_table_context_snapshot_validates_specific_month_and_year(self):
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["A", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Pending"]],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([
+            {"provider": {"name": "A"}, "submitted_claims_count": 10, "month": "Sep", "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+        ])
+        self.assertTrue(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "Sep", "2026", "Vetting Pending", identities,
+        ))
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "Aug", "2026", "Vetting Pending", identities,
+        ))
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "Sep", "2025", "Vetting Pending", identities,
+        ))
+
+    def test_table_context_snapshot_rejects_rows_from_a_different_api_response(self):
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["A", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Pending"]],
+            "loading": False,
+        }
+        other_identities = runner.response_identity_candidates([
+            {"provider": {"name": "Different"}, "submitted_claims_count": 10, "month": "Sep", "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+        ])
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "All", "All", "Vetting Pending", other_identities,
+        ))
+
+    def test_wrong_context_cannot_fall_through_to_legacy_transition_acceptance(self):
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["A", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Pending"]],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([
+            {"provider": {"name": "A"}, "submitted_claims_count": 10, "month": "Sep", "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+        ])
+        for require_transition in (False, True):
+            portal_runner = object.__new__(runner.CuracelPilesRunner)
+            portal_runner._heartbeat = lambda *_args: None
+            portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
+            portal_runner._visible_table_row_count = lambda: 1
+            portal_runner._table_preview_fingerprint = lambda: ("new preview",)
+            portal_runner._table_loading_visible = lambda: False
+            portal_runner._table_context_snapshot = lambda: snapshot
+
+            state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
+                portal_runner,
+                1,
+                ("old preview",),
+                timeout_ms=20,
+                require_transition=require_transition,
+                month_label="All",
+                year_label="All",
+                status_label="Vetting Ongoing",
+                response_identity_candidates=identities,
+            )
+
+            self.assertEqual(state, "stable")
+            self.assertFalse(coherent)
+
+    def test_filter_dom_coherence_rejects_churning_context_snapshots(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._heartbeat = lambda *_args: None
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "unreadable"
+        portal_runner._visible_table_row_count = lambda: 1
+        portal_runner._table_preview_fingerprint = lambda: ("unchanged preview",)
+        portal_runner._table_loading_visible = lambda: False
+        sample_index = 0
+
+        def read_snapshot():
+            nonlocal sample_index
+            sample_index += 1
+            return {
+                "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+                "rows": [[f"Provider {sample_index % 2}", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Pending"]],
+                "loading": False,
+            }
+
+        portal_runner._table_context_snapshot = read_snapshot
+        state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
+            portal_runner,
+            1,
+            ("unchanged preview",),
+            timeout_ms=450,
+            month_label="All",
+            year_label="All",
+            status_label="Vetting Pending",
+            response_identity_candidates=runner.response_identity_candidates([
+                {"provider": {"name": "Provider 0"}, "submitted_claims_count": 10, "month": "Sep", "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+            ]),
+        )
+
+        self.assertEqual(state, "unreadable")
+        self.assertFalse(coherent)
+
     def test_filter_dom_coherence_accepts_exact_empty_without_table_markup(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         portal_runner.wait_for_table_ready = lambda **_kwargs: "unreadable"
