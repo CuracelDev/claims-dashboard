@@ -1347,7 +1347,43 @@ class YearFilterScanningTests(unittest.TestCase):
             timeout_ms=1,
         )
 
-    def test_filter_wait_requires_and_finishes_the_matching_year_response(self):
+    def test_open_piles_scopes_response_history_to_current_navigation(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = object()
+        portal_runner._piles_response_sequence = 7
+        portal_runner._filter_state = {}
+        portal_runner._table_headers_cache = []
+
+        def navigate(_url):
+            portal_runner._piles_response_sequence = 9
+
+        portal_runner._goto_with_soft_readiness = navigate
+        portal_runner._wait_for_piles_page_ready = lambda: None
+        portal_runner._dismiss_popup = lambda: None
+
+        runner.CuracelPilesRunner.open_piles(portal_runner)
+
+        self.assertEqual(portal_runner._page_open_response_marker, 7)
+
+    def test_page_open_marker_rejects_a_pre_navigation_matching_response(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_events = [
+            (4, 200, "https://api.health.curacel.co/api/piles?page=1&month=0&status%5Bcode%5D=All", object()),
+        ]
+
+        state, details = runner.CuracelPilesRunner._filter_network_state(
+            portal_runner,
+            7,
+            "All",
+            "All",
+            "All",
+            page_number=1,
+        )
+
+        self.assertEqual(state, "not_observed")
+        self.assertEqual(details, {})
+
+    def test_filter_wait_accepts_the_matching_year_response_event(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
 
         class Response:
@@ -1371,7 +1407,7 @@ class YearFilterScanningTests(unittest.TestCase):
             timeout_ms=1,
         )
 
-        self.assertEqual(response.finished_calls, 1)
+        self.assertEqual(response.finished_calls, 0)
 
     def test_filter_wait_rejects_a_response_for_the_previous_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
@@ -1605,6 +1641,7 @@ class YearFilterScanningTests(unittest.TestCase):
         portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
         portal_runner._visible_table_row_count = lambda: 2
         portal_runner._table_preview_fingerprint = lambda: ("old rows",)
+        portal_runner._table_loading_visible = lambda: False
 
         state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
             portal_runner,
@@ -1621,6 +1658,7 @@ class YearFilterScanningTests(unittest.TestCase):
         portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
         portal_runner._visible_table_row_count = lambda: 2
         portal_runner._table_preview_fingerprint = lambda: ("new rows",)
+        portal_runner._table_loading_visible = lambda: False
 
         state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
             portal_runner,
@@ -1630,6 +1668,23 @@ class YearFilterScanningTests(unittest.TestCase):
         )
 
         self.assertEqual(state, "stable")
+        self.assertTrue(coherent)
+
+    def test_filter_dom_coherence_accepts_exact_empty_without_table_markup(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "unreadable"
+        portal_runner._visible_table_row_count = lambda: 0
+        portal_runner._table_preview_fingerprint = lambda: ()
+        portal_runner._table_loading_visible = lambda: False
+
+        state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
+            portal_runner,
+            0,
+            ("old rows",),
+            timeout_ms=10,
+        )
+
+        self.assertEqual(state, "structurally_empty")
         self.assertTrue(coherent)
 
     def test_page_size_change_waits_for_exact_response_and_dom_count(self):

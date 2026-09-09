@@ -3146,6 +3146,7 @@ class CuracelPilesRunner:
         self._table_headers_cache: list[str] = []
         self._piles_response_events: list[tuple[int, int, str, Any]] = []
         self._piles_response_sequence = 0
+        self._page_open_response_marker = 0
         self.year_filter_confirmation_timeout_ms = 5000
         self.execution_ledger: Any = None
         self.insurer_run_id = ""
@@ -3241,7 +3242,6 @@ class CuracelPilesRunner:
             if matching_events:
                 status, url, response = matching_events[-1]
                 if 200 <= status < 400:
-                    response.finished()
                     return
                 raise RuntimeError(
                     "Piles data request for "
@@ -3283,13 +3283,9 @@ class CuracelPilesRunner:
         if not 200 <= status < 400:
             return "failed", details
         try:
-            response.finished()
-        except Exception as error:
-            return "failed", {**details, "completion_error": type(error).__name__}
-        try:
             summary = summarize_piles_response(response.json())
-        except Exception:
-            summary = {"authoritative": False}
+        except Exception as error:
+            summary = {"authoritative": False, "payload_error": type(error).__name__}
         details.update(summary)
         details["authoritative_empty"] = (
             summary.get("authoritative") is True
@@ -3520,11 +3516,13 @@ class CuracelPilesRunner:
         assert self.page
         last_error: Exception | None = None
         for attempt in range(3):
+            navigation_marker = self._piles_response_sequence
             try:
                 self._goto_with_soft_readiness(f"{CURACEL_BASE_URL}/hmo/piles")
                 self._wait_for_piles_page_ready()
                 time.sleep(1)
                 self._dismiss_popup()
+                self._page_open_response_marker = navigation_marker
                 self._invalidate_filter_state()
                 return
             except Exception as error:
@@ -4301,6 +4299,9 @@ class CuracelPilesRunner:
         final_year_select = None
         final_status_select = None
         filter_response_marker = self._piles_response_sequence
+        filter_state_was_initialized = all(
+            norm(self._filter_state.get(key)) for key in ("month", "year", "status")
+        )
         desired_year_state = "All" if norm_key(year_label) == "all" else year_label
         month_changed = self._filter_state["month"] != month_label
         year_changed = self._filter_state["year"] != desired_year_state
@@ -4420,13 +4421,6 @@ class CuracelPilesRunner:
             except Exception:
                 continue
         time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
-        self._wait_for_piles_filter_response(
-            filter_response_marker,
-            month_label,
-            year_label,
-            status_label,
-            page_number=1,
-        )
         network_state, network_details = self._filter_network_state(
             filter_response_marker,
             month_label,
@@ -4434,11 +4428,44 @@ class CuracelPilesRunner:
             status_label,
             page_number=1,
         )
+        response_requires_dom_transition = True
+        if network_state == "not_observed" and not filter_state_was_initialized:
+            historical_state, historical_details = self._filter_network_state(
+                getattr(self, "_page_open_response_marker", filter_response_marker),
+                month_label,
+                year_label,
+                status_label,
+                page_number=1,
+            )
+            if (
+                historical_state == "succeeded"
+                and historical_details.get("authoritative") is True
+            ):
+                network_state = historical_state
+                network_details = historical_details
+                response_requires_dom_transition = False
+        if network_state == "not_observed":
+            self._wait_for_piles_filter_response(
+                filter_response_marker,
+                month_label,
+                year_label,
+                status_label,
+                timeout_ms=30000,
+                page_number=1,
+            )
+            network_state, network_details = self._filter_network_state(
+                filter_response_marker,
+                month_label,
+                year_label,
+                status_label,
+                page_number=1,
+            )
         if network_details.get("authoritative") is True:
             table_state, dom_matches_response = self._wait_for_table_response_coherence(
                 safe_int(network_details.get("item_count"), -1),
                 previous_fingerprint,
                 timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000,
+                require_transition=response_requires_dom_transition,
             )
         else:
             table_state = self.wait_for_table_ready(
@@ -4459,7 +4486,15 @@ class CuracelPilesRunner:
         )
         decision = evaluate_filter_evidence(evidence)
         if not decision.accepted:
-            raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
+            raise RuntimeError(
+                f"Piles filters were not confirmed: {decision.code}. "
+                "Safe evidence: "
+                f"table_state={table_state}, "
+                f"expected_rows={network_details.get('item_count', 'unknown')}, "
+                f"visible_rows={self._visible_table_row_count()}, "
+                f"http_status={network_details.get('http_status', 'not_observed')}, "
+                f"dom_matches_response={dom_matches_response}."
+            )
         return evidence
 
     def try_set_page_size(self, page_size: int = 100) -> None:
@@ -4588,13 +4623,7 @@ class CuracelPilesRunner:
                     and table.is_visible()
                     and table_body.count() > 0
                 )
-                loading = self.page.locator(
-                    "[aria-busy='true'], [role='progressbar'], .p-datatable-loading-overlay, .p-progressspinner"
-                )
-                loading_visible = any(
-                    loading.nth(index).is_visible()
-                    for index in range(min(loading.count(), 5))
-                )
+                loading_visible = self._table_loading_visible()
                 snapshot = classify_table_snapshot(
                     texts,
                     no_data,
@@ -4709,6 +4738,19 @@ class CuracelPilesRunner:
         except Exception:
             return -1
 
+    def _table_loading_visible(self) -> bool:
+        assert self.page
+        try:
+            loading = self.page.locator(
+                "[aria-busy='true'], [role='progressbar'], .p-datatable-loading-overlay, .p-progressspinner"
+            )
+            return any(
+                loading.nth(index).is_visible()
+                for index in range(min(loading.count(), 5))
+            )
+        except Exception:
+            return True
+
     def _wait_for_table_response_coherence(
         self,
         expected_item_count: int,
@@ -4725,8 +4767,11 @@ class CuracelPilesRunner:
             visible_count = self._visible_table_row_count()
             current_fingerprint = self._table_preview_fingerprint()
             if expected_item_count == 0:
-                if visible_count == 0 and last_state in {"empty", "structurally_empty"}:
-                    return last_state, True
+                if visible_count == 0 and not self._table_loading_visible():
+                    return (
+                        last_state if last_state in {"empty", "structurally_empty"} else "structurally_empty",
+                        True,
+                    )
             elif (
                 expected_item_count > 0
                 and visible_count == expected_item_count
