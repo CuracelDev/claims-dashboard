@@ -53,6 +53,11 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.connection = RecordingConnection()
         self.ledger = ExecutionLedger(self.connection)
 
+    def test_insurer_lock_uses_runner_canonical_alias(self):
+        self.assertTrue(self.ledger.try_acquire_insurer_lock("UAPOM"))
+        _sql, params = self.connection.statements[-1]
+        self.assertEqual(params, ("piles-insurer:OLD MUTUAL",))
+
     def test_transition_uses_compare_and_set(self):
         self.ledger.transition_attempt(
             "attempt-1",

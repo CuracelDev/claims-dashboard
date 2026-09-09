@@ -233,9 +233,8 @@ def insurer_aliases(text: Any) -> set[str]:
     label = label_key(text)
     canonical = canonical_insurer_key(text)
     aliases = {label, canonical}
-    if canonical == "old mutual":
+    if canonical == "OLD MUTUAL":
         aliases.add("uapom")
-    if label == "uapom":
         aliases.add("old mutual")
     return {alias for alias in aliases if alias}
 

@@ -26,6 +26,11 @@ def _json(value: Any) -> str:
     return json.dumps(value or {}, default=str, sort_keys=True)
 
 
+def _insurer_lock_key(value: Any) -> str:
+    label = " ".join(str(value or "").strip().lower().split())
+    return "OLD MUTUAL" if label in {"uapom", "old mutual"} else label
+
+
 class ExecutionLedger:
     """Owns a non-autocommit PostgreSQL connection for ledger transactions."""
 
@@ -41,7 +46,7 @@ class ExecutionLedger:
         with self.connection.cursor() as cursor:
             cursor.execute(
                 "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
-                (f"piles-insurer:{str(insurer_name).strip().lower()}",),
+                (f"piles-insurer:{_insurer_lock_key(insurer_name)}",),
             )
             row = cursor.fetchone()
         return bool(row and row[0])

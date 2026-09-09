@@ -254,6 +254,7 @@ class AssignmentPlanningTests(unittest.TestCase):
         self.assertEqual(runner.canonical_insurer_key("UAPOM"), "OLD MUTUAL")
         self.assertEqual(runner.canonical_insurer_key("OLD MUTUAL"), "OLD MUTUAL")
         self.assertIn("old mutual", runner.insurer_aliases("UAPOM"))
+        self.assertIn("uapom", runner.insurer_aliases("OLD MUTUAL"))
 
     def test_only_explicit_false_disables_legacy_rows(self):
         self.assertTrue(runner.enabled_by_default(None))
