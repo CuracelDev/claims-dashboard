@@ -590,6 +590,19 @@ def _canonical_date(value: Any) -> str:
     day_first = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](20\d{2})(?!\d)", text)
     if day_first:
         return f"{day_first.group(3)}-{int(day_first.group(2)):02d}-{int(day_first.group(1)):02d}"
+    month_name = re.search(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\s+(\d{1,2}),?\s+(20\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if month_name:
+        parsed = datetime.strptime(
+            f"{month_name.group(1)[:3]} {month_name.group(2)} {month_name.group(3)}",
+            "%b %d %Y",
+        )
+        return parsed.date().isoformat()
     for date_format in ("%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"):
         try:
             parsed = datetime.strptime(re.sub(r"[,]+", "", text), date_format)
@@ -641,17 +654,14 @@ def response_identity_candidates(rows: list[Any]) -> list[list[str]]:
         if not isinstance(row, dict):
             result.append([])
             continue
-        provider = _nested_display_value(row.get("provider"))
-        claims_values = [row.get("submitted_claims_count"), row.get("pending_claims_count")]
-        amount_values = [row.get("amount_requested"), row.get("amount_created"), row.get("amount_outstanding")]
-        date_values = [row.get("last_claim_submitted_at"), row.get("created_at")]
-        candidates = {
-            candidate
-            for claims in claims_values
-            for amount in amount_values
-            for submitted_date in date_values
-            if (candidate := _row_identity_hash(provider, claims, row.get("month"), amount, submitted_date))
-        }
+        candidate = _row_identity_hash(
+            _nested_display_value(row.get("provider")),
+            row.get("submitted_claims_count"),
+            row.get("month"),
+            row.get("amount_requested"),
+            row.get("last_claim_submitted_at"),
+        )
+        candidates = {candidate} if candidate else set()
         result.append(sorted(candidates))
     return result
 
@@ -716,7 +726,7 @@ def table_snapshot_matches_filter_context(
     expected_month = _canonical_month(month_label)
     expected_year = norm(year_label)
 
-    visible_identity_hashes: list[str] = []
+    visible_identity_candidates: list[set[str]] = []
     for row in rows:
         if not isinstance(row, list) or status_index >= len(row):
             return False
@@ -742,26 +752,32 @@ def table_snapshot_matches_filter_context(
         )
         if any(index < 0 or index >= len(row) for index in identity_indexes):
             return False
-        identity_hash = _row_identity_hash(
-            row[provider_index],
-            row[claims_index],
-            row[month_index],
-            row[provider_bill_index],
-            row[submitted_date_index],
-        )
-        if not identity_hash:
+        provider_text = norm(row[provider_index])
+        provider_values = {provider_text, *(norm(line) for line in provider_text.splitlines())}
+        identity_hashes = {
+            identity_hash
+            for provider in provider_values
+            if (identity_hash := _row_identity_hash(
+                provider,
+                row[claims_index],
+                row[month_index],
+                row[provider_bill_index],
+                row[submitted_date_index],
+            ))
+        }
+        if not identity_hashes:
             return False
-        visible_identity_hashes.append(identity_hash)
+        visible_identity_candidates.append(identity_hashes)
 
-    if len(response_identity_candidates) != len(visible_identity_hashes):
+    if len(response_identity_candidates) != len(visible_identity_candidates):
         return False
     candidate_sets = [set(candidates) for candidates in response_identity_candidates]
     matched_response_rows: dict[int, int] = {}
 
     def match_visible_row(visible_index: int, seen: set[int]) -> bool:
-        identity_hash = visible_identity_hashes[visible_index]
+        identity_hashes = visible_identity_candidates[visible_index]
         for response_index, candidates in enumerate(candidate_sets):
-            if response_index in seen or identity_hash not in candidates:
+            if response_index in seen or identity_hashes.isdisjoint(candidates):
                 continue
             seen.add(response_index)
             prior_visible = matched_response_rows.get(response_index)
@@ -770,7 +786,7 @@ def table_snapshot_matches_filter_context(
                 return True
         return False
 
-    return all(match_visible_row(index, set()) for index in range(len(visible_identity_hashes)))
+    return all(match_visible_row(index, set()) for index in range(len(visible_identity_candidates)))
 
 
 def slack_mention(slack_user_id: str, fallback_name: str) -> str:

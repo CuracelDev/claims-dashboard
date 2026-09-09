@@ -1869,6 +1869,38 @@ class YearFilterScanningTests(unittest.TestCase):
             snapshot, 1, "September", "All", "Vetting Ongoing", identities,
         ))
 
+    def test_table_context_snapshot_accepts_supported_live_rendering_variants(self):
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["Provider A\nCODE-1", "10", "Sep", "UGX 1,000", "Sep 9, 2026 10:00 AM", "Vetting Ongoing"]],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([{
+            "provider": {"name": "Provider A"}, "submitted_claims_count": 10, "month": 9,
+            "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z",
+        }])
+
+        self.assertTrue(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "All", "All", "Vetting Ongoing", identities,
+        ))
+
+    def test_response_identity_rejects_cross_mixed_stale_field_tuple(self):
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["Provider A", "7", "Sep", "UGX 500", "Sep 8, 2026", "Vetting Ongoing"]],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([{
+            "provider": {"name": "Provider A"},
+            "submitted_claims_count": 10, "pending_claims_count": 7,
+            "month": 9, "amount_requested": 1000, "amount_paid": 500,
+            "last_claim_submitted_at": "2026-09-09T10:00:00Z", "updated_at": "2026-09-08T10:00:00Z",
+        }])
+
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "All", "All", "Vetting Ongoing", identities,
+        ))
+
     def test_table_context_snapshot_rejects_rows_from_a_different_api_response(self):
         snapshot = {
             "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
