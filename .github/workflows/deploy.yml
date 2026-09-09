@@ -5,6 +5,10 @@ on:
   push:
     branches: [ master, main ]
 
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -37,8 +41,33 @@ jobs:
           METABASE_PASSWORD: ${{ secrets.METABASE_PASSWORD }}
           PILES_WEEKEND_ROSTER_TOKEN: ${{ secrets.PILES_WEEKEND_ROSTER_TOKEN }}
 
+      - name: Stage database migration files
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "scripts/piles-auto-assignment-schema.sql,scripts/apply-piles-auto-assignment-schema.mjs,scripts/audit-piles-auto-assignment-readiness.mjs,scripts/db-schema-audit.mjs"
+          target: "~/claims-dashboard"
+
+      - name: Apply and audit database schema
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DATABASE_URL
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            node scripts/apply-piles-auto-assignment-schema.mjs
+            node scripts/db-schema-audit.mjs
+            node scripts/audit-piles-auto-assignment-readiness.mjs --mode database
+
       - name: Rsync files to server
-        uses: appleboy/scp-action@master
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
@@ -47,7 +76,7 @@ jobs:
           target: "~/claims-dashboard"
 
       - name: Restart App via SSH
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
@@ -75,6 +104,8 @@ jobs:
             CURACEL_PORTAL_BASE_URL_TEST="${{ vars.CURACEL_PORTAL_BASE_URL_TEST }}"
             CURACEL_PORTAL_ENVIRONMENT="${{ vars.CURACEL_PORTAL_ENVIRONMENT }}"
             PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND="${{ vars.PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND }}"
+            PILES_EXECUTION_LEDGER_ENABLED="${{ vars.PILES_EXECUTION_LEDGER_ENABLED }}"
+            PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="${{ vars.PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY }}"
             PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python"
             PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
             ALLOW_PRODUCTION_ASSIGNMENTS="${{ vars.ALLOW_PRODUCTION_ASSIGNMENTS }}"
@@ -97,3 +128,13 @@ jobs:
             chmod +x scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh
             ./scripts/install-piles-auto-assignment-cron.sh
             pm2 restart claims-dashboard || pm2 start npm --name "claims-dashboard" -- start -- -p 3030
+            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              if curl --fail --silent --show-error --output /dev/null http://127.0.0.1:3030/api/tools/piles-auto-assignment; then
+                echo "Piles Auto-Assignment API health check passed."
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "Piles Auto-Assignment API health check failed after 60 seconds." >&2
+            pm2 logs claims-dashboard --lines 100 --nostream >&2 || true
+            exit 1

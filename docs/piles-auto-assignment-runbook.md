@@ -20,6 +20,8 @@ The runner must account for every expected month/year/status context and every p
    python3 scripts/piles_auto_assignment_runner.py --all-active --portal-environment production --month All --year All --read-only
    ```
 
+   On the production host, these probes can also be run from the **Piles Production Readiness** GitHub Actions workflow. It always uses `--read-only` and cannot click **Assign Claims**.
+
 7. Compare expected contexts with complete/empty contexts. Resolve any failed or missing context before authorizing assignment.
 8. A live one-insurer canary requires separate explicit approval and `ALLOW_PRODUCTION_ASSIGNMENTS=true`. Remove that variable after the canary.
 

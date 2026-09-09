@@ -1,0 +1,68 @@
+name: Piles Production Readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Read-only portal probe scope
+        required: true
+        default: one-insurer
+        type: choice
+        options:
+          - one-insurer
+          - all-active
+      insurer:
+        description: Insurer name when scope is one-insurer
+        required: false
+        default: DEFMIS
+        type: string
+
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Audit production database and portal without assignments
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          PROBE_SCOPE: ${{ inputs.scope }}
+          PROBE_INSURER: ${{ inputs.insurer }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 110m
+          envs: PROBE_SCOPE,PROBE_INSURER
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+
+            node scripts/db-schema-audit.mjs
+            node scripts/audit-piles-auto-assignment-readiness.mjs --mode database
+
+            if [ "$PROBE_SCOPE" = "all-active" ]; then
+              "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
+                --all-active \
+                --portal-environment production \
+                --month All \
+                --year All \
+                --read-only
+            else
+              if [ -z "$PROBE_INSURER" ]; then
+                echo "insurer is required for a one-insurer probe" >&2
+                exit 1
+              fi
+              "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
+                --insurer "$PROBE_INSURER" \
+                --portal-environment production \
+                --month All \
+                --year All \
+                --read-only
+            fi
