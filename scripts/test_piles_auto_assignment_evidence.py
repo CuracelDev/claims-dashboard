@@ -28,6 +28,104 @@ class FilterEvidenceTests(unittest.TestCase):
         )
         self.assertTrue(decision.accepted)
 
+    def test_changed_filter_requires_its_exact_network_response(self):
+        decision = evaluate_filter_evidence(
+            FilterEvidence(
+                True,
+                True,
+                True,
+                "stable",
+                "not_observed",
+                {"selection_changed": True},
+            )
+        )
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.code, "filter_response_not_confirmed")
+
+    def test_changed_filter_empty_ui_requires_authoritative_empty_payload(self):
+        decision = evaluate_filter_evidence(
+            FilterEvidence(
+                True,
+                True,
+                True,
+                "empty",
+                "succeeded",
+                {
+                    "selection_changed": True,
+                    "network": {"authoritative": True, "authoritative_empty": False},
+                    "dom_matches_response": False,
+                },
+            )
+        )
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.code, "empty_ui_conflicts_with_response")
+
+    def test_changed_filter_rejects_stable_old_rows_against_empty_payload(self):
+        decision = evaluate_filter_evidence(
+            FilterEvidence(
+                True,
+                True,
+                True,
+                "stable",
+                "succeeded",
+                {
+                    "selection_changed": True,
+                    "network": {"authoritative": True, "authoritative_empty": True},
+                    "dom_matches_response": False,
+                },
+            )
+        )
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.code, "filter_dom_response_mismatch")
+
+    def test_changed_filter_accepts_only_coherent_authoritative_response(self):
+        decision = evaluate_filter_evidence(
+            FilterEvidence(
+                True,
+                True,
+                True,
+                "stable",
+                "succeeded",
+                {
+                    "selection_changed": True,
+                    "network": {"authoritative": True, "item_count": 2},
+                    "dom_matches_response": True,
+                },
+            )
+        )
+        self.assertTrue(decision.accepted)
+
+    def test_structurally_empty_table_requires_matching_network_success(self):
+        accepted = evaluate_filter_evidence(
+            FilterEvidence(
+                True,
+                True,
+                True,
+                "structurally_empty",
+                "succeeded",
+                {"network": {"authoritative_empty": True}},
+            )
+        )
+        rejected = evaluate_filter_evidence(
+            FilterEvidence(
+                True,
+                True,
+                True,
+                "structurally_empty",
+                "succeeded",
+                {"network": {"authoritative_empty": False}},
+            )
+        )
+        self.assertTrue(accepted.accepted)
+        self.assertFalse(rejected.accepted)
+
+    def test_structural_empty_rejects_stale_success_without_empty_payload(self):
+        decision = evaluate_filter_evidence(
+            FilterEvidence(True, True, True, "structurally_empty", "succeeded")
+        )
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.code, "structural_empty_without_authoritative_response")
+
     def test_failed_response_rejects_even_if_controls_match(self):
         decision = evaluate_filter_evidence(
             FilterEvidence(True, True, True, "stable", "failed")

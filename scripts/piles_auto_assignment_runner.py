@@ -74,6 +74,13 @@ TARGET_STATUSES = [
     "Audit Ongoing",
     "AI Audit",
 ]
+STATUS_FILTER_CODES = {
+    "Vetting Pending": "P",
+    "Vetting Ongoing": "O",
+    "Audit Pending": "AP",
+    "Audit Ongoing": "AO",
+    "AI Audit": "AA",
+}
 STATUS_ASSIGNMENT_TYPE = {
     "Vetting Pending": "Vetting",
     "Vetting Ongoing": "Vetting",
@@ -448,6 +455,96 @@ def piles_response_matches_filter_year(url: str, requested_year: str) -> bool:
     return False
 
 
+def _query_values(url: str, key_pattern: str) -> list[str]:
+    parsed_url = urlsplit(norm(url))
+    return [
+        norm(value)
+        for key, value in parse_qsl(parsed_url.query, keep_blank_values=True)
+        if re.fullmatch(key_pattern, key, flags=re.IGNORECASE)
+    ]
+
+
+def piles_response_matches_context(
+    url: str,
+    month_label: str,
+    year_label: str,
+    status_label: str,
+    *,
+    page_number: int | None = None,
+    page_size: int | None = None,
+) -> bool:
+    """Match a Piles response to the exact visible table context.
+
+    The production Vue table serializes status objects as ``status[code]`` /
+    ``status[name]`` and years as an array. Matching all requested dimensions
+    prevents an earlier request from authorizing a later empty DOM state.
+    """
+    parsed_url = urlsplit(norm(url))
+    if not re.search(r"/piles(?:/|$)", parsed_url.path, flags=re.IGNORECASE):
+        return False
+
+    requested_month = parse_month_labels(month_label)[0]
+    month_values = _query_values(url, r"month")
+    if norm_key(requested_month) == "all":
+        if month_values and not all(norm_key(value) in {"", "0", "all"} for value in month_values):
+            return False
+    else:
+        expected_month = str(MONTH_OPTIONS.index(requested_month))
+        if expected_month not in month_values and norm_key(requested_month) not in {
+            norm_key(value) for value in month_values
+        }:
+            return False
+
+    requested_year = parse_year_label(year_label)
+    if norm_key(requested_year) != "all":
+        year_values = _query_values(url, r"year(?:\[\d*\])?")
+        if requested_year not in year_values:
+            return False
+
+    requested_status = norm(status_label) or "All"
+    status_values = _query_values(url, r"status(?:\[(?:id|code|name)\]|\.(?:id|code|name)|_code)?")
+    if norm_key(requested_status) == "all":
+        if status_values and not any(norm_key(value) in {"", "0", "all"} for value in status_values):
+            return False
+    else:
+        expected_code = STATUS_FILTER_CODES.get(requested_status, "")
+        normalized_status_values = {norm_key(value) for value in status_values}
+        if (
+            norm_key(requested_status) not in normalized_status_values
+            and norm_key(expected_code) not in normalized_status_values
+        ):
+            return False
+
+    if page_number is not None:
+        if str(page_number) not in _query_values(url, r"page"):
+            return False
+    if page_size is not None:
+        if str(page_size) not in _query_values(url, r"per_page"):
+            return False
+    return True
+
+
+def summarize_piles_response(payload: Any) -> dict[str, Any]:
+    """Return only non-sensitive pagination evidence from a Piles response."""
+    if not isinstance(payload, dict) or "data" not in payload:
+        return {"authoritative": False}
+    container = payload.get("data")
+    total = payload.get("total")
+    rows: Any = container
+    if isinstance(container, dict) and "data" in container:
+        rows = container.get("data")
+        total = container.get("total", total)
+    if not isinstance(rows, (list, dict)):
+        return {"authoritative": False}
+    summary: dict[str, Any] = {
+        "authoritative": True,
+        "item_count": len(rows),
+    }
+    if isinstance(total, (int, float)) and not isinstance(total, bool):
+        summary["total"] = int(total)
+    return summary
+
+
 def supports_multiple_year_selection(
     *,
     control_classes: str,
@@ -459,6 +556,21 @@ def supports_multiple_year_selection(
         "p-multiselect" in norm(control_classes).lower().split()
         or norm(listbox_aria_multiselectable).lower() == "true"
     )
+
+
+def classify_table_snapshot(
+    row_texts: list[str],
+    explicit_empty_message: bool,
+    table_structure_visible: bool,
+    loading_visible: bool,
+) -> str:
+    if explicit_empty_message:
+        return "empty"
+    if any(norm(text) for text in row_texts):
+        return "rows"
+    if table_structure_visible and not loading_visible:
+        return "structurally_empty"
+    return "pending"
 
 
 def slack_mention(slack_user_id: str, fallback_name: str) -> str:
@@ -3100,14 +3212,31 @@ class CuracelPilesRunner:
         except Exception:
             return
 
-    def _wait_for_piles_filter_response(self, marker: int, year_label: str, timeout_ms: int = 10000) -> None:
+    def _wait_for_piles_filter_response(
+        self,
+        marker: int,
+        month_label: str,
+        year_label: str,
+        status_label: str,
+        timeout_ms: int = 10000,
+        *,
+        page_number: int | None = None,
+        page_size: int | None = None,
+    ) -> None:
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
             matching_events = [
                 (status, url, response)
                 for sequence, status, url, response in self._piles_response_events
                 if sequence > marker
-                if piles_response_matches_filter_year(url, year_label)
+                if piles_response_matches_context(
+                    url,
+                    month_label,
+                    year_label,
+                    status_label,
+                    page_number=page_number,
+                    page_size=page_size,
+                )
             ]
             if matching_events:
                 status, url, response = matching_events[-1]
@@ -3115,18 +3244,37 @@ class CuracelPilesRunner:
                     response.finished()
                     return
                 raise RuntimeError(
-                    f"Piles data request for year '{year_label}' failed with HTTP {status}: {url}"
+                    "Piles data request for "
+                    f"'{year_label} / {month_label} / {status_label}' failed with HTTP {status}: {url}"
                 )
             time.sleep(0.1)
         raise RuntimeError(
-            f"No completed Piles data request confirmed the year '{year_label}' within {timeout_ms}ms."
+            "No completed Piles data request confirmed "
+            f"'{year_label} / {month_label} / {status_label}' within {timeout_ms}ms."
         )
 
-    def _filter_network_state(self, marker: int, year_label: str) -> tuple[str, dict[str, Any]]:
+    def _filter_network_state(
+        self,
+        marker: int,
+        month_label: str,
+        year_label: str,
+        status_label: str,
+        *,
+        page_number: int | None = None,
+        page_size: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         matching_events = [
             (sequence, status, response)
             for sequence, status, url, response in self._piles_response_events
-            if sequence > marker and piles_response_matches_filter_year(url, year_label)
+            if sequence > marker
+            and piles_response_matches_context(
+                url,
+                month_label,
+                year_label,
+                status_label,
+                page_number=page_number,
+                page_size=page_size,
+            )
         ]
         if not matching_events:
             return "not_observed", {}
@@ -3138,6 +3286,16 @@ class CuracelPilesRunner:
             response.finished()
         except Exception as error:
             return "failed", {**details, "completion_error": type(error).__name__}
+        try:
+            summary = summarize_piles_response(response.json())
+        except Exception:
+            summary = {"authoritative": False}
+        details.update(summary)
+        details["authoritative_empty"] = (
+            summary.get("authoritative") is True
+            and summary.get("item_count") == 0
+            and summary.get("total", 0) == 0
+        )
         return "succeeded", details
 
     def _dismiss_popup(self) -> None:
@@ -4152,7 +4310,9 @@ class CuracelPilesRunner:
             table_state = self.wait_for_table_ready(timeout_ms=6000)
             network_state, network_details = self._filter_network_state(
                 filter_response_marker,
+                month_label,
                 year_label,
+                status_label,
             )
             evidence = FilterEvidence(
                 month_matches=True,
@@ -4166,6 +4326,10 @@ class CuracelPilesRunner:
             if not decision.accepted:
                 raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
             return evidence
+
+        self._reset_pagination_to_first_page()
+        previous_fingerprint = self._table_preview_fingerprint()
+        filter_response_marker = self._piles_response_sequence
 
         for attempt in range(1, 4):
             if attempt > 1:
@@ -4236,7 +4400,6 @@ class CuracelPilesRunner:
         self._filter_state["month"] = month_label
         self._filter_state["year"] = desired_year_state
         self._filter_state["status"] = status_label
-        self._filter_state["page_size"] = None
 
         month_display = self._read_select_text(final_month_select) or month_label
         year_display = self._read_select_text(final_year_select) or self._read_year_chip_text() or year_label
@@ -4257,20 +4420,42 @@ class CuracelPilesRunner:
             except Exception:
                 continue
         time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
-        table_state = self.wait_for_table_ready(
-            timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000
+        self._wait_for_piles_filter_response(
+            filter_response_marker,
+            month_label,
+            year_label,
+            status_label,
+            page_number=1,
         )
         network_state, network_details = self._filter_network_state(
             filter_response_marker,
+            month_label,
             year_label,
+            status_label,
+            page_number=1,
         )
+        if network_details.get("authoritative") is True:
+            table_state, dom_matches_response = self._wait_for_table_response_coherence(
+                safe_int(network_details.get("item_count"), -1),
+                previous_fingerprint,
+                timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000,
+            )
+        else:
+            table_state = self.wait_for_table_ready(
+                timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000
+            )
+            dom_matches_response = False
         evidence = FilterEvidence(
             month_matches=(not month_changed or final_month_select is not None),
             year_matches=(not year_changed or final_year_select is not None),
             status_matches=final_status_select is not None,
             table_state=table_state,
             network_state=network_state,
-            details={"network": network_details, "selection_changed": True},
+            details={
+                "network": network_details,
+                "selection_changed": True,
+                "dom_matches_response": dom_matches_response,
+            },
         )
         decision = evaluate_filter_evidence(evidence)
         if not decision.accepted:
@@ -4294,13 +4479,60 @@ class CuracelPilesRunner:
                     continue
                 target = loc.last
                 if target.is_visible():
+                    selected_page_size = ""
+                    try:
+                        selected_page_size = norm(target.input_value())
+                    except Exception:
+                        selected_page_size = norm(target.get_attribute("value"))
+                    if (
+                        selected_page_size == str(page_size)
+                        or norm(self._read_select_text(target)) == str(page_size)
+                    ):
+                        self._filter_state["page_size"] = page_size
+                        return
+                    response_marker = self._piles_response_sequence
+                    previous_fingerprint = self._table_preview_fingerprint()
                     target.click()
                     time.sleep(0.4)
                     if self._choose_option_from_open_dropdown(str(page_size)):
-                        time.sleep(1)
+                        self._wait_for_piles_filter_response(
+                            response_marker,
+                            self._filter_state["month"],
+                            self._filter_state["year"],
+                            self._filter_state["status"],
+                            page_number=1,
+                            page_size=page_size,
+                        )
+                        network_state, network_details = self._filter_network_state(
+                            response_marker,
+                            self._filter_state["month"],
+                            self._filter_state["year"],
+                            self._filter_state["status"],
+                            page_number=1,
+                            page_size=page_size,
+                        )
+                        if (
+                            network_state != "succeeded"
+                            or network_details.get("authoritative") is not True
+                        ):
+                            raise IncompleteScan(
+                                "The Piles page-size response payload could not be verified."
+                            )
+                        _, coherent = self._wait_for_table_response_coherence(
+                            safe_int(network_details.get("item_count"), -1),
+                            previous_fingerprint,
+                            timeout_ms=10000,
+                            require_transition=False,
+                        )
+                        if not coherent:
+                            raise IncompleteScan(
+                                "The Piles table did not match the selected page size response."
+                            )
                         self._filter_state["page_size"] = page_size
                         return
                     self.page.keyboard.press("Escape")
+            except IncompleteScan:
+                raise
             except Exception:
                 continue
 
@@ -4344,15 +4576,40 @@ class CuracelPilesRunner:
                 rows = self.page.locator("table tbody tr")
                 count = rows.count()
                 texts = [norm(rows.nth(i).inner_text()) for i in range(min(count, 3))] if count > 0 else []
-                no_data = self.page.locator("text=No data found").count() > 0
-                fingerprint = ("rows", tuple(texts)) if texts else ("empty", no_data)
+                empty_message = self.page.locator("text=/^No Data Found$/i")
+                no_data = any(
+                    empty_message.nth(index).is_visible()
+                    for index in range(min(empty_message.count(), 5))
+                )
+                table = self.page.locator("table").first
+                table_body = self.page.locator("table tbody").first
+                table_structure_visible = (
+                    table.count() > 0
+                    and table.is_visible()
+                    and table_body.count() > 0
+                )
+                loading = self.page.locator(
+                    "[aria-busy='true'], [role='progressbar'], .p-datatable-loading-overlay, .p-progressspinner"
+                )
+                loading_visible = any(
+                    loading.nth(index).is_visible()
+                    for index in range(min(loading.count(), 5))
+                )
+                snapshot = classify_table_snapshot(
+                    texts,
+                    no_data,
+                    table_structure_visible,
+                    loading_visible,
+                )
+                fingerprint = (snapshot, tuple(texts))
                 if fingerprint == last_fingerprint:
                     stable_ticks += 1
                 else:
                     stable_ticks = 0
                     last_fingerprint = fingerprint
-                if stable_ticks >= 1 and (texts or no_data):
-                    return "stable" if texts else "empty"
+                required_ticks = 5 if snapshot == "structurally_empty" else 1
+                if stable_ticks >= required_ticks and snapshot in {"rows", "empty", "structurally_empty"}:
+                    return "stable" if snapshot == "rows" else snapshot
             except Exception:
                 pass
             time.sleep(0.3)
@@ -4426,8 +4683,110 @@ class CuracelPilesRunner:
             ))
         return piles
 
-    def goto_next_page(self) -> bool:
+    def _table_preview_fingerprint(self) -> tuple[str, ...]:
         assert self.page
+        try:
+            rows = self.page.locator("table tbody tr")
+            return tuple(
+                text
+                for index in range(min(rows.count(), 3))
+                if (text := norm(rows.nth(index).inner_text()))
+                and norm_key(text) != "no data found"
+            )
+        except Exception:
+            return ()
+
+    def _visible_table_row_count(self) -> int:
+        assert self.page
+        try:
+            rows = self.page.locator("table tbody tr")
+            return sum(
+                1
+                for index in range(rows.count())
+                if (text := norm(rows.nth(index).inner_text()))
+                and norm_key(text) != "no data found"
+            )
+        except Exception:
+            return -1
+
+    def _wait_for_table_response_coherence(
+        self,
+        expected_item_count: int,
+        previous_fingerprint: tuple[str, ...],
+        *,
+        timeout_ms: int,
+        require_transition: bool = True,
+    ) -> tuple[str, bool]:
+        deadline = time.time() + (timeout_ms / 1000)
+        last_state = "unreadable"
+        while time.time() < deadline:
+            remaining_ms = max(int((deadline - time.time()) * 1000), 1)
+            last_state = self.wait_for_table_ready(timeout_ms=min(2500, remaining_ms))
+            visible_count = self._visible_table_row_count()
+            current_fingerprint = self._table_preview_fingerprint()
+            if expected_item_count == 0:
+                if visible_count == 0 and last_state in {"empty", "structurally_empty"}:
+                    return last_state, True
+            elif (
+                expected_item_count > 0
+                and visible_count == expected_item_count
+                and last_state == "stable"
+                and (
+                    not require_transition
+                    or not previous_fingerprint
+                    or current_fingerprint != previous_fingerprint
+                )
+            ):
+                return last_state, True
+            time.sleep(0.2)
+        return last_state, False
+
+    def _reset_pagination_to_first_page(self) -> None:
+        assert self.page
+        if not all(norm(self._filter_state.get(key)) for key in ("month", "year", "status")):
+            return
+        for selector in [
+            "button[aria-label='First Page']",
+            ".p-paginator-first",
+        ]:
+            try:
+                button = self.page.locator(selector).first
+                if button.count() == 0 or not button.is_visible():
+                    continue
+                disabled = button.get_attribute("disabled") is not None
+                classes = norm(button.get_attribute("class")).lower()
+                if disabled or "disabled" in classes:
+                    return
+                marker = self._piles_response_sequence
+                button.click()
+                self._wait_for_piles_filter_response(
+                    marker,
+                    self._filter_state["month"],
+                    self._filter_state["year"],
+                    self._filter_state["status"],
+                    page_number=1,
+                    page_size=self._filter_state.get("page_size"),
+                )
+                if self.wait_for_table_ready() == "unreadable":
+                    raise IncompleteScan("The Piles table did not return to page 1 before filtering.")
+                return
+            except IncompleteScan:
+                raise
+            except Exception as error:
+                raise IncompleteScan(
+                    f"The Piles paginator could not return to page 1 before filtering: {error}"
+                ) from error
+
+    def goto_next_page(
+        self,
+        month_label: str = "",
+        year_label: str = "",
+        status_label: str = "",
+        *,
+        next_page: int | None = None,
+    ) -> bool:
+        assert self.page
+        response_marker = getattr(self, "_piles_response_sequence", 0)
         selectors = [
             "button[aria-label='Next Page']",
             "button[aria-label='Next']",
@@ -4443,10 +4802,51 @@ class CuracelPilesRunner:
                 classes = norm(loc.get_attribute("class")).lower()
                 if disabled or "disabled" in classes:
                     return False
+                previous_fingerprint = self._table_preview_fingerprint()
                 loc.click()
+                if next_page is not None:
+                    try:
+                        self._wait_for_piles_filter_response(
+                            response_marker,
+                            month_label,
+                            year_label,
+                            status_label,
+                            page_number=next_page,
+                            page_size=self._filter_state.get("page_size"),
+                        )
+                    except Exception as error:
+                        raise IncompleteScan(
+                            f"The next Piles page request was not confirmed: {error}"
+                        ) from error
+                    network_state, network_details = self._filter_network_state(
+                        response_marker,
+                        month_label,
+                        year_label,
+                        status_label,
+                        page_number=next_page,
+                        page_size=self._filter_state.get("page_size"),
+                    )
+                    if (
+                        network_state != "succeeded"
+                        or network_details.get("authoritative") is not True
+                        or safe_int(network_details.get("item_count"), 0) <= 0
+                    ):
+                        raise IncompleteScan(
+                            "The next Piles page response payload contained no readable rows."
+                        )
                 time.sleep(0.45)
-                if self.wait_for_table_ready() == "unreadable":
-                    raise IncompleteScan("The next Piles page did not settle into a readable state.")
+                if self.wait_for_table_ready() != "stable":
+                    raise IncompleteScan("The next Piles page did not settle into a readable row state.")
+                if previous_fingerprint:
+                    deadline = time.time() + 3
+                    while time.time() < deadline:
+                        if self._table_preview_fingerprint() != previous_fingerprint:
+                            break
+                        time.sleep(0.2)
+                    else:
+                        raise IncompleteScan(
+                            "The next Piles page response completed but the visible rows did not change."
+                        )
                 return True
             except IncompleteScan:
                 raise
@@ -4456,8 +4856,22 @@ class CuracelPilesRunner:
 
     def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
         filter_evidence = self.apply_filters(month_label, year_label, status_label)
-        self._last_filter_evidence = filter_evidence
+        filter_decision = evaluate_filter_evidence(filter_evidence)
+        if not filter_decision.accepted:
+            raise IncompleteScan(f"Piles table was not ready for scanning: {filter_decision.code}.")
+        if filter_evidence.table_state in {"empty", "structurally_empty"}:
+            scan = ScanAccumulator()
+            result = scan.finish(explicit_empty=True)
+            self._last_filter_evidence = filter_evidence
+            self._last_scan_result = result
+            return []
         self.try_set_page_size(100)
+        settled_table_state = self.wait_for_table_ready()
+        filter_evidence = replace(filter_evidence, table_state=settled_table_state)
+        table_decision = evaluate_filter_evidence(filter_evidence)
+        if not table_decision.accepted:
+            raise IncompleteScan(f"Piles table was not ready for scanning: {table_decision.code}.")
+        self._last_filter_evidence = filter_evidence
         scan = ScanAccumulator()
         page_number = 1
         while True:
@@ -4474,11 +4888,16 @@ class CuracelPilesRunner:
                 )
             if scan.observe_page(page_number, page_rows):
                 break
-            if not self.goto_next_page():
+            if not self.goto_next_page(
+                month_label,
+                year_label,
+                status_label,
+                next_page=page_number + 1,
+            ):
                 break
             page_number += 1
         result = scan.finish(
-            explicit_empty=bool(filter_evidence and filter_evidence.table_state == "empty")
+            explicit_empty=filter_evidence.table_state in {"empty", "structurally_empty"}
         )
         self._last_scan_result = result
         return [
@@ -4607,7 +5026,12 @@ class CuracelPilesRunner:
         self.try_set_page_size(100)
         current_page = 1
         while current_page < page_number:
-            if not self.goto_next_page():
+            if not self.goto_next_page(
+                month_label,
+                year_label,
+                status_label,
+                next_page=current_page + 1,
+            ):
                 break
             current_page += 1
         return self.rows_on_current_page(status_label, current_page, month_label, year_label)
@@ -5634,7 +6058,12 @@ class CuracelPilesRunner:
                                     f"  Deferred {len(deferred_missing_keys)} unstable pile(s) for '{assignee_name}' "
                                     f"to a follow-up selection pass."
                                 )
-                    if not self.goto_next_page():
+                    if not self.goto_next_page(
+                        filter_month,
+                        filter_year,
+                        status_label,
+                        next_page=page_number + 1,
+                    ):
                         break
                     page_number += 1
                 if pending_status_plans:

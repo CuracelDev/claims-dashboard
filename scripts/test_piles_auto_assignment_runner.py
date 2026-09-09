@@ -416,7 +416,7 @@ class YearFilterScanningTests(unittest.TestCase):
         portal_runner.open_piles = lambda: None
         portal_runner.apply_filters = lambda *_args: None
         portal_runner.try_set_page_size = lambda *_args: None
-        portal_runner.goto_next_page = lambda: False
+        portal_runner.goto_next_page = lambda *_args, **_kwargs: False
         received = []
 
         def rows_on_current_page(*args):
@@ -465,12 +465,15 @@ class YearFilterScanningTests(unittest.TestCase):
 
     def test_scan_rejects_rows_rendered_for_a_different_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
-        portal_runner.apply_filters = lambda *_args: None
+        portal_runner.apply_filters = lambda *_args: runner.FilterEvidence(
+            True, True, True, "stable", "succeeded"
+        )
         portal_runner.try_set_page_size = lambda *_args: None
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: "stable"
         stale_row = make_pile(1, filter_year="2025")
         stale_row.month = "Jul 2026"
         portal_runner.rows_on_current_page = lambda *_args: [stale_row]
-        portal_runner.goto_next_page = lambda: False
+        portal_runner.goto_next_page = lambda *_args, **_kwargs: False
 
         with self.assertRaisesRegex(RuntimeError, "expected year '2025'.*Jul 2026"):
             runner.CuracelPilesRunner.scan_status(
@@ -482,12 +485,15 @@ class YearFilterScanningTests(unittest.TestCase):
 
     def test_scan_accepts_month_only_rows_after_the_filter_request_is_confirmed(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
-        portal_runner.apply_filters = lambda *_args: None
+        portal_runner.apply_filters = lambda *_args: runner.FilterEvidence(
+            True, True, True, "stable", "succeeded"
+        )
         portal_runner.try_set_page_size = lambda *_args: None
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: "stable"
         month_only_row = make_pile(1, filter_year="2025")
         month_only_row.month = "Jul"
         portal_runner.rows_on_current_page = lambda *_args: [month_only_row]
-        portal_runner.goto_next_page = lambda: False
+        portal_runner.goto_next_page = lambda *_args, **_kwargs: False
 
         rows = runner.CuracelPilesRunner.scan_status(
             portal_runner,
@@ -1266,6 +1272,49 @@ class YearFilterScanningTests(unittest.TestCase):
         self.assertFalse(matches("https://api.health.curacel.co/api/piles?year=2026&submitted_from=2025-01-01", "2025"))
         self.assertFalse(matches("https://api.health.curacel.co/api/providers?year=2025", "2025"))
 
+    def test_piles_response_context_matches_all_filter_dimensions(self):
+        url = (
+            "https://api.health.curacel.co/api/piles?page=1&per_page=100&month=8"
+            "&year%5B%5D=2026&status%5Bid%5D=2&status%5Bcode%5D=O"
+            "&status%5Bname%5D=Vetting+Ongoing"
+        )
+
+        self.assertTrue(runner.piles_response_matches_context(
+            url, "Aug", "2026", "Vetting Ongoing", page_number=1, page_size=100
+        ))
+        self.assertFalse(runner.piles_response_matches_context(
+            url, "Aug", "2026", "Audit Pending", page_number=1, page_size=100
+        ))
+        self.assertFalse(runner.piles_response_matches_context(
+            url, "Jul", "2026", "Vetting Ongoing", page_number=1, page_size=100
+        ))
+        self.assertFalse(runner.piles_response_matches_context(
+            url, "Aug", "2026", "Vetting Ongoing", page_number=2, page_size=100
+        ))
+
+    def test_piles_response_context_accepts_explicit_all_values(self):
+        url = (
+            "https://api.health.curacel.co/api/piles?page=1&per_page=10&month=0"
+            "&year%5B%5D=2026&year%5B%5D=2025&status%5Bid%5D=0"
+            "&status%5Bcode%5D=All&status%5Bname%5D=All"
+        )
+        self.assertTrue(runner.piles_response_matches_context(
+            url, "All", "All", "All", page_number=1, page_size=10
+        ))
+
+    def test_piles_response_summary_only_marks_a_paginated_empty_collection(self):
+        empty = runner.summarize_piles_response({
+            "data": {"data": [], "total": 0, "current_page": 1}
+        })
+        populated = runner.summarize_piles_response({
+            "data": {"data": [{"id": 123}], "total": 1, "current_page": 1}
+        })
+        unrelated = runner.summarize_piles_response({"success": True})
+
+        self.assertEqual(empty, {"authoritative": True, "item_count": 0, "total": 0})
+        self.assertEqual(populated, {"authoritative": True, "item_count": 1, "total": 1})
+        self.assertEqual(unrelated, {"authoritative": False})
+
     def test_filter_response_marker_survives_history_truncation(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
 
@@ -1292,7 +1341,9 @@ class YearFilterScanningTests(unittest.TestCase):
         runner.CuracelPilesRunner._wait_for_piles_filter_response(
             portal_runner,
             marker,
+            "All",
             "2025",
+            "All",
             timeout_ms=1,
         )
 
@@ -1314,7 +1365,9 @@ class YearFilterScanningTests(unittest.TestCase):
         runner.CuracelPilesRunner._wait_for_piles_filter_response(
             portal_runner,
             0,
+            "All",
             "2025",
+            "All",
             timeout_ms=1,
         )
 
@@ -1330,7 +1383,9 @@ class YearFilterScanningTests(unittest.TestCase):
             runner.CuracelPilesRunner._wait_for_piles_filter_response(
                 portal_runner,
                 0,
+                "All",
                 "2025",
+                "All",
                 timeout_ms=1,
             )
 
@@ -1366,7 +1421,9 @@ class YearFilterScanningTests(unittest.TestCase):
         state, details = runner.CuracelPilesRunner._filter_network_state(
             portal_runner,
             6,
+            "All",
             "2025",
+            "All",
         )
 
         self.assertEqual(state, "failed")
@@ -1378,11 +1435,12 @@ class YearFilterScanningTests(unittest.TestCase):
             True, True, True, "stable", "not_observed"
         )
         portal_runner.try_set_page_size = lambda *_args: None
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: "stable"
         portal_runner.rows_on_current_page = lambda *_args: [
             make_pile(1) if _args[1] == 1 else runner.replace(make_pile(1), provider="Changed Provider")
         ]
         pages = iter([True, False])
-        portal_runner.goto_next_page = lambda: next(pages)
+        portal_runner.goto_next_page = lambda *_args, **_kwargs: next(pages)
 
         with self.assertRaisesRegex(RuntimeError, "Conflicting rows shared tracking key"):
             runner.CuracelPilesRunner.scan_status(
@@ -1391,6 +1449,44 @@ class YearFilterScanningTests(unittest.TestCase):
                 "2026",
                 "Vetting Pending",
             )
+
+    def test_scan_status_accepts_stable_empty_body_after_matching_response(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.apply_filters = lambda *_args: runner.FilterEvidence(
+            True,
+            True,
+            True,
+            "structurally_empty",
+            "succeeded",
+            {"network": {"authoritative_empty": True}},
+        )
+        portal_runner.try_set_page_size = lambda *_args: self.fail(
+            "An authoritative empty result must not trigger a second request."
+        )
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: self.fail(
+            "An authoritative empty result must not be reclassified from stale DOM."
+        )
+        portal_runner.rows_on_current_page = lambda *_args: []
+        portal_runner.goto_next_page = lambda *_args, **_kwargs: False
+
+        rows = runner.CuracelPilesRunner.scan_status(
+            portal_runner,
+            "All",
+            "All",
+            "Audit Pending",
+        )
+
+        self.assertEqual(rows, [])
+
+    def test_table_snapshot_distinguishes_loading_from_structural_empty(self):
+        self.assertEqual(
+            runner.classify_table_snapshot([], False, True, False),
+            "structurally_empty",
+        )
+        self.assertEqual(
+            runner.classify_table_snapshot([], False, True, True),
+            "pending",
+        )
 
     def test_pagination_does_not_treat_an_unreadable_next_page_as_finished(self):
         class NextButton:
@@ -1421,6 +1517,171 @@ class YearFilterScanningTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "next Piles page did not settle"):
             runner.CuracelPilesRunner.goto_next_page(portal_runner)
+
+    def test_pagination_waits_for_the_exact_next_page_context(self):
+        class NextButton:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, _name):
+                return None
+
+            def click(self):
+                return None
+
+        class Page:
+            def locator(self, _selector):
+                return NextButton()
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = Page()
+        portal_runner._piles_response_sequence = 9
+        portal_runner._filter_state = {"page_size": 100}
+        portal_runner.wait_for_table_ready = lambda *_args, **_kwargs: "stable"
+        fingerprints = iter([("page-one",), ("page-two",)])
+        portal_runner._table_preview_fingerprint = lambda: next(fingerprints)
+        observed = []
+        portal_runner._wait_for_piles_filter_response = lambda *args, **kwargs: observed.append(
+            (args, kwargs)
+        )
+        portal_runner._filter_network_state = lambda *args, **kwargs: (
+            "succeeded",
+            {"authoritative": True, "item_count": 1},
+        )
+
+        moved = runner.CuracelPilesRunner.goto_next_page(
+            portal_runner,
+            "Aug",
+            "2026",
+            "Vetting Ongoing",
+            next_page=2,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(
+            observed,
+            [((9, "Aug", "2026", "Vetting Ongoing"), {"page_number": 2, "page_size": 100})],
+        )
+
+    def test_pagination_rejects_a_blank_or_unparsed_exact_response(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = type("Page", (), {
+            "locator": lambda _self, _selector: type("Button", (), {
+                "first": property(lambda self: self),
+                "count": lambda _self: 1,
+                "is_visible": lambda _self: True,
+                "get_attribute": lambda _self, _name: None,
+                "click": lambda _self: None,
+            })(),
+        })()
+        portal_runner._piles_response_sequence = 3
+        portal_runner._filter_state = {"page_size": 100}
+        portal_runner._table_preview_fingerprint = lambda: ("page-one",)
+        portal_runner._wait_for_piles_filter_response = lambda *_args, **_kwargs: None
+        portal_runner._filter_network_state = lambda *_args, **_kwargs: (
+            "succeeded",
+            {"authoritative": False},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "payload contained no readable rows"):
+            runner.CuracelPilesRunner.goto_next_page(
+                portal_runner,
+                "Aug",
+                "2026",
+                "Vetting Ongoing",
+                next_page=2,
+            )
+
+    def test_filter_dom_coherence_rejects_previous_rows_for_empty_response(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
+        portal_runner._visible_table_row_count = lambda: 2
+        portal_runner._table_preview_fingerprint = lambda: ("old rows",)
+
+        state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
+            portal_runner,
+            0,
+            ("old rows",),
+            timeout_ms=1,
+        )
+
+        self.assertEqual(state, "stable")
+        self.assertFalse(coherent)
+
+    def test_filter_dom_coherence_requires_the_new_visible_rows(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
+        portal_runner._visible_table_row_count = lambda: 2
+        portal_runner._table_preview_fingerprint = lambda: ("new rows",)
+
+        state, coherent = runner.CuracelPilesRunner._wait_for_table_response_coherence(
+            portal_runner,
+            2,
+            ("old rows",),
+            timeout_ms=10,
+        )
+
+        self.assertEqual(state, "stable")
+        self.assertTrue(coherent)
+
+    def test_page_size_change_waits_for_exact_response_and_dom_count(self):
+        class Target:
+            @property
+            def last(self):
+                return self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, _name):
+                return None
+
+            def click(self):
+                return None
+
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = type("Page", (), {"locator": lambda _self, _selector: Target()})()
+        portal_runner._filter_state = {
+            "month": "Aug",
+            "year": "2026",
+            "status": "Vetting Ongoing",
+            "page_size": None,
+        }
+        portal_runner._piles_response_sequence = 11
+        portal_runner._read_select_text = lambda _target: "10"
+        portal_runner._choose_option_from_open_dropdown = lambda _value: True
+        portal_runner._table_preview_fingerprint = lambda: ("first row",)
+        waits = []
+        portal_runner._wait_for_piles_filter_response = lambda *args, **kwargs: waits.append(
+            (args, kwargs)
+        )
+        portal_runner._filter_network_state = lambda *args, **kwargs: (
+            "succeeded",
+            {"authoritative": True, "item_count": 42},
+        )
+        portal_runner._wait_for_table_response_coherence = lambda *args, **kwargs: (
+            "stable",
+            True,
+        )
+
+        runner.CuracelPilesRunner.try_set_page_size(portal_runner, 100)
+
+        self.assertEqual(portal_runner._filter_state["page_size"], 100)
+        self.assertEqual(
+            waits,
+            [((11, "Aug", "2026", "Vetting Ongoing"), {"page_number": 1, "page_size": 100})],
+        )
 
 
 class ExecutionLedgerIntegrationTests(unittest.TestCase):

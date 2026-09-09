@@ -72,6 +72,30 @@ def evaluate_filter_evidence(evidence: FilterEvidence) -> EvidenceDecision:
         return EvidenceDecision(False, "filter_response_failed")
     if not evidence.controls_match:
         return EvidenceDecision(False, "controls_not_confirmed")
+    selection_changed = evidence.details.get("selection_changed") is True
+    network_details = evidence.details.get("network", {})
+    authoritative_empty = (
+        isinstance(network_details, Mapping)
+        and network_details.get("authoritative_empty") is True
+    )
+    if selection_changed and evidence.network_state != "succeeded":
+        return EvidenceDecision(False, "filter_response_not_confirmed")
+    if (
+        selection_changed
+        and (
+            not isinstance(network_details, Mapping)
+            or network_details.get("authoritative") is not True
+        )
+    ):
+        return EvidenceDecision(False, "filter_response_payload_unreadable")
+    if evidence.table_state == "empty" and selection_changed and not authoritative_empty:
+        return EvidenceDecision(False, "empty_ui_conflicts_with_response")
+    if selection_changed and evidence.details.get("dom_matches_response") is not True:
+        return EvidenceDecision(False, "filter_dom_response_mismatch")
+    if evidence.table_state == "structurally_empty":
+        if evidence.network_state == "succeeded" and authoritative_empty:
+            return EvidenceDecision(True, "confirmed_structural_empty")
+        return EvidenceDecision(False, "structural_empty_without_authoritative_response")
     if evidence.table_state not in {"stable", "empty"}:
         return EvidenceDecision(False, "table_not_settled")
     if evidence.network_state == "succeeded":
