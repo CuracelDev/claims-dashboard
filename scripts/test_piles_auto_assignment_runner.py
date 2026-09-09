@@ -1850,6 +1850,25 @@ class YearFilterScanningTests(unittest.TestCase):
             snapshot, 1, "Sep", "2025", "Vetting Pending", identities,
         ))
 
+    def test_table_context_snapshot_normalizes_numeric_api_month_to_visible_name(self):
+        self.assertEqual(runner._canonical_month("09"), "09")
+        self.assertEqual(runner._canonical_month("September"), "09")
+        self.assertEqual(runner._canonical_month("Sep"), "09")
+        self.assertEqual(runner._canonical_month("9.5"), "")
+        self.assertEqual(runner._canonical_month("Infinity"), "")
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["A", "10", "Sep", "KES 1,000.00", "09/09/2026", "Vetting Ongoing"]],
+            "loading": False,
+        }
+        identities = runner.response_identity_candidates([
+            {"provider": {"name": "A"}, "submitted_claims_count": 10, "month": 9, "amount_requested": 1000, "last_claim_submitted_at": "2026-09-09T10:00:00Z"},
+        ])
+
+        self.assertTrue(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "September", "All", "Vetting Ongoing", identities,
+        ))
+
     def test_table_context_snapshot_rejects_rows_from_a_different_api_response(self):
         snapshot = {
             "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],

@@ -599,11 +599,33 @@ def _canonical_date(value: Any) -> str:
     return ""
 
 
+def _canonical_month(value: Any) -> str:
+    text = norm(value).lower()
+    if not text:
+        return ""
+    try:
+        numeric_month = Decimal(text)
+        number = int(numeric_month) if numeric_month == numeric_month.to_integral_value() else 0
+    except (InvalidOperation, ValueError, OverflowError):
+        number = 0
+    if 1 <= number <= 12:
+        return f"{number:02d}"
+    month_names = (
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    )
+    key = norm_key(text)
+    for index, name in enumerate(month_names, start=1):
+        if key in {name, name[:3]}:
+            return f"{index:02d}"
+    return ""
+
+
 def _row_identity_hash(provider: Any, claims: Any, month: Any, amount: Any, submitted_date: Any) -> str:
     identity = "|".join([
         norm_key(provider),
         str(safe_int(claims, -1)),
-        norm_key(month),
+        _canonical_month(month),
         _canonical_amount(amount),
         _canonical_date(submitted_date),
     ])
@@ -691,7 +713,7 @@ def table_snapshot_matches_filter_context(
     claims_index = column_index("claims")
     provider_bill_index = column_index("provider bill")
     submitted_date_index = column_index("submitted date")
-    expected_month = norm_key(month_label)
+    expected_month = _canonical_month(month_label)
     expected_year = norm(year_label)
 
     visible_identity_hashes: list[str] = []
@@ -701,8 +723,8 @@ def table_snapshot_matches_filter_context(
         visible_status = norm_key(row[status_index])
         if not visible_status or expected_status not in visible_status:
             return False
-        if expected_month != "all":
-            if month_index < 0 or month_index >= len(row) or norm_key(row[month_index]) != expected_month:
+        if norm_key(month_label) != "all":
+            if month_index < 0 or month_index >= len(row) or _canonical_month(row[month_index]) != expected_month:
                 return False
         if norm_key(expected_year) != "all":
             if (
