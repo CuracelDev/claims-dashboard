@@ -51,7 +51,7 @@ def make_bot(bot_id, role, *, ratio=1, active=True, available=True, load=0, prio
         support_capacity_ratio=ratio,
         availability_status="available",
         availability_note="",
-        active_from_time="09:00",
+        active_from_time="",
         active_to_time="",
         shift_grace_minutes=120,
         is_active=active,
@@ -247,6 +247,17 @@ class AssignmentPlanningTests(unittest.TestCase):
         self.assertTrue(runner.enabled_by_default(None))
         self.assertTrue(runner.enabled_by_default(True))
         self.assertFalse(runner.enabled_by_default(False))
+
+
+class ReadOnlyProbeTests(unittest.TestCase):
+    def test_overlap_is_a_probe_failure_in_read_only_mode(self):
+        self.assertEqual(
+            runner.overlap_probe_failure(True, "DEFMIS"),
+            "Read-only probe skipped DEFMIS because another runner held its lock.",
+        )
+
+    def test_overlap_remains_coalesced_for_normal_runs(self):
+        self.assertIsNone(runner.overlap_probe_failure(False, "DEFMIS"))
 
 
 class WeekendRestoreTests(unittest.TestCase):

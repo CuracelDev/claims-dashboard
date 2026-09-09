@@ -1,4 +1,6 @@
 import pg from 'pg';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const { Pool } = pg;
 
@@ -240,11 +242,39 @@ function evaluate(table, columns, constraints) {
   return issues;
 }
 
+export async function auditDatabase(pool, logger = console) {
+  const [columnsByTable, constraintsByTable, rowCounts] = await Promise.all([
+    getColumns(pool),
+    getConstraints(pool),
+    getRowCounts(pool, TABLES),
+  ]);
+
+  logger.log('Production schema audit');
+  logger.log('=======================');
+
+  let issueCount = 0;
+  for (const table of TABLES) {
+    const columns = columnsByTable.get(table) || [];
+    const constraints = constraintsByTable.get(table) || [];
+    const issues = evaluate(table, columns, constraints);
+    issueCount += issues.filter((issue) => !issue.startsWith('works but should')).length;
+
+    logger.log(`\n${table}`);
+    logger.log(`  rows: ${rowCounts[table]}`);
+    logger.log(`  columns: ${columns.length ? columns.map((c) => `${c.column_name}:${c.data_type}`).join(', ') : 'missing table'}`);
+    logger.log(`  keys: ${constraints.length ? constraints.map((c) => `${c.constraint_type}(${c.columns.join(',')})`).join(', ') : 'none'}`);
+    logger.log(`  issues: ${issues.length ? issues.join('; ') : 'none detected'}`);
+  }
+
+  if (issueCount > 0) {
+    throw new Error(`Production schema audit failed with ${issueCount} issue(s).`);
+  }
+}
+
 async function main() {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('DATABASE_URL is required. Set it to the production Postgres connection string.');
-    process.exit(1);
+    throw new Error('DATABASE_URL is required. Set it to the production Postgres connection string.');
   }
 
   const pool = new Pool({
@@ -253,32 +283,15 @@ async function main() {
   });
 
   try {
-    const [columnsByTable, constraintsByTable, rowCounts] = await Promise.all([
-      getColumns(pool),
-      getConstraints(pool),
-      getRowCounts(pool, TABLES),
-    ]);
-
-    console.log('Production schema audit');
-    console.log('=======================');
-
-    for (const table of TABLES) {
-      const columns = columnsByTable.get(table) || [];
-      const constraints = constraintsByTable.get(table) || [];
-      const issues = evaluate(table, columns, constraints);
-
-      console.log(`\n${table}`);
-      console.log(`  rows: ${rowCounts[table]}`);
-      console.log(`  columns: ${columns.length ? columns.map((c) => `${c.column_name}:${c.data_type}`).join(', ') : 'missing table'}`);
-      console.log(`  keys: ${constraints.length ? constraints.map((c) => `${c.constraint_type}(${c.columns.join(',')})`).join(', ') : 'none'}`);
-      console.log(`  issues: ${issues.length ? issues.join('; ') : 'none detected'}`);
-    }
+    await auditDatabase(pool);
   } finally {
     await pool.end();
   }
 }
 
-main().catch((err) => {
-  console.error(err.message);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error(err.message);
+    process.exit(1);
+  });
+}

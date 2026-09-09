@@ -6663,6 +6663,12 @@ def runner_effective_date(args: argparse.Namespace) -> str:
     return datetime.now(RUNNER_TIMEZONE).date().isoformat()
 
 
+def overlap_probe_failure(read_only: bool, insurer_name: str) -> str | None:
+    if not read_only:
+        return None
+    return f"Read-only probe skipped {insurer_name} because another runner held its lock."
+
+
 def _run_for_insurer_once(
     store: DataStore,
     args: argparse.Namespace,
@@ -7702,15 +7708,20 @@ def main() -> None:
             if not insurer_locked:
                 if slot >= 0:
                     store.release_runner_slot(slot)
-                request_id = store.mark_coalesced_request(insurer_name, run_id)
                 insurer_statuses.append(InsurerRunStatus.SKIPPED_OVERLAP)
+                probe_failure = overlap_probe_failure(args.read_only, insurer_name)
+                request_id = None if probe_failure else store.mark_coalesced_request(insurer_name, run_id)
                 store.log_runner_event(
                     insurer_name=insurer_name,
                     event_type="runner_overlap",
                     status="skipped_overlap",
                     details={"coalesced_request_id": request_id, "runner_run_id": run_id},
                 )
-                print(f"\nSKIPPED overlap for {insurer_name}; one follow-up request is queued.")
+                if probe_failure:
+                    failures.append((insurer_name, probe_failure))
+                    print(f"\nFAILED read-only probe for {insurer_name}: another runner held its lock.")
+                else:
+                    print(f"\nSKIPPED overlap for {insurer_name}; one follow-up request is queued.")
                 continue
             try:
                 followup_completed = False
