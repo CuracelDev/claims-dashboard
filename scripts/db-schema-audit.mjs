@@ -169,7 +169,7 @@ async function getConstraints(pool) {
         tc.table_name,
         tc.constraint_name,
         tc.constraint_type,
-        array_agg(kcu.column_name order by kcu.ordinal_position) as columns
+        array_agg(kcu.column_name::text order by kcu.ordinal_position) as columns
       from information_schema.table_constraints tc
       join information_schema.key_column_usage kcu
         on tc.constraint_name = kcu.constraint_name
@@ -185,9 +185,21 @@ async function getConstraints(pool) {
   const byTable = new Map();
   for (const row of rows) {
     if (!byTable.has(row.table_name)) byTable.set(row.table_name, []);
-    byTable.get(row.table_name).push(row);
+    byTable.get(row.table_name).push({
+      ...row,
+      columns: normalizeConstraintColumns(row.columns),
+    });
   }
   return byTable;
+}
+
+export function normalizeConstraintColumns(value) {
+  if (Array.isArray(value)) return value.map((column) => String(column));
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const body = raw.startsWith('{') && raw.endsWith('}') ? raw.slice(1, -1) : raw;
+  if (!body) return [];
+  return body.split(',').map((column) => column.trim().replace(/^"|"$/g, ''));
 }
 
 async function getRowCounts(pool, tableNames) {
