@@ -259,6 +259,58 @@ class ReadOnlyProbeTests(unittest.TestCase):
     def test_overlap_remains_coalesced_for_normal_runs(self):
         self.assertIsNone(runner.overlap_probe_failure(False, "DEFMIS"))
 
+    def test_new_external_assignment_is_simulated_without_a_database_write(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.read_only = True
+        store.mode = "postgres"
+        store._fetchall_postgres = lambda *_args, **_kwargs: []
+        store._execute_postgres = lambda *_args, **_kwargs: self.fail(
+            "read-only external detection must not attempt a database write"
+        )
+        pile = make_pile(1)
+        pile.assigned = "Primary Bot"
+        bot = make_bot("primary", "primary", priority=1)
+        bot.bot_name = "Primary Bot"
+
+        record, is_new = store.save_external_assignment(
+            "master-1", "OLD MUTUAL", pile, matched_bot=bot,
+        )
+
+        self.assertTrue(is_new)
+        self.assertEqual(record.tracking_key, pile.tracking_key)
+        self.assertEqual(record.current_assigned, "Primary Bot")
+        self.assertEqual(record.bot_account_id, bot.id)
+
+    def test_transient_scan_response_timeout_is_retryable(self):
+        self.assertTrue(runner.is_retryable_scan_error(RuntimeError(
+            "No completed Piles data request confirmed 'All / All / Vetting Pending' within 30000ms."
+        )))
+        self.assertFalse(runner.is_retryable_scan_error(RuntimeError(
+            "Configured bot names did not match the portal dropdown."
+        )))
+
+    def test_scan_context_reloads_once_after_a_transient_response_timeout(self):
+        portal = object.__new__(runner.CuracelPilesRunner)
+        attempts = []
+        reloads = []
+
+        def scan_status(*_args, **_kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise RuntimeError(
+                    "No completed Piles data request confirmed 'All / All / Vetting Pending' within 30000ms."
+                )
+            return [make_pile(1)]
+
+        portal.scan_status = scan_status
+        portal.open_piles = lambda: reloads.append(True)
+
+        rows = portal._scan_status_with_transient_retry("All", "All", "Vetting Pending")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(reloads), 1)
+
 
 class WeekendRestoreTests(unittest.TestCase):
     def test_restore_does_not_overwrite_manual_active_state(self):

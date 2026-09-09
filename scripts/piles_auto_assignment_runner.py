@@ -2498,6 +2498,13 @@ class DataStore:
             "details": details,
             "updated_at": now_iso,
         }
+        if getattr(self, "read_only", False):
+            simulated_payload = {
+                "id": existing.id if existing else str(uuid.uuid4()),
+                **payload,
+                "first_detected_at": existing.first_detected_at if existing else now_iso,
+            }
+            return self._rows_to_external_assignments([simulated_payload])[0], existing is None
         if existing:
             if self.mode == "postgres":
                 self._execute_postgres(
@@ -4953,6 +4960,30 @@ class CuracelPilesRunner:
             if not only_unassigned or not norm(row.assigned)
         ]
 
+    def _scan_status_with_transient_retry(
+        self,
+        month_label: str,
+        year_label: str,
+        status_label: str,
+        *,
+        only_unassigned: bool = False,
+    ) -> list[PileRow]:
+        try:
+            return self.scan_status(
+                month_label, year_label, status_label, only_unassigned=only_unassigned,
+            )
+        except Exception as error:
+            if not is_retryable_scan_error(error):
+                raise
+            print(
+                "  Piles data request did not settle. Reloading the Piles page and "
+                "retrying this filter context once..."
+            )
+            self.open_piles()
+            return self.scan_status(
+                month_label, year_label, status_label, only_unassigned=only_unassigned,
+            )
+
     def scan_all_unassigned(self, month_labels: list[str], year_label: str) -> list[PileRow]:
         all_rows = self.scan_all_rows(month_labels, year_label)
         seen = set()
@@ -5013,7 +5044,9 @@ class CuracelPilesRunner:
                     self._last_scan_result = None
                     self._last_filter_evidence = None
                     try:
-                        rows = self.scan_status(month_label, scan_year, status_label)
+                        rows = self._scan_status_with_transient_retry(
+                            month_label, scan_year, status_label,
+                        )
                         scan_result = self._last_scan_result
                         if scan_result is None:
                             accumulator = ScanAccumulator()
@@ -5055,7 +5088,9 @@ class CuracelPilesRunner:
         for month_label, filter_year, status_label in filter_contexts:
             active_year = norm(filter_year) or year_label
             print(f"\nScanning follow-up context: {active_year} / {month_label} / {status_label}")
-            rows = self.scan_status(month_label, active_year, status_label, only_unassigned=only_unassigned)
+            rows = self._scan_status_with_transient_retry(
+                month_label, active_year, status_label, only_unassigned=only_unassigned,
+            )
             if only_unassigned:
                 print(f"  Found {len(rows)} unassigned rows")
             else:
@@ -7127,6 +7162,30 @@ def is_retryable_runner_browser_error(exc: Exception) -> bool:
             return True
         pending.append(getattr(current, "__cause__", None))
         pending.append(getattr(current, "__context__", None))
+    return False
+
+
+def is_retryable_scan_error(exc: Exception) -> bool:
+    """Recognize bounded, read-safe portal failures that a page reload can recover."""
+    phrases = (
+        "no completed piles data request confirmed",
+        "piles filters were not confirmed: filter_dom_response_mismatch",
+        "piles table did not settle into a readable row state",
+        "piles table did not match the selected page size response",
+    )
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if any(phrase in norm(str(current)).lower() for phrase in phrases):
+            return True
+        pending.extend([
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+        ])
     return False
 
 
