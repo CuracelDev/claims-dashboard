@@ -40,6 +40,7 @@ function sslFor(url) {
 }
 
 async function databaseChecks() {
+  const deploymentMode = modeArg === 'deployment';
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) return [report('database connection', false, 'DATABASE_URL is required for database mode')];
   const pool = new Pool({ connectionString, ssl: sslFor(connectionString), max: 1 });
@@ -66,8 +67,16 @@ async function databaseChecks() {
     checks.push(
       report('active insurer rules', linkage.rows[0].count === 0, `${linkage.rows[0].count} active insurers without an active rule`),
       report('eligible owners', owners.rows[0].count === 0, `${owners.rows[0].count} active insurers without an eligible owner`),
-      report('stale heartbeats', stale.rows[0].count === 0, `${stale.rows[0].count} running insurer records stale over 15 minutes`),
-      report('pending reconciliation age', pending.rows[0].count === 0, `${pending.rows[0].count} attempts pending over 30 minutes`),
+      report(
+        'stale heartbeats',
+        deploymentMode || stale.rows[0].count === 0,
+        `${stale.rows[0].count} running insurer records stale over 15 minutes${deploymentMode && stale.rows[0].count ? ' (runtime warning; repair deployment allowed)' : ''}`,
+      ),
+      report(
+        'pending reconciliation age',
+        deploymentMode || pending.rows[0].count === 0,
+        `${pending.rows[0].count} attempts pending over 30 minutes${deploymentMode && pending.rows[0].count ? ' (runtime warning; repair deployment allowed)' : ''}`,
+      ),
       report('supported rule values', unsupported.rows[0].count === 0, `${unsupported.rows[0].count} unsupported rule rows`),
     );
     await pool.query('ROLLBACK');

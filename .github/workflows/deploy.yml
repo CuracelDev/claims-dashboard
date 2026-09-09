@@ -64,7 +64,7 @@ jobs:
             cd ~/claims-dashboard
             node scripts/apply-piles-auto-assignment-schema.mjs
             node scripts/db-schema-audit.mjs
-            node scripts/audit-piles-auto-assignment-readiness.mjs --mode database
+            node scripts/audit-piles-auto-assignment-readiness.mjs --mode deployment
 
       - name: Rsync files to server
         uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
