@@ -550,6 +550,9 @@ def summarize_piles_response(payload: Any) -> dict[str, Any]:
         identity_candidates = response_identity_candidates(rows)
         if rows and len(identity_candidates) == len(rows) and all(identity_candidates):
             summary["row_identity_candidates"] = identity_candidates
+        id_hashes = response_row_id_hashes(rows)
+        if rows and len(id_hashes) == len(rows) and all(id_hashes):
+            summary["row_id_hashes"] = id_hashes
     return summary
 
 
@@ -666,6 +669,29 @@ def response_identity_candidates(rows: list[Any]) -> list[list[str]]:
     return result
 
 
+def response_row_id_hashes(rows: list[Any]) -> list[str]:
+    """Hash stable response IDs so raw identifiers never enter evidence."""
+    return [
+        hashlib.sha256(norm(row.get("id")).encode("utf-8")).hexdigest()
+        if isinstance(row, dict) and norm(row.get("id")) else ""
+        for row in rows
+    ]
+
+
+def _dom_attribute_id_hashes(values: Any) -> set[str]:
+    hashes: set[str] = set()
+    for value in values if isinstance(values, list) else []:
+        text = norm(value)
+        if not text:
+            continue
+        tokens = {text, *re.split(r"[^A-Za-z0-9_-]+", text)}
+        hashes.update(
+            hashlib.sha256(token.encode("utf-8")).hexdigest()
+            for token in tokens if len(token) >= 4
+        )
+    return hashes
+
+
 def supports_multiple_year_selection(
     *,
     control_classes: str,
@@ -701,6 +727,7 @@ def table_snapshot_matches_filter_context(
     year_label: str,
     status_label: str,
     response_identity_candidates: list[list[str]],
+    response_row_id_hashes: list[str] | None = None,
 ) -> bool:
     """Validate an atomic DOM snapshot against the requested filter context."""
     if snapshot.get("loading") is not False:
@@ -727,6 +754,8 @@ def table_snapshot_matches_filter_context(
     expected_year = norm(year_label)
 
     visible_identity_candidates: list[set[str]] = []
+    visible_id_candidates: list[set[str]] = []
+    row_attributes = snapshot.get("row_attributes") or []
     for row in rows:
         if not isinstance(row, list) or status_index >= len(row):
             return False
@@ -765,9 +794,21 @@ def table_snapshot_matches_filter_context(
                 row[submitted_date_index],
             ))
         }
-        if not identity_hashes:
-            return False
         visible_identity_candidates.append(identity_hashes)
+        visible_id_candidates.append(
+            _dom_attribute_id_hashes(row_attributes[len(visible_id_candidates)])
+            if len(row_attributes) > len(visible_id_candidates) else set()
+        )
+
+    expected_id_hashes = response_row_id_hashes or []
+    if len(expected_id_hashes) == len(rows) and all(expected_id_hashes):
+        unmatched = list(visible_id_candidates)
+        for expected_hash in expected_id_hashes:
+            match_index = next((i for i, candidates in enumerate(unmatched) if expected_hash in candidates), -1)
+            if match_index < 0:
+                return False
+            unmatched.pop(match_index)
+        return True
 
     if len(response_identity_candidates) != len(visible_identity_candidates):
         return False
@@ -4570,7 +4611,7 @@ class CuracelPilesRunner:
                     "network": {
                         key: value
                         for key, value in network_details.items()
-                        if key != "row_identity_candidates"
+                        if key not in {"row_identity_candidates", "row_id_hashes"}
                     },
                     "selection_changed": False,
                 },
@@ -4722,6 +4763,7 @@ class CuracelPilesRunner:
                 year_label=year_label,
                 status_label=status_label,
                 response_identity_candidates=network_details.get("row_identity_candidates") or [],
+                response_row_id_hashes=network_details.get("row_id_hashes") or [],
             )
         else:
             table_state = self.wait_for_table_ready(
@@ -4738,7 +4780,7 @@ class CuracelPilesRunner:
                 "network": {
                     key: value
                     for key, value in network_details.items()
-                    if key != "row_identity_candidates"
+                    if key not in {"row_identity_candidates", "row_id_hashes"}
                 },
                 "selection_changed": True,
                 "dom_matches_response": dom_matches_response,
@@ -5029,7 +5071,18 @@ class CuracelPilesRunner:
                       const text = cells.join(' ').replace(/\s+/g, '').toLowerCase();
                       return text && text !== 'nodatafound';
                     });
-                  return { headers, rows, loading };
+                  const rowAttributes = Array.from(table.querySelectorAll('tbody tr'))
+                    .filter((row) => {
+                      const text = (row.innerText || '').replace(/\s+/g, '').toLowerCase();
+                      return text && text !== 'nodatafound';
+                    })
+                    .map((row) => Array.from(row.querySelectorAll('*')).concat([row])
+                      .flatMap((node) => Array.from(node.attributes || []))
+                      .filter((attribute) => attribute.name === 'href' || attribute.name === 'value'
+                        || attribute.name === 'id' || attribute.name === 'name'
+                        || attribute.name.startsWith('data-'))
+                      .map((attribute) => attribute.value));
+                  return { headers, rows, row_attributes: rowAttributes, loading };
                 }"""
             )
             return snapshot if isinstance(snapshot, dict) else {"headers": [], "rows": [], "loading": True}
@@ -5060,6 +5113,7 @@ class CuracelPilesRunner:
         year_label: str = "",
         status_label: str = "",
         response_identity_candidates: list[list[str]] | None = None,
+        response_row_id_hashes: list[str] | None = None,
     ) -> tuple[str, bool]:
         deadline = time.time() + (timeout_ms / 1000)
         last_state = "unreadable"
@@ -5082,6 +5136,7 @@ class CuracelPilesRunner:
                 year_label,
                 status_label,
                 response_identity_candidates or [],
+                response_row_id_hashes or [],
             ):
                 context_fingerprint = (
                     tuple(context_snapshot.get("headers") or []),

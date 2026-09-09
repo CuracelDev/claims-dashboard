@@ -1389,6 +1389,7 @@ class YearFilterScanningTests(unittest.TestCase):
         unrelated = runner.summarize_piles_response({"success": True})
 
         self.assertEqual(empty, {"authoritative": True, "item_count": 0, "total": 0})
+        self.assertEqual(len(populated.pop("row_id_hashes")), 1)
         self.assertEqual(populated, {
             "authoritative": True,
             "item_count": 1,
@@ -1899,6 +1900,23 @@ class YearFilterScanningTests(unittest.TestCase):
 
         self.assertFalse(runner.table_snapshot_matches_filter_context(
             snapshot, 1, "All", "All", "Vetting Ongoing", identities,
+        ))
+
+    def test_table_context_uses_stable_response_ids_in_dom_attributes(self):
+        snapshot = {
+            "headers": ["PROVIDER", "CLAIMS", "MONTH", "PROVIDER BILL", "SUBMITTED DATE", "STATUS"],
+            "rows": [["", "", "", "", "", "Vetting Ongoing"]],
+            "row_attributes": [["/piles/pile-live-123", "pile-live-123"]],
+            "loading": False,
+        }
+        id_hashes = runner.response_row_id_hashes([{"id": "pile-live-123"}])
+
+        self.assertTrue(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "All", "All", "Vetting Ongoing", [], id_hashes,
+        ))
+        snapshot["row_attributes"] = [["/piles/pile-stale-456"]]
+        self.assertFalse(runner.table_snapshot_matches_filter_context(
+            snapshot, 1, "All", "All", "Vetting Ongoing", [], id_hashes,
         ))
 
     def test_table_context_snapshot_rejects_rows_from_a_different_api_response(self):
