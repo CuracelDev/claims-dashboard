@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from scripts.piles_auto_assignment.domain import (
@@ -90,6 +90,53 @@ class DispatchCoverageTests(unittest.TestCase):
             WorkDisposition.COVERED_BY_ACTIVE_CYCLE,
         )
         self.assertEqual(decision.covered_by_insurer_run_id, "insurer-run-1")
+
+    def test_request_rejects_naive_requested_at_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "requested_at must be timezone-aware"):
+            WorkRequest(
+                "Jubilee Uganda",
+                WorkSource.SCHEDULE,
+                requested_at=datetime(2026, 9, 10, 10, 0),
+            )
+
+    def test_coverage_rejects_naive_active_timestamps_at_construction(self):
+        for field_name in ("active_started_at", "active_finished_at"):
+            with self.subTest(field_name=field_name):
+                values = {
+                    "active_started_at": T1,
+                    "active_finished_at": T2,
+                }
+                values[field_name] = datetime(2026, 9, 10, 9, 0)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"{field_name} must be timezone-aware",
+                ):
+                    InsurerCoverage(state="completed", **values)
+
+    def test_different_aware_offsets_compare_as_the_same_timeline(self):
+        east_africa = timezone(timedelta(hours=3))
+        request_time = datetime(2026, 9, 10, 13, 0, tzinfo=east_africa)
+        decision = decide_dispatch(
+            WorkRequest(
+                "Jubilee Uganda",
+                WorkSource.SCHEDULE,
+                requested_at=request_time,
+            ),
+            InsurerCoverage(
+                state="completed",
+                active_started_at=datetime(
+                    2026, 9, 10, 9, 0, tzinfo=timezone.utc
+                ),
+                active_finished_at=datetime(
+                    2026, 9, 10, 10, 15, tzinfo=timezone.utc
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            decision.disposition,
+            WorkDisposition.COVERED_BY_ACTIVE_CYCLE,
+        )
 
     def test_active_manual_single_insurer_request_queues_one_follow_up(self):
         decision = decide_dispatch(

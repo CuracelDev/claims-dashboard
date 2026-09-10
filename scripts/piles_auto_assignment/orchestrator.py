@@ -101,7 +101,7 @@ def derive_parent_status(
         return ParentRunStatus.COVERED_BY_ACTIVE_CYCLE
     if signal_set <= {"cancelled", "inactive"} and "cancelled" in signal_set:
         return ParentRunStatus.CANCELLED
-    if "failed" in signal_set and not signal_set & {"completed", "issue", "covered"}:
+    if "failed" in signal_set and not signal_set & {"completed", "issue"}:
         return ParentRunStatus.FAILED
     if signal_set & {"failed", "issue"}:
         return ParentRunStatus.COMPLETED_WITH_ISSUES

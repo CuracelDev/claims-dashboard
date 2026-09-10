@@ -77,6 +77,31 @@ class OrchestratorTests(unittest.TestCase):
             ParentRunStatus.FAILED,
         )
 
+    def test_covered_acknowledgement_does_not_turn_owned_failure_into_issues(self):
+        self.assertEqual(
+            derive_parent_status(
+                [
+                    WorkDisposition.COVERED_BY_ACTIVE_CYCLE,
+                    WorkDisposition.FAILED,
+                ],
+                [InsurerRunStatus.FAILED],
+            ),
+            ParentRunStatus.FAILED,
+        )
+
+    def test_owned_completion_with_covered_and_failed_work_derives_issues(self):
+        self.assertEqual(
+            derive_parent_status(
+                [
+                    WorkDisposition.COMPLETED,
+                    WorkDisposition.COVERED_BY_ACTIVE_CYCLE,
+                    WorkDisposition.FAILED,
+                ],
+                [InsurerRunStatus.COMPLETED, InsurerRunStatus.FAILED],
+            ),
+            ParentRunStatus.COMPLETED_WITH_ISSUES,
+        )
+
     def test_all_covered_work_derives_covered_by_active_cycle(self):
         self.assertEqual(
             derive_parent_status(

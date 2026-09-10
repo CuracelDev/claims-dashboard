@@ -6,6 +6,15 @@ from enum import Enum
 from typing import Any, Iterable, Mapping, Optional
 
 
+def _require_timezone_aware(name: str, value: datetime) -> None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{name} must be timezone-aware")
+
+
 class AttemptStatus(str, Enum):
     PLANNED = "planned"
     SELECTED = "selected"
@@ -92,12 +101,15 @@ class ParentRunStatus(str, Enum):
 
 @dataclass(frozen=True)
 class WorkRequest:
+    """An immutable request whose timestamp is an absolute point in time."""
+
     insurer_name: str
     source: WorkSource
     requested_at: datetime
     request_scope: Optional[RequestScope] = None
 
     def __post_init__(self) -> None:
+        _require_timezone_aware("requested_at", self.requested_at)
         insurer_name = self.insurer_name.strip()
         if not insurer_name:
             raise ValueError("insurer_name must not be empty")
@@ -116,6 +128,8 @@ class WorkRequest:
 
 @dataclass(frozen=True)
 class InsurerCoverage:
+    """Immutable coverage evidence with timezone-aware lifecycle timestamps."""
+
     state: str = "idle"
     active_started_at: Optional[datetime] = None
     active_finished_at: Optional[datetime] = None
@@ -124,6 +138,10 @@ class InsurerCoverage:
     follow_up_queued: bool = False
 
     def __post_init__(self) -> None:
+        for name in ("active_started_at", "active_finished_at"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_timezone_aware(name, value)
         state = str(self.state).strip().lower()
         if state not in {
             "idle",
