@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -2418,6 +2419,89 @@ class WorkerAdapterIntegrationTests(unittest.TestCase):
         self.assertNotIn("patient", repr(records))
 
 
+class ManualWorkflowOutcomeTests(unittest.TestCase):
+    def manual_workflow(self, *, recorded=False, v2=True):
+        events, assignment_calls, finals = [], [], []
+        class Portal:
+            def __init__(self, **_):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def login(self, *_):
+                pass
+            def select_account(self, *_):
+                pass
+            def open_piles(self):
+                pass
+            def scan_all_rows(self, *_):
+                return [make_pile(1)]
+            def scan_selected_statuses(self, *_, **__):
+                return []
+            def execute_assignment_plan(self, *_, **__):
+                assignment_calls.append("assignment")
+                raise AssertionError("Manual override must not execute assignments")
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def create_batch_with_attempts(self, *_):
+                raise AssertionError("Manual override has no assignment attempts")
+            def finalize_insurer_run(self, run_id, **fields):
+                finals.append(fields)
+        store = types.SimpleNamespace(
+            get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
+            get_bot_accounts=lambda _: [], get_weekend_roster_policy=lambda **_: None,
+            get_bot_metrics=lambda _: {}, get_team_slack_map=lambda: {},
+            get_all_tracked_tracking_keys=lambda _: set(), get_active_external_assignments=lambda _: [],
+            sync_external_assignments_for_insurer=lambda *_: None,
+            get_rule=lambda name: runner.AssignmentRule(name, "manual_override", 25, 60, 50, 60),
+            log_runner_event=lambda **event: events.append(event),
+        )
+        guard = types.SimpleNamespace(started=lambda _: None, check=lambda: None)
+        with TemporaryDirectory(prefix="piles-manual-test-") as directory, \
+                patch.object(runner, "CuracelPilesRunner", Portal), patch.object(sys, "stdout", io.StringIO()):
+            args = types.SimpleNamespace(execute=True, all_active=False, slow_mo=0, effective_date="2026-09-10",
+                                         out=str(Path(directory) / "plan.json"), worker_safe_diagnostics=v2)
+            if recorded:
+                result = runner.run_insurer_recorded(store, args, "Kenya", ["Jul"], "2026", False,
+                                                    Ledger(), "parent", ownership=guard if v2 else None)
+            else:
+                result = runner._run_for_insurer_once(store, args, "Kenya", ["Jul"], "2026", False, Ledger(), "run")
+        self.assertEqual(assignment_calls, [])
+        self.assertEqual([(event["event_type"], event["status"]) for event in events],
+                         [("runner_scan", "manual_action_required"), ("runner_complete", "manual_action_required")])
+        return result, finals, guard
+
+    def test_actual_manual_override_returns_manual_action_without_attempt_rows(self):
+        result, _, _ = self.manual_workflow()
+        self.assertEqual(result.get("workflow_status"), "manual_action_required")
+        self.assertEqual(result.get("manual_action_required_count"), 1)
+
+    def test_recorded_manual_override_cannot_finalize_as_clean_completion(self):
+        _, finals, guard = self.manual_workflow(recorded=True)
+        self.assertEqual(finals[-1]["status"], "manual_action_required")
+        self.assertEqual(finals[-1].get("error_code"), "manual_action_required")
+        self.assertEqual(guard.status, runner.InsurerRunStatus.MANUAL_ACTION_REQUIRED)
+
+    def test_empty_attempt_summary_without_explicit_workflow_success_is_not_clean(self):
+        finals = []
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def finalize_insurer_run(self, run_id, **fields):
+                finals.append(fields)
+        guard = types.SimpleNamespace(started=lambda _: None, check=lambda: None)
+        store = types.SimpleNamespace(get_master_account=lambda name: {"insurer_name": name})
+        with patch.object(runner, "run_for_insurer", lambda *_: {}):
+            runner.run_insurer_recorded(store, types.SimpleNamespace(), "Kenya", ["All"], "2026", False,
+                                       Ledger(), "parent", ownership=guard)
+        self.assertEqual(finals[-1]["status"], "completed_with_issues")
+        self.assertEqual(finals[-1].get("error_code"), "workflow_outcome_unconfirmed")
+
+    def test_legacy_manual_workflow_keeps_original_return_and_finalization_behavior(self):
+        result, finals, _ = self.manual_workflow(recorded=True, v2=False)
+        self.assertNotIn("workflow_status", result)
+        self.assertNotIn("manual_action_required_count", result)
+        self.assertEqual(finals, [{"status": "completed"}])
+
+
 class DispatcherRunnerFencingTests(unittest.TestCase):
     def modal(self, guard, *, click_error=False):
         events = []
@@ -2636,8 +2720,62 @@ class DispatcherRunnerFencingTests(unittest.TestCase):
                          ("completed", "original", '{"dispatch_requests":["opaque"]}'))
 
 
+class DispatcherNotificationPrivacyTests(unittest.TestCase):
+    hostile = 'password="SECRET-FIXTURE" <html>patient-fixture</html> private@example.invalid https://private.invalid/token'
+
+    def test_actual_parent_notification_helpers_never_print_hostile_service_errors(self):
+        plan = types.SimpleNamespace(insurer_name="Kenya", remaining_claims=10, claim_month="Jul",
+                                     filter_month="Jul", provider="Fixture", status_bucket="Vetting")
+        item = runner.NotificationItem("assignment", plan, "Bot", "Owner", "", "Bot")
+        external = runner.ExternalNotificationItem("Kenya", "Fixture", 10, 10, "Jul", "Vetting", "Bot", "Owner", "")
+        args = types.SimpleNamespace(execute=True, read_only=False, run_source="schedule", insurer=None)
+        for stage in ("external", "thread", "owner"):
+            with self.subTest(stage=stage):
+                calls, stdout, stderr = [], io.StringIO(), io.StringIO()
+                def post(*args, **fields):
+                    calls.append(fields["json"])
+                    if stage == "owner" and len(calls) == 1:
+                        return types.SimpleNamespace(raise_for_status=lambda: None,
+                                                     json=lambda: {"ok": True, "ts": "fixture-thread"})
+                    raise RuntimeError(self.hostile)
+                result = runner.DispatchResult(runner.ParentRunStatus.COMPLETED, (),
+                    (item,) if stage != "external" else (), (external,) if stage == "external" else ())
+                original_result = repr(vars(result))
+                with patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr), \
+                        patch.object(runner, "SLACK_PRISM_BOT_TOKEN", "fixture"), \
+                        patch.object(runner, "SLACK_ALERTS_CHANNEL_ID", "fixture"), \
+                        patch.object(runner.requests, "post", post, create=True):
+                    runner.notify_dispatch_result(args, result)
+                self.assertEqual(len(calls), 2 if stage == "owner" else 1)
+                observable = stdout.getvalue() + stderr.getvalue() + repr(vars(result))
+                for forbidden in ("SECRET-FIXTURE", "patient-fixture", "private@example.invalid", "https://private.invalid", "<html>"):
+                    self.assertNotIn(forbidden, observable)
+                self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+                self.assertEqual(repr(vars(result)), original_result)
+
+    def test_legacy_notification_helpers_keep_their_original_diagnostics(self):
+        plan = types.SimpleNamespace(insurer_name="Kenya", remaining_claims=10, claim_month="Jul",
+                                     filter_month="Jul", provider="Fixture", status_bucket="Vetting")
+        item = runner.NotificationItem("assignment", plan, "Bot", "Owner", "", "Bot")
+        external = runner.ExternalNotificationItem("Kenya", "Fixture", 10, 10, "Jul", "Vetting", "Bot", "Owner", "")
+        helpers = (
+            lambda: runner.send_external_assignment_alert([external], "test", "schedule"),
+            lambda: runner.create_assignment_thread("Kenya", "test", 1, 10, 0, 0),
+            lambda: runner.send_assignment_owner_reply([item], "fixture-thread"),
+            lambda: runner.send_weekend_restore_update([{"insurer_name": "Kenya", "owner_name": "Owner"}]),
+        )
+        for helper in helpers:
+            with self.subTest(helper=helper):
+                output = io.StringIO()
+                with patch.object(sys, "stdout", output), patch.object(runner, "SLACK_PRISM_BOT_TOKEN", "fixture"), \
+                        patch.object(runner, "SLACK_ALERTS_CHANNEL_ID", "fixture"), \
+                        patch.object(runner.requests, "post", side_effect=RuntimeError(self.hostile), create=True):
+                    helper()
+                self.assertIn(self.hostile, output.getvalue())
+
+
 class DispatcherMainTests(unittest.TestCase):
-    def invoke(self, state, run_one, *, execute=True, flag="true", maximum=2, terminal_replay=False):
+    def invoke(self, state, run_one, *, execute=True, flag="true", maximum=2, terminal_replay=False, restored_rows=()):
         now = datetime(2026, 9, 10, tzinfo=timezone.utc)
         self.args = types.SimpleNamespace(read_only=not execute, execute=execute, portal_environment="test",
             month="All", year="2026", visible=False, all_active=True, insurer=None, run_id="parent",
@@ -2654,7 +2792,11 @@ class DispatcherMainTests(unittest.TestCase):
                 owner.events.append(("created", fields["run_source"]))
                 return "parent"
             def try_acquire_insurer_lock(self, name):
-                return False
+                return name == "__weekend_state__" and bool(restored_rows)
+            def release_insurer_lock(self, name):
+                pass
+            def restore_due_weekend_bot_states(self, effective_date):
+                return list(restored_rows)
             def try_acquire_runner_slot(self, maximum):
                 return -1
             def mark_coalesced_request(self, *args):
@@ -2688,15 +2830,16 @@ class DispatcherMainTests(unittest.TestCase):
             notify(())
             self.events.append(("assignment_thread", tuple(fields["insurer_names"])))
             return "thread"
-        def owner_reply(items, thread):
+        def owner_reply(items, thread, **fields):
             self.assertEqual(thread, "thread")
             self.events.append(("owner_reply", tuple(item.owner_name for item in items)))
             return True
         with ExitStack() as patches:
             patches.enter_context(patch.dict(os.environ, {"PILES_AUTO_ASSIGNMENT_DISPATCHER_V2": flag,
                 "PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY": str(maximum)}))
-            patches.enter_context(patch.object(sys, "stdout", io.StringIO()))
-            patches.enter_context(patch.object(sys, "stderr", io.StringIO()))
+            self.stdout, self.stderr = io.StringIO(), io.StringIO()
+            patches.enter_context(patch.object(sys, "stdout", self.stdout))
+            patches.enter_context(patch.object(sys, "stderr", self.stderr))
             patches.enter_context(patch.object(runner, "parse_args", lambda: self.args))
             patches.enter_context(patch.object(runner, "DataStore", ParentStore))
             patches.enter_context(patch.object(runner, "build_dispatch_store", lambda store: coordinator, create=True))
@@ -2735,6 +2878,38 @@ class DispatcherMainTests(unittest.TestCase):
         self.assertEqual([event[1] for event in state.events if event[0] == "parent"],
                          [runner.ParentRunStatus.COVERED_BY_ACTIVE_CYCLE])
         self.assertFalse(any(event[0] in {"notification", "legacy_finalized"} for event in self.events))
+
+    def test_manual_results_flow_through_insurer_work_and_mixed_or_all_manual_parent(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        for manual_names in ({"Kenya"}, {"Kenya", "Uganda"}):
+            with self.subTest(manual_names=manual_names):
+                state, calls = DispatchState(), []
+                class Ledger(runner.ReadOnlyExecutionLedger):
+                    def create_insurer_run(self, parent, master):
+                        return "run-" + master["insurer_name"]
+                    def finalize_insurer_run(self, run_id, **fields):
+                        state.insurer_statuses[run_id] = fields["status"]
+                def workflow(store, args, name, *rest):
+                    calls.append(name)
+                    return {"workflow_status": "manual_action_required" if name in manual_names else "completed",
+                            "manual_action_required_count": 1 if name in manual_names else 0}
+                def recorded(work, context):
+                    context.store.get_master_account = lambda name: {"insurer_name": name}
+                    return runner.run_insurer_recorded(context.store, types.SimpleNamespace(), work.insurer_name,
+                        ["All"], "2026", False, Ledger(), "parent", ownership=context.ownership)
+                with patch.object(runner, "run_for_insurer", workflow):
+                    result = self.invoke(state, recorded)
+                self.assertCountEqual(calls, ["Kenya", "Uganda"])
+                self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED_WITH_ISSUES)
+                for outcome in result.outcomes:
+                    manual = outcome.insurer_name in manual_names
+                    expected = "manual_action_required" if manual else "completed"
+                    self.assertEqual(outcome.status.value, expected)
+                    self.assertEqual(outcome.error_code, "manual_action_required" if manual else "")
+                    self.assertEqual(state.insurer_statuses["run-" + outcome.insurer_name], expected)
+                for row in state.rows.values():
+                    self.assertEqual(row.disposition.value, "completed")
+                    self.assertEqual(row.reason_code, "manual_action_required" if row.insurer_name in manual_names else "")
 
     def test_probe_never_enqueues_or_creates_parent_and_reports_held_insurer(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
@@ -2791,6 +2966,22 @@ class DispatcherMainTests(unittest.TestCase):
                     runner.main()
         self.assertNotIn("SECRET", str(failure.exception))
         self.assertNotIn("patient", str(failure.exception))
+
+    def test_actual_v2_weekend_notification_does_not_leak_into_logs_or_durable_outcomes(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya",)), []
+        def post(*args, **fields):
+            calls.append("notification")
+            raise RuntimeError(DispatcherNotificationPrivacyTests.hostile)
+        with patch.object(runner, "SLACK_PRISM_BOT_TOKEN", "fixture"), \
+                patch.object(runner, "SLACK_ALERTS_CHANNEL_ID", "fixture"), \
+                patch.object(runner.requests, "post", post, create=True):
+            result = self.invoke(state, lambda *_: {}, restored_rows=({"insurer_name": "Kenya", "owner_name": "Owner"},))
+        self.assertEqual(calls, ["notification"])
+        observable = self.stdout.getvalue() + self.stderr.getvalue() + repr(state.rows) + repr(state.events) + repr(result)
+        for forbidden in ("SECRET-FIXTURE", "patient-fixture", "private@example.invalid", "https://private.invalid", "<html>"):
+            self.assertNotIn(forbidden, observable)
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
 
     def test_terminal_parent_replay_does_not_redispatch_or_renotify(self):
         from dataclasses import replace

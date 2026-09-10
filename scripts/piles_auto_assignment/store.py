@@ -125,6 +125,19 @@ class DispatchStore:
         return value
 
     @staticmethod
+    def _lock_claim(cursor: Any, work_id: str, claim_token: str) -> bool:
+        # Acquire the potentially contended row before sampling *any* lease
+        # or advisory-lock evidence. An UPDATE can evaluate its predicates
+        # before waiting; even pg_locks evidence then outlives lock loss.
+        # Every following mutation still rechecks token/state plus fresh time.
+        cursor.execute(
+            "SELECT id FROM piles_auto_assignment_work_items "
+            "WHERE id = %s AND claim_token = %s AND disposition = 'claimed' FOR UPDATE",
+            (work_id, claim_token),
+        )
+        return cursor.fetchone() is not None
+
+    @staticmethod
     def _lock_parent(cursor: Any, parent_id: str) -> dict[str, Any]:
         cursor.execute(
             "SELECT status, details FROM piles_auto_assignment_runner_runs WHERE id = %s FOR UPDATE",
@@ -356,12 +369,14 @@ class DispatchStore:
     def renew_claim(self, work_id: str, claim_token: str, lease_seconds: int = 120) -> bool:
         lease_seconds = self._lease_seconds(lease_seconds)
         with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
             cursor.execute(
                 """
                 UPDATE piles_auto_assignment_work_items
-                SET heartbeat_at = now(), lease_expires_at = now() + %s * interval '1 second', updated_at = now()
+                SET heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp() + %s * interval '1 second', updated_at = clock_timestamp()
                 WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
-                  AND lease_expires_at > now() RETURNING id
+                  AND lease_expires_at > clock_timestamp() RETURNING id
                 """, (lease_seconds, work_id, claim_token),
             )
             renewed = cursor.fetchone() is not None
@@ -381,15 +396,17 @@ class DispatchStore:
         if type(owner_pid) is not int or owner_pid <= 0 or type(capacity_slot) is not int or capacity_slot not in (0, 1):
             raise ValueError("A valid lock-owning backend and capacity slot are required")
         with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
             cursor.execute(
                 """
                 UPDATE piles_auto_assignment_work_items AS work
-                SET heartbeat_at = now(), lease_expires_at = now() + %s * interval '1 second',
-                    updated_at = now(),
-                    started_at = CASE WHEN %s::text IS NOT NULL THEN coalesce(started_at, now()) ELSE started_at END,
+                SET heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp() + %s * interval '1 second',
+                    updated_at = clock_timestamp(),
+                    started_at = CASE WHEN %s::text IS NOT NULL THEN coalesce(started_at, clock_timestamp()) ELSE started_at END,
                     covered_by_insurer_run_id = coalesce(%s, covered_by_insurer_run_id)
                 WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
-                  AND lease_expires_at > now()
+                  AND lease_expires_at > clock_timestamp()
                   AND (%s::text IS NULL OR EXISTS (
                     SELECT 1 FROM piles_auto_assignment_insurer_runs run
                     WHERE run.id = %s AND run.runner_run_id = work.parent_runner_run_id))
@@ -408,21 +425,23 @@ class DispatchStore:
         return renewed
 
     def release_claim(self, work_id: str, claim_token: str, reason_code: str) -> bool:
-        """Return a never-started contention attempt to guarded claim recovery.
+        """Return a never-started contention/shutdown attempt to claim recovery.
 
         Keep the same row, owner and generation. Expiring its lease avoids a
         queued/follow-up unique-index collision with a later legitimate request;
         claim_next still checks insurer-lock freedom and rotates the token.
         """
-        if reason_code not in {"worker_capacity_unavailable", "insurer_lock_unavailable"}:
-            raise ValueError("Only pre-execution lock contention may release a claim")
+        if reason_code not in {"worker_capacity_unavailable", "insurer_lock_unavailable", "dispatch_stopped"}:
+            raise ValueError("Only pre-execution contention or shutdown may release a claim")
         with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
             cursor.execute(
                 """
                 UPDATE piles_auto_assignment_work_items
-                SET lease_expires_at = now(), heartbeat_at = now(), updated_at = now(), reason_code = %s
+                SET lease_expires_at = clock_timestamp(), heartbeat_at = clock_timestamp(), updated_at = clock_timestamp(), reason_code = %s
                 WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
-                  AND lease_expires_at > now() AND started_at IS NULL
+                  AND lease_expires_at > clock_timestamp() AND started_at IS NULL
                 RETURNING id
                 """, (reason_code, work_id, claim_token),
             )
@@ -437,13 +456,15 @@ class DispatchStore:
         if reason_code and (len(reason_code) > 80 or re.fullmatch(r"[a-z0-9._-]+", reason_code) is None):
             raise ValueError("reason_code must be a bounded sanitized code")
         with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
             cursor.execute(
                 """
                 UPDATE piles_auto_assignment_work_items
                 SET disposition = %s, covered_by_insurer_run_id = %s, reason_code = %s,
-                    finished_at = now(), heartbeat_at = now(), lease_expires_at = NULL, updated_at = now()
+                    finished_at = clock_timestamp(), heartbeat_at = clock_timestamp(), lease_expires_at = NULL, updated_at = clock_timestamp()
                 WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
-                  AND lease_expires_at > now()
+                  AND lease_expires_at > clock_timestamp()
                 RETURNING id
                 """, (disposition.value, insurer_run_id, reason_code or None, work_id, claim_token),
             )

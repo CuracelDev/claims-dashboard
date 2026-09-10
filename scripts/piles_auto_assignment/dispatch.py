@@ -121,6 +121,7 @@ class ClaimOwnership:
         self.owner_pid, self.slot, self.lease_seconds = owner_pid, slot, lease_seconds
         self.insurer_run_id = ""
         self.status = InsurerRunStatus.COMPLETED
+        self.error_code = ""
         self.lost = False
 
     def check(self, phase: str = "", *, insurer_run_id=None) -> None:
@@ -151,7 +152,7 @@ def execute_claimed_insurer(
     work: ClaimedWork,
     context_factory: Callable[[ClaimedWork], ContextManager[WorkerContext]],
     run_one: Callable[[ClaimedWork, WorkerContext], Any],
-    *, lease_seconds: int = 120,
+    *, lease_seconds: int = 120, stop_event=None,
 ) -> InsurerOutcome:
     """Execute exactly once after lock acquisition, never consume legacy work.
 
@@ -161,6 +162,8 @@ def execute_claimed_insurer(
     """
     ownership = None
     try:
+        if stop_event is not None and stop_event.is_set():
+            raise WorkerUnavailable("dispatch_stopped")
         with context_factory(work) as context:
             with ExitStack() as locks:
                 slot = context.store.try_acquire_runner_slot(context.max_concurrency)
@@ -175,6 +178,8 @@ def execute_claimed_insurer(
                                                context.store.conn.get_backend_pid(), slot, lease_seconds)
                     context = replace(context, ownership=ownership)
                     ownership.check()
+                if stop_event is not None and stop_event.is_set():
+                    raise WorkerUnavailable("dispatch_stopped")
                 try:
                     result = run_one(work, context)
                 except Exception:
@@ -187,7 +192,8 @@ def execute_claimed_insurer(
                 # acknowledgement; the bound raw buffer stays worker-local.
                 output = "Worker output withheld.\n" if context.output.getvalue() else ""
                 value = WorkerResult(result, output, ownership.insurer_run_id if ownership else "")
-        return InsurerOutcome(work.insurer_name, ownership.status if ownership else InsurerRunStatus.COMPLETED, value=value)
+        return InsurerOutcome(work.insurer_name, ownership.status if ownership else InsurerRunStatus.COMPLETED,
+                              value=value, error_code=ownership.error_code if ownership else "")
     except Exception as error:
         code, message = safe_worker_error(error)
         return InsurerOutcome(work.insurer_name, InsurerRunStatus.FAILED,
@@ -256,8 +262,12 @@ def dispatch_parent(parent_id, work_items, max_workers, context_factory, run_one
                         break
                     if work.parent_runner_run_id != parent_id or work.disposition != WorkDisposition.CLAIMED:
                         raise ValueError("Dispatcher received work not claimed for this parent")
+                    if stopped.is_set():
+                        if not store.release_claim(work.id, work.claim_token, "dispatch_stopped"):
+                            lost_ownership = True
+                        break
                     pending[pool.submit(execute_claimed_insurer, work, owned_context, run_one,
-                                        lease_seconds=lease_seconds)] = work
+                                        lease_seconds=lease_seconds, stop_event=stopped)] = work
                 if not pending:
                     try:
                         status = store.finalize_parent(parent_id)
@@ -277,7 +287,7 @@ def dispatch_parent(parent_id, work_items, max_workers, context_factory, run_one
                         code, message = safe_worker_error(error)
                         outcome = InsurerOutcome(work.insurer_name, InsurerRunStatus.FAILED,
                                                  error_code=code, error_message=message)
-                    if outcome.error_code in {"worker_capacity_unavailable", "insurer_lock_unavailable"}:
+                    if outcome.error_code in {"worker_capacity_unavailable", "insurer_lock_unavailable", "dispatch_stopped"}:
                         if not store.release_claim(work.id, work.claim_token, outcome.error_code):
                             lost_ownership = True
                         contended = True

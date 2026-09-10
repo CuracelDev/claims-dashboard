@@ -75,6 +75,7 @@ class DispatchState:
         self.claim_attempts = 0
         self.contention = 0
         self.references = []
+        self.insurer_statuses = {}
 
     def store(self):
         state = self
@@ -110,7 +111,8 @@ class DispatchState:
                     row = state.rows[work_id]
                     if row.claim_token != token or row.disposition != WorkDisposition.CLAIMED:
                         return False
-                    state.rows[work_id] = replace(row, disposition=disposition)
+                    state.rows[work_id] = replace(row, disposition=disposition,
+                        covered_by_insurer_run_id=insurer_run_id or "", reason_code=reason_code)
                     state.events.append(("finish", work_id, str(disposition)))
                     return True
 
@@ -128,7 +130,10 @@ class DispatchState:
                     owned = [row.disposition for row in state.rows.values() if row.parent_runner_run_id == parent_id]
                     if any(value in {"queued", "claimed", "follow_up_queued"} for value in owned + state.references):
                         raise dispatch.ParentWorkPending("Owned or referenced work is nonterminal")
-                    status = derive_parent_status(owned or (["covered_by_active_cycle"] if state.references else []), [])
+                    insurer_statuses = [state.insurer_statuses[row.covered_by_insurer_run_id]
+                        for row in state.rows.values() if row.parent_runner_run_id == parent_id
+                        and row.covered_by_insurer_run_id in state.insurer_statuses]
+                    status = derive_parent_status(owned or (["covered_by_active_cycle"] if state.references else []), insurer_statuses)
                     state.events.append(("parent", status, threading.get_ident()))
                     return status
         return Store()
@@ -377,6 +382,58 @@ class BoundedDispatcherTests(unittest.TestCase):
         result = self.run_dispatch(state, lambda *_: self.fail("portal must not run"), stop_event=stopped)
         self.assertEqual(result.status, ParentRunStatus.RUNNING)
         self.assertEqual(state.events, [])
+
+    def test_stop_during_claim_releases_never_started_work_without_portal_entry(self):
+        state, calls, stopped = DispatchState(("Kenya",)), [], threading.Event()
+        coordinator = state.store()
+        claim_next = coordinator.claim_next
+        def interrupted_claim(*args):
+            work = claim_next(*args)
+            stopped.set()
+            return work
+        coordinator.claim_next = interrupted_claim
+        result = dispatch.dispatch_parent("parent", tuple(state.rows.values()), 1, state.context,
+            lambda work, context: calls.append(work.id), store=coordinator, stop_event=stopped, poll_interval=0.001)
+        self.assertEqual(calls, [])
+        self.assertEqual(state.contexts, [])
+        self.assertEqual(result.outcomes, ())
+        self.assertEqual(result.status, ParentRunStatus.RUNNING)
+        self.assertEqual(state.rows["0"].disposition, WorkDisposition.QUEUED)
+        self.assertIn(("release_claim", "0", "dispatch_stopped"), state.events)
+        self.assertFalse(any(event[0] in {"finish", "parent"} for event in state.events))
+
+        recovered = self.run_dispatch(state, lambda work, context: calls.append(work.id) or {})
+        self.assertEqual(calls, ["0"])
+        self.assertEqual(state.claim_attempts, 2)
+        self.assertEqual(recovered.status, ParentRunStatus.COMPLETED)
+
+    def test_stop_after_pool_submission_still_fences_portal_entry(self):
+        state, calls, stopped = DispatchState(("Kenya",)), [], threading.Event()
+        class StoppingPool(ThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                stopped.set()
+                return super().submit(*args, **kwargs)
+        with patch.object(dispatch, "ThreadPoolExecutor", StoppingPool):
+            result = self.run_dispatch(state, lambda work, context: calls.append(work.id), stop_event=stopped)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.status, ParentRunStatus.RUNNING)
+        self.assertEqual(result.outcomes, ())
+        self.assertEqual(state.rows["0"].disposition, WorkDisposition.QUEUED)
+        self.assertIn(("release_claim", "0", "dispatch_stopped"), state.events)
+
+    def test_stop_during_worker_setup_prevents_portal_entry_and_preserves_claim(self):
+        state, calls, stopped = DispatchState(("Kenya",)), [], threading.Event()
+        @contextmanager
+        def context(work):
+            with state.context(work) as resources:
+                stopped.set()
+                yield resources
+        result = dispatch.dispatch_parent("parent", tuple(state.rows.values()), 1, context,
+            lambda work, context: calls.append(work.id), store=state.store(), stop_event=stopped, poll_interval=0.001)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.status, ParentRunStatus.RUNNING)
+        self.assertEqual(result.outcomes, ())
+        self.assertEqual(state.rows["0"].disposition, WorkDisposition.QUEUED)
 
     def test_foreign_work_is_never_submitted(self):
         state, calls = DispatchState(), []

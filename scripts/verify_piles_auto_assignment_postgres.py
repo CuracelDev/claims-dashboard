@@ -1,0 +1,213 @@
+"""Explicit disposable-PostgreSQL regression gate (not part of offline discovery).
+
+Run from the repository root with:
+  python3 -m scripts.verify_piles_auto_assignment_postgres --bridge /path/to/pg-bridge.cjs
+
+The supplied local Node DB-API bridge must target a disposable database containing
+the Piles schema. These tests insert uniquely named fixture rows, use independent
+real PostgreSQL sessions, and never connect to a portal or notification service.
+"""
+
+import argparse
+import json
+import subprocess
+import threading
+import time
+import unittest
+import uuid
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+from scripts.test_piles_auto_assignment_dispatch import dispatch
+from scripts import test_piles_auto_assignment_runner as runner_tests
+
+runner = runner_tests.runner
+
+
+class Connection:
+    autocommit = False
+
+    def __init__(self, bridge):
+        self.process = subprocess.Popen(["node", bridge], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, text=True)
+
+    def query(self, sql, params=()):
+        self.process.stdin.write(json.dumps({"sql": sql, "params": params}, default=str) + "\n")
+        self.process.stdin.flush()
+        result = json.loads(self.process.stdout.readline())
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            def __enter__(self):
+                connection.query("BEGIN")
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, sql, params=()):
+                result = connection.query(sql, params)
+                self.description = result.get("fields") or []
+                self.rows = [tuple(datetime.fromisoformat(row[name]) if oid == 1184 and row[name]
+                                   else row[name] for name, oid in self.description)
+                             for row in result.get("rows") or []]
+
+            def fetchone(self):
+                return self.rows[0] if self.rows else None
+
+            def fetchall(self):
+                return self.rows
+
+        return Cursor()
+
+    def commit(self):
+        self.query("COMMIT")
+
+    def rollback(self):
+        self.query("ROLLBACK")
+
+    def close(self):
+        self.process.stdin.close()
+        self.process.wait(timeout=5)
+        self.process.stdout.close()
+
+
+class FinalAssignmentPostgresTests(unittest.TestCase):
+    bridge = ""
+
+    def setUp(self):
+        self.connections = [Connection(self.bridge) for _ in range(4)]
+        self.admin, self.worker, self.lock_owner, self.blocker = self.connections
+        for connection in self.connections:
+            self.addCleanup(connection.close)
+        suffix = uuid.uuid4().hex
+        self.insurer, self.parent = "Fence fixture " + suffix, "fence-parent-" + suffix
+        self.admin.query("INSERT INTO piles_auto_assignment_master_accounts(id,insurer_name,login_email) "
+                         "VALUES (%s,%s,%s)", [self.insurer, self.insurer, "fixture.invalid"])
+        self.admin.query("INSERT INTO piles_auto_assignment_runner_runs(id,status,mode,run_scope) "
+                         "VALUES (%s,'started','execute','all-active')", [self.parent])
+        self.store = runner.DispatchStore(self.worker)
+        self.store.enqueue_parent_work(self.parent, [runner.WorkRequest(self.insurer, "schedule", datetime.now(timezone.utc))])
+        self.work = self.store.claim_next(self.parent, "fixture-worker")
+        self.lock_key = "piles-insurer:" + self.work.canonical_insurer_name
+        for key in (self.lock_key, "piles-capacity:0"):
+            self.lock_owner.query("SELECT pg_advisory_lock(hashtextextended(%s,0))", [key])
+        self.owner_pid = self.lock_owner.query("SELECT pg_backend_pid() AS pid")["rows"][0]["pid"]
+        self.worker_pid = self.worker.query("SELECT pg_backend_pid() AS pid")["rows"][0]["pid"]
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            threading.Event().wait(0.01)
+        self.fail("Disposable PostgreSQL did not reach the expected lock/clock boundary")
+
+    def assert_final_click_fenced(self, *, expire_lease=False):
+        owner = dispatch.ClaimOwnership(self.work, self.store, self.owner_pid, 0,
+                                        1 if expire_lease else 120)
+        browser, clicks = runner_tests.DispatcherRunnerFencingTests().modal(owner.check)
+        locked, errors = threading.Event(), []
+
+        def before_submit():
+            # The first guard has passed. Hold the work row immediately before
+            # the second (final) guard, just as slow evidence persistence can.
+            self.blocker.query("BEGIN")
+            self.blocker.query("SELECT id FROM piles_auto_assignment_work_items WHERE id=%s FOR UPDATE",
+                               [self.work.id])
+            locked.set()
+
+        browser._before_assignment_submit = before_submit
+
+        def apply():
+            try:
+                browser._apply_assignment_modal("Vetting", "Assignee", True)
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(runner.time, "sleep", lambda _: None):
+            thread = threading.Thread(target=apply)
+            thread.start()
+            try:
+                self.assertTrue(locked.wait(5))
+                self.wait_until(lambda: self.admin.query(
+                    "SELECT wait_event_type='Lock' AS blocked FROM pg_stat_activity WHERE pid=%s",
+                    [self.worker_pid])["rows"][0]["blocked"])
+                if expire_lease:
+                    # Keep both locks: elapsed wall-clock lease expiry alone
+                    # must fence a transaction that started before expiry.
+                    self.wait_until(lambda: self.admin.query(
+                        "SELECT lease_expires_at <= clock_timestamp() AS expired "
+                        "FROM piles_auto_assignment_work_items WHERE id=%s", [self.work.id])["rows"][0]["expired"])
+                else:
+                    self.lock_owner.query("SELECT pg_advisory_unlock(hashtextextended(%s,0))", [self.lock_key])
+            finally:
+                self.blocker.commit()
+                thread.join(timeout=8)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(clicks, [], "A stale final guard must not click any assignment candidate")
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], runner.WorkOwnershipLost)
+        self.assertTrue(owner.lost)
+        with self.assertRaises(runner.WorkOwnershipLost):
+            owner.check()
+        self.assertEqual(self.admin.query("SELECT disposition FROM piles_auto_assignment_work_items WHERE id=%s",
+                                         [self.work.id])["rows"][0]["disposition"], "claimed")
+
+    def test_lock_loss_during_final_guard_row_wait_prevents_assignment(self):
+        self.assert_final_click_fenced()
+
+    def test_lease_expiry_during_final_guard_row_wait_prevents_assignment(self):
+        self.assert_final_click_fenced(expire_lease=True)
+
+    def assert_expired_transition_fenced(self, transition):
+        self.assertTrue(self.store.heartbeat_claim(self.work.id, self.work.claim_token, self.owner_pid, 0, 1))
+        self.blocker.query("BEGIN")
+        self.blocker.query("SELECT id FROM piles_auto_assignment_work_items WHERE id=%s FOR UPDATE", [self.work.id])
+        results, errors = [], []
+        def transition_once():
+            try:
+                results.append(transition())
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=transition_once)
+        thread.start()
+        try:
+            self.wait_until(lambda: errors or self.admin.query(
+                "SELECT wait_event_type='Lock' AS blocked FROM pg_stat_activity WHERE pid=%s",
+                [self.worker_pid])["rows"][0]["blocked"])
+            self.assertEqual(errors, [])
+            self.wait_until(lambda: self.admin.query(
+                "SELECT lease_expires_at <= clock_timestamp() AS expired "
+                "FROM piles_auto_assignment_work_items WHERE id=%s", [self.work.id])["rows"][0]["expired"])
+        finally:
+            self.blocker.commit()
+            thread.join(timeout=8)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [False])
+        self.assertEqual(self.admin.query("SELECT disposition FROM piles_auto_assignment_work_items WHERE id=%s",
+                                         [self.work.id])["rows"][0]["disposition"], "claimed")
+
+    def test_lease_expiry_during_terminal_row_wait_prevents_false_completion(self):
+        self.assert_expired_transition_fenced(lambda: self.store.finish_claim(
+            self.work.id, self.work.claim_token, dispatch.WorkDisposition.COMPLETED))
+
+    def test_lease_expiry_during_renew_row_wait_prevents_resurrection(self):
+        self.assert_expired_transition_fenced(lambda: self.store.renew_claim(self.work.id, self.work.claim_token))
+
+    def test_lease_expiry_during_release_row_wait_refuses_the_expired_owner(self):
+        self.assert_expired_transition_fenced(lambda: self.store.release_claim(
+            self.work.id, self.work.claim_token, "dispatch_stopped"))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bridge", required=True, help="Inspected local bridge to a disposable PostgreSQL database")
+    FinalAssignmentPostgresTests.bridge = parser.parse_args().bridge
+    unittest.main(argv=[__file__], verbosity=2)

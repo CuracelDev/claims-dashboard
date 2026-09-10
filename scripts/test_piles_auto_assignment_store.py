@@ -299,7 +299,9 @@ class LeaseSqlConnection:
 
     def __init__(self):
         self.database = sqlite3.connect(":memory:")
+        self.wall_time = 1000
         self.database.create_function("now", 0, lambda: 1000)
+        self.database.create_function("clock_timestamp", 0, lambda: self.wall_time)
         self.database.create_function("current_database", 0, lambda: "fixture")
         self.database.create_function("hashtextextended", 2,
                                       lambda key, seed: {"piles-insurer:OLD MUTUAL": 11, "piles-capacity:0": 12}.get(key, 99))
@@ -332,7 +334,7 @@ class LeaseSqlConnection:
                 self.raw.close()
             def execute(self, sql, params=()):
                 sql = sql.replace("%s", "?").replace("::bigint", "").replace("::text", "")
-                sql = sql.replace("* interval '1 second'", "")
+                sql = sql.replace("* interval '1 second'", "").replace(" FOR UPDATE", "")
                 self.raw.execute(sql, params)
                 self.description = self.raw.description
             def fetchone(self):
@@ -364,6 +366,13 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         ).fetchone(), (1060, 1000, "run"))
         self.assertFalse(self.heartbeat(run_id="foreign"))
 
+    def test_heartbeat_uses_fresh_clock_not_transaction_start_to_fence_expiry(self):
+        self.connection.wall_time = 1121
+        self.assertFalse(self.heartbeat())
+        self.assertEqual(self.connection.database.execute(
+            "SELECT lease_expires_at,heartbeat_at FROM piles_auto_assignment_work_items"
+        ).fetchone(), (1120, None))
+
     def test_token_expiry_and_actual_session_locks_all_fence_heartbeat(self):
         self.assertFalse(self.heartbeat(token="stale"))
         for mutation in ("UPDATE pg_locks SET pid=42", "DELETE FROM pg_locks WHERE objid=11",
@@ -394,6 +403,24 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.connection.commit()
         self.assertFalse(self.store.release_claim("work", "current", "insurer_lock_unavailable"))
 
+    def test_shutdown_release_is_token_fenced_and_never_finalizes_work(self):
+        try:
+            self.assertFalse(self.store.release_claim("work", "stale", "dispatch_stopped"))
+            self.assertTrue(self.store.release_claim("work", "current", "dispatch_stopped"))
+        except ValueError:
+            self.fail("A never-started shutdown claim must be recoverably releasable")
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,lease_expires_at,finished_at,reason_code FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", 1000, None, "dispatch_stopped"))
+
+    def test_shutdown_cannot_release_started_work(self):
+        self.connection.database.execute("UPDATE piles_auto_assignment_work_items SET started_at=950")
+        self.connection.commit()
+        try:
+            self.assertFalse(self.store.release_claim("work", "current", "dispatch_stopped"))
+        except ValueError:
+            self.fail("Shutdown release must use the same started-work ownership guard")
+
     def test_expired_or_replaced_token_cannot_finalize_work(self):
         self.assertFalse(self.store.finish_claim("work", "stale", WorkDisposition.COMPLETED))
         self.connection.database.execute("UPDATE piles_auto_assignment_work_items SET lease_expires_at=1000")
@@ -402,6 +429,27 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.assertEqual(self.connection.database.execute(
             "SELECT disposition FROM piles_auto_assignment_work_items"
         ).fetchone(), ("claimed",))
+
+    def test_finish_does_not_accept_a_lease_live_only_at_transaction_start(self):
+        self.connection.wall_time = 1121
+        self.assertFalse(self.store.finish_claim("work", "current", WorkDisposition.COMPLETED))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,finished_at FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", None))
+
+    def test_renew_does_not_resurrect_a_lease_live_only_at_transaction_start(self):
+        self.connection.wall_time = 1121
+        self.assertFalse(self.store.renew_claim("work", "current"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT lease_expires_at,heartbeat_at FROM piles_auto_assignment_work_items"
+        ).fetchone(), (1120, None))
+
+    def test_release_does_not_mutate_a_claim_expired_since_transaction_start(self):
+        self.connection.wall_time = 1121
+        self.assertFalse(self.store.release_claim("work", "current", "dispatch_stopped"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT lease_expires_at,reason_code FROM piles_auto_assignment_work_items"
+        ).fetchone(), (1120, None))
 
     def test_summary_exposes_submitted_and_manual_action_before_success_aggregation(self):
         self.connection.database.executescript("""
@@ -540,17 +588,17 @@ class DispatchStoreTests(unittest.TestCase):
         self.assertEqual((self.connection.commit_count, self.connection.rollback_count), (0, 1))
 
     def test_renew_and_finish_are_token_fenced(self):
-        self.make_store([{"id": "work-1"}], [{"id": "work-1"}])
+        self.make_store(*([[{"id": "work-1"}]] * 4))
         self.assertTrue(self.store.renew_claim("work-1", "token-1", 30))
         self.assertTrue(self.store.finish_claim("work-1", "token-1", WorkDisposition.COMPLETED, "insurer-run-1"))
         for sql, params in self.connection.statements:
             self.assertIn("claim_token = %s", sql)
             self.assertIn("disposition = 'claimed'", sql)
             self.assertIn("token-1", params)
-        self.assertIn("lease_expires_at > now()", self.connection.statements[0][0])
-        self.assertIn("finished_at = now()", self.connection.statements[1][0])
-        self.assertIn("insurer-run-1", self.connection.statements[1][1])
-        self.assertIn(None, self.connection.statements[1][1])  # empty reason is SQL NULL
+        self.assertIn("lease_expires_at > clock_timestamp()", self.connection.statements[1][0])
+        self.assertIn("finished_at = clock_timestamp()", self.connection.statements[3][0])
+        self.assertIn("insurer-run-1", self.connection.statements[3][1])
+        self.assertIn(None, self.connection.statements[3][1])  # empty reason is SQL NULL
         self.assertEqual(self.connection.commit_count, 2)
 
     def test_stale_token_cannot_renew_or_finish(self):
@@ -618,7 +666,7 @@ class DispatchStoreTests(unittest.TestCase):
     def test_store_connection_is_separate_from_ledger_and_is_closed(self):
         ledger_connection = RecordingConnection()
         ledger = ExecutionLedger(ledger_connection)
-        self.make_store([{"id": "work-1"}])
+        self.make_store([{"id": "work-1"}], [{"id": "work-1"}])
         self.store.renew_claim("work-1", "token-1")
         self.store.close()
         self.assertTrue(self.connection.closed)

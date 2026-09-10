@@ -906,7 +906,7 @@ def send_weekend_schedule_update(
         print(f"\n⚠️ Slack weekend schedule update failed for {insurer_name}: {exc}")
 
 
-def send_weekend_restore_update(restored_rows: list[dict[str, Any]]) -> None:
+def send_weekend_restore_update(restored_rows: list[dict[str, Any]], *, safe_diagnostics: bool = False) -> None:
     if not restored_rows or not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return
     by_insurer: dict[str, list[str]] = {}
@@ -923,7 +923,10 @@ def send_weekend_restore_update(restored_rows: list[dict[str, Any]]) -> None:
     try:
         slack_post_message(SLACK_PRISM_BOT_TOKEN, SLACK_ALERTS_CHANNEL_ID, text)
     except Exception as exc:
-        print(f"\n⚠️ Slack weekend restore update failed: {exc}")
+        if safe_diagnostics:
+            print("WARNING: weekend roster notification failed.")
+        else:
+            print(f"\n⚠️ Slack weekend restore update failed: {exc}")
 
 
 def create_assignment_thread(
@@ -934,6 +937,7 @@ def create_assignment_thread(
     reassigned_piles: int,
     reassigned_claims: int,
     insurer_names: list[str] | None = None,
+    *, safe_diagnostics: bool = False,
 ) -> str | None:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return None
@@ -983,11 +987,14 @@ def create_assignment_thread(
         )
         return str(result.get("ts") or "")
     except Exception as exc:
-        print(f"\n⚠️ Slack thread creation failed for {scope_label}: {exc}")
+        if safe_diagnostics:
+            print("WARNING: assignment summary notification failed.")
+        else:
+            print(f"\n⚠️ Slack thread creation failed for {scope_label}: {exc}")
         return None
 
 
-def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts: str) -> bool:
+def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts: str, *, safe_diagnostics: bool = False) -> bool:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID and thread_ts):
         return False
     if not owner_items:
@@ -1093,7 +1100,10 @@ def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts
         )
         return True
     except Exception as exc:
-        print(f"   ⚠️ Slack owner summary failed for {owner_name}: {exc}")
+        if safe_diagnostics:
+            print("WARNING: assignment owner notification failed.")
+        else:
+            print(f"   ⚠️ Slack owner summary failed for {owner_name}: {exc}")
         return False
 
 
@@ -1101,6 +1111,7 @@ def send_external_assignment_alert(
     items: list["ExternalNotificationItem"],
     portal_environment: str,
     run_source: str,
+    *, safe_diagnostics: bool = False,
 ) -> bool:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return False
@@ -1153,7 +1164,10 @@ def send_external_assignment_alert(
         )
         return True
     except Exception as exc:
-        print(f"\n⚠️ Slack external-assignment alert failed: {exc}")
+        if safe_diagnostics:
+            print("WARNING: external assignment notification failed.")
+        else:
+            print(f"\n⚠️ Slack external-assignment alert failed: {exc}")
         return False
 
 
@@ -8580,7 +8594,7 @@ def _run_for_insurer_once(
     )
 
     print("\nDone.")
-    return {
+    result = {
         "insurer_name": insurer_name,
         "captured_at": captured_at,
         "tracked_reconcile": tracked_reconcile,
@@ -8601,6 +8615,12 @@ def _run_for_insurer_once(
         "external_notification_items": external_detection["notifications"],
         "late_arrival_detection": late_arrival_detection,
     }
+    if getattr(args, "worker_safe_diagnostics", False):
+        # A manual workflow can have no assignment attempts at all. Carry its
+        # explicit result across the worker boundary, not only ledger counts.
+        result["workflow_status"] = "manual_action_required" if manual_action_count else "completed"
+        result["manual_action_required_count"] = manual_action_count
+    return result
 
 
 def run_for_insurer(
@@ -8668,14 +8688,26 @@ def run_insurer_recorded(
         )
         if insurer_run_id:
             status = "completed"
+            error_code = ""
             if ownership:
                 ownership.check()
                 summary = execution_ledger.summarize_insurer_run(insurer_run_id)
-                if any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed", "manual_action_required")):
+                workflow_status = result.get("workflow_status") if isinstance(result, dict) else None
+                manual_count = safe_int(result.get("manual_action_required_count"), 0) if isinstance(result, dict) else 0
+                if workflow_status == "manual_action_required" or manual_count or summary.get("manual_action_required", 0):
+                    status, error_code = "manual_action_required", "manual_action_required"
+                elif workflow_status not in {"completed", "completed_with_issues"}:
+                    status, error_code = "completed_with_issues", "workflow_outcome_unconfirmed"
+                elif workflow_status == "completed_with_issues" or any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed")):
                     status = "completed_with_issues"
+                    error_code = "assignment_follow_up_required"
                 ownership.status = InsurerRunStatus(status)
+                ownership.error_code = error_code
                 ownership.check()
-            execution_ledger.finalize_insurer_run(insurer_run_id, status=status)
+            fields = {"status": status}
+            if error_code:
+                fields["error_code"] = error_code
+            execution_ledger.finalize_insurer_run(insurer_run_id, **fields)
         return result
     except Exception as exc:
         if ownership:
@@ -8727,7 +8759,7 @@ def notify_dispatch_result(args: argparse.Namespace, result: DispatchResult) -> 
     if should_send_external_assignment_alert(args, external):
         try:
             send_external_assignment_alert(external, portal_environment=PORTAL_ENVIRONMENT,
-                                           run_source=norm(args.run_source) or "manual")
+                                           run_source=norm(args.run_source) or "manual", safe_diagnostics=True)
         except Exception:
             print("WARNING: external assignment notification failed.")
     items = list(result.notification_items)
@@ -8741,10 +8773,11 @@ def notify_dispatch_result(args: argparse.Namespace, result: DispatchResult) -> 
             assigned_piles=len(assigned), assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned),
             reassigned_piles=len(reassigned), reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned),
             insurer_names=[item.plan.insurer_name for item in items],
+            safe_diagnostics=True,
         ) or ""
         if thread:
             for owner_items in group_notification_items_by_owner(items):
-                send_assignment_owner_reply(owner_items, thread)
+                send_assignment_owner_reply(owner_items, thread, safe_diagnostics=True)
     except Exception:
         print("WARNING: assignment summary notification failed.")
 
@@ -8827,7 +8860,7 @@ def main_v2() -> DispatchResult:
                 notify_dispatch_result(args, result)
                 if restored:
                     try:
-                        send_weekend_restore_update(restored)
+                        send_weekend_restore_update(restored, safe_diagnostics=True)
                     except Exception:
                         print("WARNING: weekend roster notification failed.")
                 if result.status == ParentRunStatus.RUNNING:
