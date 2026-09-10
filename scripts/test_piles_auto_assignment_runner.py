@@ -1,9 +1,13 @@
 import importlib.util
+import io
 import os
 import sys
+import threading
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_runner_module():
@@ -2229,6 +2233,238 @@ class PerPileVerificationIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(applied), 1)
         self.assertFalse(applied[0].verified_on_table)
+
+
+class WorkerAdapterIntegrationTests(unittest.TestCase):
+    def test_worker_scan_failure_persists_only_normalized_diagnostics(self):
+        records = []
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def fail_scan_context(self, context_id, **fields):
+                records.append(fields)
+        browser = runner.CuracelPilesRunner()
+        browser.safe_diagnostics = True
+        browser.execution_ledger = Ledger()
+        browser.insurer_run_id = "run"
+        browser.year_filter_capabilities = lambda: (False, ["2026"])
+        def fail(*_):
+            raise RuntimeError('credential="SECRET" <html>patient</html>')
+        browser._scan_status_with_transient_retry = fail
+        with patch.object(sys, "stdout", io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                browser.scan_all_rows(["All"], "2026")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["error_code"], "authentication_failed")
+        self.assertNotIn("SECRET", repr(records))
+        self.assertNotIn("patient", repr(records))
+
+    def test_worker_factory_rejects_unsupported_capacity_before_opening_resources(self):
+        from scripts.piles_auto_assignment.dispatch import ContextOutputRouter
+        for capacity in (0, 3, True, "2"):
+            with self.subTest(capacity=capacity):
+                with self.assertRaises(ValueError):
+                    runner.worker_context_factory(types.SimpleNamespace(read_only=False), ContextOutputRouter(io.StringIO()), max_concurrency=capacity)
+
+    def test_worker_factory_closes_store_and_buffer_when_ledger_close_fails(self):
+        from scripts.test_piles_auto_assignment_dispatch import claimed, Resource
+        from scripts.piles_auto_assignment.dispatch import ContextOutputRouter
+        store = Resource()
+        class Ledger:
+            def close(self):
+                raise RuntimeError("expected close failure")
+        router = ContextOutputRouter(io.StringIO())
+        with patch.object(runner, "DataStore", lambda **_: store), patch.object(runner, "build_execution_ledger", lambda *_a, **_kw: Ledger()):
+            with self.assertRaisesRegex(RuntimeError, "expected close failure"):
+                with runner.worker_context_factory(types.SimpleNamespace(read_only=False), router)(claimed()) as context:
+                    pass
+        self.assertEqual(store.events, ["close"])
+        self.assertTrue(context.output.closed)
+
+    def test_dispatch_flag_is_explicit_opt_in(self):
+        self.assertTrue(callable(getattr(runner, "dispatcher_v2_enabled", None)), "Dispatcher opt-in is missing")
+        for value, expected in [(None, False), ("", False), ("false", False), ("garbage", False), (" TRUE ", True), ("1", True)]:
+            environment = {} if value is None else {"PILES_AUTO_ASSIGNMENT_DISPATCHER_V2": value}
+            self.assertIs(runner.dispatcher_v2_enabled(environment), expected)
+
+    def test_worker_factory_owns_independent_connections_and_closes_on_failure(self):
+        self.assertTrue(callable(getattr(runner, "worker_context_factory", None)), "Worker factory is missing")
+        from scripts.test_piles_auto_assignment_dispatch import claimed
+        from scripts.piles_auto_assignment.dispatch import ContextOutputRouter
+        connections = []
+        class Connection:
+            autocommit = True
+            closed = False
+            def close(self):
+                self.closed = True
+        def connect(_url):
+            connection = Connection()
+            connections.append(connection)
+            return connection
+        args = types.SimpleNamespace(read_only=False)
+        barrier = threading.Barrier(2)
+        def visit(work):
+            with factory(work) as context:
+                barrier.wait(timeout=3)
+                self.assertIsNot(context.store.conn, context.ledger.connection)
+                self.assertTrue(context.store.conn.autocommit)
+                self.assertFalse(context.ledger.connection.autocommit)
+                return context
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://fixture", "PILES_EXECUTION_LEDGER_ENABLED": "false"}):
+            with patch.object(runner.psycopg2, "connect", connect, create=True):
+                with ContextOutputRouter.installed() as router:
+                    factory = runner.worker_context_factory(args, router, max_concurrency=2)
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        contexts = list(pool.map(visit, [claimed("Kenya"), claimed("Uganda")]))
+                    with self.assertRaisesRegex(ValueError, "expected"):
+                        with factory(claimed()):
+                            raise ValueError("expected")
+        self.assertEqual(len(connections), 6)
+        self.assertTrue(all(c.closed for c in connections))
+        self.assertIsNot(contexts[0].store, contexts[1].store)
+        self.assertIsNot(contexts[0].ledger, contexts[1].ledger)
+        self.assertIsNot(contexts[0].output, contexts[1].output)
+        self.assertTrue(all(c.output.closed for c in contexts))
+
+    def test_worker_factory_closes_store_when_ledger_creation_fails(self):
+        self.assertTrue(callable(getattr(runner, "worker_context_factory", None)), "Worker factory is missing")
+        from scripts.test_piles_auto_assignment_dispatch import claimed, Resource
+        from scripts.piles_auto_assignment.dispatch import ContextOutputRouter
+        store = Resource()
+        with patch.object(runner, "DataStore", lambda **_: store):
+            with patch.object(runner, "build_execution_ledger", side_effect=RuntimeError("expected")):
+                with self.assertRaisesRegex(RuntimeError, "expected"):
+                    with runner.worker_context_factory(types.SimpleNamespace(read_only=False), ContextOutputRouter(io.StringIO()))(claimed()):
+                        self.fail("must not yield")
+        self.assertEqual(store.events, ["close"])
+
+    def test_claim_adapter_records_once_owns_browser_and_does_not_share_arguments(self):
+        self.assertTrue(callable(getattr(runner, "run_claimed_insurer_once", None)), "Single-claim runner is missing")
+        from scripts.test_piles_auto_assignment_dispatch import claimed, Resource
+        from scripts.piles_auto_assignment.dispatch import ContextOutputRouter, execute_claimed_insurer
+        calls, browsers, contexts = [], [], []
+        barrier = threading.Barrier(2)
+        args = types.SimpleNamespace(read_only=True, values=[])
+        months = ["All"]
+        class Store(Resource):
+            def __init__(self, **_):
+                super().__init__()
+            def get_master_account(self, name):
+                return {"insurer_name": name}
+        class Browser:
+            closed = False
+            def new_page(self, **_):
+                return types.SimpleNamespace(on=lambda *_: None)
+            def close(self):
+                self.closed = True
+        class Playwright:
+            stopped = False
+            def __init__(self):
+                self.browser = Browser()
+                self.chromium = types.SimpleNamespace(launch=lambda **_: self.browser)
+                browsers.append(self)
+            def stop(self):
+                self.stopped = True
+        def portal(store, local_args, name, local_months, year, visible, ledger, insurer_run_id):
+            self.assertTrue(local_args.worker_safe_diagnostics)
+            calls.append((name, insurer_run_id))
+            with runner.CuracelPilesRunner():
+                barrier.wait(timeout=3)
+                local_args.values.append(name)
+                local_months.append(name)
+                if name == "Kenya":
+                    raise TimeoutError('password="SECRET" <html>patient</html>')
+                return {"notification_items": [name]}
+        def execute(work):
+            def run_one(work, context):
+                contexts.append(context)
+                return runner.run_claimed_insurer_once(work, context, args, months, "2026", False)
+            return execute_claimed_insurer(work, factory, run_one)
+        with patch.object(runner, "DataStore", Store), patch.object(runner, "run_for_insurer", portal):
+            with patch.object(runner, "sync_playwright", lambda: types.SimpleNamespace(start=Playwright)):
+                with ContextOutputRouter.installed() as router:
+                    factory = runner.worker_context_factory(args, router, max_concurrency=2)
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        outcomes = list(pool.map(execute, [claimed("Kenya"), claimed("Uganda")]))
+        self.assertEqual([item.status.value for item in outcomes], ["failed", "completed"])
+        self.assertCountEqual([name for name, _ in calls], ["Kenya", "Uganda"])
+        self.assertEqual(len({run_id for _, run_id in calls}), 2)
+        self.assertEqual(len(browsers), 2)
+        self.assertTrue(all(p.stopped and p.browser.closed for p in browsers))
+        self.assertEqual(args.values, [])
+        self.assertEqual(months, ["All"])
+        self.assertNotIn("SECRET", repr(outcomes))
+        self.assertTrue(all(c.store.events[-1] == "close" for c in contexts))
+
+    def test_v2_recorded_error_is_sanitized_before_ledger_persistence(self):
+        self.assertTrue(callable(getattr(runner, "run_claimed_insurer_once", None)), "Single-claim runner is missing")
+        from scripts.test_piles_auto_assignment_dispatch import claimed, Resource
+        from scripts.piles_auto_assignment.dispatch import WorkerContext
+        records = []
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def finalize_insurer_run(self, run_id, **fields):
+                records.append(fields)
+        store = Resource()
+        store.get_master_account = lambda name: {"insurer_name": name}
+        context = WorkerContext(store, Ledger(), io.StringIO(), "worker")
+        with patch.object(runner, "run_for_insurer", side_effect=RuntimeError('credential="SECRET" <html>patient</html>')):
+            with self.assertRaises(RuntimeError):
+                runner.run_claimed_insurer_once(claimed(), context, types.SimpleNamespace(), ["All"], "2026", False)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["error_code"], "authentication_failed")
+        self.assertNotIn("SECRET", repr(records))
+        self.assertNotIn("patient", repr(records))
+
+
+class BrowserLifecycleTests(unittest.TestCase):
+    def test_cleanup_failure_does_not_mask_original_portal_or_startup_error(self):
+        def close_fail():
+            raise RuntimeError("cleanup error")
+        for stage in ("startup", "portal"):
+            with self.subTest(stage=stage):
+                events = []
+                def page(**_):
+                    if stage == "startup":
+                        raise ValueError("original failure")
+                    return types.SimpleNamespace(on=lambda *_: None)
+                browser = types.SimpleNamespace(new_page=page, close=close_fail)
+                playwright = types.SimpleNamespace(chromium=types.SimpleNamespace(launch=lambda **_: browser), stop=lambda: events.append("stopped"))
+                with patch.object(runner, "sync_playwright", lambda: types.SimpleNamespace(start=lambda: playwright)):
+                    with self.assertRaises(Exception) as caught:
+                        with runner.CuracelPilesRunner():
+                            raise ValueError("original failure")
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertEqual(str(caught.exception), "original failure")
+                self.assertEqual(events, ["stopped"])
+
+    def test_failed_browser_startup_closes_acquired_resources(self):
+        for stage in ("launch", "new_page", "response"):
+            with self.subTest(stage=stage):
+                events = []
+                def fail():
+                    raise RuntimeError("expected startup failure")
+                browser = types.SimpleNamespace(
+                    new_page=lambda **_: fail() if stage == "new_page" else types.SimpleNamespace(on=lambda *_: fail()),
+                    close=lambda: events.append("browser closed"),
+                )
+                playwright = types.SimpleNamespace(
+                    chromium=types.SimpleNamespace(launch=lambda **_: fail() if stage == "launch" else browser),
+                    stop=lambda: events.append("playwright stopped"),
+                )
+                with patch.object(runner, "sync_playwright", lambda: types.SimpleNamespace(start=lambda: playwright)):
+                    with self.assertRaisesRegex(RuntimeError, "expected startup failure"):
+                        with runner.CuracelPilesRunner():
+                            self.fail("must not enter")
+                self.assertEqual(events, ["playwright stopped"] if stage == "launch" else ["browser closed", "playwright stopped"])
+
+    def test_browser_close_failure_still_stops_playwright(self):
+        events = []
+        def fail():
+            raise RuntimeError("expected close failure")
+        browser = runner.CuracelPilesRunner()
+        browser.browser = types.SimpleNamespace(close=fail)
+        browser.playwright = types.SimpleNamespace(stop=lambda: events.append("stopped"))
+        with self.assertRaisesRegex(RuntimeError, "expected close failure"):
+            browser.__exit__(None, None, None)
+        self.assertEqual(events, ["stopped"])
 
 
 if __name__ == "__main__":

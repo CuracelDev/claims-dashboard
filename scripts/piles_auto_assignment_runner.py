@@ -22,6 +22,8 @@ import sys
 import time
 import traceback
 import uuid
+from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
@@ -38,6 +40,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 try:
+    from piles_auto_assignment.dispatch import ContextOutputRouter, WorkerContext, safe_worker_error
     from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
@@ -50,6 +53,7 @@ try:
     from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
     from piles_auto_assignment.scheduling import configured_max_concurrency
 except ModuleNotFoundError:  # Repository-level unittest import path.
+    from scripts.piles_auto_assignment.dispatch import ContextOutputRouter, WorkerContext, safe_worker_error
     from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
     from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
@@ -132,6 +136,11 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def dispatcher_v2_enabled(environ=os.environ) -> bool:
+    """Explicit opt-in; the coordinator integration is separate from this adapter."""
+    return str(environ.get("PILES_AUTO_ASSIGNMENT_DISPATCHER_V2", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_test_portal(url: str) -> bool:
@@ -3370,11 +3379,11 @@ class DataStore:
             self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot_id, payload)
 
 
-def build_execution_ledger(store: DataStore, args: argparse.Namespace) -> Any:
+def build_execution_ledger(store: DataStore, args: argparse.Namespace, *, required: bool = False) -> Any:
     """Build the optional durable ledger without sharing DataStore autocommit state."""
     if bool(getattr(args, "read_only", False)):
         return ReadOnlyExecutionLedger()
-    if not env_bool("PILES_EXECUTION_LEDGER_ENABLED", False):
+    if not required and not env_bool("PILES_EXECUTION_LEDGER_ENABLED", False):
         return None
     if store.mode != "postgres" or not store.database_url:
         raise RuntimeError(
@@ -3383,6 +3392,28 @@ def build_execution_ledger(store: DataStore, args: argparse.Namespace) -> Any:
     connection = psycopg2.connect(store.database_url)
     connection.autocommit = False
     return ExecutionLedger(connection)
+
+
+def worker_context_factory(args: argparse.Namespace, output_router: ContextOutputRouter, *, max_concurrency: int = 1):
+    """Build fresh resources on the calling worker; never share parent stores.
+
+    V2 always needs a durable execution ledger (or the read-only probe ledger),
+    independently of the optional legacy ledger flag. The coordinator installs
+    output_router before creating threads and keeps it installed until they join.
+    """
+    if type(max_concurrency) is not int or max_concurrency not in (1, 2):
+        raise ValueError("Worker concurrency must be exactly 1 or 2.")
+    @contextmanager
+    def create(work):
+        with output_router.bind(work.insurer_name) as output:
+            with ExitStack() as resources:
+                resources.callback(output.close)
+                store = DataStore(read_only=bool(args.read_only))
+                resources.callback(store.close)
+                ledger = build_execution_ledger(store, args, required=True)
+                resources.callback(ledger.close)
+                yield WorkerContext(store, ledger, output, work.worker_id, max_concurrency)
+    return create
 
 
 def ensure_runner_lock_available(store: DataStore) -> None:
@@ -3450,22 +3481,34 @@ class CuracelPilesRunner:
     def __enter__(self) -> "CuracelPilesRunner":
         self.playwright = sync_playwright().start()
         try:
-            self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
-        except Exception as error:
-            message = str(error)
-            if "Executable doesn't exist" not in message:
-                raise
-            self._ensure_playwright_browsers()
-            self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
-        self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
-        self.page.on("response", self._capture_piles_response)
+            try:
+                self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
+            except Exception as error:
+                message = str(error)
+                if "Executable doesn't exist" not in message:
+                    raise
+                self._ensure_playwright_browsers()
+                self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
+            self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
+            self.page.on("response", self._capture_piles_response)
+        except BaseException:
+            # A failed __enter__ does not receive a context-manager __exit__.
+            self.__exit__(*sys.exc_info())
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
+        try:
+            try:
+                if self.browser:
+                    self.browser.close()
+            finally:
+                if self.playwright:
+                    self.playwright.stop()
+        except Exception:
+            # Preserve the portal/startup error that controls retry safety.
+            if exc_type is None:
+                raise
 
     def _invalidate_filter_state(self) -> None:
         self._filter_state = {
@@ -5439,10 +5482,11 @@ class CuracelPilesRunner:
                             )
                     except Exception as error:
                         if context:
+                            safe_diagnostics = bool(getattr(self, "safe_diagnostics", False))
                             ledger.fail_scan_context(
                                 context["id"],
-                                error_code=type(error).__name__.lower(),
-                                error_message=str(error)[:2000],
+                                error_code=classify_runner_error(error) if safe_diagnostics else type(error).__name__.lower(),
+                                error_message=safe_worker_error(error)[1] if safe_diagnostics else str(error)[:2000],
                             )
                         raise
                     unassigned = [row for row in rows if not norm(row.assigned)]
@@ -7828,6 +7872,7 @@ def _run_for_insurer_once(
         )
 
     with CuracelPilesRunner(visible=visible, slow_mo=args.slow_mo) as runner:
+        runner.safe_diagnostics = bool(getattr(args, "worker_safe_diagnostics", False))
         runner.allow_test_any_assignee = False
         runner.execution_ledger = execution_ledger
         runner.insurer_run_id = insurer_run_id
@@ -8535,6 +8580,8 @@ def run_insurer_recorded(
     visible: bool,
     execution_ledger: Any,
     runner_run_id: str,
+    *,
+    safe_diagnostics: bool = False,
 ) -> dict[str, Any]:
     """Run one insurer and keep ledger-finalization failures from masking portal errors."""
     insurer_run_id = ""
@@ -8557,11 +8604,30 @@ def run_insurer_recorded(
                     insurer_run_id,
                     status="failed",
                     error_code=classify_runner_error(exc),
-                    error_message=str(exc)[:500],
+                    error_message=safe_worker_error(exc)[1] if safe_diagnostics else str(exc)[:500],
                 )
             except Exception as ledger_error:
-                print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
+                if safe_diagnostics:
+                    print("WARNING: could not finalize insurer ledger state.")
+                else:
+                    print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
         raise
+
+
+def run_claimed_insurer_once(work, context: WorkerContext, args: argparse.Namespace,
+                             month_labels: list[str], year_label: str, visible: bool) -> dict[str, Any]:
+    """V2 portal boundary: one recorded execution, no coalescing or follow-up.
+
+    Shared invocation settings are copied before portal execution. Returned
+    notification payloads belong to the caller, never a shared parent list.
+    """
+    worker_args = deepcopy(args)
+    worker_args.worker_safe_diagnostics = True
+    return run_insurer_recorded(
+        context.store, worker_args, work.insurer_name, list(month_labels),
+        year_label, visible, context.ledger, work.parent_runner_run_id or "",
+        safe_diagnostics=True,
+    )
 
 
 def main() -> None:
