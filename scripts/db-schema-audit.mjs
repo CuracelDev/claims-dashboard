@@ -55,6 +55,7 @@ const EXPECTED = {
       details: ['jsonb'], created_at: ['timestamp with time zone'], updated_at: ['timestamp with time zone'],
     },
     preferredTypes: { details: ['jsonb'] },
+    requiredCheckFragments: ['completed_with_issues'],
   },
   piles_auto_assignment_scan_contexts: {
     requiredColumns: {
@@ -94,6 +95,42 @@ const EXPECTED = {
       claimed_by_runner_run_id: ['text'], requested_at: ['timestamp with time zone'],
       created_at: ['timestamp with time zone'], updated_at: ['timestamp with time zone'],
     },
+    requiredCheckFragments: ['cancelled_legacy'],
+  },
+  piles_auto_assignment_runner_runs: {
+    requiredColumns: {
+      id: ['text'], status: ['text'], created_at: ['timestamp with time zone'],
+      updated_at: ['timestamp with time zone'],
+    },
+    requiredCheckFragments: ['completed_with_issues'],
+  },
+  piles_auto_assignment_work_items: {
+    requiredColumns: {
+      id: ['text'], parent_runner_run_id: ['text'], insurer_name: ['text'],
+      canonical_insurer_name: ['text'], source: ['text'], request_scope: ['text'],
+      disposition: ['text'], covered_by_insurer_run_id: ['text'], worker_id: ['text'],
+      claim_token: ['text'], lease_expires_at: ['timestamp with time zone'],
+      heartbeat_at: ['timestamp with time zone'], generation_requested_at: ['timestamp with time zone'],
+      attempt_number: ['integer'], requested_at: ['timestamp with time zone'],
+      claimed_at: ['timestamp with time zone'], started_at: ['timestamp with time zone'],
+      finished_at: ['timestamp with time zone'], reason_code: ['text'],
+      created_at: ['timestamp with time zone'], updated_at: ['timestamp with time zone'],
+    },
+    requiredCheckFragments: [
+      'schedule', 'manual', 'readiness', 'recovery', 'all_active', 'single_insurer',
+      'queued', 'claimed', 'covered_by_active_cycle', 'follow_up_queued', 'inactive',
+      'completed', 'failed', 'cancelled', 'reason_code', '^[a-z0-9._-]+$',
+    ],
+    requiredForeignKeys: [
+      { column: 'parent_runner_run_id', table: 'piles_auto_assignment_runner_runs', deleteRule: 'SET NULL' },
+      { column: 'covered_by_insurer_run_id', table: 'piles_auto_assignment_insurer_runs', deleteRule: 'SET NULL' },
+    ],
+    requiredIndexes: [
+      { name: 'piles_auto_assignment_work_items_queued_generation_idx', fragments: ['unique index', 'canonical_insurer_name', 'source', 'request_scope', 'disposition', 'queued'] },
+      { name: 'piles_auto_assignment_work_items_follow_up_idx', fragments: ['unique index', 'canonical_insurer_name', 'disposition', 'follow_up_queued'] },
+      { name: 'piles_auto_assignment_work_items_claim_order_idx', fragments: ['parent_runner_run_id', 'disposition', 'generation_requested_at', 'requested_at', 'id'] },
+      { name: 'piles_auto_assignment_work_items_expired_lease_idx', fragments: ['lease_expires_at', 'canonical_insurer_name', 'disposition', 'claimed'] },
+    ],
   },
 };
 
@@ -116,6 +153,8 @@ const TABLES = [
   'piles_auto_assignment_rules',
   'piles_auto_assignment_scan_contexts',
   'piles_auto_assignment_schedule_requests',
+  'piles_auto_assignment_runner_runs',
+  'piles_auto_assignment_work_items',
   'prism_conversations',
   'prism_logs',
   'prism_messages',
@@ -193,6 +232,73 @@ async function getConstraints(pool) {
   return byTable;
 }
 
+async function getCheckConstraints(pool) {
+  const { rows } = await pool.query(
+    `
+      select
+        relation.relname as table_name,
+        constraint_record.conname as constraint_name,
+        pg_get_constraintdef(constraint_record.oid) as definition
+      from pg_constraint constraint_record
+      join pg_class relation on relation.oid = constraint_record.conrelid
+      join pg_namespace namespace on namespace.oid = relation.relnamespace
+      where namespace.nspname = 'public'
+        and constraint_record.contype = 'c'
+      order by relation.relname, constraint_record.conname
+    `
+  );
+  return groupByTable(rows);
+}
+
+async function getIndexes(pool) {
+  const { rows } = await pool.query(
+    `
+      select tablename as table_name, indexname, indexdef
+      from pg_indexes
+      where schemaname = 'public'
+      order by tablename, indexname
+    `
+  );
+  return groupByTable(rows);
+}
+
+async function getForeignKeys(pool) {
+  const { rows } = await pool.query(
+    `
+      select
+        constraint_table.table_name,
+        constraint_table.constraint_name,
+        constraint_column.column_name,
+        referenced_table.table_name as referenced_table,
+        referential.delete_rule
+      from information_schema.table_constraints constraint_table
+      join information_schema.key_column_usage constraint_column
+        on constraint_column.constraint_schema = constraint_table.constraint_schema
+       and constraint_column.constraint_name = constraint_table.constraint_name
+      join information_schema.referential_constraints referential
+        on referential.constraint_schema = constraint_table.constraint_schema
+       and referential.constraint_name = constraint_table.constraint_name
+      join information_schema.constraint_column_usage referenced_table
+        on referenced_table.constraint_schema = referential.unique_constraint_schema
+       and referenced_table.constraint_name = referential.unique_constraint_name
+      where constraint_table.table_schema = 'public'
+        and constraint_table.constraint_type = 'FOREIGN KEY'
+      order by constraint_table.table_name, constraint_table.constraint_name,
+               constraint_column.ordinal_position
+    `
+  );
+  return groupByTable(rows);
+}
+
+function groupByTable(rows) {
+  const byTable = new Map();
+  for (const row of rows) {
+    if (!byTable.has(row.table_name)) byTable.set(row.table_name, []);
+    byTable.get(row.table_name).push(row);
+  }
+  return byTable;
+}
+
 export function normalizeConstraintColumns(value) {
   if (Array.isArray(value)) return value.map((column) => String(column));
   const raw = String(value || '').trim();
@@ -220,7 +326,14 @@ function hasConstraintGroup(constraints, columns) {
   return (constraints || []).some((constraint) => (constraint.columns || []).join(',') === wanted);
 }
 
-function evaluate(table, columns, constraints) {
+export function evaluateTable(
+  table,
+  columns,
+  constraints,
+  checkConstraints = [],
+  indexes = [],
+  foreignKeys = [],
+) {
   const expected = EXPECTED[table];
   if (!expected) return [];
 
@@ -251,13 +364,51 @@ function evaluate(table, columns, constraints) {
     }
   }
 
+  const checkDefinitions = checkConstraints
+    .map((constraint) => String(constraint.definition || ''))
+    .join('\n');
+  for (const fragment of expected.requiredCheckFragments || []) {
+    if (!checkDefinitions.includes(fragment)) {
+      issues.push(`missing CHECK constraint fragment ${fragment}`);
+    }
+  }
+
+  for (const requirement of expected.requiredForeignKeys || []) {
+    const present = foreignKeys.some((foreignKey) => (
+      foreignKey.column_name === requirement.column
+      && foreignKey.referenced_table === requirement.table
+      && foreignKey.delete_rule === requirement.deleteRule
+    ));
+    if (!present) {
+      issues.push(`missing FOREIGN KEY ${requirement.column} -> ${requirement.table} ON DELETE ${requirement.deleteRule}`);
+    }
+  }
+
+  const indexesByName = new Map(indexes.map((index) => [index.indexname, index]));
+  for (const requirement of expected.requiredIndexes || []) {
+    const index = indexesByName.get(requirement.name);
+    if (!index) {
+      issues.push(`missing index ${requirement.name}`);
+      continue;
+    }
+    const definition = String(index.indexdef || '').toLowerCase();
+    for (const fragment of requirement.fragments) {
+      if (!definition.includes(fragment.toLowerCase())) {
+        issues.push(`index ${requirement.name} missing ${fragment}`);
+      }
+    }
+  }
+
   return issues;
 }
 
 export async function auditDatabase(pool, logger = console) {
-  const [columnsByTable, constraintsByTable, rowCounts] = await Promise.all([
+  const [columnsByTable, constraintsByTable, checksByTable, indexesByTable, foreignKeysByTable, rowCounts] = await Promise.all([
     getColumns(pool),
     getConstraints(pool),
+    getCheckConstraints(pool),
+    getIndexes(pool),
+    getForeignKeys(pool),
     getRowCounts(pool, TABLES),
   ]);
 
@@ -268,13 +419,19 @@ export async function auditDatabase(pool, logger = console) {
   for (const table of TABLES) {
     const columns = columnsByTable.get(table) || [];
     const constraints = constraintsByTable.get(table) || [];
-    const issues = evaluate(table, columns, constraints);
+    const checks = checksByTable.get(table) || [];
+    const indexes = indexesByTable.get(table) || [];
+    const foreignKeys = foreignKeysByTable.get(table) || [];
+    const issues = evaluateTable(table, columns, constraints, checks, indexes, foreignKeys);
     issueCount += issues.filter((issue) => !issue.startsWith('works but should')).length;
 
     logger.log(`\n${table}`);
     logger.log(`  rows: ${rowCounts[table]}`);
     logger.log(`  columns: ${columns.length ? columns.map((c) => `${c.column_name}:${c.data_type}`).join(', ') : 'missing table'}`);
     logger.log(`  keys: ${constraints.length ? constraints.map((c) => `${c.constraint_type}(${c.columns.join(',')})`).join(', ') : 'none'}`);
+    logger.log(`  checks: ${checks.length ? checks.map((c) => c.constraint_name).join(', ') : 'none'}`);
+    logger.log(`  indexes: ${indexes.length ? indexes.map((i) => i.indexname).join(', ') : 'none'}`);
+    logger.log(`  foreign keys: ${foreignKeys.length ? foreignKeys.map((f) => `${f.column_name}->${f.referenced_table}(${f.delete_rule})`).join(', ') : 'none'}`);
     logger.log(`  issues: ${issues.length ? issues.join('; ') : 'none detected'}`);
   }
 

@@ -289,7 +289,10 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_runner_runs (
   months jsonb DEFAULT '[]'::jsonb,
   year text,
   mode text NOT NULL DEFAULT 'dry-run',
-  status text NOT NULL DEFAULT 'started',
+  status text NOT NULL DEFAULT 'started' CONSTRAINT piles_auto_assignment_runner_runs_status_check CHECK (status IN (
+    'queued', 'started', 'running', 'completed', 'completed_with_issues', 'failed',
+    'covered_by_active_cycle', 'cancelled', 'manual_action_required', 'partial', 'skipped_overlap'
+  )),
   started_at timestamptz DEFAULT now(),
   finished_at timestamptz,
   duration_ms integer DEFAULT 0,
@@ -308,9 +311,10 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_insurer_runs (
   runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
   master_account_id text REFERENCES piles_auto_assignment_master_accounts(id) ON DELETE SET NULL,
   insurer_name text NOT NULL,
-  status text NOT NULL DEFAULT 'queued' CHECK (status IN (
-    'queued', 'running', 'completed', 'partial', 'failed',
-    'manual_action_required', 'skipped_inactive', 'skipped_overlap'
+  status text NOT NULL DEFAULT 'queued' CONSTRAINT piles_auto_assignment_insurer_runs_status_check CHECK (status IN (
+    'queued', 'running', 'completed', 'completed_with_issues', 'partial', 'failed',
+    'manual_action_required', 'skipped_inactive', 'skipped_overlap',
+    'covered_by_active_cycle', 'cancelled'
   )),
   phase text NOT NULL DEFAULT 'configuration' CHECK (phase IN (
     'configuration', 'login', 'scan', 'plan', 'apply', 'reconcile', 'complete'
@@ -343,6 +347,53 @@ CREATE INDEX IF NOT EXISTS piles_auto_assignment_insurer_runs_runner_idx
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_insurer_runs_active_idx
   ON piles_auto_assignment_insurer_runs (insurer_name, heartbeat_at DESC)
   WHERE status IN ('queued', 'running');
+
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'piles_auto_assignment_runner_runs'::regclass
+      AND conname = 'piles_auto_assignment_runner_runs_status_check'
+      AND pg_get_constraintdef(oid) NOT LIKE '%completed_with_issues%'
+  ) THEN
+    ALTER TABLE piles_auto_assignment_runner_runs
+      DROP CONSTRAINT piles_auto_assignment_runner_runs_status_check;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'piles_auto_assignment_runner_runs'::regclass
+      AND conname = 'piles_auto_assignment_runner_runs_status_check'
+  ) THEN
+    ALTER TABLE piles_auto_assignment_runner_runs
+      ADD CONSTRAINT piles_auto_assignment_runner_runs_status_check CHECK (status IN (
+        'queued', 'started', 'running', 'completed', 'completed_with_issues', 'failed',
+        'covered_by_active_cycle', 'cancelled', 'manual_action_required', 'partial', 'skipped_overlap'
+      )) NOT VALID;
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'piles_auto_assignment_insurer_runs'::regclass
+      AND conname = 'piles_auto_assignment_insurer_runs_status_check'
+      AND pg_get_constraintdef(oid) NOT LIKE '%completed_with_issues%'
+  ) THEN
+    ALTER TABLE piles_auto_assignment_insurer_runs
+      DROP CONSTRAINT piles_auto_assignment_insurer_runs_status_check;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'piles_auto_assignment_insurer_runs'::regclass
+      AND conname = 'piles_auto_assignment_insurer_runs_status_check'
+  ) THEN
+    ALTER TABLE piles_auto_assignment_insurer_runs
+      ADD CONSTRAINT piles_auto_assignment_insurer_runs_status_check CHECK (status IN (
+        'queued', 'running', 'completed', 'completed_with_issues', 'partial', 'failed',
+        'manual_action_required', 'skipped_inactive', 'skipped_overlap',
+        'covered_by_active_cycle', 'cancelled'
+      )) NOT VALID;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_scan_contexts (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
@@ -602,7 +653,9 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_schedule_requests (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
   insurer_name text NOT NULL,
   requested_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
-  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed')),
+  status text NOT NULL DEFAULT 'pending' CONSTRAINT piles_auto_assignment_schedule_requests_status_check CHECK (status IN (
+    'pending', 'claimed', 'cancelled_legacy'
+  )),
   claimed_by_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
   requested_at timestamptz NOT NULL DEFAULT now(),
   claimed_at timestamptz,
@@ -613,6 +666,77 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_schedule_requests (
 CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_schedule_requests_pending_idx
   ON piles_auto_assignment_schedule_requests (lower(insurer_name))
   WHERE status = 'pending';
+
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'piles_auto_assignment_schedule_requests'::regclass
+      AND conname = 'piles_auto_assignment_schedule_requests_status_check'
+      AND pg_get_constraintdef(oid) NOT LIKE '%cancelled_legacy%'
+  ) THEN
+    ALTER TABLE piles_auto_assignment_schedule_requests
+      DROP CONSTRAINT piles_auto_assignment_schedule_requests_status_check;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'piles_auto_assignment_schedule_requests'::regclass
+      AND conname = 'piles_auto_assignment_schedule_requests_status_check'
+  ) THEN
+    ALTER TABLE piles_auto_assignment_schedule_requests
+      ADD CONSTRAINT piles_auto_assignment_schedule_requests_status_check CHECK (
+        status IN ('pending', 'claimed', 'cancelled_legacy')
+      ) NOT VALID;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items (
+  id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+  parent_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+  insurer_name text NOT NULL,
+  canonical_insurer_name text NOT NULL CHECK (btrim(canonical_insurer_name) <> ''),
+  source text NOT NULL CHECK (source IN ('schedule', 'manual', 'readiness', 'recovery')),
+  request_scope text NOT NULL CHECK (request_scope IN ('all_active', 'single_insurer')),
+  disposition text NOT NULL DEFAULT 'queued' CHECK (disposition IN (
+    'queued', 'claimed', 'covered_by_active_cycle', 'follow_up_queued', 'inactive',
+    'completed', 'failed', 'cancelled'
+  )),
+  covered_by_insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL,
+  worker_id text,
+  claim_token text,
+  lease_expires_at timestamptz,
+  heartbeat_at timestamptz,
+  generation_requested_at timestamptz NOT NULL DEFAULT now(),
+  attempt_number integer NOT NULL DEFAULT 0 CHECK (attempt_number >= 0),
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  claimed_at timestamptz,
+  started_at timestamptz,
+  finished_at timestamptz,
+  reason_code text CHECK (
+    reason_code IS NULL OR (
+      char_length(reason_code) <= 80 AND reason_code ~ '^[a-z0-9._-]+$'
+    )
+  ),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_queued_generation_idx
+  ON piles_auto_assignment_work_items (canonical_insurer_name, source, request_scope)
+  WHERE disposition = 'queued';
+
+CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_follow_up_idx
+  ON piles_auto_assignment_work_items (canonical_insurer_name)
+  WHERE disposition = 'follow_up_queued';
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_work_items_claim_order_idx
+  ON piles_auto_assignment_work_items (
+    parent_runner_run_id, disposition, generation_requested_at, requested_at, id
+  )
+  WHERE disposition IN ('queued', 'follow_up_queued');
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_work_items_expired_lease_idx
+  ON piles_auto_assignment_work_items (lease_expires_at, canonical_insurer_name)
+  WHERE disposition = 'claimed';
 
 ALTER TABLE IF EXISTS piles_auto_assignment_logs
   ADD COLUMN IF NOT EXISTS insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL;

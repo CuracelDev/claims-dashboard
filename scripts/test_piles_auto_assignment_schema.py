@@ -14,6 +14,7 @@ LEDGER_TABLES = (
     "piles_auto_assignment_batches",
     "piles_auto_assignment_attempts",
     "piles_auto_assignment_bot_account_history",
+    "piles_auto_assignment_work_items",
 )
 
 
@@ -85,6 +86,107 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
         for table in LEDGER_TABLES:
             with self.subTest(table=table):
                 self.assertIn(f"'{table}'", self.audit)
+
+    def test_dispatch_work_items_are_additive_and_lease_guarded(self):
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items",
+            self.sql,
+        )
+        definition = re.search(
+            r"CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items\s*\((.*?)\n\);",
+            self.sql,
+            re.DOTALL,
+        ).group(1)
+        for column in (
+            "parent_runner_run_id",
+            "canonical_insurer_name",
+            "source",
+            "request_scope",
+            "disposition",
+            "covered_by_insurer_run_id",
+            "worker_id",
+            "claim_token",
+            "lease_expires_at",
+            "heartbeat_at",
+            "generation_requested_at",
+            "attempt_number",
+            "requested_at",
+            "claimed_at",
+            "started_at",
+            "finished_at",
+            "reason_code",
+            "created_at",
+            "updated_at",
+        ):
+            with self.subTest(column=column):
+                self.assertRegex(definition, rf"\b{column}\b")
+        self.assertGreaterEqual(definition.count("ON DELETE SET NULL"), 2)
+        for source in ("schedule", "manual", "readiness", "recovery"):
+            self.assertIn(f"'{source}'", definition)
+        for disposition in (
+            "queued",
+            "claimed",
+            "covered_by_active_cycle",
+            "follow_up_queued",
+            "inactive",
+            "completed",
+            "failed",
+            "cancelled",
+        ):
+            self.assertIn(f"'{disposition}'", definition)
+        self.assertIn("attempt_number >= 0", definition)
+        self.assertIn("reason_code", definition)
+        self.assertIn("~ '^[a-z0-9._-]+$'", definition)
+
+    def test_dispatch_indexes_deduplicate_and_order_work(self):
+        self.assertRegex(
+            self.sql,
+            re.compile(
+                r"CREATE UNIQUE INDEX IF NOT EXISTS "
+                r"piles_auto_assignment_work_items_queued_generation_idx.*?"
+                r"canonical_insurer_name.*?source.*?request_scope.*?"
+                r"WHERE disposition = 'queued'",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            self.sql,
+            re.compile(
+                r"CREATE UNIQUE INDEX IF NOT EXISTS "
+                r"piles_auto_assignment_work_items_follow_up_idx.*?"
+                r"canonical_insurer_name.*?WHERE disposition = 'follow_up_queued'",
+                re.DOTALL,
+            ),
+        )
+        self.assertIn("piles_auto_assignment_work_items_claim_order_idx", self.sql)
+        self.assertIn("piles_auto_assignment_work_items_expired_lease_idx", self.sql)
+
+    def test_dispatch_parent_and_legacy_statuses_are_backward_compatible(self):
+        for status in (
+            "completed_with_issues",
+            "partial",
+            "skipped_overlap",
+        ):
+            self.assertIn(f"'{status}'", self.sql)
+        self.assertRegex(
+            self.sql,
+            re.compile(
+                r"piles_auto_assignment_schedule_requests_status_check.*?"
+                r"cancelled_legacy",
+                re.DOTALL,
+            ),
+        )
+
+    def test_fresh_bootstrap_defines_dispatch_table_and_indexes(self):
+        for token in (
+            "piles_auto_assignment_work_items",
+            "piles_auto_assignment_work_items_queued_generation_idx",
+            "piles_auto_assignment_work_items_follow_up_idx",
+            "piles_auto_assignment_work_items_claim_order_idx",
+            "piles_auto_assignment_work_items_expired_lease_idx",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, self.migration)
 
 
 if __name__ == "__main__":
