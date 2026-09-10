@@ -83,11 +83,31 @@ For every run, verify this invariant: submitted attempts equal confirmed-visible
 ## Incident response
 
 1. Disable new live work by removing `ALLOW_PRODUCTION_ASSIGNMENTS` or switching scheduled execution off. Do not delete ledger rows.
-2. Inspect the failed insurer's phase, error code, context totals, heartbeat, and attempt-state counts.
+2. Inspect the failed insurer's phase, error code, context totals, heartbeat, and attempt-state counts. From the production host, generate a sanitized report for the last 24 hours:
+
+   ```bash
+   node scripts/inspect-piles-runner-incidents.mjs --hours 24
+   ```
+
+   To inspect one parent run, add its UUID:
+
+   ```bash
+   node scripts/inspect-piles-runner-incidents.mjs --hours 24 --run-id 123e4567-e89b-42d3-a456-426614174000
+   ```
+
+   The **Piles Incident Inspection** GitHub Actions workflow runs these same read-only commands. It accepts only `hours` and optional `run_id`. The inspector starts a read-only database transaction, prints only bounded operational fields, and rolls the transaction back. `work_items_available=false` is expected before the dispatcher work-item schema is deployed; use `pending_requests` for the legacy queue view in that case.
 3. For filter or scan failures, use a read-only visible-browser probe; do not bypass evidence checks.
 4. For pending attempts, observe the original filter context. Retry only if the pile is positively visible and unassigned.
 5. For conflicts, preserve the observed assignment and resolve manually. Never overwrite an unexpected assignee automatically.
 6. Notification failures are repaired separately; they do not invalidate confirmed portal assignments.
+
+Interpret the incident report as follows:
+
+- `completed_with_issues` means safe work completed but at least one insurer, context, conflict, or reconciliation outcome still needs attention. Legacy `partial` carries the older mixed-outcome meaning and remains readable.
+- `covered_by_active_cycle` means an already-running all-active cycle owns the request; it is evidence of deduplication, not a new successful assignment run.
+- `follow_up_queued` means a manual request arrived during an active insurer run and one later generation is waiting. Confirm that it is eventually claimed or cancelled explicitly.
+- `reconciliation_pending` means submission occurred without enough positive portal evidence to declare success or retry. Observe the original context before taking action.
+- A large elapsed duration is not itself a failure. Treat a heartbeat as stale only when `heartbeat_age_seconds` exceeds the 15-minute threshold and lock evidence shows that no live insurer worker owns the run.
 
 ## Rollback
 

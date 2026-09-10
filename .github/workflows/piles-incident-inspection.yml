@@ -1,0 +1,48 @@
+name: Piles Incident Inspection
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: Incident window in hours (1 through 168)
+        required: true
+        default: 24
+        type: number
+      run_id:
+        description: Optional parent runner UUID
+        required: false
+        type: string
+
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
+jobs:
+  inspection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect sanitized Piles incident evidence
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          INCIDENT_HOURS: ${{ inputs.hours }}
+          INCIDENT_RUN_ID: ${{ inputs.run_id }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: INCIDENT_HOURS,INCIDENT_RUN_ID
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+
+            if [ -n "$INCIDENT_RUN_ID" ]; then
+              node scripts/inspect-piles-runner-incidents.mjs \
+                --hours "$INCIDENT_HOURS" \
+                --run-id "$INCIDENT_RUN_ID"
+            else
+              node scripts/inspect-piles-runner-incidents.mjs \
+                --hours "$INCIDENT_HOURS"
+            fi
