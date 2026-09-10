@@ -7,6 +7,7 @@ const { Pool } = pg;
 export const WORK_ITEMS_TABLE = 'piles_auto_assignment_work_items';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SAFE_ERROR_MESSAGE = 'Operational details redacted; use error_code.';
 
 const SAFE_FIELDS = Object.freeze({
   parents: [
@@ -86,8 +87,8 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
       select id, insurer_name, run_scope, backend, run_source, mode, status,
              started_at, finished_at, duration_ms, created_at, updated_at
       from piles_auto_assignment_runner_runs
-      where created_at >= now() - ($1::int * interval '1 hour')
-        and ($2::text is null or id = $2::text)
+      where (($2::text is null and created_at >= now() - ($1::int * interval '1 hour'))
+             or id = $2::text)
       order by created_at desc
     `, hours, runId),
     insurers: query(`
@@ -99,7 +100,9 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
              reconciliation_pending_pile_count, reconciliation_pending_claim_count,
              conflict_pile_count, failed_pile_count,
              regexp_replace(lower(trim(coalesce(error_code, 'unknown'))), '[^a-z0-9._-]+', '_', 'g') as error_code,
-             regexp_replace(left(coalesce(error_message, ''), 240), '[[:cntrl:]]+', ' ', 'g') as error_message,
+             case when error_message is null or btrim(error_message) = '' then ''
+                  else '${SAFE_ERROR_MESSAGE}'
+             end as error_message,
              heartbeat_at,
              case when heartbeat_at is null then null
                   else greatest(0, extract(epoch from (now() - heartbeat_at)))::int
@@ -117,7 +120,9 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
              c.status_bucket, c.status, c.page_count, c.distinct_pile_count,
              c.unassigned_pile_count, c.claim_count,
              regexp_replace(lower(trim(coalesce(c.error_code, 'unknown'))), '[^a-z0-9._-]+', '_', 'g') as error_code,
-             regexp_replace(left(coalesce(c.error_message, ''), 240), '[[:cntrl:]]+', ' ', 'g') as error_message,
+             case when c.error_message is null or btrim(c.error_message) = '' then ''
+                  else '${SAFE_ERROR_MESSAGE}'
+             end as error_message,
              c.started_at, c.settled_at, c.finished_at, c.created_at, c.updated_at
       from piles_auto_assignment_scan_contexts c
       join piles_auto_assignment_insurer_runs i on i.id = c.insurer_run_id
@@ -190,12 +195,7 @@ function normalizeErrorCode(value) {
 }
 
 function sanitizeMessage(value) {
-  return String(value ?? '')
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
-    .replace(/\b(password|passwd|pwd|token|secret|authorization|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
-    .replace(/\bpostgres(?:ql)?:\/\/[^@\s]+@/gi, 'postgresql://[REDACTED]@')
-    .slice(0, 240);
+  return String(value ?? '').trim() ? SAFE_ERROR_MESSAGE : '';
 }
 
 function projectRows(section, rows) {
