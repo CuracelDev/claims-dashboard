@@ -293,6 +293,148 @@ def work_row(**changes):
     }
 
 
+class LeaseSqlConnection:
+    """Execute CAS predicates in SQL; emulate only PostgreSQL dialect/lock catalog."""
+    autocommit = False
+
+    def __init__(self):
+        self.database = sqlite3.connect(":memory:")
+        self.database.create_function("now", 0, lambda: 1000)
+        self.database.create_function("current_database", 0, lambda: "fixture")
+        self.database.create_function("hashtextextended", 2,
+                                      lambda key, seed: {"piles-insurer:OLD MUTUAL": 11, "piles-capacity:0": 12}.get(key, 99))
+        self.database.executescript("""
+            CREATE TABLE piles_auto_assignment_work_items(
+                id TEXT PRIMARY KEY, parent_runner_run_id TEXT, canonical_insurer_name TEXT,
+                disposition TEXT, claim_token TEXT, lease_expires_at INTEGER, heartbeat_at INTEGER,
+                started_at INTEGER, finished_at INTEGER, updated_at INTEGER,
+                covered_by_insurer_run_id TEXT, reason_code TEXT);
+            INSERT INTO piles_auto_assignment_work_items
+                (id,parent_runner_run_id,canonical_insurer_name,disposition,claim_token,lease_expires_at)
+                VALUES ('work','parent','OLD MUTUAL','claimed','current',1120);
+            CREATE TABLE piles_auto_assignment_insurer_runs(id TEXT, runner_run_id TEXT);
+            INSERT INTO piles_auto_assignment_insurer_runs VALUES ('run','parent'),('foreign','other');
+            CREATE TABLE pg_database(oid INTEGER, datname TEXT);
+            INSERT INTO pg_database VALUES (1,'fixture');
+            CREATE TABLE pg_locks(locktype TEXT, pid INTEGER, classid INTEGER, objid INTEGER,
+                                  objsubid INTEGER, database INTEGER, mode TEXT, granted BOOLEAN);
+            INSERT INTO pg_locks VALUES ('advisory',41,0,11,1,1,'ExclusiveLock',true),
+                                        ('advisory',41,0,12,1,1,'ExclusiveLock',true);
+        """)
+
+    def cursor(self):
+        connection = self
+        class Cursor:
+            def __enter__(self):
+                self.raw = connection.database.cursor()
+                return self
+            def __exit__(self, *_):
+                self.raw.close()
+            def execute(self, sql, params=()):
+                sql = sql.replace("%s", "?").replace("::bigint", "").replace("::text", "")
+                sql = sql.replace("* interval '1 second'", "")
+                self.raw.execute(sql, params)
+                self.description = self.raw.description
+            def fetchone(self):
+                return self.raw.fetchone()
+        return Cursor()
+
+    def commit(self):
+        self.database.commit()
+    def rollback(self):
+        self.database.rollback()
+    def close(self):
+        self.database.close()
+
+
+class DispatchLeaseSqlTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = LeaseSqlConnection()
+        self.addCleanup(self.connection.close)
+        self.store = store.DispatchStore(self.connection)
+
+    def heartbeat(self, token="current", run_id=None):
+        self.assertTrue(callable(getattr(self.store, "heartbeat_claim", None)), "Owned heartbeat is missing")
+        return self.store.heartbeat_claim("work", token, 41, 0, 60, insurer_run_id=run_id)
+
+    def test_owned_heartbeat_renews_and_attaches_only_matching_parent_run(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT lease_expires_at,started_at,covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
+        ).fetchone(), (1060, 1000, "run"))
+        self.assertFalse(self.heartbeat(run_id="foreign"))
+
+    def test_token_expiry_and_actual_session_locks_all_fence_heartbeat(self):
+        self.assertFalse(self.heartbeat(token="stale"))
+        for mutation in ("UPDATE pg_locks SET pid=42", "DELETE FROM pg_locks WHERE objid=11",
+                         "DELETE FROM pg_locks WHERE objid=12", "UPDATE pg_locks SET granted=false",
+                         "UPDATE pg_locks SET database=2", "UPDATE pg_locks SET objsubid=2",
+                         "UPDATE piles_auto_assignment_work_items SET lease_expires_at=1000"):
+            with self.subTest(mutation=mutation):
+                self.connection.database.execute("SAVEPOINT fixture")
+                self.connection.database.execute(mutation)
+                self.assertFalse(self.heartbeat())
+                # heartbeat commits its transaction; restore the controlled fixture.
+                self.connection.close()
+                self.connection = LeaseSqlConnection()
+                self.addCleanup(self.connection.close)
+                self.store = store.DispatchStore(self.connection)
+
+    def test_contention_release_keeps_recoverable_row_and_stale_token_cannot_release(self):
+        self.assertTrue(callable(getattr(self.store, "release_claim", None)), "Claim release is missing")
+        self.assertFalse(self.store.release_claim("work", "stale", "worker_capacity_unavailable"))
+        self.assertTrue(self.store.release_claim("work", "current", "worker_capacity_unavailable"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,lease_expires_at,finished_at FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", 1000, None))
+
+    def test_started_work_is_not_requeued_after_possible_portal_side_effects(self):
+        self.assertTrue(callable(getattr(self.store, "release_claim", None)), "Claim release is missing")
+        self.connection.database.execute("UPDATE piles_auto_assignment_work_items SET started_at=950")
+        self.connection.commit()
+        self.assertFalse(self.store.release_claim("work", "current", "insurer_lock_unavailable"))
+
+    def test_expired_or_replaced_token_cannot_finalize_work(self):
+        self.assertFalse(self.store.finish_claim("work", "stale", WorkDisposition.COMPLETED))
+        self.connection.database.execute("UPDATE piles_auto_assignment_work_items SET lease_expires_at=1000")
+        self.connection.commit()
+        self.assertFalse(self.store.finish_claim("work", "current", WorkDisposition.COMPLETED))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed",))
+
+    def test_summary_exposes_submitted_and_manual_action_before_success_aggregation(self):
+        self.connection.database.executescript("""
+            CREATE TABLE piles_auto_assignment_attempts(insurer_run_id TEXT, status TEXT);
+            INSERT INTO piles_auto_assignment_attempts VALUES
+                ('run','submitted'),('run','manual_action_required'),('run','confirmed_visible');
+        """)
+        summary = ExecutionLedger(self.connection).summarize_insurer_run("run")
+        self.assertEqual(summary.get("submitted"), 1)
+        self.assertEqual(summary.get("manual_action_required"), 1)
+
+    def test_parent_generation_uses_immutable_created_time(self):
+        self.assertTrue(callable(getattr(self.store, "parent_requested_at", None)), "Parent timestamp reader is missing")
+        connection = DispatchConnection([{"created_at": NOW}])
+        self.assertEqual(store.DispatchStore(connection).parent_requested_at("parent"), NOW)
+
+    def test_setup_failure_cannot_finalize_a_parent_with_prior_owned_or_reused_work(self):
+        self.assertTrue(callable(getattr(self.store, "fail_parent_setup", None)), "Setup failure transition is missing")
+        self.connection.database.executescript("""
+            CREATE TABLE piles_auto_assignment_runner_runs(id TEXT, status TEXT, finished_at INTEGER,
+                updated_at INTEGER, details TEXT);
+            INSERT INTO piles_auto_assignment_runner_runs VALUES
+                ('parent','started',NULL,NULL,'{}'),('empty','started',NULL,NULL,'{}'),
+                ('reused','started',NULL,NULL,'{"dispatch_requests":[{"work_item_id":"foreign"}]}');
+        """)
+        self.assertFalse(self.store.fail_parent_setup("parent"))
+        self.assertFalse(self.store.fail_parent_setup("reused"))
+        self.assertTrue(self.store.fail_parent_setup("empty"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status,finished_at FROM piles_auto_assignment_runner_runs WHERE id='empty'"
+        ).fetchone(), ("failed", 1000))
+
+
 class DispatchStoreTests(unittest.TestCase):
     def make_store(self, *responses):
         self.connection = DispatchConnection(*responses)

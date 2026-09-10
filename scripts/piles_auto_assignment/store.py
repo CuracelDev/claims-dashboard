@@ -23,6 +23,14 @@ class ConcurrentStateChange(RuntimeError):
     """Raised when another worker changed an attempt before our CAS update."""
 
 
+class ParentWorkPending(ValueError):
+    """Owned or referenced work is still live; this is not a parent failure."""
+
+
+class ParentAlreadyTerminal(ValueError):
+    """A replay must return the saved parent outcome without new work."""
+
+
 def _value(record: Any, name: str, default: Any = None) -> Any:
     if isinstance(record, Mapping):
         return record.get(name, default)
@@ -141,6 +149,33 @@ class DispatchStore:
             WorkDisposition(reference["disposition"])
         return list(references)
 
+    def parent_requested_at(self, parent_id: str) -> datetime:
+        """Reuse the immutable parent timestamp when a launcher retries its ID."""
+        with self._transaction() as cursor:
+            cursor.execute("SELECT created_at FROM piles_auto_assignment_runner_runs WHERE id = %s", (parent_id,))
+            row = cursor.fetchone()
+            if not row or not isinstance(row[0], datetime) or row[0].utcoffset() is None:
+                raise ValueError("Parent request timestamp is missing or invalid")
+            requested_at = row[0]
+        return requested_at
+
+    def fail_parent_setup(self, parent_id: str) -> bool:
+        """Only an empty parent can fail setup; never overwrite waiting work."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_runner_runs AS parent
+                SET status = 'failed', finished_at = now(), updated_at = now()
+                WHERE id = %s AND status IN ('queued','started','running')
+                  AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items
+                                  WHERE parent_runner_run_id = parent.id)
+                  AND coalesce(details ->> 'dispatch_requests', '[]') = '[]'
+                RETURNING id
+                """, (parent_id,),
+            )
+            failed = cursor.fetchone() is not None
+        return failed
+
     def enqueue_parent_work(self, parent_id: str, requests: Iterable[WorkRequest]) -> list[DispatchDecision]:
         requests = tuple(requests)
         if len(requests) > 256:
@@ -151,7 +186,7 @@ class DispatchStore:
         with self._transaction() as cursor:
             parent = self._lock_parent(cursor, parent_id)
             if parent["status"] not in {"queued", "started", "running"}:
-                raise ValueError("Cannot enqueue work for a terminal parent")
+                raise ParentAlreadyTerminal("Cannot enqueue work for a terminal parent")
             references = self._references(parent)
             # Take all locks in canonical order before reading coverage, avoiding
             # cross-parent deadlocks and stale statement snapshots after waits.
@@ -332,6 +367,68 @@ class DispatchStore:
             renewed = cursor.fetchone() is not None
         return renewed
 
+    def heartbeat_claim(self, work_id: str, claim_token: str, owner_pid: int,
+                        capacity_slot: int, lease_seconds: int = 120,
+                        insurer_run_id: Optional[str] = None) -> bool:
+        """Renew only while the live token AND both session locks still belong here.
+
+        Inspect pg_locks, never reacquire a lost advisory lock. This connection is
+        independent of the worker's lock-owning DataStore and execution ledger.
+        A start attachment also verifies that the insurer run belongs to this
+        parent. Call immediately before every final portal assignment click.
+        """
+        lease_seconds = self._lease_seconds(lease_seconds)
+        if type(owner_pid) is not int or owner_pid <= 0 or type(capacity_slot) is not int or capacity_slot not in (0, 1):
+            raise ValueError("A valid lock-owning backend and capacity slot are required")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_work_items AS work
+                SET heartbeat_at = now(), lease_expires_at = now() + %s * interval '1 second',
+                    updated_at = now(),
+                    started_at = CASE WHEN %s::text IS NOT NULL THEN coalesce(started_at, now()) ELSE started_at END,
+                    covered_by_insurer_run_id = coalesce(%s, covered_by_insurer_run_id)
+                WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                  AND lease_expires_at > now()
+                  AND (%s::text IS NULL OR EXISTS (
+                    SELECT 1 FROM piles_auto_assignment_insurer_runs run
+                    WHERE run.id = %s AND run.runner_run_id = work.parent_runner_run_id))
+                  AND (SELECT count(DISTINCT ((classid::bigint << 32) | objid::bigint))
+                       FROM pg_locks WHERE locktype = 'advisory' AND pid = %s
+                         AND objsubid = 1 AND granted AND mode = 'ExclusiveLock'
+                         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                         AND ((classid::bigint << 32) | objid::bigint) IN (
+                           hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0),
+                           hashtextextended(%s, 0))) = 2
+                RETURNING id
+                """, (lease_seconds, insurer_run_id, insurer_run_id, work_id, claim_token,
+                       insurer_run_id, insurer_run_id, owner_pid, f"piles-capacity:{capacity_slot}"),
+            )
+            renewed = cursor.fetchone() is not None
+        return renewed
+
+    def release_claim(self, work_id: str, claim_token: str, reason_code: str) -> bool:
+        """Return a never-started contention attempt to guarded claim recovery.
+
+        Keep the same row, owner and generation. Expiring its lease avoids a
+        queued/follow-up unique-index collision with a later legitimate request;
+        claim_next still checks insurer-lock freedom and rotates the token.
+        """
+        if reason_code not in {"worker_capacity_unavailable", "insurer_lock_unavailable"}:
+            raise ValueError("Only pre-execution lock contention may release a claim")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_work_items
+                SET lease_expires_at = now(), heartbeat_at = now(), updated_at = now(), reason_code = %s
+                WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                  AND lease_expires_at > now() AND started_at IS NULL
+                RETURNING id
+                """, (reason_code, work_id, claim_token),
+            )
+            released = cursor.fetchone() is not None
+        return released
+
     def finish_claim(self, work_id: str, claim_token: str, disposition: WorkDisposition,
                      insurer_run_id: Optional[str] = None, reason_code: str = "") -> bool:
         disposition = WorkDisposition(disposition)
@@ -346,6 +443,7 @@ class DispatchStore:
                 SET disposition = %s, covered_by_insurer_run_id = %s, reason_code = %s,
                     finished_at = now(), heartbeat_at = now(), lease_expires_at = NULL, updated_at = now()
                 WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                  AND lease_expires_at > now()
                 RETURNING id
                 """, (disposition.value, insurer_run_id, reason_code or None, work_id, claim_token),
             )
@@ -399,6 +497,8 @@ class DispatchStore:
                 referenced = _rows(cursor)
                 if {row["id"] for row in referenced} != set(reference_ids):
                     raise ValueError("A referenced dispatch generation is missing")
+                if any(row["disposition"] in {"queued", "claimed", "follow_up_queued"} for row in referenced):
+                    raise ParentWorkPending("Referenced dispatch work is nonterminal")
                 # This validates completion only. Foreign insurer outcomes never
                 # become an owned success/failure of the requesting parent.
                 # Terminal work is immutable; a plain read avoids cross-parent
@@ -406,6 +506,9 @@ class DispatchStore:
                 derive_parent_status((row["disposition"] for row in referenced), [])
                 if not rows:
                     acknowledgements.append(WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+            if any(row["disposition"] in {"queued", "claimed", "follow_up_queued"}
+                   or row["insurer_status"] in {"queued", "running"} for row in rows):
+                raise ParentWorkPending("Owned dispatch work is nonterminal")
             status = derive_parent_status(
                 [row["disposition"] for row in rows] + acknowledgements,
                 (row["insurer_status"] for row in rows if row["insurer_status"] is not None),
@@ -928,18 +1031,22 @@ class ExecutionLedger:
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) AS confirmed,
                     count(*) FILTER (WHERE status = 'reconciliation_pending') AS reconciliation_pending,
                     count(*) FILTER (WHERE status = 'conflict') AS conflict,
-                    count(*) FILTER (WHERE status = 'failed') AS failed
+                    count(*) FILTER (WHERE status = 'failed') AS failed,
+                    count(*) FILTER (WHERE status = 'submitted') AS submitted,
+                    count(*) FILTER (WHERE status = 'manual_action_required') AS manual_action_required
                 FROM piles_auto_assignment_attempts
                 WHERE insurer_run_id = %s
                 """,
                 (insurer_run_id,),
             )
-            row = cursor.fetchone() or (0, 0, 0, 0)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0)
         return {
             "confirmed": int(row[0] or 0),
             "reconciliation_pending": int(row[1] or 0),
             "conflict": int(row[2] or 0),
             "failed": int(row[3] or 0),
+            "submitted": int(row[4] or 0),
+            "manual_action_required": int(row[5] or 0),
         }
 
 

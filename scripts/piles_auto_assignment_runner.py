@@ -17,8 +17,11 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -40,9 +43,12 @@ from dotenv import load_dotenv
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 try:
-    from piles_auto_assignment.dispatch import ContextOutputRouter, WorkerContext, safe_worker_error
-    from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
+    from piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
+        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
+        dispatch_parent, execute_claimed_insurer)
+    from piles_auto_assignment.store import DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger, ParentAlreadyTerminal
+    from piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
+        ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
     from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from piles_auto_assignment.planning import (
@@ -53,9 +59,12 @@ try:
     from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
     from piles_auto_assignment.scheduling import configured_max_concurrency
 except ModuleNotFoundError:  # Repository-level unittest import path.
-    from scripts.piles_auto_assignment.dispatch import ContextOutputRouter, WorkerContext, safe_worker_error
-    from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
+    from scripts.piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
+        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
+        dispatch_parent, execute_claimed_insurer)
+    from scripts.piles_auto_assignment.store import DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger, ParentAlreadyTerminal
+    from scripts.piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
+        ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
     from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
     from scripts.piles_auto_assignment.planning import (
@@ -3230,6 +3239,7 @@ class DataStore:
         year: str,
         mode: str,
         details: dict[str, Any],
+        preserve_existing: bool = False,
     ) -> str:
         run_id = norm(run_id) or str(uuid.uuid4())
         payload = {
@@ -3247,8 +3257,7 @@ class DataStore:
             "details": details,
         }
         if self.mode == "postgres" and norm(run_id):
-            self._execute_postgres(
-                """
+            sql = """
                 insert into piles_auto_assignment_runner_runs
                 (id, insurer_name, run_scope, portal_environment, backend, run_source, months, year, mode, status, started_at, details)
                 values (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
@@ -3265,7 +3274,11 @@ class DataStore:
                   started_at = excluded.started_at,
                   details = coalesce(piles_auto_assignment_runner_runs.details, '{}'::jsonb) || excluded.details,
                   updated_at = now()
-                """,
+                """
+            if preserve_existing:
+                sql = sql.partition("on conflict")[0] + "on conflict (id) do nothing"
+            self._execute_postgres(
+                sql,
                 (
                     payload["id"],
                     payload["insurer_name"],
@@ -3394,7 +3407,16 @@ def build_execution_ledger(store: DataStore, args: argparse.Namespace, *, requir
     return ExecutionLedger(connection)
 
 
-def worker_context_factory(args: argparse.Namespace, output_router: ContextOutputRouter, *, max_concurrency: int = 1):
+def build_dispatch_store(store: DataStore) -> DispatchStore:
+    if store.mode != "postgres" or not store.database_url:
+        raise RuntimeError("Dispatcher v2 requires DATABASE_URL")
+    connection = psycopg2.connect(store.database_url)
+    connection.autocommit = False
+    return DispatchStore(connection)
+
+
+def worker_context_factory(args: argparse.Namespace, output_router: ContextOutputRouter, *,
+                           max_concurrency: int = 1, durable_claims: bool = False):
     """Build fresh resources on the calling worker; never share parent stores.
 
     V2 always needs a durable execution ledger (or the read-only probe ledger),
@@ -3412,7 +3434,12 @@ def worker_context_factory(args: argparse.Namespace, output_router: ContextOutpu
                 resources.callback(store.close)
                 ledger = build_execution_ledger(store, args, required=True)
                 resources.callback(ledger.close)
-                yield WorkerContext(store, ledger, output, work.worker_id, max_concurrency)
+                dispatch_store = build_dispatch_store(store) if durable_claims else None
+                if dispatch_store:
+                    resources.callback(dispatch_store.close)
+                output_dir = resources.enter_context(tempfile.TemporaryDirectory(prefix="piles-work-"))
+                yield WorkerContext(store, ledger, output, work.worker_id, max_concurrency,
+                                    dispatch_store=dispatch_store, output_path=str(Path(output_dir) / "plan.json"))
     return create
 
 
@@ -3453,6 +3480,11 @@ class CuracelPilesRunner:
         self.retry_attempt_numbers: dict[str, int] = {}
 
     def _heartbeat(self, phase: str) -> None:
+        work_heartbeat = getattr(self, "work_heartbeat", None)
+        if work_heartbeat:
+            # Ownership loss is fatal even if the optional ledger heartbeat is
+            # absent, throttled, or failing. Never swallow this callback.
+            work_heartbeat(phase)
         ledger = getattr(self, "execution_ledger", None)
         insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
         if not ledger or not insurer_run_id:
@@ -5605,18 +5637,31 @@ class CuracelPilesRunner:
         selected_keys = [plan.pile_key for plan in selected_group]
         self._heartbeat("apply")
         self._open_assign_modal()
-        selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
+        submission_recorded = False
+        def before_submit():
+            nonlocal submission_recorded
+            self._transition_assignment_attempts(
+                selected_group, AttemptStatus.SUBMITTED, {AttemptStatus.SELECTED},
+                {"code": "portal_submission_starting", "details": {}},
+            )
+            submission_recorded = True
+        self._before_assignment_submit = before_submit if execute and getattr(self, "work_heartbeat", None) else None
+        try:
+            selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
+        finally:
+            self._before_assignment_submit = None
         verified_on_table = False
         observed_assigned_values: list[str] = []
         if execute:
-            self._transition_assignment_attempts(
-                selected_group,
-                AttemptStatus.SUBMITTED,
-                {AttemptStatus.SELECTED},
-                {"code": "portal_submit_returned", "details": {
-                    "selected_assignee": selected_assignee,
-                }},
-            )
+            if not submission_recorded:
+                self._transition_assignment_attempts(
+                    selected_group,
+                    AttemptStatus.SUBMITTED,
+                    {AttemptStatus.SELECTED},
+                    {"code": "portal_submit_returned", "details": {
+                        "selected_assignee": selected_assignee,
+                    }},
+                )
             self._heartbeat("apply")
             source_pages: list[int] = []
             for plan in selected_group:
@@ -6232,10 +6277,29 @@ class CuracelPilesRunner:
                     try:
                         button = root.locator(selector).first
                         if button.count() and button.is_visible():
+                            work_heartbeat = getattr(self, "work_heartbeat", None)
+                            if work_heartbeat:
+                                work_heartbeat("apply")
+                                before_submit = getattr(self, "_before_assignment_submit", None)
+                                if before_submit:
+                                    before_submit()
+                                # Ledger recording can block too. Recheck at the
+                                # final boundary, not just before modal work.
+                                work_heartbeat("apply")
+                                try:
+                                    button.click(force=True)
+                                except Exception as error:
+                                    raise AssignmentSubmissionUncertain() from error
+                                clicked = True
+                                break
                             button.click(force=True)
                             clicked = True
                             break
+                    except (WorkOwnershipLost, AssignmentSubmissionUncertain):
+                        raise
                     except Exception:
+                        if getattr(self, "work_heartbeat", None):
+                            raise
                         continue
                 if clicked:
                     break
@@ -6265,6 +6329,8 @@ class CuracelPilesRunner:
                         pass
                     time.sleep(0.3)
             if not verified:
+                if getattr(self, "work_heartbeat", None):
+                    raise AssignmentSubmissionUncertain()
                 raise RuntimeError(f"Assign action for '{selected_assignee}' did not show a clear portal success state.")
             self._dismiss_popup()
         else:
@@ -7877,6 +7943,7 @@ def _run_for_insurer_once(
         runner.execution_ledger = execution_ledger
         runner.insurer_run_id = insurer_run_id
         runner.insurer_name = insurer_name
+        runner.work_heartbeat = getattr(args, "work_heartbeat", None)
 
         def ensure_portal_mapping(sample_pile: PileRow) -> None:
             nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots, portal_mapping_warnings
@@ -8561,6 +8628,8 @@ def run_for_insurer(
             )
         except Exception as exc:
             last_error = exc
+            if isinstance(exc, (WorkOwnershipLost, AssignmentSubmissionUncertain)):
+                raise
             if attempt >= 2 or not is_retryable_runner_browser_error(exc):
                 raise
             print(
@@ -8582,6 +8651,7 @@ def run_insurer_recorded(
     runner_run_id: str,
     *,
     safe_diagnostics: bool = False,
+    ownership: Any = None,
 ) -> dict[str, Any]:
     """Run one insurer and keep ledger-finalization failures from masking portal errors."""
     insurer_run_id = ""
@@ -8589,21 +8659,34 @@ def run_insurer_recorded(
         if execution_ledger:
             master = store.get_master_account(insurer_name)
             insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
+            if ownership:
+                ownership.started(insurer_run_id)
             execution_ledger.heartbeat(insurer_run_id, phase="login")
         result = run_for_insurer(
             store, args, insurer_name, month_labels, year_label, visible,
             execution_ledger, insurer_run_id,
         )
         if insurer_run_id:
-            execution_ledger.finalize_insurer_run(insurer_run_id, status="completed")
+            status = "completed"
+            if ownership:
+                ownership.check()
+                summary = execution_ledger.summarize_insurer_run(insurer_run_id)
+                if any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed", "manual_action_required")):
+                    status = "completed_with_issues"
+                ownership.status = InsurerRunStatus(status)
+                ownership.check()
+            execution_ledger.finalize_insurer_run(insurer_run_id, status=status)
         return result
     except Exception as exc:
+        if ownership:
+            # Lost owners cannot finalize even their old insurer run.
+            ownership.check()
         if insurer_run_id:
             try:
                 execution_ledger.finalize_insurer_run(
                     insurer_run_id,
                     status="failed",
-                    error_code=classify_runner_error(exc),
+                    error_code=safe_worker_error(exc)[0] if safe_diagnostics else classify_runner_error(exc),
                     error_message=safe_worker_error(exc)[1] if safe_diagnostics else str(exc)[:500],
                 )
             except Exception as ledger_error:
@@ -8623,14 +8706,154 @@ def run_claimed_insurer_once(work, context: WorkerContext, args: argparse.Namesp
     """
     worker_args = deepcopy(args)
     worker_args.worker_safe_diagnostics = True
+    if context.ownership:
+        worker_args.work_heartbeat = context.ownership.check
+    if context.output_path:
+        worker_args.out = context.output_path
+    elif getattr(worker_args, "out", None):
+        path = Path(worker_args.out)
+        identifier = hashlib.sha256(f"{work.id}:{work.claim_token}".encode()).hexdigest()[:16]
+        worker_args.out = str(path.with_name(f"{path.stem}-{identifier}{path.suffix}"))
     return run_insurer_recorded(
         context.store, worker_args, work.insurer_name, list(month_labels),
         year_label, visible, context.ledger, work.parent_runner_run_id or "",
-        safe_diagnostics=True,
+        safe_diagnostics=True, ownership=context.ownership,
     )
 
 
+def notify_dispatch_result(args: argparse.Namespace, result: DispatchResult) -> None:
+    """Send only parent-aggregated payloads after every worker has joined."""
+    external = list(result.external_notification_items)
+    if should_send_external_assignment_alert(args, external):
+        try:
+            send_external_assignment_alert(external, portal_environment=PORTAL_ENVIRONMENT,
+                                           run_source=norm(args.run_source) or "manual")
+        except Exception:
+            print("WARNING: external assignment notification failed.")
+    items = list(result.notification_items)
+    if not args.execute or not items:
+        return
+    assigned = [item for item in items if item.kind == "assignment"]
+    reassigned = [item for item in items if item.kind == "reassignment"]
+    try:
+        thread = create_assignment_thread(
+            scope_label=args.insurer or "All active insurers", portal_environment=PORTAL_ENVIRONMENT,
+            assigned_piles=len(assigned), assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned),
+            reassigned_piles=len(reassigned), reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned),
+            insurer_names=[item.plan.insurer_name for item in items],
+        ) or ""
+        if thread:
+            for owner_items in group_notification_items_by_owner(items):
+                send_assignment_owner_reply(owner_items, thread)
+    except Exception:
+        print("WARNING: assignment summary notification failed.")
+
+
+def main_v2() -> DispatchResult:
+    """Default-disabled composition root; no legacy follow-up or parent writer."""
+    args = parse_args()
+    if args.read_only and args.execute:
+        raise RuntimeError("--read-only cannot be combined with --execute.")
+    configure_portal_environment(args.portal_environment)
+    months, year = parse_month_labels(args.month), parse_year_label(args.year)
+    visible = args.visible or not env_bool("HEADLESS", True)
+    maximum = configured_max_concurrency()
+    if args.execute and not is_test_portal(CURACEL_BASE_URL) and not env_bool("ALLOW_PRODUCTION_ASSIGNMENTS", False):
+        raise RuntimeError("Execute mode is blocked outside the test portal without explicit production approval.")
+    # Non-execute v2 invocations are probes: no parent/queue/assignment writes.
+    if not args.execute:
+        args = deepcopy(args)
+        args.read_only = True
+    run_id, coordinator = "", None
+    with ExitStack() as resources:
+        stopped = threading.Event()
+        def request_stop(_signal, _frame):
+            stopped.set()
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            original = signal.signal(shutdown_signal, request_stop)
+            resources.callback(signal.signal, shutdown_signal, original)
+        store = DataStore(read_only=bool(args.read_only))
+        resources.callback(store.close)
+        insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
+        if not insurers:
+            raise RuntimeError("No active insurer master accounts were found to run.")
+        with ContextOutputRouter.installed() as router:
+            factory = worker_context_factory(args, router, max_concurrency=maximum, durable_claims=bool(args.execute))
+            def run_one(work, context):
+                return run_claimed_insurer_once(work, context, args, months, year, visible)
+            if not args.execute:
+                @contextmanager
+                def probe_context(work):
+                    with factory(work) as context:
+                        yield replace(context, dispatch_store=None)
+                outcomes = []
+                for insurer in insurers:
+                    work = ProbeWork(insurer, canonical_insurer_key(insurer))
+                    outcome = execute_claimed_insurer(work, probe_context, run_one)
+                    if outcome.error_code == "insurer_lock_unavailable":
+                        outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
+                    elif outcome.error_code == "worker_capacity_unavailable":
+                        outcome = replace(outcome, error_code="probe_blocked_by_capacity")
+                    outcomes.append(outcome)
+                failures = [outcome.error_code for outcome in outcomes if outcome.status == InsurerRunStatus.FAILED]
+                if failures:
+                    raise WorkerUnavailable(failures[0])
+                return DispatchResult(ParentRunStatus.COMPLETED, tuple(outcomes))
+            try:
+                coordinator = build_dispatch_store(store)
+                resources.callback(coordinator.close)
+                run_id = store.create_runner_run(
+                    run_id=args.run_id, insurer_name=args.insurer or "",
+                    run_scope="all-active" if args.all_active else "single",
+                    portal_environment=PORTAL_ENVIRONMENT, backend=norm(args.invocation_backend) or "local",
+                    run_source=WorkSource(norm(args.run_source) or "manual").value,
+                    months=months, year=year, mode="execute",
+                    details={"dispatcher_v2": True, "insurers": insurers},
+                    preserve_existing=True,
+                )
+                requested_at = coordinator.parent_requested_at(run_id)
+                requests = [WorkRequest(insurer, WorkSource(norm(args.run_source) or "manual"), requested_at,
+                                        RequestScope.ALL_ACTIVE if args.all_active else RequestScope.SINGLE_INSURER)
+                            for insurer in insurers]
+                work_items = coordinator.enqueue_parent_work(run_id, requests)
+                restored = []
+                if store.try_acquire_insurer_lock("__weekend_state__"):
+                    try:
+                        restored = store.restore_due_weekend_bot_states(runner_effective_date(args))
+                    finally:
+                        store.release_insurer_lock("__weekend_state__")
+                result = dispatch_parent(run_id, work_items, maximum, factory, run_one,
+                                         store=coordinator, stop_event=stopped)
+                notify_dispatch_result(args, result)
+                if restored:
+                    try:
+                        send_weekend_restore_update(restored)
+                    except Exception:
+                        print("WARNING: weekend roster notification failed.")
+                if result.status == ParentRunStatus.RUNNING:
+                    raise WorkerUnavailable("dispatch_work_pending")
+                if any(outcome.status == InsurerRunStatus.FAILED for outcome in result.outcomes):
+                    raise RuntimeError("One or more insurers failed; inspect the normalized insurer outcomes.")
+                return result
+            except ParentAlreadyTerminal:
+                return DispatchResult(coordinator.finalize_parent(run_id), ())
+            except Exception as error:
+                if coordinator and run_id:
+                    try:
+                        coordinator.fail_parent_setup(run_id)
+                    except Exception:
+                        pass  # Keep durable state recoverable when the DB is unavailable.
+                code, _ = safe_worker_error(error)
+                raise WorkerUnavailable(code) from None
+
+
 def main() -> None:
+    if dispatcher_v2_enabled():
+        try:
+            return main_v2()
+        except Exception as error:
+            code, _ = safe_worker_error(error)
+            raise RuntimeError(f"Dispatcher could not complete ({code}).") from None
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     stdout_capture = TeeCapture(original_stdout)

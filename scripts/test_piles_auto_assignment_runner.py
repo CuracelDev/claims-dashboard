@@ -1,11 +1,15 @@
 import importlib.util
 import io
 import os
+import signal
+import sqlite3
 import sys
 import threading
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2412,6 +2416,410 @@ class WorkerAdapterIntegrationTests(unittest.TestCase):
         self.assertEqual(records[0]["error_code"], "authentication_failed")
         self.assertNotIn("SECRET", repr(records))
         self.assertNotIn("patient", repr(records))
+
+
+class DispatcherRunnerFencingTests(unittest.TestCase):
+    def modal(self, guard, *, click_error=False):
+        events = []
+        class Button:
+            @property
+            def first(self):
+                return self
+            def count(self):
+                return 1
+            def is_visible(self):
+                return True
+            def click(self, **_):
+                events.append("assignment")
+                if click_error:
+                    raise TimeoutError("browser acknowledgement lost")
+        class Root:
+            def locator(self, _selector):
+                return Button()
+            def wait_for(self, **_):
+                pass
+        browser = runner.CuracelPilesRunner()
+        browser.page = Root()
+        browser.work_heartbeat = guard
+        browser._visible_overlay_roots = lambda: [Root()]
+        browser._wait_for_assign_user_control = lambda **_: object()
+        browser._open_select_control = lambda _: True
+        browser._choose_option_from_open_dropdown = lambda _: "Assignee"
+        browser._dismiss_popup = lambda: None
+        return browser, events
+
+    def test_final_assignment_boundary_fences_loss_after_dropdown_selection(self):
+        WorkOwnershipLost = runner.WorkOwnershipLost
+        checked = []
+        def lost(phase):
+            checked.append(phase)
+            raise WorkOwnershipLost()
+        browser, events = self.modal(lost)
+        with patch.object(runner.time, "sleep", lambda _: None):
+            with self.assertRaises(WorkOwnershipLost):
+                browser._apply_assignment_modal("Vetting", "Assignee", True)
+        self.assertEqual(events, [])
+        self.assertEqual(checked, ["apply"])
+
+    def test_ambiguous_assignment_click_is_never_tried_on_a_second_selector(self):
+        browser, events = self.modal(lambda phase: None, click_error=True)
+        with patch.object(runner.time, "sleep", lambda _: None):
+            with self.assertRaises(Exception):
+                browser._apply_assignment_modal("Vetting", "Assignee", True)
+        self.assertEqual(events, ["assignment"])
+
+    def test_worker_heartbeat_loss_is_not_swallowed_by_ledger_throttling(self):
+        WorkOwnershipLost = runner.WorkOwnershipLost
+        browser = runner.CuracelPilesRunner()
+        def lost(phase):
+            raise WorkOwnershipLost()
+        browser.work_heartbeat = lost
+        with self.assertRaises(WorkOwnershipLost):
+            browser._heartbeat("scan")
+
+    def test_submission_evidence_is_written_before_the_only_ambiguous_click(self):
+        browser, events = self.modal(lambda phase: None, click_error=True)
+        browser._open_assign_modal = lambda: None
+        browser._transition_assignment_attempts = lambda group, status, *rest: events.append(status.value)
+        with patch.object(runner.time, "sleep", lambda _: None):
+            with self.assertRaises(Exception):
+                browser._apply_selected_group("All", "2026", "Vetting Pending", "Assignee", "Vetting",
+                                              [types.SimpleNamespace(pile_key="fixture")], True)
+        self.assertEqual(events, ["submitted", "assignment"])
+
+    def test_fence_loss_after_submission_recording_still_prevents_click(self):
+        WorkOwnershipLost = runner.WorkOwnershipLost
+        calls = []
+        def heartbeat(phase):
+            calls.append(phase)
+            if len(calls) == 2:
+                raise WorkOwnershipLost()
+        browser, events = self.modal(heartbeat)
+        browser._before_assignment_submit = lambda: events.append("submitted")
+        with patch.object(runner.time, "sleep", lambda _: None):
+            with self.assertRaises(WorkOwnershipLost):
+                browser._apply_assignment_modal("Vetting", "Assignee", True)
+        self.assertEqual(events, ["submitted"])
+
+    def test_ambiguous_browser_closed_submission_cannot_restart_insurer_flow(self):
+        AssignmentSubmissionUncertain = runner.AssignmentSubmissionUncertain
+        calls = []
+        def portal(*args):
+            calls.append("assignment")
+            try:
+                raise RuntimeError("Target page, context or browser has been closed")
+            except RuntimeError as error:
+                raise AssignmentSubmissionUncertain() from error
+        with patch.object(runner, "_run_for_insurer_once", portal), patch.object(runner.time, "sleep", lambda _: None):
+            with self.assertRaises(AssignmentSubmissionUncertain):
+                runner.run_for_insurer(None, types.SimpleNamespace(), "Kenya", ["All"], "2026", False)
+        self.assertEqual(calls, ["assignment"])
+
+    def test_lost_owner_cannot_finalize_its_insurer_record(self):
+        WorkOwnershipLost = runner.WorkOwnershipLost
+        finals = []
+        class Guard:
+            def started(self, run_id):
+                pass
+            def check(self, phase=""):
+                raise WorkOwnershipLost()
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def finalize_insurer_run(self, *args, **kwargs):
+                finals.append(kwargs)
+        store = types.SimpleNamespace(get_master_account=lambda name: {"insurer_name": name})
+        with patch.object(runner, "run_for_insurer", lambda *args: {}):
+            with self.assertRaises(WorkOwnershipLost):
+                runner.run_insurer_recorded(store, types.SimpleNamespace(), "Kenya", ["All"], "2026", False,
+                                           Ledger(), "parent", ownership=Guard())
+        self.assertEqual(finals, [])
+
+    def test_ownership_is_rechecked_after_slow_summary_before_insurer_finalization(self):
+        finals = []
+        class Guard:
+            lost = False
+            def started(self, run_id):
+                pass
+            def check(self, phase=""):
+                if self.lost:
+                    raise runner.WorkOwnershipLost()
+        guard = Guard()
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def summarize_insurer_run(self, run_id):
+                guard.lost = True
+                return {"confirmed": 1}
+            def finalize_insurer_run(self, *args, **kwargs):
+                finals.append(kwargs)
+        store = types.SimpleNamespace(get_master_account=lambda name: {"insurer_name": name})
+        with patch.object(runner, "run_for_insurer", lambda *args: {}):
+            with self.assertRaises(runner.WorkOwnershipLost):
+                runner.run_insurer_recorded(store, types.SimpleNamespace(), "Kenya", ["All"], "2026", False,
+                                           Ledger(), "parent", ownership=guard)
+        self.assertEqual(finals, [])
+
+    def test_adapter_attaches_run_before_portal_and_uses_unique_claim_output(self):
+        from scripts.test_piles_auto_assignment_dispatch import claimed, Resource
+        from scripts.piles_auto_assignment.dispatch import WorkerContext
+        records, outputs = [], []
+        class Guard:
+            status = runner.InsurerRunStatus.COMPLETED
+            def started(self, run_id):
+                records.append("attached")
+            def check(self, phase=""):
+                records.append("renewed")
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def finalize_insurer_run(self, run_id, **fields):
+                records.append(fields["status"])
+            def summarize_insurer_run(self, run_id):
+                return {"confirmed": 1, "reconciliation_pending": 1, "conflict": 0, "failed": 0}
+        store = Resource()
+        store.get_master_account = lambda name: {"insurer_name": name}
+        args = types.SimpleNamespace(out="tmp/shared.json")
+        guard = Guard()
+        context = WorkerContext(store, Ledger(), io.StringIO(), "worker", ownership=guard)
+        def portal(store, args, *rest):
+            self.assertIn("attached", records)
+            self.assertTrue(callable(args.work_heartbeat))
+            outputs.append(args.out)
+            return {}
+        with patch.object(runner, "run_for_insurer", portal):
+            runner.run_claimed_insurer_once(claimed("Kenya"), context, args, ["All"], "2026", False)
+            runner.run_claimed_insurer_once(claimed("Uganda"), context, args, ["All"], "2026", False)
+        self.assertNotEqual(outputs[0], outputs[1])
+        self.assertEqual(args.out, "tmp/shared.json")
+        self.assertEqual(guard.status, runner.InsurerRunStatus.COMPLETED_WITH_ISSUES)
+        self.assertEqual(records.count("completed_with_issues"), 2)
+
+    def test_durable_worker_context_uses_three_distinct_connections(self):
+        from scripts.test_piles_auto_assignment_dispatch import claimed
+        from scripts.piles_auto_assignment.dispatch import ContextOutputRouter
+        connections = []
+        class Connection:
+            autocommit = True
+            closed = False
+            def close(self):
+                self.closed = True
+        def connect(_url):
+            result = Connection()
+            connections.append(result)
+            return result
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://fixture"}):
+            with patch.object(runner.psycopg2, "connect", connect, create=True):
+                factory = runner.worker_context_factory(types.SimpleNamespace(read_only=False),
+                    ContextOutputRouter(io.StringIO()), durable_claims=True)
+                with factory(claimed()) as context:
+                    self.assertEqual(len({id(context.store.conn), id(context.ledger.connection),
+                                          id(context.dispatch_store.connection)}), 3)
+                    output_path = Path(context.output_path)
+                    output_path.write_text("private test fixture")
+        self.assertEqual(len(connections), 3)
+        self.assertTrue(all(connection.closed for connection in connections))
+        self.assertFalse(output_path.parent.exists())
+
+    def test_v2_parent_retry_preserves_terminal_status_and_prior_dispatch_references(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.executescript("""
+            CREATE TABLE piles_auto_assignment_runner_runs(
+                id TEXT PRIMARY KEY, insurer_name TEXT, run_scope TEXT, portal_environment TEXT,
+                backend TEXT, run_source TEXT, months TEXT, year TEXT, mode TEXT,
+                status TEXT, started_at TEXT, details TEXT, updated_at TEXT);
+            INSERT INTO piles_auto_assignment_runner_runs(id,status,started_at,details)
+                VALUES ('parent','completed','original','{"dispatch_requests":["opaque"]}');
+        """)
+        store = object.__new__(runner.DataStore)
+        store.mode = "postgres"
+        store._execute_postgres = lambda sql, params: db.execute(sql.replace("::jsonb", "").replace("%s", "?"), params)
+        store.create_runner_run(run_id="parent", insurer_name="Kenya", run_scope="single", portal_environment="test",
+            backend="local", run_source="manual", months=["All"], year="2026", mode="execute",
+            details={}, preserve_existing=True)
+        self.assertEqual(db.execute("SELECT status,started_at,details FROM piles_auto_assignment_runner_runs").fetchone(),
+                         ("completed", "original", '{"dispatch_requests":["opaque"]}'))
+
+
+class DispatcherMainTests(unittest.TestCase):
+    def invoke(self, state, run_one, *, execute=True, flag="true", maximum=2, terminal_replay=False):
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        self.args = types.SimpleNamespace(read_only=not execute, execute=execute, portal_environment="test",
+            month="All", year="2026", visible=False, all_active=True, insurer=None, run_id="parent",
+            invocation_backend="local", run_source="schedule", effective_date="", slow_mo=0,
+            out="tmp/unused.json")
+        self.events = []
+        owner = self
+        class ParentStore:
+            def __init__(self, **options):
+                owner.events.append(("store", options))
+            def get_active_master_accounts(self):
+                return [types.SimpleNamespace(insurer_name=row.insurer_name) for row in state.rows.values()]
+            def create_runner_run(self, **fields):
+                owner.events.append(("created", fields["run_source"]))
+                return "parent"
+            def try_acquire_insurer_lock(self, name):
+                return False
+            def try_acquire_runner_slot(self, maximum):
+                return -1
+            def mark_coalesced_request(self, *args):
+                if flag == "true":
+                    owner.fail("v2 called legacy coalescing")
+                owner.events.append(("legacy_coalesced",))
+                return "legacy-request"
+            def claim_coalesced_request(self, *args):
+                owner.fail("v2 entered legacy follow-up")
+            def log_runner_event(self, **fields):
+                pass
+            def finalize_runner_run(self, *args, **fields):
+                owner.events.append(("legacy_finalized", fields["status"]))
+            def close(self):
+                owner.events.append(("closed",))
+        coordinator = state.store()
+        def enqueue(parent_id, requests):
+            if terminal_replay:
+                raise runner.ParentAlreadyTerminal("Terminal fixture")
+            owner.events.append(("enqueued", tuple(requests)))
+            return list(state.rows.values())
+        coordinator.enqueue_parent_work = enqueue
+        coordinator.parent_requested_at = lambda parent_id: now
+        coordinator.close = lambda: None
+        coordinator.fail_parent_setup = lambda *args: owner.events.append(("setup_failed",))
+        def notify(items, **fields):
+            self.assertTrue(all(row.disposition.value in {"completed", "failed", "covered_by_active_cycle"} for row in state.rows.values()))
+            self.assertEqual(threading.current_thread(), threading.main_thread())
+            self.events.append(("notification", tuple(items)))
+        def assignment_thread(**fields):
+            notify(())
+            self.events.append(("assignment_thread", tuple(fields["insurer_names"])))
+            return "thread"
+        def owner_reply(items, thread):
+            self.assertEqual(thread, "thread")
+            self.events.append(("owner_reply", tuple(item.owner_name for item in items)))
+            return True
+        with ExitStack() as patches:
+            patches.enter_context(patch.dict(os.environ, {"PILES_AUTO_ASSIGNMENT_DISPATCHER_V2": flag,
+                "PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY": str(maximum)}))
+            patches.enter_context(patch.object(sys, "stdout", io.StringIO()))
+            patches.enter_context(patch.object(sys, "stderr", io.StringIO()))
+            patches.enter_context(patch.object(runner, "parse_args", lambda: self.args))
+            patches.enter_context(patch.object(runner, "DataStore", ParentStore))
+            patches.enter_context(patch.object(runner, "build_dispatch_store", lambda store: coordinator, create=True))
+            patches.enter_context(patch.object(runner, "build_execution_ledger", lambda *args, **kwargs: None))
+            patches.enter_context(patch.object(runner, "worker_context_factory", lambda *args, **kwargs: state.context))
+            patches.enter_context(patch.object(runner, "run_claimed_insurer_once", lambda work, context, *args: run_one(work, context)))
+            patches.enter_context(patch.object(runner, "send_external_assignment_alert", notify))
+            patches.enter_context(patch.object(runner, "create_assignment_thread", assignment_thread))
+            patches.enter_context(patch.object(runner, "send_assignment_owner_reply", owner_reply))
+            return runner.main()
+
+    def test_v2_main_dispatches_mixed_outcomes_then_notifies_in_parent(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(), []
+        barrier = threading.Barrier(2)
+        def portal(work, context):
+            calls.append(work.id)
+            barrier.wait(timeout=3)
+            if work.id == "0":
+                raise TimeoutError("private fixture")
+            return {"external_notification_items": ["Uganda"]}
+        with self.assertRaises(RuntimeError):
+            self.invoke(state, portal)
+        self.assertCountEqual(calls, ["0", "1"])
+        self.assertEqual([event[1] for event in state.events if event[0] == "parent"],
+                         [runner.ParentRunStatus.COMPLETED_WITH_ISSUES])
+        self.assertIn(("notification", ("Uganda",)), self.events)
+        self.assertFalse(any(event[0] == "legacy_finalized" for event in self.events))
+
+    def test_covered_only_main_has_no_portal_call_follow_up_or_notification(self):
+        from dataclasses import replace
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState()
+        state.rows = {key: replace(row, disposition="covered_by_active_cycle") for key, row in state.rows.items()}
+        self.invoke(state, lambda *_: self.fail("covered work cannot run"))
+        self.assertEqual([event[1] for event in state.events if event[0] == "parent"],
+                         [runner.ParentRunStatus.COVERED_BY_ACTIVE_CYCLE])
+        self.assertFalse(any(event[0] in {"notification", "legacy_finalized"} for event in self.events))
+
+    def test_probe_never_enqueues_or_creates_parent_and_reports_held_insurer(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        state.insurer_locks["kenya"] = "foreign"
+        with self.assertRaisesRegex(RuntimeError, "probe_blocked_by_active_insurer"):
+            self.invoke(state, lambda *_: self.fail("blocked probe cannot run"), execute=False)
+        self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"} for event in self.events))
+        self.assertEqual(state.events, [])
+
+    def test_original_request_timestamp_is_passed_to_enqueue(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        self.invoke(state, lambda *_: {})
+        requests = next(event[1] for event in self.events if event[0] == "enqueued")
+        self.assertEqual(requests[0].requested_at, datetime(2026, 9, 10, tzinfo=timezone.utc))
+
+    def test_disabled_flag_keeps_legacy_overlap_and_parent_status_behavior(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        self.invoke(DispatchState(), lambda *_: self.fail("legacy overlap cannot run"), flag="false")
+        self.assertEqual(self.events.count(("legacy_coalesced",)), 2)
+        self.assertIn(("legacy_finalized", "skipped_overlap"), self.events)
+        self.assertFalse(any(event[0] == "enqueued" for event in self.events))
+
+    def test_unblocked_probe_is_one_pass_without_queue_or_parent_writes(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya",)), []
+        result = self.invoke(state, lambda work, context: calls.append(work.insurer_name) or {}, execute=False)
+        self.assertEqual(calls, ["Kenya"])
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"} for event in self.events))
+        self.assertEqual(state.events, [])
+
+    def test_shutdown_signal_finishes_active_work_and_leaves_next_work_queued(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(), []
+        original = signal.getsignal(signal.SIGTERM)
+        def portal(work, context):
+            calls.append(work.id)
+            handler = signal.getsignal(signal.SIGTERM)
+            self.assertTrue(callable(handler), "V2 did not install a safe shutdown handler")
+            handler(signal.SIGTERM, None)
+            return {}
+        with self.assertRaises(RuntimeError):
+            self.invoke(state, portal, maximum=1)
+        self.assertEqual(calls, ["0"])
+        self.assertEqual([row.disposition.value for row in state.rows.values()], ["completed", "queued"])
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_v2_top_level_setup_error_never_exposes_driver_or_portal_text(self):
+        with patch.dict(os.environ, {"PILES_AUTO_ASSIGNMENT_DISPATCHER_V2": "true"}):
+            with patch.object(runner, "main_v2", side_effect=RuntimeError('password="SECRET" <html>patient</html>')):
+                with self.assertRaises(RuntimeError) as failure:
+                    runner.main()
+        self.assertNotIn("SECRET", str(failure.exception))
+        self.assertNotIn("patient", str(failure.exception))
+
+    def test_terminal_parent_replay_does_not_redispatch_or_renotify(self):
+        from dataclasses import replace
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        state.rows["0"] = replace(state.rows["0"], disposition="completed")
+        result = self.invoke(state, lambda *_: self.fail("terminal parent cannot rerun"), terminal_replay=True)
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        self.assertEqual(result.outcomes, ())
+        self.assertFalse(any(event[0] in {"enqueued", "notification", "legacy_finalized"} for event in self.events))
+
+    def test_assignment_notifications_are_ordered_after_all_workers_finish(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState()
+        barrier = threading.Barrier(2)
+        second_done = threading.Event()
+        def portal(work, context):
+            barrier.wait(timeout=3)
+            if work.id == "0":
+                self.assertTrue(second_done.wait(3))
+            else:
+                second_done.set()
+            item = types.SimpleNamespace(kind="assignment", plan=types.SimpleNamespace(remaining_claims=10,
+                insurer_name=work.insurer_name), owner_name=work.insurer_name, owner_slack_user_id="",
+                actual_assignee_name=work.insurer_name)
+            return {"notification_items": [item]}
+        self.invoke(state, portal)
+        self.assertIn(("assignment_thread", ("Kenya", "Uganda")), self.events)
+        self.assertEqual([event[1] for event in self.events if event[0] == "owner_reply"], [("Kenya",), ("Uganda",)])
 
 
 class BrowserLifecycleTests(unittest.TestCase):
