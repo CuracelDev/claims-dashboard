@@ -3,7 +3,12 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
-from .domain import ContextStatus, InsurerRunStatus
+from .domain import (
+    ContextStatus,
+    InsurerRunStatus,
+    ParentRunStatus,
+    WorkDisposition,
+)
 from .scanning import IncompleteScan
 
 
@@ -44,7 +49,71 @@ def classify_runner_error(error: BaseException) -> str:
     return "unexpected_error"
 
 
-def derive_overall_run_status(statuses: Iterable[InsurerRunStatus]) -> InsurerRunStatus:
+def derive_parent_status(
+    dispositions: Iterable[WorkDisposition],
+    insurer_statuses: Iterable[InsurerRunStatus],
+) -> ParentRunStatus:
+    """Aggregate terminal owned work while normalizing legacy read values."""
+    disposition_values = tuple(WorkDisposition(value) for value in dispositions)
+    status_values = tuple(InsurerRunStatus(value) for value in insurer_statuses)
+
+    nonterminal_dispositions = {
+        WorkDisposition.QUEUED,
+        WorkDisposition.CLAIMED,
+        WorkDisposition.FOLLOW_UP_QUEUED,
+    }
+    nonterminal_statuses = {
+        InsurerRunStatus.QUEUED,
+        InsurerRunStatus.RUNNING,
+    }
+    if set(disposition_values) & nonterminal_dispositions:
+        raise ValueError("Parent work cannot be finalized while work is nonterminal")
+    if set(status_values) & nonterminal_statuses:
+        raise ValueError("Parent work cannot be finalized while an insurer is active")
+
+    signals = []
+    disposition_signals = {
+        WorkDisposition.COVERED_BY_ACTIVE_CYCLE: "covered",
+        WorkDisposition.INACTIVE: "inactive",
+        WorkDisposition.COMPLETED: "completed",
+        WorkDisposition.FAILED: "failed",
+        WorkDisposition.CANCELLED: "cancelled",
+    }
+    status_signals = {
+        InsurerRunStatus.COMPLETED: "completed",
+        InsurerRunStatus.COMPLETED_WITH_ISSUES: "issue",
+        InsurerRunStatus.PARTIAL: "issue",
+        InsurerRunStatus.FAILED: "failed",
+        InsurerRunStatus.MANUAL_ACTION_REQUIRED: "issue",
+        InsurerRunStatus.SKIPPED_INACTIVE: "inactive",
+        InsurerRunStatus.SKIPPED_OVERLAP: "covered",
+        InsurerRunStatus.COVERED_BY_ACTIVE_CYCLE: "covered",
+        InsurerRunStatus.CANCELLED: "cancelled",
+    }
+    signals.extend(disposition_signals[value] for value in disposition_values)
+    signals.extend(status_signals[value] for value in status_values)
+
+    if not signals:
+        return ParentRunStatus.COMPLETED
+
+    signal_set = set(signals)
+    if signal_set == {"covered"}:
+        return ParentRunStatus.COVERED_BY_ACTIVE_CYCLE
+    if signal_set <= {"cancelled", "inactive"} and "cancelled" in signal_set:
+        return ParentRunStatus.CANCELLED
+    if "failed" in signal_set and not signal_set & {"completed", "issue", "covered"}:
+        return ParentRunStatus.FAILED
+    if signal_set & {"failed", "issue"}:
+        return ParentRunStatus.COMPLETED_WITH_ISSUES
+    if "cancelled" in signal_set:
+        return ParentRunStatus.COMPLETED_WITH_ISSUES
+    return ParentRunStatus.COMPLETED
+
+
+def derive_overall_run_status(
+    statuses: Iterable[InsurerRunStatus],
+) -> InsurerRunStatus:
+    """Retain the legacy sequential runner's persisted status behavior."""
     values = tuple(InsurerRunStatus(value) for value in statuses)
     successful = sum(value in {
         InsurerRunStatus.COMPLETED,

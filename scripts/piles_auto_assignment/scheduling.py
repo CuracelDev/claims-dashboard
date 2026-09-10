@@ -1,9 +1,15 @@
-"""Deterministic overlap coalescing used by the durable scheduler adapter."""
+"""Pure dispatch coverage decisions for the durable scheduler adapter."""
 
 import os
-import uuid
-from dataclasses import dataclass
 from typing import Mapping, Optional
+
+from .domain import (
+    DispatchDecision,
+    InsurerCoverage,
+    RequestScope,
+    WorkDisposition,
+    WorkRequest,
+)
 
 
 def configured_max_concurrency(environ: Optional[Mapping[str, str]] = None) -> int:
@@ -17,40 +23,49 @@ def configured_max_concurrency(environ: Optional[Mapping[str, str]] = None) -> i
     return value
 
 
-@dataclass(frozen=True)
-class ScheduleDecision:
-    insurer_name: str
-    request_id: str
-    status: str
-    coalesced_request_id: str = ""
+def decide_dispatch(
+    request: WorkRequest,
+    coverage: InsurerCoverage,
+) -> DispatchDecision:
+    """Decide whether a request needs work without reading mutable state."""
+    disposition = WorkDisposition.QUEUED
+    create_work_item = True
+    covered_by_run_id = ""
 
+    if coverage.state == "inactive":
+        disposition = WorkDisposition.INACTIVE
+    elif request.request_scope == RequestScope.ALL_ACTIVE:
+        active_all_cycle = coverage.active_request_scope == RequestScope.ALL_ACTIVE
+        covered_by_active_cycle = active_all_cycle and coverage.state in {
+            "queued",
+            "claimed",
+            "running",
+        }
+        completed_after_request = (
+            active_all_cycle
+            and coverage.state == "completed"
+            and coverage.active_finished_at is not None
+            and coverage.active_finished_at >= request.requested_at
+        )
+        if covered_by_active_cycle or completed_after_request:
+            disposition = WorkDisposition.COVERED_BY_ACTIVE_CYCLE
+            covered_by_run_id = coverage.active_run_id
+    elif coverage.state in {"claimed", "running"}:
+        disposition = WorkDisposition.FOLLOW_UP_QUEUED
+        create_work_item = not coverage.follow_up_queued
+    elif coverage.state == "follow_up_queued" or coverage.follow_up_queued:
+        disposition = WorkDisposition.FOLLOW_UP_QUEUED
+        create_work_item = False
+    elif coverage.state == "queued":
+        disposition = WorkDisposition.QUEUED
+        create_work_item = False
 
-class CoalescingScheduler:
-    """Small in-memory model of the PostgreSQL lock/coalescing contract."""
-
-    def __init__(self) -> None:
-        self.active: dict[str, ScheduleDecision] = {}
-        self.pending: dict[str, ScheduleDecision] = {}
-
-    def request(self, insurer_name: str, request_id: str = "") -> ScheduleDecision:
-        key = insurer_name.strip().lower()
-        request_id = request_id or str(uuid.uuid4())
-        if key not in self.active:
-            decision = ScheduleDecision(insurer_name, request_id, "running")
-            self.active[key] = decision
-            return decision
-        if key not in self.pending:
-            self.pending[key] = ScheduleDecision(
-                insurer_name, request_id, "skipped_overlap", coalesced_request_id=request_id,
-            )
-        return self.pending[key]
-
-    def finish(self, active: ScheduleDecision) -> Optional[ScheduleDecision]:
-        key = active.insurer_name.strip().lower()
-        self.active.pop(key, None)
-        pending = self.pending.pop(key, None)
-        if pending is None:
-            return None
-        followup = ScheduleDecision(active.insurer_name, pending.request_id, "running")
-        self.active[key] = followup
-        return followup
+    return DispatchDecision(
+        insurer_name=request.insurer_name,
+        source=request.source,
+        request_scope=request.request_scope,
+        disposition=disposition,
+        generation_requested_at=request.requested_at,
+        create_work_item=create_work_item,
+        covered_by_insurer_run_id=covered_by_run_id,
+    )
