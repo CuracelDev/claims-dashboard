@@ -200,10 +200,13 @@ class DispatchStore:
                       FROM piles_auto_assignment_insurer_runs run
                       JOIN piles_auto_assignment_runner_runs parent ON parent.id = run.runner_run_id
                       WHERE run.status IN ('queued','running')
+                        AND parent.mode = 'execute'
                         AND CASE WHEN regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
                             ELSE regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') END = %s
                         AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items work
-                                        WHERE work.covered_by_insurer_run_id = run.id)
+                                        WHERE work.covered_by_insurer_run_id = run.id
+                                          AND work.parent_runner_run_id = run.runner_run_id
+                                          AND work.disposition IN ('claimed','completed','failed','cancelled'))
                     ) coverage
                     ORDER BY CASE disposition WHEN 'claimed' THEN 0 WHEN 'running' THEN 0 WHEN 'queued' THEN 1
                         WHEN 'follow_up_queued' THEN 2 ELSE 3 END,

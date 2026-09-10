@@ -1,4 +1,6 @@
 import json
+import re
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -93,6 +95,187 @@ class DispatchConnection(RecordingConnection):
 
     def close(self):
         self.closed = True
+
+
+class EnqueueSqlConnection:
+    """Execute enqueue's relational SQL, adapting only PostgreSQL dialect APIs.
+
+    This adapter does not model lock/concurrency semantics: those are covered by
+    the recording tests and disposable PostgreSQL checks. Coverage predicates,
+    inserts, parent references, and unique indexes execute against real tables.
+    """
+
+    autocommit = False
+
+    def __init__(self):
+        self.database = sqlite3.connect(":memory:")
+        self.database.create_function("now", 0, lambda: NOW.isoformat())
+        self.database.create_function("btrim", 1, str.strip)
+        self.database.create_function("regexp_replace", 4, lambda value, pattern, replacement, flags: re.sub(pattern, replacement, value))
+        self.database.create_function("hashtextextended", 2, lambda value, seed: value)
+        self.database.create_function("pg_advisory_xact_lock", 1, lambda value: 1)
+        self.database.executescript("""
+            CREATE TABLE piles_auto_assignment_master_accounts(insurer_name TEXT, is_active BOOLEAN);
+            CREATE TABLE piles_auto_assignment_runner_runs(
+                id TEXT PRIMARY KEY, status TEXT DEFAULT 'started', mode TEXT DEFAULT 'execute',
+                run_scope TEXT DEFAULT 'all-active', details TEXT DEFAULT '{}', updated_at TEXT);
+            CREATE TABLE piles_auto_assignment_insurer_runs(
+                id TEXT PRIMARY KEY, runner_run_id TEXT, insurer_name TEXT, status TEXT,
+                started_at TEXT, finished_at TEXT, created_at TEXT DEFAULT (now()));
+            CREATE TABLE piles_auto_assignment_work_items(
+                id TEXT PRIMARY KEY, parent_runner_run_id TEXT, insurer_name TEXT,
+                canonical_insurer_name TEXT, source TEXT, request_scope TEXT,
+                disposition TEXT, generation_requested_at TEXT,
+                covered_by_insurer_run_id TEXT, requested_at TEXT,
+                started_at TEXT, finished_at TEXT, updated_at TEXT);
+            CREATE UNIQUE INDEX queued_generation ON piles_auto_assignment_work_items
+                (canonical_insurer_name, source, request_scope) WHERE disposition = 'queued';
+            CREATE UNIQUE INDEX follow_up ON piles_auto_assignment_work_items
+                (canonical_insurer_name) WHERE disposition = 'follow_up_queued';
+        """)
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            def __enter__(self):
+                self.raw = connection.database.cursor()
+                return self
+
+            def __exit__(self, *_args):
+                self.raw.close()
+                return False
+
+            def execute(self, sql, params=()):
+                sql = sql.replace("%s", "?").replace(" FOR UPDATE", "")
+                sql = sql.replace(
+                    "jsonb_set(coalesce(details, '{}'::jsonb), '{dispatch_requests}', ?::jsonb)",
+                    "json_set(coalesce(details, '{}'), '$.dispatch_requests', json(?))",
+                )
+                self.raw.execute(sql, tuple(value.isoformat() if isinstance(value, datetime) else value for value in params))
+                self.description = self.raw.description
+
+            def fetchall(self):
+                return [tuple(
+                    json.loads(value) if column[0] == "details" else
+                    datetime.fromisoformat(value) if column[0].endswith("_at") and value else value
+                    for column, value in zip(self.description, row)
+                ) for row in self.raw.fetchall()]
+
+            def fetchone(self):
+                rows = self.fetchall()
+                return rows[0] if rows else None
+
+        return Cursor()
+
+    def commit(self):
+        self.database.commit()
+
+    def rollback(self):
+        self.database.rollback()
+
+    def close(self):
+        self.database.close()
+
+
+class LegacyCoverageSqlTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = EnqueueSqlConnection()
+        self.addCleanup(self.connection.close)
+        self.store = store.DispatchStore(self.connection)
+        self.connection.database.execute(
+            "INSERT INTO piles_auto_assignment_master_accounts VALUES ('OLD MUTUAL', true)"
+        )
+        for parent_id in ("legacy", "request-1", "request-2", "request-3"):
+            self.connection.database.execute(
+                "INSERT INTO piles_auto_assignment_runner_runs(id) VALUES (?)", (parent_id,)
+            )
+        self.connection.database.execute("""
+            INSERT INTO piles_auto_assignment_insurer_runs
+                (id, runner_run_id, insurer_name, status, started_at)
+            VALUES ('legacy-insurer', 'legacy', 'old  mutual', 'running', ?)
+        """, ((NOW - timedelta(minutes=30)).isoformat(),))
+        self.connection.commit()
+
+    def enqueue(self, parent_id, source=WorkSource.SCHEDULE):
+        return self.store.enqueue_parent_work(parent_id, [WorkRequest("UAPOM", source, NOW)])[0]
+
+    def test_repeated_execute_overlaps_keep_covering_the_active_legacy_cycle(self):
+        for parent_id in ("request-1", "request-2", "request-3"):
+            with self.subTest(parent=parent_id):
+                decision = self.enqueue(parent_id)
+                self.assertEqual(decision.disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+                self.assertEqual(decision.covered_by_insurer_run_id, "legacy-insurer")
+        rows = self.connection.database.execute(
+            "SELECT disposition FROM piles_auto_assignment_work_items ORDER BY parent_runner_run_id"
+        ).fetchall()
+        self.assertEqual(rows, [("covered_by_active_cycle",)] * 3)
+
+    def test_dry_run_cycle_does_not_cover_execute_requests(self):
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_runner_runs SET mode = 'dry-run' WHERE id = 'legacy'"
+        )
+        self.connection.commit()
+        decision = self.enqueue("request-1")
+        self.assertEqual(decision.disposition, WorkDisposition.QUEUED)
+        self.assertEqual(decision.covered_by_insurer_run_id, "")
+        row = self.connection.database.execute(
+            "SELECT disposition, covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
+        ).fetchone()
+        self.assertEqual(row, ("queued", None))
+
+    def test_same_parent_acknowledgement_does_not_hide_legacy_execute_run(self):
+        self.assertEqual(self.enqueue("legacy").disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+        self.assertEqual(self.enqueue("request-1").disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+
+    def test_terminal_owned_execution_is_not_reintroduced_as_legacy_coverage(self):
+        self.connection.database.execute("""
+            INSERT INTO piles_auto_assignment_work_items
+                (id, parent_runner_run_id, insurer_name, canonical_insurer_name,
+                 source, request_scope, disposition, covered_by_insurer_run_id, requested_at)
+            VALUES ('finished-work', 'legacy', 'UAPOM', 'OLD MUTUAL',
+                    'schedule', 'all_active', 'failed', 'legacy-insurer', now())
+        """)
+        self.connection.commit()
+        self.assertEqual(self.enqueue("request-1").disposition, WorkDisposition.QUEUED)
+
+    def test_readiness_probe_does_not_create_work_alongside_execute_cycle(self):
+        with self.assertRaises(ValueError):
+            self.enqueue("request-1", WorkSource.READINESS)
+        self.assertEqual(self.connection.database.execute(
+            "SELECT count(*) FROM piles_auto_assignment_work_items"
+        ).fetchone()[0], 0)
+
+    def test_dry_run_does_not_turn_manual_execute_work_into_a_follow_up(self):
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_runner_runs SET mode = 'dry-run' WHERE id = 'legacy'"
+        )
+        self.connection.commit()
+        decision = self.enqueue("request-1", WorkSource.MANUAL)
+        self.assertEqual(decision.disposition, WorkDisposition.QUEUED)
+        self.assertTrue(decision.create_work_item)
+
+    def test_v2_queued_and_claimed_generations_still_cover_execute_overlap(self):
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_runner_runs SET mode = 'dry-run' WHERE id = 'legacy'"
+        )
+        self.connection.database.execute("""
+            INSERT INTO piles_auto_assignment_work_items
+                (id, parent_runner_run_id, insurer_name, canonical_insurer_name,
+                 source, request_scope, disposition, requested_at)
+            VALUES ('v2-work', 'request-1', 'UAPOM', 'OLD MUTUAL',
+                    'schedule', 'all_active', 'queued', now())
+        """)
+        self.connection.commit()
+        self.assertEqual(self.enqueue("request-2").disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_work_items SET disposition = 'claimed' WHERE id = 'v2-work'"
+        )
+        self.connection.commit()
+        self.assertEqual(self.enqueue("request-3").disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+        self.assertEqual(self.connection.database.execute(
+            "SELECT count(*) FROM piles_auto_assignment_work_items WHERE disposition IN ('queued','claimed')"
+        ).fetchone()[0], 1)
 
 
 def work_row(**changes):
