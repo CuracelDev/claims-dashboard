@@ -92,6 +92,217 @@ def make_pile(index, claims=100, *, filter_year="2026"):
     )
 
 
+class LateArrivalWorkflowTests(unittest.TestCase):
+    def workflow(self, initial, late, *, attempts=(), v2=True, years=("2026",),
+                 supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
+                 after_initial=None):
+        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[])
+        pending = [dict(item) for item in attempts]
+
+        class Ledger(runner.ReadOnlyExecutionLedger):
+            def finish_scan_context(self, context_id, result, evidence=None):
+                if persist_error:
+                    raise RuntimeError("fixture persistence failure")
+                state.persisted[context_id] = result
+
+            def pending_attempts(self, _):
+                return [dict(item) for item in pending if item["status"] in ("submitted", "reconciliation_pending")]
+
+            def transition_attempt(self, attempt_id, target, *, expected, evidence=None):
+                item = next(item for item in pending if item["id"] == attempt_id)
+                assert item["status"] in expected
+                item["status"] = target.value
+                state.transitions.append((attempt_id, target.value))
+
+        class Portal(runner.CuracelPilesRunner):
+            def __init__(self, **_):
+                self.retry_attempt_numbers = {}
+                state.portal = self
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def login(self, *_):
+                pass
+            def select_account(self, *_):
+                pass
+            def open_piles(self):
+                pass
+            def year_filter_capabilities(self):
+                return supports_multiple, list(years)
+            def scan_all_rows(self, *args):
+                rows = super().scan_all_rows(*args)
+                if after_initial:
+                    after_initial(state)
+                return rows
+            def scan_status(self, month, year, status, *, only_unassigned=False):
+                context = (month, year, status)
+                final = context in state.scans
+                state.scans.append(context)
+                rows = [runner.replace(row) for row in (late if final else initial).get(context, [])]
+                accumulator = runner.ScanAccumulator()
+                accumulator.observe_page(1, rows)
+                self._last_scan_result = accumulator.finish(explicit_empty=not rows)
+                if not final and statuses and context in statuses:
+                    self._last_scan_result = runner.replace(self._last_scan_result, status=statuses[context])
+                return [row for row in rows if not only_unassigned or not row.assigned]
+            def discover_portal_assignees(self, *args):
+                state.mapping.append(args)
+                return [runner.PortalAssignee("Daniel", "primary", 1, 1)]
+            def execute_assignment_plan(self, months, year, plans, **_):
+                state.applied.append(list(plans))
+                return {}, []
+
+        store = types.SimpleNamespace(
+            get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
+            get_bot_accounts=lambda _: [], get_weekend_roster_policy=lambda **_: None,
+            get_bot_metrics=lambda _: {}, get_team_slack_map=lambda: {},
+            get_all_tracked_tracking_keys=lambda _: set(), get_active_external_assignments=lambda _: [],
+            sync_external_assignments_for_insurer=lambda *_: None,
+            get_rule=lambda name: runner.AssignmentRule(name, "manual_override", 25, 60, 50, 60) if manual else None,
+            log_runner_event=lambda **event: state.events.append(event),
+        )
+        with TemporaryDirectory(prefix="piles-late-test-") as directory, \
+                patch.object(runner, "CuracelPilesRunner", Portal), \
+                patch.object(runner, "is_test_portal", lambda _: True), \
+                patch.object(sys, "stdout", io.StringIO()):
+            args = types.SimpleNamespace(execute=True, all_active=False, slow_mo=0, effective_date="2026-09-10",
+                                         out=str(Path(directory) / "plan.json"), worker_safe_diagnostics=v2,
+                                         work_heartbeat=guard)
+            try:
+                state.result = runner._run_for_insurer_once(store, args, "Kenya", ["Jul"], "All", False, Ledger(), "run")
+            except Exception as error:
+                state.error = error
+        return state
+
+    def test_actual_flow_rescans_initially_empty_and_assigned_only_contexts_once(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        for rows in ([], [runner.replace(make_pile(1), assigned="Daniel")]):
+            with self.subTest(initially_assigned=bool(rows)):
+                state = self.workflow({context: rows}, {context: [make_pile(2)]})
+                self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+                self.assertEqual(len(state.scans), 10)
+                self.assertEqual(state.scans.count(context), 2)
+                self.assertEqual([[plan.pile_key for plan in batch] for batch in state.applied], [["pile-2"]])
+                self.assertEqual(state.result["late_arrival_detection"]["count"], 1)
+
+    def test_actual_flow_preserves_concrete_and_all_year_contexts(self):
+        for multiple, expected in ((False, {"2026", "2025"}), (True, {"All"})):
+            with self.subTest(multiple=multiple):
+                state = self.workflow({}, {}, years=("2026", "2025"), supports_multiple=multiple)
+                self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+                contexts = state.result["late_arrival_detection"]["contexts"]
+                self.assertEqual({item["year"] for item in contexts}, expected)
+                self.assertEqual(len(contexts), len(expected) * 5)
+
+    def test_initial_assigned_identity_is_excluded_after_key_status_and_synced_count_change(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = runner.replace(make_pile(1), assigned="Daniel", tracking_key="Provider|100|0|1000|Jul|2026-07-01")
+        reappeared = runner.replace(original, assigned="", key="changed-key", tracking_key="Provider|100|9|1000|Jul|2026-07-01")
+        late = runner.replace(make_pile(2), tracking_key="New|100|0|1000|Jul|2026-07-01")
+        duplicate = runner.replace(late, key="duplicate", tracking_key="New|100|4|1000|Jul|2026-07-01")
+        state = self.workflow({context: [original]}, {context: [reappeared, late, duplicate]})
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual([[plan.pile_key for plan in batch] for batch in state.applied], [["pile-2"]])
+
+    def test_all_initial_scan_observations_are_excluded_even_if_pile_keys_repeat(self):
+        first = ("Jul", "2026", "Vetting Pending")
+        second = ("Jul", "2026", "Vetting Ongoing")
+        row = runner.replace(make_pile(1), assigned="Daniel")
+        alias = runner.replace(row, tracking_key="another-stable-identity")
+        late = runner.replace(alias, key="changed-key", assigned="")
+        state = self.workflow({first: [row], second: [alias]}, {second: [late]})
+        self.assertEqual(state.applied, [])
+        self.assertEqual(state.result["plans"], [])
+
+    def test_reappearing_submitted_or_pending_attempt_reconciles_with_zero_execute_calls(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        for status in ("submitted", "reconciliation_pending"):
+            for assignee, expected in (("", "still_unassigned"), ("Daniel", "confirmed_reconciled")):
+                with self.subTest(status=status, assignee=assignee):
+                    row = runner.replace(make_pile(1), assigned=assignee, tracking_key="Provider|100|8|1000|Jul|2026-07-01")
+                    attempt = dict(id="attempt", tracking_key="Provider|100|0|1000|Jul|2026-07-01",
+                                   status=status, intended_portal_assignee="Daniel", attempt_number=1)
+                    state = self.workflow({}, {context: [row]}, attempts=[attempt])
+                    self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+                    self.assertEqual(state.applied, [])  # execute_assignment_plan call count is zero.
+                    self.assertIn(("attempt", expected), state.transitions)
+                    self.assertEqual(state.result["plans"], [])
+                    self.assertEqual(state.mapping, [])
+                    self.assertEqual(state.result["workflow_status"],
+                                     "completed" if expected == "confirmed_reconciled" else "completed_with_issues")
+
+    def test_persistence_failure_cannot_make_context_eligible(self):
+        state = self.workflow({}, {}, persist_error=True)
+        self.assertIsInstance(getattr(state, "error", None), RuntimeError)
+        self.assertEqual(state.persisted, {})
+        self.assertTrue(hasattr(state.portal, "initial_scan_results"))
+        self.assertEqual(runner.late_arrival_contexts(state.portal.initial_scan_results.values()), ())
+        self.assertEqual(state.applied, [])
+
+    def test_submitted_attempt_matches_last_pile_identity_even_when_tracking_key_changes(self):
+        attempt = dict(id="attempt", tracking_key="previous-tracking", last_pile_key="pile-1",
+                       status="submitted", intended_portal_assignee="Daniel", attempt_number=1)
+        state = self.workflow({}, {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, attempts=[attempt])
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(state.applied, [])
+        self.assertIn(("attempt", "still_unassigned"), state.transitions)
+
+    def test_flag_off_retains_empty_context_legacy_behavior(self):
+        state = self.workflow({}, {}, v2=False)
+        self.assertEqual(len(state.scans), 5)
+        self.assertEqual(state.result["late_arrival_detection"]["contexts"], [])
+
+    def test_failed_and_pending_contexts_are_excluded_and_safely_reported(self):
+        failed = ("Jul", "2026", "Vetting Pending")
+        pending = ("Jul", "2026", "Vetting Ongoing")
+        state = self.workflow({}, {}, statuses={failed: runner.ContextStatus.FAILED, pending: runner.ContextStatus.PENDING})
+        self.assertEqual(state.scans.count(failed), 1)
+        self.assertEqual(state.scans.count(pending), 1)
+        self.assertEqual(len(state.scans), 8)
+        self.assertEqual(state.result["workflow_status"], "completed_with_issues")
+        self.assertEqual(state.result["late_arrival_detection"]["excluded_contexts"], [
+            {"month": "Jul", "year": "2026", "status": "Vetting Pending", "code": "initial_context_failed"},
+            {"month": "Jul", "year": "2026", "status": "Vetting Ongoing", "code": "initial_context_pending"},
+        ])
+        self.assertEqual([event["status"] for event in state.events if event["event_type"] == "late_arrival_contexts_excluded"],
+                         ["completed_with_issues"])
+
+    def test_final_scan_with_assigned_alias_never_plans_the_unassigned_alias(self):
+        first = ("Jul", "2026", "AI Audit")
+        second = ("Jul", "2026", "Vetting Pending")
+        row = make_pile(1)
+        for key in (row.key, "assigned-alias"):
+            with self.subTest(key=key):
+                state = self.workflow({}, {first: [row], second: [runner.replace(row, key=key, assigned="Daniel")]})
+                self.assertEqual(state.applied, [])
+                self.assertEqual(state.result["plans"], [])
+
+    def test_late_only_manual_override_never_discovers_assignees_or_applies(self):
+        state = self.workflow({}, {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, manual=True)
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(state.applied, [])
+        self.assertEqual(state.mapping, [])
+        self.assertEqual(state.result["workflow_status"], "manual_action_required")
+        self.assertEqual(state.result["manual_action_required_count"], 1)
+
+    def test_ownership_loss_stops_each_final_phase_before_further_work(self):
+        for phase in ("scan", "reconcile", "plan", "apply"):
+            with self.subTest(phase=phase):
+                active = []
+                def check(current):
+                    if active and current == phase:
+                        raise runner.WorkOwnershipLost()
+                state = self.workflow({}, {("Jul", "2026", "Vetting Pending"): [make_pile(1)]},
+                                      guard=check, after_initial=lambda state: active.append(state))
+                self.assertIsInstance(getattr(state, "error", None), runner.WorkOwnershipLost)
+                self.assertEqual(state.applied, [])
+                if phase == "scan":
+                    self.assertEqual(len(state.scans), 5)
+                if phase in ("scan", "reconcile", "plan"):
+                    self.assertEqual(state.mapping, [])
+
+
 class AssignmentPlanningTests(unittest.TestCase):
     def test_all_years_expand_for_single_select_portal(self):
         self.assertEqual(
@@ -2422,7 +2633,7 @@ class WorkerAdapterIntegrationTests(unittest.TestCase):
 class ManualWorkflowOutcomeTests(unittest.TestCase):
     def manual_workflow(self, *, recorded=False, v2=True):
         events, assignment_calls, finals = [], [], []
-        class Portal:
+        class Portal(runner.CuracelPilesRunner):
             def __init__(self, **_):
                 pass
             def __enter__(self):

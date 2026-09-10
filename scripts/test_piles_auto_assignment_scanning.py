@@ -1,4 +1,6 @@
 import unittest
+from dataclasses import replace
+from scripts.piles_auto_assignment import scanning
 
 from scripts.piles_auto_assignment.domain import ContextStatus
 from scripts.piles_auto_assignment.scanning import (
@@ -20,6 +22,23 @@ def row(key, *, provider="Provider", claims=5, assigned=""):
 
 
 class ScanAccumulatorTests(unittest.TestCase):
+    def test_late_contexts_include_empty_and_assigned_only_and_preserve_years(self):
+        self.assertTrue(hasattr(scanning, "late_arrival_contexts"), "Missing settled-context selection")
+        empty = ScanAccumulator().finish(explicit_empty=True)
+        assigned = ScanAccumulator()
+        assigned.observe_page(1, [row("assigned", assigned="Daniel")])
+        contexts = [scanning.FilterContext("Jul", year, "Vetting Pending") for year in ("2025", "All")]
+        results = [replace(empty, context=contexts[0]), replace(assigned.finish(), context=contexts[1])]
+        self.assertEqual(scanning.late_arrival_contexts(results + results), tuple(contexts))
+        self.assertEqual(scanning.late_arrival_contexts(reversed(results)), tuple(contexts))
+
+    def test_late_contexts_exclude_failed_pending_and_scanning(self):
+        self.assertTrue(hasattr(scanning, "late_arrival_contexts"), "Missing settled-context selection")
+        empty = ScanAccumulator().finish(explicit_empty=True)
+        results = [replace(empty, context=scanning.FilterContext("Jul", "2026", str(index)), status=status)
+                   for index, status in enumerate((ContextStatus.FAILED, ContextStatus.PENDING, ContextStatus.SCANNING))]
+        self.assertEqual(scanning.late_arrival_contexts(results), ())
+
     def test_explicit_empty_is_complete_but_unreadable_table_is_failed(self):
         self.assertEqual(
             ScanAccumulator().finish(explicit_empty=True).status,

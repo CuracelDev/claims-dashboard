@@ -50,7 +50,7 @@ try:
     from piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
-    from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
@@ -66,7 +66,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
-    from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from scripts.piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
@@ -5474,6 +5474,14 @@ class CuracelPilesRunner:
             available_years,
             supports_multiple=supports_multiple,
         )
+        # Per-run snapshots become eligible only after ledger persistence succeeds.
+        self.initial_scan_results = {
+            (month, year, status): replace(
+                ScanAccumulator().finish(explicit_empty=True),
+                status=ContextStatus.PENDING, context=FilterContext(month, year, status),
+            )
+            for year in scan_years for month in month_labels for status in TARGET_STATUSES
+        }
         ledger = getattr(self, "execution_ledger", None)
         insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
         context_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -5506,6 +5514,7 @@ class CuracelPilesRunner:
                 for status_label in TARGET_STATUSES:
                     print(f"\nScanning status: {status_label}")
                     context = context_by_key.get((month_label, scan_year, status_label))
+                    context_key = (month_label, scan_year, status_label)
                     if context:
                         ledger.heartbeat(insurer_run_id, phase="scan")
                         ledger.start_scan_context(context["id"])
@@ -5520,13 +5529,18 @@ class CuracelPilesRunner:
                             accumulator = ScanAccumulator()
                             accumulator.observe_page(1, rows)
                             scan_result = accumulator.finish(explicit_empty=not rows)
+                        scan_result = replace(scan_result, context=FilterContext(*context_key))
                         if context:
                             ledger.finish_scan_context(
                                 context["id"],
                                 scan_result,
                                 self._last_filter_evidence,
                             )
+                            self.initial_scan_results[context_key] = scan_result
                     except Exception as error:
+                        self.initial_scan_results[context_key] = replace(
+                            self.initial_scan_results[context_key], status=ContextStatus.FAILED,
+                        )
                         if context:
                             safe_diagnostics = bool(getattr(self, "safe_diagnostics", False))
                             ledger.fail_scan_context(
@@ -5555,6 +5569,7 @@ class CuracelPilesRunner:
         all_rows: list[PileRow] = []
         seen: set[str] = set()
         for month_label, filter_year, status_label in filter_contexts:
+            self._heartbeat("scan")
             active_year = norm(filter_year) or year_label
             print(f"\nScanning follow-up context: {active_year} / {month_label} / {status_label}")
             rows = self._scan_status_with_transient_retry(
@@ -5566,7 +5581,10 @@ class CuracelPilesRunner:
                 unassigned = [row for row in rows if not norm(row.assigned)]
                 print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
             for row in rows:
-                if row.key in seen:
+                # V2 needs every observation to detect contradictory assignment
+                # evidence across contexts before canonical late-row deduplication.
+                preserve_evidence = bool(getattr(self, "safe_diagnostics", False)) and not only_unassigned
+                if row.key in seen and not preserve_evidence:
                     continue
                 seen.add(row.key)
                 all_rows.append(row)
@@ -7912,6 +7930,7 @@ def _run_for_insurer_once(
     slack_replies_sent = 0
     reconciliation_manual_count = 0
     reconciliation_manual_keys: set[str] = set()
+    prior_attempt_keys: set[str] = set()
 
     print("=" * 72)
     print("Piles Auto-Assignment Runner")
@@ -8024,6 +8043,10 @@ def _run_for_insurer_once(
                     )]
 
             pending_attempts = execution_ledger.pending_attempts(insurer_name)
+            prior_attempt_keys.update(expanded_tracking_key_set(
+                key for attempt in pending_attempts
+                for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
+            ))
             if pending_attempts:
                 reconcile_pending_for_insurer(
                     ScannedRowsPortal(),
@@ -8179,6 +8202,9 @@ def _run_for_insurer_once(
             if canonical_pile_tracking_key(row.tracking_key) not in reconciliation_manual_keys
         ]
         initial_unassigned_keys = {row.key for row in unassigned}
+        initial_observed_keys = expanded_tracking_key_set(
+            key for row in scanned_rows for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+        )
         follow_up_context_pairs = {
             (row.filter_month, effective_filter_year(row, year_label), row.status_bucket)
             for row in unassigned
@@ -8348,6 +8374,29 @@ def _run_for_insurer_once(
                 TARGET_STATUSES.index(item[2]) if item[2] in TARGET_STATUSES else 99,
             ),
         )
+        v2 = bool(getattr(args, "worker_safe_diagnostics", False))
+        if v2:
+            snapshots = tuple(getattr(runner, "initial_scan_results", {}).values())
+            initial_observed_keys.update(expanded_tracking_key_set(
+                key for result in snapshots for row in result.rows
+                for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+            ))
+            follow_up_contexts = [
+                (context.filter_month, context.requested_year, context.status_bucket)
+                for context in late_arrival_contexts(snapshots)
+            ]
+            excluded = [
+                {"month": result.context.filter_month, "year": result.context.requested_year,
+                 "status": result.context.status_bucket, "code": "initial_context_" + result.status.value}
+                for result in snapshots if result.context is not None
+                and result.status not in {ContextStatus.COMPLETE, ContextStatus.EMPTY}
+            ]
+            late_arrival_detection["excluded_contexts"] = excluded
+            if excluded:
+                store.log_runner_event(
+                    insurer_name=insurer_name, event_type="late_arrival_contexts_excluded",
+                    status="completed_with_issues", details={"contexts": excluded},
+                )
         late_arrival_detection["contexts"] = [
             {"month": month_label, "year": filter_year, "status": status_label}
             for month_label, filter_year, status_label in follow_up_contexts
@@ -8355,14 +8404,59 @@ def _run_for_insurer_once(
 
         if follow_up_contexts:
             print("\nFinal late-arrival targeted rescan...")
-            follow_up_rows = runner.scan_selected_statuses(follow_up_contexts, year_label, only_unassigned=True)
+            if v2:
+                runner._heartbeat("scan")
+            follow_up_rows = runner.scan_selected_statuses(follow_up_contexts, year_label, only_unassigned=not v2)
         else:
             follow_up_rows = []
-        follow_up_unassigned = [
-            row for row in unique_unassigned_rows(follow_up_rows)
-            if row.key not in initial_unassigned_keys
-        ]
+        if v2:
+            if execution_ledger and insurer_run_id:
+                runner._heartbeat("reconcile")
+                final_pending = execution_ledger.pending_attempts(insurer_name)
+                prior_attempt_keys.update(expanded_tracking_key_set(
+                    key for attempt in final_pending
+                    for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
+                ))
+                observations_by_key: dict[str, list[Observation]] = {}
+                for row in follow_up_rows:
+                    for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]):
+                        observations_by_key.setdefault(key, []).append(Observation(
+                            assignable=not norm(row.assigned), assignee=norm(row.assigned),
+                            source="complete_final_scan",
+                        ))
+
+                class FinalScanPortal:
+                    def observe_attempt(self, attempt):
+                        runner._heartbeat("reconcile")
+                        return [observation
+                                for key in expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
+                                for observation in observations_by_key.get(key, [])]
+
+                for attempt in final_pending:
+                    runner._heartbeat("reconcile")
+                    decisions = reconcile_pending_for_insurer(FinalScanPortal(), execution_ledger, [attempt])
+                    for decision in decisions:
+                        counts = late_arrival_detection.setdefault("reconciliation", {})
+                        status = decision.status.value
+                        counts[status] = counts.get(status, 0) + 1
+            seen_late = initial_observed_keys | prior_attempt_keys | expanded_tracking_key_set(
+                key for row in follow_up_rows if norm(row.assigned)
+                for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+            )
+            follow_up_unassigned = []
+            for row in follow_up_rows:
+                identities = expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key])
+                if not norm(row.assigned) and not identities.intersection(seen_late):
+                    follow_up_unassigned.append(row)
+                seen_late.update(identities)
+        else:
+            follow_up_unassigned = [
+                row for row in unique_unassigned_rows(follow_up_rows)
+                if row.key not in initial_unassigned_keys
+            ]
         if follow_up_unassigned:
+            if v2:
+                runner._heartbeat("plan")
             late_arrival_detection["count"] = len(follow_up_unassigned)
             late_arrival_detection["claims"] = sum(row.claims for row in follow_up_unassigned)
             late_arrival_detection["piles"] = [row.__dict__ for row in follow_up_unassigned]
@@ -8370,10 +8464,20 @@ def _run_for_insurer_once(
                 f"Late-arrival unassigned piles detected after the first scan: "
                 f"{late_arrival_detection['count']} pile(s), {late_arrival_detection['claims']} claim(s)"
             )
-            ensure_portal_mapping(follow_up_unassigned[0])
+            late_manual = bool(rule and rule.distribution_mode == "manual_override")
+            if not late_manual:
+                ensure_portal_mapping(follow_up_unassigned[0])
             late_plans: list[PlannedAssignment]
             late_summary: dict[str, dict[str, Any]]
-            if not bots:
+            if v2:
+                runner._heartbeat("plan")
+            if late_manual:
+                manual_action_count += len(follow_up_unassigned)
+                late_plans, late_summary = build_assignment_plan(
+                    insurer_name, follow_up_unassigned, resolved_bots, metrics,
+                    rule=rule, effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
+            elif not bots:
                 late_plans, late_summary = build_assignment_plan_from_portal_options(insurer_name, follow_up_unassigned, portal_assignees)
             else:
                 late_plans, late_summary = build_assignment_plan(
@@ -8390,7 +8494,7 @@ def _run_for_insurer_once(
             store.log_runner_event(
                 insurer_name=insurer_name,
                 event_type="late_arrival_detected",
-                status="follow_up_execute" if args.execute else "follow_up_preview",
+                status="manual_action_required" if late_manual else "follow_up_execute" if args.execute else "follow_up_preview",
                 pile_count=late_arrival_detection["count"],
                 claim_count=late_arrival_detection["claims"],
                 details={
@@ -8416,6 +8520,8 @@ def _run_for_insurer_once(
                         f"projected_finish={item['projected_finish_minutes']} mins"
                     )
             if late_plans:
+                if v2:
+                    runner._heartbeat("apply")
                 late_month_labels = list(dict.fromkeys(plan.filter_month for plan in late_plans if norm(plan.filter_month))) or month_labels
                 late_results, late_applied = runner.execute_assignment_plan(
                     late_month_labels,
@@ -8619,6 +8725,11 @@ def _run_for_insurer_once(
         # A manual workflow can have no assignment attempts at all. Carry its
         # explicit result across the worker boundary, not only ledger counts.
         result["workflow_status"] = "manual_action_required" if manual_action_count else "completed"
+        if late_arrival_detection.get("excluded_contexts") or any(
+            count for status, count in late_arrival_detection.get("reconciliation", {}).items()
+            if status != AttemptStatus.CONFIRMED_RECONCILED.value
+        ):
+            result["workflow_status"] = "completed_with_issues"
         result["manual_action_required_count"] = manual_action_count
     return result
 
