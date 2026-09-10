@@ -380,19 +380,60 @@ function sqlStringValues(definition) {
 }
 
 function normalizeIndexColumn(value) {
-  return String(value || '').trim().replaceAll('"', '').toLowerCase();
+  return normalizeSqlExpression(value);
 }
 
-function normalizePredicate(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replaceAll('"', '')
-    .replace(/::(?:text|character varying)/g, '')
-    .replace(/[\s()]/g, '');
+function normalizeSqlExpression(value) {
+  const sql = String(value || '').trim();
+  let normalized = '';
+  let quote = null;
+
+  for (let index = 0; index < sql.length; index += 1) {
+    const character = sql[index];
+    if (quote === "'") {
+      normalized += character;
+      if (character === "'" && sql[index + 1] === "'") {
+        normalized += sql[index + 1];
+        index += 1;
+      } else if (character === "'") {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"' && sql[index + 1] === '"') {
+        normalized += '"';
+        index += 1;
+      } else if (character === '"') {
+        quote = null;
+      } else {
+        normalized += character;
+      }
+      continue;
+    }
+    if (character === "'") {
+      quote = character;
+      normalized += character;
+      continue;
+    }
+    if (character === '"') {
+      quote = character;
+      continue;
+    }
+    const cast = sql.slice(index).match(/^::\s*(?:text|character\s+varying)\b/i)?.[0];
+    if (cast) {
+      index += cast.length - 1;
+      continue;
+    }
+    if (/\s/.test(character) || character === '(' || character === ')') continue;
+    normalized += character.toLowerCase();
+  }
+
+  return normalized;
 }
 
 function predicateMatches(actual, requirement) {
-  const normalized = normalizePredicate(actual);
+  const normalized = normalizeSqlExpression(actual);
   const column = normalizeIndexColumn(requirement.column);
   if (!sameValues(sqlStringValues(actual), requirement.values)) return false;
   if (requirement.kind === 'equals') {
@@ -411,7 +452,7 @@ function enumCheckMatches(checkConstraints, requirement) {
     if (!normalizeConstraintColumns(constraint.columns).includes(requirement.column)) return false;
     const actualValues = sqlStringValues(constraint.definition);
     if (!sameValues(actualValues, requirement.values)) return false;
-    const normalized = normalizePredicate(constraint.definition).replace(/^check/, '');
+    const normalized = normalizeSqlExpression(constraint.definition).replace(/^check/, '');
     const column = normalizeIndexColumn(requirement.column);
     const orderedValues = actualValues.map((value) => `'${value}'`).join(',');
     return normalized === `${column}=anyarray[${orderedValues}]`
@@ -422,7 +463,7 @@ function enumCheckMatches(checkConstraints, requirement) {
 function expressionCheckMatches(checkConstraints, requirement) {
   return checkConstraints.some((constraint) => (
     normalizeConstraintColumns(constraint.columns).includes(requirement.column)
-    && normalizePredicate(constraint.definition).replace(/^check/, '') === requirement.normalized
+    && normalizeSqlExpression(constraint.definition).replace(/^check/, '') === requirement.normalized
   ));
 }
 
