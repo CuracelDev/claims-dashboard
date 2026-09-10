@@ -98,7 +98,7 @@ export async function inspectQueueHealth(pool) {
       [lockName],
     );
     if (probe.rows[0]?.acquired) {
-      expiredLeasesWithFreeLock += 1;
+      expiredLeasesWithFreeLock += Number(row.expired_lease_count || 1);
       await pool.query(
         'select pg_advisory_unlock(hashtextextended($1, 0)) as released',
         [lockName],
