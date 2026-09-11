@@ -16,6 +16,7 @@ import time
 import unittest
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.test_piles_auto_assignment_dispatch import dispatch
@@ -204,6 +205,26 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
     def test_lease_expiry_during_release_row_wait_refuses_the_expired_owner(self):
         self.assert_expired_transition_fenced(lambda: self.store.release_claim(
             self.work.id, self.work.claim_token, "dispatch_stopped"))
+
+    def test_work_scope_schema_applies_to_a_fresh_namespace_and_repeats(self):
+        schema_name = "piles_scope_" + uuid.uuid4().hex
+        connection = Connection(self.bridge)
+        self.addCleanup(connection.close)
+        connection.query(f'CREATE SCHEMA "{schema_name}"')
+        self.addCleanup(lambda: self.admin.query(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        connection.query(f'SET search_path TO "{schema_name}"')
+        connection.query("CREATE TABLE piles_auto_assignment_runner_runs (id text PRIMARY KEY, portal_environment text, months jsonb, year text)")
+        connection.query("CREATE TABLE piles_auto_assignment_insurer_runs (id text PRIMARY KEY)")
+        schema = Path(__file__).with_name("piles-auto-assignment-schema.sql").read_text()
+        work_schema = schema.split("CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items", 1)[1]
+        work_schema = "CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items" + work_schema.split(
+            "ALTER TABLE IF EXISTS piles_auto_assignment_logs", 1
+        )[0]
+        connection.query(work_schema)
+        connection.query(work_schema)
+        indexes = connection.query("SELECT indexname FROM pg_indexes WHERE schemaname=current_schema()")
+        self.assertIn("piles_auto_assignment_work_items_queued_generation_idx",
+                      {row["indexname"] for row in indexes["rows"]})
 
 
 if __name__ == "__main__":

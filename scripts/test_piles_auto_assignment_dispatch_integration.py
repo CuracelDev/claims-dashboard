@@ -260,19 +260,21 @@ class AcceptanceHarness:
             assigned="", status="Vetting Pending", status_bucket="Vetting Pending",
             filter_month="Jul", filter_year="2026", page_number=1, assignment_type="Vetting")
 
-    def parent(self, parent, insurer=None, source="schedule"):
+    def parent(self, parent, insurer=None, source="schedule", *, portal="test", months=("Jul",), year="2026"):
         self.db.now += timedelta(seconds=1)
         store = self.store_type()()
         try:
             store.create_runner_run(run_id=parent, insurer_name=insurer or "", run_source=source,
-                run_scope="single" if insurer else "all-active", details={}, mode="execute")
+                run_scope="single" if insurer else "all-active", portal_environment=portal,
+                months=list(months), year=year, details={}, mode="execute")
         finally:
             store.close()
         coordinator = runner.DispatchStore(self.db.connect())
         try:
             return coordinator.enqueue_parent_work(parent, [runner.WorkRequest(
                 name, source, coordinator.parent_requested_at(parent),
-                runner.RequestScope.SINGLE_INSURER if insurer else runner.RequestScope.ALL_ACTIVE)
+                runner.RequestScope.SINGLE_INSURER if insurer else runner.RequestScope.ALL_ACTIVE,
+                portal, tuple(months), year)
                 for name in ([insurer] if insurer else INSURERS)])
         finally:
             coordinator.close()
@@ -397,8 +399,8 @@ class AcceptanceHarness:
                 return runner.AssignmentVerificationResult(confirmed == len(keys), list(observed.values()), confirmed, pending, wrong, decisions)
         return Portal
 
-    def invoke(self, *, parent="parent", insurer=None, maximum=1):
-        argv = ["runner", "--execute", "--portal-environment", "test", "--month", "Jul", "--year", "2026", "--run-id", parent,
+    def invoke(self, *, parent="parent", insurer=None, maximum=1, portal="test", month="Jul", year="2026"):
+        argv = ["runner", "--execute", "--portal-environment", portal, "--month", month, "--year", year, "--run-id", parent,
                 "--run-source", "manual" if insurer else "schedule"]
         argv += ["--insurer", insurer] if insurer else ["--all-active"]
         result = None
@@ -501,6 +503,24 @@ class DispatcherAcceptanceTests(unittest.TestCase):
                     self.complete_lifecycle(harness, maximum)
                 finally:
                     harness.db.close()
+
+    def test_parent_replay_rejects_changed_persisted_execution_scope_before_portal_work(self):
+        cases = (
+            ("portal", {"portal": "production"}, {}),
+            ("months", {"months": ("Jul",)}, {"month": "Aug"}),
+            ("year", {"year": "2026"}, {"year": "2025"}),
+        )
+        for label, persisted, replay in cases:
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                harness = AcceptanceHarness(directory)
+                self.addCleanup(harness.db.close)
+                harness.parent("parent", **persisted)
+                result, error = harness.invoke(parent="parent", **replay)
+                self.assertIsNone(result)
+                self.assertIsNotNone(error)
+                self.assertIn("scope", str(error).lower())
+                self.assertEqual(harness.portals, [])
+                self.assertEqual(harness.clicks, [])
 
     def complete_lifecycle(self, harness, maximum):
         harness.failures = {"DEFMIS"}

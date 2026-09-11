@@ -46,7 +46,8 @@ try:
     from piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
         AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
         dispatch_parent, execute_claimed_insurer)
-    from piles_auto_assignment.store import DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger, ParentAlreadyTerminal
+    from piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
+        ParentAlreadyTerminal, ParentScopeMismatch)
     from piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
@@ -63,7 +64,8 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
         AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
         dispatch_parent, execute_claimed_insurer)
-    from scripts.piles_auto_assignment.store import DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger, ParentAlreadyTerminal
+    from scripts.piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
+        ParentAlreadyTerminal, ParentScopeMismatch)
     from scripts.piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
@@ -9097,7 +9099,8 @@ def main_v2() -> DispatchResult:
                 )
                 requested_at = coordinator.parent_requested_at(run_id)
                 requests = [WorkRequest(insurer, WorkSource(norm(args.run_source) or "manual"), requested_at,
-                                        RequestScope.ALL_ACTIVE if args.all_active else RequestScope.SINGLE_INSURER)
+                                        RequestScope.ALL_ACTIVE if args.all_active else RequestScope.SINGLE_INSURER,
+                                        PORTAL_ENVIRONMENT, tuple(months), year)
                             for insurer in insurers]
                 work_items = coordinator.enqueue_parent_work(run_id, requests)
                 restored = []
@@ -9135,7 +9138,7 @@ def main_v2() -> DispatchResult:
                         coordinator.fail_parent_setup(run_id)
                     except Exception:
                         pass  # Keep durable state recoverable when the DB is unavailable.
-                code, _ = safe_worker_error(error)
+                code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
                 raise WorkerUnavailable(code) from None
 
 

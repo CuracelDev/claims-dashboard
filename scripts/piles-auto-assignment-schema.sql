@@ -788,12 +788,12 @@ ALTER TABLE piles_auto_assignment_work_items VALIDATE CONSTRAINT piles_auto_assi
 ALTER TABLE piles_auto_assignment_work_items VALIDATE CONSTRAINT piles_auto_assignment_work_items_months_check;
 ALTER TABLE piles_auto_assignment_work_items VALIDATE CONSTRAINT piles_auto_assignment_work_items_year_check;
 
-DO $$ BEGIN
-  IF to_regclass('piles_auto_assignment_work_items_queued_generation_idx') IS NOT NULL
-    AND pg_get_indexdef('piles_auto_assignment_work_items_queued_generation_idx'::regclass)
-      NOT LIKE '%portal_environment%months%year%'
-  THEN
-    DROP INDEX piles_auto_assignment_work_items_queued_generation_idx;
+DO $$ DECLARE target_index regclass; BEGIN
+  target_index := to_regclass('piles_auto_assignment_work_items_queued_generation_idx');
+  IF target_index IS NOT NULL THEN
+    IF pg_get_indexdef(target_index) NOT LIKE '%portal_environment%months%year%' THEN
+      EXECUTE format('DROP INDEX %s', target_index);
+    END IF;
   END IF;
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_queued_generation_idx
@@ -802,12 +802,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_queued_genera
   )
   WHERE disposition = 'queued';
 
-DO $$ BEGIN
-  IF to_regclass('piles_auto_assignment_work_items_follow_up_idx') IS NOT NULL
-    AND pg_get_indexdef('piles_auto_assignment_work_items_follow_up_idx'::regclass)
-      NOT LIKE '%portal_environment%months%year%'
-  THEN
-    DROP INDEX piles_auto_assignment_work_items_follow_up_idx;
+DO $$ DECLARE target_index regclass; BEGIN
+  target_index := to_regclass('piles_auto_assignment_work_items_follow_up_idx');
+  IF target_index IS NOT NULL THEN
+    IF pg_get_indexdef(target_index) NOT LIKE '%portal_environment%months%year%' THEN
+      EXECUTE format('DROP INDEX %s', target_index);
+    END IF;
   END IF;
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_follow_up_idx

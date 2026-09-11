@@ -208,7 +208,13 @@ class LegacyCoverageSqlTests(unittest.TestCase):
         self.connection.commit()
 
     def enqueue(self, parent_id, source=WorkSource.SCHEDULE):
-        return self.store.enqueue_parent_work(parent_id, [WorkRequest("UAPOM", source, NOW)])[0]
+        portal, months, year = self.connection.database.execute(
+            "SELECT portal_environment,months,year FROM piles_auto_assignment_runner_runs WHERE id=?", (parent_id,)
+        ).fetchone()
+        return self.store.enqueue_parent_work(parent_id, [
+            WorkRequest("UAPOM", source, NOW, portal_environment=portal,
+                        months=tuple(json.loads(months)), year=year)
+        ])[0]
 
     def set_parent_scope(self, parent_id, *, portal="production", months=("All",), year="All"):
         self.connection.database.execute(

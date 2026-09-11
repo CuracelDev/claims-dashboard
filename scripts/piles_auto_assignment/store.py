@@ -33,6 +33,10 @@ class ParentAlreadyTerminal(ValueError):
     """A replay must return the saved parent outcome without new work."""
 
 
+class ParentScopeMismatch(ValueError):
+    """The invocation does not match the immutable persisted parent scope."""
+
+
 def _value(record: Any, name: str, default: Any = None) -> Any:
     if isinstance(record, Mapping):
         return record.get(name, default)
@@ -219,12 +223,23 @@ class DispatchStore:
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"piles-dispatch:{canonical}",))
             for request in requests:
                 canonical = _insurer_lock_key(request.insurer_name)
-                request = replace(
+                persisted_request = replace(
                     request,
                     portal_environment=parent.get("portal_environment") or "production",
                     months=tuple(parent.get("months") or ("All",)),
                     year=parent.get("year") or "All",
                 )
+                if (
+                    request.portal_environment,
+                    request.months,
+                    request.year,
+                ) != (
+                    persisted_request.portal_environment,
+                    persisted_request.months,
+                    persisted_request.year,
+                ):
+                    raise ParentScopeMismatch("Invocation scope does not match persisted parent scope")
+                request = persisted_request
                 request_id = hashlib.sha256(_json([
                     canonical, request.source.value, request.request_scope.value,
                     request.portal_environment, request.months, request.year,
