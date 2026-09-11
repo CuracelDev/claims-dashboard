@@ -195,6 +195,7 @@ const TABLE_COLUMNS = {
   piles_auto_assignment_work_items: [
     ['id', 'text'], ['parent_runner_run_id', 'text'], ['insurer_name', 'text'],
     ['canonical_insurer_name', 'text'], ['source', 'text'], ['request_scope', 'text'],
+    ['portal_environment', 'text'], ['months', 'jsonb'], ['year', 'text'],
     ['disposition', 'text'], ['covered_by_insurer_run_id', 'text'], ['worker_id', 'text'],
     ['claim_token', 'text'], ['lease_expires_at', 'timestamptz'], ['heartbeat_at', 'timestamptz'],
     ['generation_requested_at', 'timestamptz'], ['attempt_number', 'integer'],
@@ -648,6 +649,13 @@ const CREATE_TABLE_SQL = {
       canonical_insurer_name text NOT NULL CHECK (btrim(canonical_insurer_name) <> ''),
       source text NOT NULL CHECK (source IN ('schedule','manual','readiness','recovery')),
       request_scope text NOT NULL CHECK (request_scope IN ('all_active','single_insurer')),
+      portal_environment text NOT NULL DEFAULT 'production' CHECK (portal_environment IN ('production','test')),
+      months jsonb NOT NULL DEFAULT '["All"]'::jsonb CHECK (
+        jsonb_typeof(months) = 'array' AND jsonb_array_length(months) > 0
+        AND months <@ '["All","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]'::jsonb
+        AND (NOT months ? 'All' OR months = '["All"]'::jsonb)
+      ),
+      year text NOT NULL DEFAULT 'All' CHECK (year = 'All' OR year ~ '^20[0-9]{2}$'),
       disposition text NOT NULL DEFAULT 'queued' CHECK (disposition IN ('queued','claimed','covered_by_active_cycle','follow_up_queued','inactive','completed','failed','cancelled')),
       covered_by_insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL,
       worker_id text,
@@ -945,8 +953,9 @@ const INDEX_SQL = [
   'CREATE INDEX piles_auto_assignment_attempts_run_idx ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at)',
   'CREATE INDEX piles_auto_assignment_bot_account_history_bot_idx ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC)',
   "CREATE UNIQUE INDEX piles_auto_assignment_schedule_requests_pending_idx ON piles_auto_assignment_schedule_requests (lower(insurer_name)) WHERE status = 'pending'",
-  "CREATE UNIQUE INDEX piles_auto_assignment_work_items_queued_generation_idx ON piles_auto_assignment_work_items (canonical_insurer_name, source, request_scope) WHERE disposition = 'queued'",
-  "CREATE UNIQUE INDEX piles_auto_assignment_work_items_follow_up_idx ON piles_auto_assignment_work_items (canonical_insurer_name) WHERE disposition = 'follow_up_queued'",
+  "CREATE UNIQUE INDEX piles_auto_assignment_work_items_queued_generation_idx ON piles_auto_assignment_work_items (canonical_insurer_name, source, request_scope, portal_environment, months, year) WHERE disposition = 'queued'",
+  "CREATE UNIQUE INDEX piles_auto_assignment_work_items_follow_up_idx ON piles_auto_assignment_work_items (canonical_insurer_name, portal_environment, months, year) WHERE disposition = 'follow_up_queued'",
+  "CREATE INDEX piles_auto_assignment_work_items_completed_scope_idx ON piles_auto_assignment_work_items (canonical_insurer_name, portal_environment, year, finished_at DESC, id) WHERE disposition = 'completed'",
   "CREATE INDEX piles_auto_assignment_work_items_claim_order_idx ON piles_auto_assignment_work_items (parent_runner_run_id, disposition, generation_requested_at, requested_at, id) WHERE disposition IN ('queued', 'follow_up_queued')",
   "CREATE INDEX piles_auto_assignment_work_items_expired_lease_idx ON piles_auto_assignment_work_items (lease_expires_at, canonical_insurer_name) WHERE disposition = 'claimed'",
   'CREATE INDEX tasks_assigned_to_idx ON tasks (assigned_to)',

@@ -76,7 +76,11 @@ class SqlDatabase:
         for suffix in ("work_items_queued_generation_idx", "work_items_follow_up_idx", "attempts_active_key_idx"):
             ddl += re.search(rf"CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_{suffix}[\s\S]*?;", schema).group()
         ddl = re.sub(r"::jsonb", "", ddl).replace("DEFAULT now()", "DEFAULT (now())")
-        ddl = ddl.replace("reason_code ~", "reason_code REGEXP")
+        ddl = ddl.replace("reason_code ~", "reason_code REGEXP").replace("year ~", "year REGEXP")
+        ddl = ddl.replace(
+            "months <@ '[\"All\",\"Jan\",\"Feb\",\"Mar\",\"Apr\",\"May\",\"Jun\",\"Jul\",\"Aug\",\"Sep\",\"Oct\",\"Nov\",\"Dec\"]'",
+            "json_contains('[\"All\",\"Jan\",\"Feb\",\"Mar\",\"Apr\",\"May\",\"Jun\",\"Jul\",\"Aug\",\"Sep\",\"Oct\",\"Nov\",\"Dec\"]', months)",
+        ).replace("NOT months ? 'All'", "NOT json_array_contains(months, 'All')")
         self.admin.raw.executescript(ddl)
         self.admin.raw.execute("CREATE TABLE pg_database(oid INTEGER, datname TEXT)")
         self.admin.raw.execute("INSERT INTO pg_database VALUES (1,'acceptance')")
@@ -130,6 +134,12 @@ class SqlConnection:
         self.raw.create_function("char_length", 1, len)
         self.raw.create_function("regexp", 2, lambda pattern, value: bool(re.search(pattern, value or "")))
         self.raw.create_function("regexp_replace", 4, lambda value, pattern, replacement, flags: re.sub(pattern, replacement, value))
+        self.raw.create_function("json_contains", 2, lambda covering, requested: int(
+            set(json.loads(covering)).issuperset(json.loads(requested))
+        ))
+        self.raw.create_function("jsonb_typeof", 1, lambda value: "array" if isinstance(json.loads(value), list) else "object")
+        self.raw.create_function("jsonb_array_length", 1, lambda value: len(json.loads(value)))
+        self.raw.create_function("json_array_contains", 2, lambda value, member: int(member in json.loads(value)))
         self.raw.create_function("hashtextextended", 2, lambda value, seed: zlib.crc32(value.encode()))
         self.raw.create_function("current_database", 0, lambda: "acceptance")
         self.raw.create_function("advisory_catalog", 0, lambda: json.dumps([
@@ -201,6 +211,7 @@ class SqlCursor:
     def execute(self, sql, params=()):
         sql = " ".join(sql.split()).replace("%s", "?")
         sql = re.sub(r" FOR UPDATE(?: OF work| SKIP LOCKED)?", "", sql)
+        sql = sql.replace("completed.months @> ?::jsonb", "json_contains(completed.months, ?)")
         sql = re.sub(r"jsonb_set\(coalesce\(details, '\{\}'::jsonb\), '\{(\w+)\}', \?::jsonb\)",
                      r"json_set(coalesce(details, '{}'), '$.\1', json(?))", sql)
         sql = re.sub(r"::(?:text|jsonb|integer|bigint)", "", sql)
@@ -217,7 +228,7 @@ class SqlCursor:
     def convert(self, row):
         if row is None:
             return None
-        return tuple(json.loads(value) if value and column[0] in {"details", "filter_context"} else
+        return tuple(json.loads(value) if value and column[0] in {"details", "filter_context", "months"} else
                      datetime.fromisoformat(value) if value and column[0].endswith("_at") else value
                      for column, value in zip(self.description, row))
 
@@ -279,11 +290,15 @@ class AcceptanceHarness:
             def get_master_account(self, name):
                 return runner.MasterAccount(name, name, "fixture-only", "fixture-only", True)
             def create_runner_run(self, **fields):
+                fields.setdefault("portal_environment", "test")
+                fields.setdefault("months", ["Jul"])
+                fields.setdefault("year", "2026")
                 with self.conn.cursor() as cursor:
                     cursor.execute("""INSERT INTO piles_auto_assignment_runner_runs
-                        (id,insurer_name,run_scope,run_source,mode,details) VALUES (%s,%s,%s,%s,%s,%s)
+                        (id,insurer_name,run_scope,portal_environment,run_source,months,year,mode,details)
+                        VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
                         ON CONFLICT(id) DO NOTHING""", tuple(fields[key] if key != "details" else json.dumps(fields[key])
-                            for key in ("run_id", "insurer_name", "run_scope", "run_source", "mode", "details")))
+                            for key in ("run_id", "insurer_name", "run_scope", "portal_environment", "run_source", "months", "year", "mode", "details")))
                 self.conn.commit()
                 return fields["run_id"]
             def try_acquire_insurer_lock(self, name):

@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Optional
 from .domain import (
     AttemptStatus, DispatchDecision, InsurerCoverage, ParentRunStatus,
     RequestScope, WorkDisposition, WorkRequest, WorkSource, can_transition_attempt,
+    execution_scope_contains,
 )
 from .orchestrator import derive_parent_status
 from .scheduling import decide_dispatch
@@ -151,7 +152,7 @@ class DispatchStore:
     @staticmethod
     def _lock_parent(cursor: Any, parent_id: str) -> dict[str, Any]:
         cursor.execute(
-            "SELECT status, details FROM piles_auto_assignment_runner_runs WHERE id = %s FOR UPDATE",
+            "SELECT status, details, portal_environment, months, year FROM piles_auto_assignment_runner_runs WHERE id = %s FOR UPDATE",
             (parent_id,),
         )
         rows = _rows(cursor)
@@ -218,8 +219,15 @@ class DispatchStore:
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"piles-dispatch:{canonical}",))
             for request in requests:
                 canonical = _insurer_lock_key(request.insurer_name)
+                request = replace(
+                    request,
+                    portal_environment=parent.get("portal_environment") or "production",
+                    months=tuple(parent.get("months") or ("All",)),
+                    year=parent.get("year") or "All",
+                )
                 request_id = hashlib.sha256(_json([
                     canonical, request.source.value, request.request_scope.value,
+                    request.portal_environment, request.months, request.year,
                     request.requested_at.astimezone(timezone.utc).isoformat(),
                 ]).encode()).hexdigest()
                 previous = next((ref for ref in references if ref["request_id"] == request_id), None)
@@ -248,14 +256,27 @@ class DispatchStore:
                     """
                     SELECT * FROM (
                       SELECT id, disposition, request_scope, covered_by_insurer_run_id,
-                             started_at, finished_at, requested_at
+                             started_at, finished_at, requested_at,
+                             portal_environment, months, year
                       FROM piles_auto_assignment_work_items
                       WHERE canonical_insurer_name = %s
-                        AND disposition IN ('queued','claimed','follow_up_queued','completed')
+                        AND (disposition IN ('queued','claimed','follow_up_queued')
+                          OR id = (
+                            SELECT completed.id FROM piles_auto_assignment_work_items completed
+                            WHERE completed.canonical_insurer_name = %s
+                              AND completed.disposition = 'completed'
+                              AND completed.finished_at >= %s
+                              AND completed.portal_environment = %s
+                              AND (completed.year = 'All' OR completed.year = %s)
+                              AND (completed.months = '["All"]'::jsonb OR completed.months @> %s::jsonb)
+                            ORDER BY completed.finished_at DESC, completed.id
+                            LIMIT 1
+                          ))
                       UNION ALL
                       SELECT run.id, 'running',
                              CASE WHEN parent.run_scope = 'all-active' THEN 'all_active' ELSE 'single_insurer' END,
-                             run.id, run.started_at, run.finished_at, run.created_at
+                             run.id, run.started_at, run.finished_at, run.created_at,
+                             parent.portal_environment, parent.months, parent.year
                       FROM piles_auto_assignment_insurer_runs run
                       JOIN piles_auto_assignment_runner_runs parent ON parent.id = run.runner_run_id
                       WHERE run.status IN ('queued','running')
@@ -270,11 +291,24 @@ class DispatchStore:
                     ORDER BY CASE disposition WHEN 'claimed' THEN 0 WHEN 'running' THEN 0 WHEN 'queued' THEN 1
                         WHEN 'follow_up_queued' THEN 2 ELSE 3 END,
                         finished_at DESC NULLS LAST, requested_at, id
-                    """, (canonical, canonical),
+                    """, (
+                        canonical, canonical, request.requested_at,
+                        request.portal_environment, request.year, _json(request.months), canonical,
+                    ),
                 )
                 existing = _rows(cursor)
-                active = existing[0] if existing else {}
-                follow_up = next((row for row in existing if row["disposition"] == "follow_up_queued"), None)
+                compatible = []
+                for row in existing:
+                    candidate = InsurerCoverage(
+                        state=row["disposition"],
+                        portal_environment=row.get("portal_environment") or "production",
+                        months=tuple(row.get("months") or ("All",)),
+                        year=row.get("year") or "All",
+                    )
+                    if execution_scope_contains(candidate, request):
+                        compatible.append(row)
+                active = compatible[0] if compatible else {}
+                follow_up = next((row for row in compatible if row["disposition"] == "follow_up_queued"), None)
                 coverage = InsurerCoverage(
                     state=active.get("disposition", "idle") if any(row["is_active"] for row in masters) else "inactive",
                     active_started_at=active.get("started_at"),
@@ -282,26 +316,32 @@ class DispatchStore:
                     active_run_id=active.get("covered_by_insurer_run_id") or "",
                     active_request_scope=active.get("request_scope", "all_active"),
                     follow_up_queued=follow_up is not None,
+                    portal_environment=active.get("portal_environment") or request.portal_environment,
+                    months=tuple(active.get("months") or request.months),
+                    year=active.get("year") or request.year,
                 )
                 decision = decide_dispatch(request, coverage)
                 if decision.create_work_item:
                     work_id = str(uuid.uuid4())
                     conflict = ""
                     if decision.disposition == WorkDisposition.QUEUED:
-                        conflict = "ON CONFLICT (canonical_insurer_name, source, request_scope) WHERE disposition = 'queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
+                        conflict = "ON CONFLICT (canonical_insurer_name, source, request_scope, portal_environment, months, year) WHERE disposition = 'queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
                     elif decision.disposition == WorkDisposition.FOLLOW_UP_QUEUED:
-                        conflict = "ON CONFLICT (canonical_insurer_name) WHERE disposition = 'follow_up_queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
+                        conflict = "ON CONFLICT (canonical_insurer_name, portal_environment, months, year) WHERE disposition = 'follow_up_queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
                     cursor.execute(
                         """
                         INSERT INTO piles_auto_assignment_work_items
                           (id, parent_runner_run_id, insurer_name, canonical_insurer_name,
-                           source, request_scope, disposition, generation_requested_at,
+                           source, request_scope, portal_environment, months, year,
+                           disposition, generation_requested_at,
                            covered_by_insurer_run_id, requested_at, finished_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,now(),
                           CASE WHEN %s THEN now() ELSE NULL END)
                         """ + conflict + " RETURNING id",
                         (work_id, parent_id, request.insurer_name, canonical,
-                         decision.source.value, decision.request_scope.value, decision.disposition.value,
+                         decision.source.value, decision.request_scope.value,
+                         request.portal_environment, _json(request.months), request.year,
+                         decision.disposition.value,
                          decision.generation_requested_at, decision.covered_by_insurer_run_id or None,
                          decision.disposition in {WorkDisposition.INACTIVE, WorkDisposition.COVERED_BY_ACTIVE_CYCLE}),
                     )

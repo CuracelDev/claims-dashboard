@@ -109,6 +109,9 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
             "lease_expires_at",
             "heartbeat_at",
             "generation_requested_at",
+            "portal_environment",
+            "months",
+            "year",
             "attempt_number",
             "requested_at",
             "claimed_at",
@@ -144,7 +147,7 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
             re.compile(
                 r"CREATE UNIQUE INDEX IF NOT EXISTS "
                 r"piles_auto_assignment_work_items_queued_generation_idx.*?"
-                r"canonical_insurer_name.*?source.*?request_scope.*?"
+                r"canonical_insurer_name.*?source.*?request_scope.*?portal_environment.*?months.*?year.*?"
                 r"WHERE disposition = 'queued'",
                 re.DOTALL,
             ),
@@ -154,12 +157,13 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
             re.compile(
                 r"CREATE UNIQUE INDEX IF NOT EXISTS "
                 r"piles_auto_assignment_work_items_follow_up_idx.*?"
-                r"canonical_insurer_name.*?WHERE disposition = 'follow_up_queued'",
+                r"canonical_insurer_name.*?portal_environment.*?months.*?year.*?WHERE disposition = 'follow_up_queued'",
                 re.DOTALL,
             ),
         )
         self.assertIn("piles_auto_assignment_work_items_claim_order_idx", self.sql)
         self.assertIn("piles_auto_assignment_work_items_expired_lease_idx", self.sql)
+        self.assertIn("piles_auto_assignment_work_items_completed_scope_idx", self.sql)
 
     def test_dispatch_parent_and_legacy_statuses_are_backward_compatible(self):
         for status in (

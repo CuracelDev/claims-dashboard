@@ -696,6 +696,13 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items (
   canonical_insurer_name text NOT NULL CHECK (btrim(canonical_insurer_name) <> ''),
   source text NOT NULL CHECK (source IN ('schedule', 'manual', 'readiness', 'recovery')),
   request_scope text NOT NULL CHECK (request_scope IN ('all_active', 'single_insurer')),
+  portal_environment text NOT NULL DEFAULT 'production' CONSTRAINT piles_auto_assignment_work_items_portal_environment_check CHECK (portal_environment IN ('production', 'test')),
+  months jsonb NOT NULL DEFAULT '["All"]'::jsonb CONSTRAINT piles_auto_assignment_work_items_months_check CHECK (
+    jsonb_typeof(months) = 'array' AND jsonb_array_length(months) > 0
+    AND months <@ '["All","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]'::jsonb
+    AND (NOT months ? 'All' OR months = '["All"]'::jsonb)
+  ),
+  year text NOT NULL DEFAULT 'All' CONSTRAINT piles_auto_assignment_work_items_year_check CHECK (year = 'All' OR year ~ '^20[0-9]{2}$'),
   disposition text NOT NULL DEFAULT 'queued' CHECK (disposition IN (
     'queued', 'claimed', 'covered_by_active_cycle', 'follow_up_queued', 'inactive',
     'completed', 'failed', 'cancelled'
@@ -720,13 +727,98 @@ CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE piles_auto_assignment_work_items ADD COLUMN IF NOT EXISTS portal_environment text;
+ALTER TABLE piles_auto_assignment_work_items ADD COLUMN IF NOT EXISTS months jsonb;
+ALTER TABLE piles_auto_assignment_work_items ADD COLUMN IF NOT EXISTS year text;
+
+UPDATE piles_auto_assignment_work_items AS work
+SET portal_environment = CASE WHEN lower(btrim(parent.portal_environment)) IN ('production', 'test')
+      THEN lower(btrim(parent.portal_environment)) ELSE 'production' END,
+    months = CASE
+      WHEN jsonb_typeof(parent.months) = 'array' AND jsonb_array_length(parent.months) > 0
+        AND parent.months <@ '["All","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]'::jsonb
+        AND (NOT parent.months ? 'All' OR parent.months = '["All"]'::jsonb)
+      THEN parent.months
+      ELSE '["All"]'::jsonb
+    END,
+    year = CASE WHEN btrim(parent.year) = 'All' OR btrim(parent.year) ~ '^20[0-9]{2}$'
+      THEN btrim(parent.year) ELSE 'All' END
+FROM piles_auto_assignment_runner_runs AS parent
+WHERE parent.id = work.parent_runner_run_id
+  AND (work.portal_environment IS NULL OR work.months IS NULL OR work.year IS NULL);
+
+UPDATE piles_auto_assignment_work_items
+SET portal_environment = coalesce(portal_environment, 'production'),
+    months = coalesce(months, '["All"]'::jsonb),
+    year = coalesce(year, 'All')
+WHERE portal_environment IS NULL OR months IS NULL OR year IS NULL;
+
+ALTER TABLE piles_auto_assignment_work_items ALTER COLUMN portal_environment SET DEFAULT 'production';
+ALTER TABLE piles_auto_assignment_work_items ALTER COLUMN portal_environment SET NOT NULL;
+ALTER TABLE piles_auto_assignment_work_items ALTER COLUMN months SET DEFAULT '["All"]'::jsonb;
+ALTER TABLE piles_auto_assignment_work_items ALTER COLUMN months SET NOT NULL;
+ALTER TABLE piles_auto_assignment_work_items ALTER COLUMN year SET DEFAULT 'All';
+ALTER TABLE piles_auto_assignment_work_items ALTER COLUMN year SET NOT NULL;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'piles_auto_assignment_work_items'::regclass
+        AND conname = 'piles_auto_assignment_work_items_portal_environment_check') THEN
+    ALTER TABLE piles_auto_assignment_work_items ADD CONSTRAINT piles_auto_assignment_work_items_portal_environment_check
+      CHECK (portal_environment IN ('production', 'test')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'piles_auto_assignment_work_items'::regclass
+        AND conname = 'piles_auto_assignment_work_items_months_check') THEN
+    ALTER TABLE piles_auto_assignment_work_items ADD CONSTRAINT piles_auto_assignment_work_items_months_check CHECK (
+      jsonb_typeof(months) = 'array' AND jsonb_array_length(months) > 0
+      AND months <@ '["All","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]'::jsonb
+      AND (NOT months ? 'All' OR months = '["All"]'::jsonb)
+    ) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'piles_auto_assignment_work_items'::regclass
+        AND conname = 'piles_auto_assignment_work_items_year_check') THEN
+    ALTER TABLE piles_auto_assignment_work_items ADD CONSTRAINT piles_auto_assignment_work_items_year_check
+      CHECK (year = 'All' OR year ~ '^20[0-9]{2}$') NOT VALID;
+  END IF;
+END $$;
+
+ALTER TABLE piles_auto_assignment_work_items VALIDATE CONSTRAINT piles_auto_assignment_work_items_portal_environment_check;
+ALTER TABLE piles_auto_assignment_work_items VALIDATE CONSTRAINT piles_auto_assignment_work_items_months_check;
+ALTER TABLE piles_auto_assignment_work_items VALIDATE CONSTRAINT piles_auto_assignment_work_items_year_check;
+
+DO $$ BEGIN
+  IF to_regclass('piles_auto_assignment_work_items_queued_generation_idx') IS NOT NULL
+    AND pg_get_indexdef('piles_auto_assignment_work_items_queued_generation_idx'::regclass)
+      NOT LIKE '%portal_environment%months%year%'
+  THEN
+    DROP INDEX piles_auto_assignment_work_items_queued_generation_idx;
+  END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_queued_generation_idx
-  ON piles_auto_assignment_work_items (canonical_insurer_name, source, request_scope)
+  ON piles_auto_assignment_work_items (
+    canonical_insurer_name, source, request_scope, portal_environment, months, year
+  )
   WHERE disposition = 'queued';
 
+DO $$ BEGIN
+  IF to_regclass('piles_auto_assignment_work_items_follow_up_idx') IS NOT NULL
+    AND pg_get_indexdef('piles_auto_assignment_work_items_follow_up_idx'::regclass)
+      NOT LIKE '%portal_environment%months%year%'
+  THEN
+    DROP INDEX piles_auto_assignment_work_items_follow_up_idx;
+  END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_work_items_follow_up_idx
-  ON piles_auto_assignment_work_items (canonical_insurer_name)
+  ON piles_auto_assignment_work_items (canonical_insurer_name, portal_environment, months, year)
   WHERE disposition = 'follow_up_queued';
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_work_items_completed_scope_idx
+  ON piles_auto_assignment_work_items (
+    canonical_insurer_name, portal_environment, year, finished_at DESC, id
+  )
+  WHERE disposition = 'completed';
 
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_work_items_claim_order_idx
   ON piles_auto_assignment_work_items (

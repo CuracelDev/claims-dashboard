@@ -21,6 +21,25 @@ T2 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
 
 
 class DispatchCoverageTests(unittest.TestCase):
+    def test_execution_scope_coverage_requires_same_portal_and_containing_filters(self):
+        cases = (
+            ("test cannot cover production", dict(portal_environment="production"), dict(portal_environment="test"), False),
+            ("production cannot cover test", dict(portal_environment="test"), dict(portal_environment="production"), False),
+            ("one month cannot cover all months", dict(months=("All",)), dict(months=("Jul",)), False),
+            ("one year cannot cover all years", dict(year="All"), dict(year="2025"), False),
+            ("all months covers one month", dict(months=("Jul",)), dict(months=("All",)), True),
+            ("month superset covers subset", dict(months=("Jul",)), dict(months=("Aug", "July")), True),
+            ("all years covers one year", dict(year="2025"), dict(year="All"), True),
+            ("equivalent normalized scope covers", dict(portal_environment=" production ", months=("Jul", "Aug"), year=" 2025 "), dict(months=("August", "July", "Jul"), year="2025"), True),
+        )
+        for label, requested, active, covered in cases:
+            with self.subTest(label=label):
+                decision = decide_dispatch(
+                    WorkRequest("Jubilee Uganda", WorkSource.SCHEDULE, requested_at=T2, **requested),
+                    InsurerCoverage(state="running", active_run_id="active", **active),
+                )
+                self.assertEqual(decision.disposition == WorkDisposition.COVERED_BY_ACTIVE_CYCLE, covered)
+
     def test_idle_scheduled_insurer_queues_current_generation(self):
         decision = decide_dispatch(
             WorkRequest("Jubilee Uganda", WorkSource.SCHEDULE, requested_at=T2),

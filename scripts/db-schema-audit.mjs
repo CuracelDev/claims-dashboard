@@ -117,6 +117,7 @@ const EXPECTED = {
       disposition: ['text'], covered_by_insurer_run_id: ['text'], worker_id: ['text'],
       claim_token: ['text'], lease_expires_at: ['timestamp with time zone'],
       heartbeat_at: ['timestamp with time zone'], generation_requested_at: ['timestamp with time zone'],
+      portal_environment: ['text'], months: ['jsonb'], year: ['text'],
       attempt_number: ['integer'], requested_at: ['timestamp with time zone'],
       claimed_at: ['timestamp with time zone'], started_at: ['timestamp with time zone'],
       finished_at: ['timestamp with time zone'], reason_code: ['text'],
@@ -125,6 +126,7 @@ const EXPECTED = {
     requiredNullability: {
       id: 'NO', parent_runner_run_id: 'YES', insurer_name: 'NO', canonical_insurer_name: 'NO',
       source: 'NO', request_scope: 'NO', disposition: 'NO', covered_by_insurer_run_id: 'YES',
+      portal_environment: 'NO', months: 'NO', year: 'NO',
       worker_id: 'YES', claim_token: 'YES', lease_expires_at: 'YES', heartbeat_at: 'YES',
       generation_requested_at: 'NO', attempt_number: 'NO', requested_at: 'NO', claimed_at: 'YES',
       started_at: 'YES', finished_at: 'YES', reason_code: 'YES', created_at: 'NO', updated_at: 'NO',
@@ -133,20 +135,24 @@ const EXPECTED = {
     requiredEnumChecks: [
       { column: 'source', values: ['schedule', 'manual', 'readiness', 'recovery'] },
       { column: 'request_scope', values: ['all_active', 'single_insurer'] },
+      { column: 'portal_environment', values: ['production', 'test'] },
       { column: 'disposition', values: ['queued', 'claimed', 'covered_by_active_cycle', 'follow_up_queued', 'inactive', 'completed', 'failed', 'cancelled'] },
     ],
     requiredExpressionChecks: [
       { column: 'canonical_insurer_name', normalized: "btrimcanonical_insurer_name<>''" },
       { column: 'attempt_number', normalized: 'attempt_number>=0' },
       { column: 'reason_code', normalized: "reason_codeisnullorchar_lengthreason_code<=80andreason_code~'^[a-z0-9._-]+$'" },
+      { column: 'months', normalized: "jsonb_typeofmonths='array'andjsonb_array_lengthmonths>0andmonths<@'[\"All\", \"Jan\", \"Feb\", \"Mar\", \"Apr\", \"May\", \"Jun\", \"Jul\", \"Aug\", \"Sep\", \"Oct\", \"Nov\", \"Dec\"]'::jsonbandnotmonths?'All'ormonths='[\"All\"]'::jsonb" },
+      { column: 'year', normalized: "year='All'oryear~'^20[0-9]{2}$'" },
     ],
     requiredForeignKeys: [
       { column: 'parent_runner_run_id', table: 'piles_auto_assignment_runner_runs', referencedColumn: 'id', deleteRule: 'SET NULL' },
       { column: 'covered_by_insurer_run_id', table: 'piles_auto_assignment_insurer_runs', referencedColumn: 'id', deleteRule: 'SET NULL' },
     ],
     requiredIndexes: [
-      { name: 'piles_auto_assignment_work_items_queued_generation_idx', unique: true, columns: ['canonical_insurer_name', 'source', 'request_scope'], predicate: { kind: 'equals', column: 'disposition', values: ['queued'] } },
-      { name: 'piles_auto_assignment_work_items_follow_up_idx', unique: true, columns: ['canonical_insurer_name'], predicate: { kind: 'equals', column: 'disposition', values: ['follow_up_queued'] } },
+      { name: 'piles_auto_assignment_work_items_queued_generation_idx', unique: true, columns: ['canonical_insurer_name', 'source', 'request_scope', 'portal_environment', 'months', 'year'], predicate: { kind: 'equals', column: 'disposition', values: ['queued'] } },
+      { name: 'piles_auto_assignment_work_items_follow_up_idx', unique: true, columns: ['canonical_insurer_name', 'portal_environment', 'months', 'year'], predicate: { kind: 'equals', column: 'disposition', values: ['follow_up_queued'] } },
+      { name: 'piles_auto_assignment_work_items_completed_scope_idx', unique: false, columns: ['canonical_insurer_name', 'portal_environment', 'year', 'finished_at', 'id'], predicate: { kind: 'equals', column: 'disposition', values: ['completed'] } },
       { name: 'piles_auto_assignment_work_items_claim_order_idx', unique: false, columns: ['parent_runner_run_id', 'disposition', 'generation_requested_at', 'requested_at', 'id'], predicate: { kind: 'in', column: 'disposition', values: ['queued', 'follow_up_queued'] } },
       { name: 'piles_auto_assignment_work_items_expired_lease_idx', unique: false, columns: ['lease_expires_at', 'canonical_insurer_name'], predicate: { kind: 'equals', column: 'disposition', values: ['claimed'] } },
     ],
