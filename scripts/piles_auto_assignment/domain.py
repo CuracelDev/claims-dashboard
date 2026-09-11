@@ -173,6 +173,12 @@ class DispatchDecision:
 
 
 @dataclass(frozen=True)
+class WaitDecision:
+    decision: str
+    code: str
+
+
+@dataclass(frozen=True)
 class FilterEvidence:
     month_matches: bool
     year_matches: bool

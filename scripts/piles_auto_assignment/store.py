@@ -17,6 +17,7 @@ from .domain import (
 )
 from .orchestrator import derive_parent_status
 from .scheduling import decide_dispatch
+from .timing import sanitize_performance
 
 
 class ConcurrentStateChange(RuntimeError):
@@ -995,6 +996,7 @@ class ExecutionLedger:
         status: str,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        performance: Optional[list] = None,
     ) -> None:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -1037,10 +1039,11 @@ class ExecutionLedger:
                 UPDATE piles_auto_assignment_insurer_runs
                 SET status = %s, phase = 'complete', error_code = %s,
                     error_message = %s, heartbeat_at = now(), finished_at = now(),
+                    details = jsonb_set(coalesce(details, '{}'::jsonb), '{performance}', %s::jsonb),
                     updated_at = now()
                 WHERE id = %s
                 """,
-                (status, error_code, error_message, insurer_run_id),
+                (status, error_code, error_message, json.dumps(sanitize_performance(performance)), insurer_run_id),
             )
         self.connection.commit()
 
@@ -1126,8 +1129,8 @@ class ReadOnlyExecutionLedger:
     def heartbeat(self, _insurer_run_id: str, *, phase: str) -> None:
         del phase
 
-    def finalize_insurer_run(self, _insurer_run_id: str, *, status: str, error_code: Optional[str] = None, error_message: Optional[str] = None) -> None:
-        del status, error_code, error_message
+    def finalize_insurer_run(self, _insurer_run_id: str, *, status: str, error_code: Optional[str] = None, error_message: Optional[str] = None, performance: Optional[list] = None) -> None:
+        del status, error_code, error_message, performance
 
     def summarize_insurer_run(self, _insurer_run_id: str) -> dict[str, int]:
         return {"confirmed": 0, "reconciliation_pending": 0, "conflict": 0, "failed": 0}

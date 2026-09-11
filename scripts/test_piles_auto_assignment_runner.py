@@ -48,6 +48,251 @@ def load_runner_module():
 runner = load_runner_module()
 
 
+class EvidenceTimingTests(unittest.TestCase):
+    class Clock:
+        ns = 0
+
+        def advance(self, ms):
+            self.ns += int(ms * 1_000_000)
+
+    def fixture(self, snapshot=None, network=None):
+        clock = self.Clock()
+        browser = runner.CuracelPilesRunner()
+        controls = {'month': 'All', 'year': '2026', 'status': 'Vetting Pending'}
+
+        class Locator:
+            first = property(lambda self: self)
+            def count(self): return 0
+
+        class Page:
+            def locator(self, _): return Locator()
+            def wait_for_timeout(self, ms): clock.advance(ms)
+
+        browser.page = Page()
+        browser._reset_pagination_to_first_page = lambda: None
+        browser._table_preview_fingerprint = lambda: ()
+        browser._direct_month_control = lambda: 'month'
+        browser._direct_status_control = lambda _: 'status'
+        browser._read_select_text = lambda control: controls.get(control, '')
+        browser._read_year_chip_text = lambda: controls['year']
+        def select(control, value, **_):
+            controls[control] = value
+            return True
+        browser._set_select_value = select
+        browser._apply_year_filter = lambda value: 'year' if select('year', value) else None
+        browser._table_context_snapshot = snapshot or (lambda: {
+            'headers': [], 'rows': [], 'loading': False, 'table_visible': True, 'explicit_empty': True})
+        if network:
+            browser._filter_network_state = lambda *_, **__: network(clock)
+        return browser, clock
+
+    def run_filters(self, browser, clock, statuses):
+        with patch.object(runner.time, 'monotonic_ns', side_effect=lambda: clock.ns), \
+             patch.object(runner.time, 'time', side_effect=lambda: clock.ns / 1e9), \
+             patch.object(runner.time, 'sleep', side_effect=lambda _: self.fail('unconditional sleep')), \
+             patch('sys.stdout', new_callable=io.StringIO):
+            return [browser.apply_filters('All', '2026', status) for status in statuses]
+
+    def test_five_explicit_empty_statuses_settle_near_grace_without_sleep(self):
+        browser, clock = self.fixture()
+        result = self.run_filters(browser, clock, ['Vetting Pending', 'Vetting Ongoing',
+                                 'Audit Pending', 'Audit Ongoing', 'AI Audit'])
+        self.assertEqual(len(result), 5)
+        self.assertTrue(all(item.table_state == 'empty' for item in result))
+        self.assertTrue(all(runner.evaluate_filter_evidence(item).accepted for item in result))
+        self.assertGreaterEqual(clock.ns, 7_500_000_000)
+        self.assertLessEqual(clock.ns, 8_000_000_000)
+        self.assertTrue(hasattr(browser, 'phase_timer'), 'runner timing missing')
+        filters = [row for row in browser.phase_timer.serialize() if row['operation'] == 'filter']
+        self.assertEqual(filters[0]['count'], 5)
+        self.assertEqual(filters[0]['total_ms'], 7500)
+
+    def test_response_arriving_during_grace_can_veto_empty_dom(self):
+        browser, clock = self.fixture(network=lambda clock: (
+            ('succeeded', {'authoritative': True, 'authoritative_empty': False, 'item_count': 2})
+            if clock.ns >= 1_000_000_000 else ('not_observed', {})))
+        with self.assertRaisesRegex(RuntimeError, 'empty_ui_conflicts_with_response'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertLess(clock.ns, 1_500_000_000)
+        self.assertEqual(browser._filter_state['status'], '')
+
+    def test_unreadable_table_waits_for_full_cap_and_never_accepts(self):
+        browser, clock = self.fixture(snapshot=lambda: {'loading': True})
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertEqual(clock.ns, 30_000_000_000)
+
+    def test_unreadable_response_cannot_be_bypassed_by_empty_dom(self):
+        browser, clock = self.fixture(network=lambda _: ('succeeded', {'authoritative': False}))
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertEqual(clock.ns, 30_000_000_000)
+
+    def test_rows_require_matching_visible_context_not_just_any_stable_table(self):
+        for visible_status, accepted in [('Vetting Pending', True), ('Completed', False)]:
+            with self.subTest(visible_status=visible_status):
+                browser, clock = self.fixture(snapshot=lambda: {
+                    'headers': ['Provider', 'Claims', 'Month', 'Provider Bill', 'Submitted Date', 'Status'],
+                    'rows': [['fixture', '2', 'Sep', 'BILL', '2026-09-01', visible_status]],
+                    'loading': False, 'table_visible': True, 'explicit_empty': False})
+                if accepted:
+                    evidence = self.run_filters(browser, clock, ['Vetting Pending'])[0]
+                    self.assertEqual(evidence.table_state, 'stable')
+                    self.assertEqual(clock.ns, 1_500_000_000)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+                        self.run_filters(browser, clock, ['Vetting Pending'])
+                    self.assertEqual(clock.ns, 30_000_000_000)
+
+    def test_transient_empty_then_loading_does_not_pass_at_grace(self):
+        browser, clock = self.fixture()
+        browser._table_context_snapshot = lambda: {
+            'headers': [], 'rows': [], 'table_visible': True, 'explicit_empty': True,
+            'loading': 1_000_000_000 <= clock.ns < 2_000_000_000}
+        self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertGreaterEqual(clock.ns, 2_300_000_000)
+
+    def test_authoritative_response_waits_while_table_is_loading(self):
+        browser, clock = self.fixture(network=lambda _: ('succeeded', {
+            'authoritative': True, 'authoritative_empty': True, 'item_count': 0}))
+        browser._table_context_snapshot = lambda: {
+            'headers': [], 'rows': [], 'table_visible': True, 'explicit_empty': True,
+            'loading': clock.ns < 2_000_000_000}
+        self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertGreaterEqual(clock.ns, 2_300_000_000)
+
+    def test_authoritative_empty_keeps_legacy_no_table_markup_acceptance(self):
+        browser, clock = self.fixture(
+            snapshot=lambda: {'headers': [], 'rows': [], 'loading': False, 'table_visible': False},
+            network=lambda _: ('succeeded', {'authoritative': True, 'authoritative_empty': True, 'item_count': 0}))
+        evidence = self.run_filters(browser, clock, ['Vetting Pending'])[0]
+        self.assertEqual(evidence.table_state, 'structurally_empty')
+        self.assertEqual(clock.ns, 1_500_000_000)
+
+    def test_year_control_drift_during_grace_cannot_accept_empty_dom(self):
+        browser, clock = self.fixture()
+        original = browser._read_select_text
+        browser._read_select_text = lambda control: (
+            '2025' if control == 'year' and clock.ns >= 500_000_000 else original(control))
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+
+    def test_filter_settlement_timeout_uses_existing_single_clean_page_retry(self):
+        browser = runner.CuracelPilesRunner()
+        attempts = []
+        browser.open_piles = lambda: attempts.append('reload')
+        def scan(*_, **__):
+            attempts.append('scan')
+            raise RuntimeError('Piles filters were not confirmed: filter_settlement_timeout.')
+        browser.scan_status = scan
+        with patch('sys.stdout', new_callable=io.StringIO):
+            with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+                browser._scan_status_with_transient_retry('All', '2026', 'Vetting Pending')
+        self.assertEqual(attempts, ['scan', 'reload', 'scan'])
+
+    def test_filter_option_click_relies_on_selection_confirmation_not_sleep(self):
+        browser = runner.CuracelPilesRunner()
+        selected = []
+        class Option:
+            def inner_text(self): return 'Vetting Pending'
+            def click(self): selected.append('Vetting Pending')
+        class Options:
+            def count(self): return 1
+            def nth(self, _): return Option()
+        class Root:
+            def locator(self, _): return Options()
+        browser.page = object()
+        browser._dropdown_root_for_control = lambda _: Root()
+        browser._open_select = lambda _: True
+        browser._read_select_text = lambda _: selected[-1] if selected else ''
+        with patch.object(runner.time, 'sleep', side_effect=lambda _: self.fail('filter click sleep')):
+            self.assertTrue(browser._set_select_value(object(), 'Vetting Pending', required=True))
+        self.assertEqual(selected, ['Vetting Pending'])
+
+    def test_recorded_run_carries_phase_aggregates_on_success_and_failure(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                connection = __import__('scripts.test_piles_auto_assignment_store', fromlist=['RecordingConnection']).RecordingConnection()
+                ledger = runner.ExecutionLedger(connection)
+                ledger.create_insurer_run = lambda *_: 'fixture-run'
+                store = types.SimpleNamespace(get_master_account=lambda _: {})
+                def flow(_store, args, *_):
+                    self.assertTrue(hasattr(args, 'phase_timer'), 'recorded run does not own timings')
+                    args.phase_timer.record('scan', 'filter', 1500, 'accept')
+                    if failed: raise RuntimeError('expected fixture failure')
+                    return {}
+                with patch.object(runner, 'run_for_insurer', flow):
+                    if failed:
+                        with self.assertRaisesRegex(RuntimeError, 'expected fixture'):
+                            runner.run_insurer_recorded(store, types.SimpleNamespace(), 'fixture', [], 'All', False, ledger, 'parent')
+                    else:
+                        runner.run_insurer_recorded(store, types.SimpleNamespace(), 'fixture', [], 'All', False, ledger, 'parent')
+                payloads = [runner.json.loads(value) for _, params in connection.statements for value in params
+                            if isinstance(value, str) and value.startswith('[')]
+                self.assertEqual(len(payloads), 1)
+                self.assertEqual(payloads[0][0]['operation'], 'filter')
+
+    def test_modal_readiness_has_no_first_attempt_sleep(self):
+        browser = runner.CuracelPilesRunner()
+        events = []
+        class Control:
+            def count(self): return 1
+            def is_visible(self): return True
+            def click(self, **_): events.append('assignment')
+            first = property(lambda self: self)
+        class Root:
+            def locator(self, _): return Control()
+            def wait_for(self, **_): events.append('acknowledged')
+        browser.page = Root()
+        browser._visible_overlay_roots = lambda: [Root()]
+        browser._wait_for_assign_user_control = lambda **_: events.append('ready') or Control()
+        browser._open_select_control = lambda _: True
+        browser._choose_option_from_open_dropdown = lambda _: 'fixture'
+        browser._dismiss_popup = lambda: None
+        with patch.object(runner.time, 'sleep', side_effect=lambda seconds: events.append(('sleep', seconds))):
+            browser._apply_assignment_modal('Vetting', 'fixture', True)
+        self.assertEqual(events, ['ready', ('sleep', 0.5), 'assignment', 'acknowledged'])
+
+    def test_assignee_discovery_uses_ready_control_without_modal_open_sleep(self):
+        browser = runner.CuracelPilesRunner()
+        sample = make_pile(1)
+        events = []
+        browser.page = types.SimpleNamespace(keyboard=types.SimpleNamespace(press=lambda _: None))
+        browser.reset_to_filtered_page = lambda *_: [sample]
+        browser._select_rows = lambda *_: types.SimpleNamespace(count=1)
+        browser._open_assign_modal = lambda: events.append('open')
+        browser._wait_for_assign_user_control = lambda: events.append('ready') or object()
+        browser._open_select_control = lambda _: True
+        browser._visible_dropdown_option_texts = lambda: ['fixture']
+        browser._dismiss_popup = lambda: None
+        with patch.object(runner.time, 'sleep', side_effect=lambda seconds: events.append(('sleep', seconds))):
+            assignees = browser.discover_portal_assignees('Jul', '2026', sample)
+        self.assertEqual([assignee.name for assignee in assignees], ['fixture'])
+        self.assertEqual(events, ['open', 'ready', ('sleep', 0.4)])
+
+    def test_login_waits_for_app_after_submit_without_fixed_sleep(self):
+        browser = runner.CuracelPilesRunner()
+        clock = self.Clock()
+        class Control:
+            def fill(self, value): pass
+            def click(self): pass
+        class Page:
+            url = 'https://fixture/auth'
+            def wait_for_timeout(self, ms):
+                clock.advance(ms)
+                if clock.ns >= 700_000_000: self.url = 'https://fixture/hmo/piles'
+        browser.page = Page()
+        browser._dismiss_popup = lambda: None
+        browser._goto_with_soft_readiness = lambda _: None
+        browser._first_visible_locator = lambda selectors, **_: (
+            None if selectors[0] == '.p-select.p-component' else Control())
+        with patch.object(runner.time, 'time', side_effect=lambda: clock.ns / 1e9), \
+             patch.object(runner.time, 'sleep', side_effect=lambda _: self.fail('fixed login sleep')):
+            browser.login('fixture', 'fixture')
+        self.assertGreaterEqual(clock.ns, 700_000_000)
+        self.assertLess(clock.ns, 2_000_000_000)
+
+
 def make_bot(bot_id, role, *, ratio=1, active=True, available=True, load=0, priority=100):
     return runner.BotAccount(
         id=bot_id,
@@ -93,6 +338,19 @@ def make_pile(index, claims=100, *, filter_year="2026"):
 
 
 class LateArrivalWorkflowTests(unittest.TestCase):
+    def test_planning_and_reconciliation_are_aggregate_only_operations(self):
+        row = runner.replace(make_pile(1), assigned='Daniel')
+        state = self.workflow({('Jul', '2026', 'Vetting Pending'): [row, make_pile(2)]}, {}, attempts=[{
+            'id': 'prior', 'tracking_key': row.tracking_key, 'last_pile_key': row.key,
+            'status': 'submitted', 'intended_portal_assignee': 'Daniel', 'attempt_number': 1,
+        }], manual=True)
+        self.assertFalse(hasattr(state, 'error'), getattr(state, 'error', None))
+        operations = {item['operation']: item for item in state.portal.phase_timer.serialize()}
+        self.assertIn('planning', operations)
+        self.assertIn('reconciliation', operations)
+        self.assertEqual(operations['planning']['count'], 1)
+        self.assertNotIn('Provider 1', runner.json.dumps(operations))
+
     def workflow(self, initial, late, *, attempts=(), v2=True, years=("2026",),
                  supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
                  after_initial=None):
@@ -2710,7 +2968,8 @@ class ManualWorkflowOutcomeTests(unittest.TestCase):
         result, finals, _ = self.manual_workflow(recorded=True, v2=False)
         self.assertNotIn("workflow_status", result)
         self.assertNotIn("manual_action_required_count", result)
-        self.assertEqual(finals, [{"status": "completed"}])
+        self.assertEqual([item['status'] for item in finals], ['completed'])
+        self.assertEqual(finals[0]['performance'][0]['operation'], 'planning')
 
 
 class DispatcherRunnerFencingTests(unittest.TestCase):

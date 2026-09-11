@@ -49,7 +49,8 @@ try:
     from piles_auto_assignment.store import DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger, ParentAlreadyTerminal
     from piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
-    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
+    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
+    from piles_auto_assignment.timing import PhaseTimer, timed_operation
     from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
@@ -65,7 +66,8 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.store import DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger, ParentAlreadyTerminal
     from scripts.piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
-    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
+    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
+    from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
     from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from scripts.piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
@@ -746,6 +748,8 @@ def table_snapshot_matches_filter_context(
     status_label: str,
     response_identity_candidates: list[list[str]],
     response_row_id_hashes: list[str] | None = None,
+    *,
+    require_response_identity: bool = True,
 ) -> bool:
     """Validate an atomic DOM snapshot against the requested filter context."""
     if snapshot.get("loading") is not False:
@@ -818,6 +822,8 @@ def table_snapshot_matches_filter_context(
             if len(row_attributes) > len(visible_id_candidates) else set()
         )
 
+    if not require_response_identity:
+        return True
     expected_id_hashes = response_row_id_hashes or []
     if len(expected_id_hashes) == len(rows) and all(expected_id_hashes):
         unmatched = list(visible_id_candidates)
@@ -3492,6 +3498,7 @@ class CuracelPilesRunner:
         self.scan_context_ids: dict[tuple[str, str, str], str] = {}
         self.assignment_attempt_ids: dict[str, str] = {}
         self.retry_attempt_numbers: dict[str, int] = {}
+        self.phase_timer = PhaseTimer()
 
     def _heartbeat(self, phase: str) -> None:
         work_heartbeat = getattr(self, "work_heartbeat", None)
@@ -3499,6 +3506,9 @@ class CuracelPilesRunner:
             # Ownership loss is fatal even if the optional ledger heartbeat is
             # absent, throttled, or failing. Never swallow this callback.
             work_heartbeat(phase)
+        timer = getattr(self, 'phase_timer', None)
+        if timer:
+            timer.enter_phase(phase)
         ledger = getattr(self, "execution_ledger", None)
         insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
         if not ledger or not insurer_run_id:
@@ -3564,6 +3574,8 @@ class CuracelPilesRunner:
             "page_size": None,
         }
         self._table_headers_cache = []
+        self._settled_year_control = None
+        self._settled_year_display = ''
 
     def _capture_piles_response(self, response: Any) -> None:
         try:
@@ -3747,7 +3759,7 @@ class CuracelPilesRunner:
                 return None
             time.sleep(0.25)
 
-    def _wait_for_login_or_app_ready(self, timeout_ms: int = 20000) -> str:
+    def _wait_for_login_or_app_ready(self, timeout_ms: int = 20000, *, require_app: bool = False) -> str:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
@@ -3777,13 +3789,14 @@ class CuracelPilesRunner:
                         'input[type="password"]',
                     ]
                 )
-                if login_input and password_input:
+                if login_input and password_input and not require_app:
                     return "login"
             except Exception:
                 pass
-            time.sleep(0.35)
+            self.page.wait_for_timeout(350)
         raise RuntimeError("Login page did not become ready.")
 
+    @timed_operation('login', 'login')
     def login(self, username: str, password: str) -> None:
         assert self.page
         last_error: Exception | None = None
@@ -3832,9 +3845,8 @@ class CuracelPilesRunner:
                 login_input.fill(username)
                 password_input.fill(password)
                 submit_button.click()
-                time.sleep(4)
                 self._dismiss_popup()
-                post_state = self._wait_for_login_or_app_ready(timeout_ms=15000)
+                post_state = self._wait_for_login_or_app_ready(timeout_ms=15000, require_app=True)
                 if post_state == "app":
                     return
                 raise RuntimeError("Login failed; still on auth page.")
@@ -3883,6 +3895,7 @@ class CuracelPilesRunner:
         time.sleep(3)
         self._dismiss_popup()
 
+    @timed_operation('navigation', 'open_piles')
     def open_piles(self) -> None:
         assert self.page
         last_error: Exception | None = None
@@ -4089,7 +4102,8 @@ class CuracelPilesRunner:
                 option_texts.append((text, option))
             if label_key(text) == label_key(desired_text):
                 option.click()
-                time.sleep(0.8)
+                if control is None:  # Assignment dropdown timing is unchanged.
+                    time.sleep(0.8)
                 return text
         if self.allow_test_any_assignee:
             for text, option in option_texts:
@@ -4667,12 +4681,14 @@ class CuracelPilesRunner:
                 continue
         return ""
 
+    @timed_operation('scan', 'filter')
     def apply_filters(self, month_label: str, year_label: str, status_label: str) -> FilterEvidence:
         assert self.page
         last_error: Exception | None = None
         final_month_select = None
         final_year_select = None
         final_status_select = None
+        confirmed_year_display = getattr(self, '_settled_year_display', '')
         filter_response_marker = self._piles_response_sequence
         filter_state_was_initialized = all(
             norm(self._filter_state.get(key)) for key in ("month", "year", "status")
@@ -4711,7 +4727,6 @@ class CuracelPilesRunner:
             return evidence
 
         self._reset_pagination_to_first_page()
-        previous_fingerprint = self._table_preview_fingerprint()
         filter_response_marker = self._piles_response_sequence
 
         for attempt in range(1, 4):
@@ -4742,6 +4757,7 @@ class CuracelPilesRunner:
             year_select = None
             if year_changed:
                 year_select = self._apply_year_filter(year_label)
+                confirmed_year_display = self._read_select_text(year_select) or self._read_year_chip_text()
 
             status_select = None
             if month_changed or year_changed or status_changed:
@@ -4780,10 +4796,6 @@ class CuracelPilesRunner:
         if final_status_select is None:
             raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
 
-        self._filter_state["month"] = month_label
-        self._filter_state["year"] = desired_year_state
-        self._filter_state["status"] = status_label
-
         month_display = self._read_select_text(final_month_select) or month_label
         year_display = self._read_select_text(final_year_select) or self._read_year_chip_text() or year_label
 
@@ -4802,93 +4814,83 @@ class CuracelPilesRunner:
                     break
             except Exception:
                 continue
-        time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
-        network_state, network_details = self._filter_network_state(
-            filter_response_marker,
-            month_label,
-            year_label,
-            status_label,
-            page_number=1,
+        def controls_match():
+            month_control = final_month_select or self._direct_month_control()
+            year_control = final_year_select or getattr(self, '_settled_year_control', None)
+            observed_year = self._read_select_text(year_control) or self._read_year_chip_text()
+            return (
+                label_key(self._read_select_text(month_control)) == label_key(month_label),
+                # _apply_year_filter already verifies the exact selected year set,
+                # including All; continue checking its confirmed display for drift.
+                bool(confirmed_year_display) and observed_year == confirmed_year_display,
+                label_key(self._read_select_text(final_status_select)) == label_key(status_label),
+            )
+
+        evidence = self._wait_for_filter_settlement(
+            filter_response_marker, month_label, year_label, status_label, controls_match,
+            historical_marker=(self._page_open_response_marker if not filter_state_was_initialized else None),
         )
-        response_requires_dom_transition = True
-        if network_state == "not_observed" and not filter_state_was_initialized:
-            historical_state, historical_details = self._filter_network_state(
-                getattr(self, "_page_open_response_marker", filter_response_marker),
-                month_label,
-                year_label,
-                status_label,
-                page_number=1,
-            )
-            if (
-                historical_state == "succeeded"
-                and historical_details.get("authoritative") is True
-            ):
-                network_state = historical_state
-                network_details = historical_details
-                response_requires_dom_transition = False
-        if network_state == "not_observed":
-            self._wait_for_piles_filter_response(
-                filter_response_marker,
-                month_label,
-                year_label,
-                status_label,
-                timeout_ms=30000,
-                page_number=1,
-            )
-            network_state, network_details = self._filter_network_state(
-                filter_response_marker,
-                month_label,
-                year_label,
-                status_label,
-                page_number=1,
-            )
-        if network_details.get("authoritative") is True:
-            table_state, dom_matches_response = self._wait_for_table_response_coherence(
-                safe_int(network_details.get("item_count"), -1),
-                previous_fingerprint,
-                timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000,
-                require_transition=response_requires_dom_transition,
-                month_label=month_label,
-                year_label=year_label,
-                status_label=status_label,
-                response_identity_candidates=network_details.get("row_identity_candidates") or [],
-                response_row_id_hashes=network_details.get("row_id_hashes") or [],
-            )
-        else:
-            table_state = self.wait_for_table_ready(
-                timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000
-            )
-            dom_matches_response = False
-        evidence = FilterEvidence(
-            month_matches=(not month_changed or final_month_select is not None),
-            year_matches=(not year_changed or final_year_select is not None),
-            status_matches=final_status_select is not None,
-            table_state=table_state,
-            network_state=network_state,
-            details={
-                "network": {
-                    key: value
-                    for key, value in network_details.items()
-                    if key not in {"row_identity_candidates", "row_id_hashes"}
-                },
-                "selection_changed": True,
-                "dom_matches_response": dom_matches_response,
-            },
-        )
-        decision = evaluate_filter_evidence(evidence)
-        if not decision.accepted:
-            raise RuntimeError(
-                f"Piles filters were not confirmed: {decision.code}. "
-                "Safe evidence: "
-                f"table_state={table_state}, "
-                f"expected_rows={network_details.get('item_count', 'unknown')}, "
-                f"visible_rows={self._visible_table_row_count()}, "
-                f"http_status={network_details.get('http_status', 'not_observed')}, "
-                f"dom_matches_response={dom_matches_response}, "
-                f"response_fields={network_details.get('row_fields', [])}, "
-                f"table_headers={self._table_headers()}."
-            )
+        self._filter_state.update(month=month_label, year=desired_year_state, status=status_label)
+        self._settled_year_control = final_year_select or getattr(self, '_settled_year_control', None)
+        self._settled_year_display = confirmed_year_display
         return evidence
+
+    def _wait_for_filter_settlement(self, marker, month_label, year_label, status_label,
+                                    controls_match, *, historical_marker=None):
+        """Poll DOM and network together, pumping Playwright events during the grace."""
+        start = time.monotonic_ns()
+        stable_since = start
+        previous = None
+        while True:
+            self._heartbeat('scan')
+            snapshot = self._table_context_snapshot()
+            controls = controls_match()
+            now = time.monotonic_ns()
+            fingerprint = (snapshot, controls)
+            if fingerprint != previous:
+                previous = deepcopy(fingerprint)
+                stable_since = now
+            stable = now - stable_since >= 300_000_000
+            rows = snapshot.get('rows') or []
+            ready = snapshot.get('table_visible') is True and snapshot.get('loading') is False
+            table_state = 'unreadable'
+            if ready and stable:
+                table_state = ('stable' if rows else
+                               'empty' if snapshot.get('explicit_empty') is True else 'structurally_empty')
+            network_state, network = self._filter_network_state(
+                marker, month_label, year_label, status_label, page_number=1)
+            if network_state == 'not_observed' and historical_marker is not None:
+                historical_state, historical = self._filter_network_state(
+                    historical_marker, month_label, year_label, status_label, page_number=1)
+                if historical_state == 'succeeded' and historical.get('authoritative') is True:
+                    network_state, network = historical_state, historical
+            # Preserve the authoritative-empty fallback for portal versions that
+            # omit table markup entirely when no rows exist. Absence alone is unknown.
+            if (stable and not rows and snapshot.get('loading') is False
+                    and network_state == 'succeeded' and network.get('authoritative') is True
+                    and network.get('authoritative_empty') is True and table_state == 'unreadable'):
+                table_state = 'structurally_empty'
+            positive_dom = table_state == 'empty' or (
+                table_state == 'stable' and table_snapshot_matches_filter_context(
+                    snapshot, len(rows), month_label, year_label, status_label, [],
+                    require_response_identity=False))
+            details = {'selection_changed': True, 'positive_dom': positive_dom,
+                       'network': {key: value for key, value in network.items()
+                                   if key not in {'row_identity_candidates', 'row_id_hashes'}}}
+            if network.get('authoritative') is True and table_state != 'unreadable':
+                details['dom_matches_response'] = (
+                    (network.get('authoritative_empty') is True and not rows)
+                    or (table_state == 'stable' and table_snapshot_matches_filter_context(
+                        snapshot, safe_int(network.get('item_count'), -1), month_label,
+                        year_label, status_label, network.get('row_identity_candidates') or [],
+                        network.get('row_id_hashes') or [])))
+            evidence = FilterEvidence(*controls, table_state, network_state, details)
+            decision = decide_filter_wait(evidence, (time.monotonic_ns() - start) / 1_000_000)
+            if decision.decision == 'accept':
+                return evidence
+            if decision.decision in {'fail', 'retry'}:
+                raise RuntimeError(f'Piles filters were not confirmed: {decision.code}.')
+            self.page.wait_for_timeout(100)
 
     def try_set_page_size(self, page_size: int = 100) -> None:
         assert self.page
@@ -5150,7 +5152,7 @@ class CuracelPilesRunner:
                   const loading = Array.from(document.querySelectorAll(
                     "[aria-busy='true'], [role='progressbar'], .p-datatable-loading-overlay, .p-progressspinner"
                   )).some(visible);
-                  if (!table) return { headers: [], rows: [], loading };
+                  if (!table) return { headers: [], rows: [], loading, table_visible: false, explicit_empty: false };
                   const headers = Array.from(table.querySelectorAll('thead tr th'))
                     .map((cell) => (cell.innerText || '').trim());
                   const rows = Array.from(table.querySelectorAll('tbody tr'))
@@ -5171,7 +5173,9 @@ class CuracelPilesRunner:
                         || attribute.name === 'id' || attribute.name === 'name'
                         || attribute.name.startsWith('data-'))
                       .map((attribute) => attribute.value));
-                  return { headers, rows, row_attributes: rowAttributes, loading };
+                  const explicit_empty = Array.from(table.querySelectorAll('tbody td'))
+                    .some((cell) => visible(cell) && /^No Data Found$/i.test((cell.innerText || '').trim()));
+                  return { headers, rows, row_attributes: rowAttributes, loading, table_visible: true, explicit_empty };
                 }"""
             )
             return snapshot if isinstance(snapshot, dict) else {"headers": [], "rows": [], "loading": True}
@@ -5298,6 +5302,7 @@ class CuracelPilesRunner:
                     f"The Piles paginator could not return to page 1 before filtering: {error}"
                 ) from error
 
+    @timed_operation('scan', 'pagination')
     def goto_next_page(
         self,
         month_label: str = "",
@@ -5559,6 +5564,7 @@ class CuracelPilesRunner:
                         all_rows.append(row)
         return all_rows
 
+    @timed_operation('final_rescan', 'final_rescan')
     def scan_selected_statuses(
         self,
         filter_contexts: list[tuple[str, str, str]],
@@ -5773,6 +5779,7 @@ class CuracelPilesRunner:
             return False
         return expected_label == observed_label
 
+    @timed_operation('apply', 'row_selection')
     def _select_rows(self, pile_keys: list[str], current_rows: list[PileRow]) -> RowSelectionResult:
         assert self.page
         rows = self.page.locator("table tbody tr")
@@ -5836,6 +5843,7 @@ class CuracelPilesRunner:
                     continue
         return RowSelectionResult(count=selected, selected_keys=selected_keys)
 
+    @timed_operation('verify', 'verification')
     def verify_assigned_rows(
         self,
         month_label: str,
@@ -6266,6 +6274,7 @@ class CuracelPilesRunner:
             pass
         return False
 
+    @timed_operation('apply', 'modal')
     def _apply_assignment_modal(self, assignment_type: str, assignee_name: str, execute: bool) -> str:
         assert self.page
         # Per current workflow, keep the assign modal on its default Vetting path.
@@ -6275,7 +6284,8 @@ class CuracelPilesRunner:
         control = None
         opened = False
         for attempt in range(1, 4):
-            time.sleep(0.8 if attempt == 1 else 1.2)
+            if attempt > 1:
+                time.sleep(1.2)
             control = self._wait_for_assign_user_control(timeout_ms=9000)
             if control is not None:
                 opened = self._open_select_control(control)
@@ -6407,7 +6417,6 @@ class CuracelPilesRunner:
         if not selected:
             raise RuntimeError("Could not select a sample pile row to inspect the portal assignee dropdown.")
         self._open_assign_modal()
-        time.sleep(2)
         control = self._wait_for_assign_user_control()
         if control is None:
             raise RuntimeError("Could not find the Select User control while discovering portal assignees.")
@@ -7722,6 +7731,7 @@ def is_retryable_scan_error(exc: Exception) -> bool:
     """Recognize bounded, read-safe portal failures that a page reload can recover."""
     phrases = (
         "no completed piles data request confirmed",
+        "piles filters were not confirmed: filter_settlement_timeout",
         "piles filters were not confirmed: filter_dom_response_mismatch",
         "piles table did not settle into a readable row state",
         "piles table did not match the selected page size response",
@@ -7977,6 +7987,7 @@ def _run_for_insurer_once(
         runner.insurer_run_id = insurer_run_id
         runner.insurer_name = insurer_name
         runner.work_heartbeat = getattr(args, "work_heartbeat", None)
+        runner.phase_timer = getattr(args, 'phase_timer', None) or PhaseTimer()
 
         def ensure_portal_mapping(sample_pile: PileRow) -> None:
             nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots, portal_mapping_warnings
@@ -8048,7 +8059,7 @@ def _run_for_insurer_once(
                 for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
             ))
             if pending_attempts:
-                reconcile_pending_for_insurer(
+                runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer,
                     ScannedRowsPortal(),
                     execution_ledger,
                     pending_attempts,
@@ -8134,7 +8145,7 @@ def _run_for_insurer_once(
                 for candidate in stale_candidates
             }
             ensure_portal_mapping(stale_candidates[0].observed_row)
-            reassignment_plans, reassignment_summary = build_stale_reassignment_plans(
+            reassignment_plans, reassignment_summary = runner.phase_timer.call('plan', 'planning', build_stale_reassignment_plans,
                 insurer_name,
                 stale_candidates,
                 resolved_bots,
@@ -8219,7 +8230,7 @@ def _run_for_insurer_once(
             if not manual_mode:
                 ensure_portal_mapping(unassigned[0])
             if manual_mode:
-                plans, summary = build_assignment_plan(
+                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name,
                     unassigned,
                     resolved_bots,
@@ -8232,9 +8243,9 @@ def _run_for_insurer_once(
                     "no automatic assignment will be attempted."
                 )
             elif not bots:
-                plans, summary = build_assignment_plan_from_portal_options(insurer_name, unassigned, portal_assignees)
+                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, unassigned, portal_assignees)
             else:
-                plans, summary = build_assignment_plan(
+                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name,
                     unassigned,
                     resolved_bots,
@@ -8434,7 +8445,7 @@ def _run_for_insurer_once(
 
                 for attempt in final_pending:
                     runner._heartbeat("reconcile")
-                    decisions = reconcile_pending_for_insurer(FinalScanPortal(), execution_ledger, [attempt])
+                    decisions = runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer, FinalScanPortal(), execution_ledger, [attempt])
                     for decision in decisions:
                         counts = late_arrival_detection.setdefault("reconciliation", {})
                         status = decision.status.value
@@ -8473,14 +8484,14 @@ def _run_for_insurer_once(
                 runner._heartbeat("plan")
             if late_manual:
                 manual_action_count += len(follow_up_unassigned)
-                late_plans, late_summary = build_assignment_plan(
+                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name, follow_up_unassigned, resolved_bots, metrics,
                     rule=rule, effective_at=datetime.now(RUNNER_TIMEZONE),
                 )
             elif not bots:
-                late_plans, late_summary = build_assignment_plan_from_portal_options(insurer_name, follow_up_unassigned, portal_assignees)
+                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, follow_up_unassigned, portal_assignees)
             else:
-                late_plans, late_summary = build_assignment_plan(
+                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name,
                     follow_up_unassigned,
                     resolved_bots,
@@ -8786,6 +8797,8 @@ def run_insurer_recorded(
 ) -> dict[str, Any]:
     """Run one insurer and keep ledger-finalization failures from masking portal errors."""
     insurer_run_id = ""
+    args = argparse.Namespace(**vars(args))
+    args.phase_timer = PhaseTimer()
     try:
         if execution_ledger:
             master = store.get_master_account(insurer_name)
@@ -8815,7 +8828,8 @@ def run_insurer_recorded(
                 ownership.status = InsurerRunStatus(status)
                 ownership.error_code = error_code
                 ownership.check()
-            fields = {"status": status}
+            args.phase_timer.finish()
+            fields = {"status": status, "performance": args.phase_timer.serialize()}
             if error_code:
                 fields["error_code"] = error_code
             execution_ledger.finalize_insurer_run(insurer_run_id, **fields)
@@ -8826,11 +8840,13 @@ def run_insurer_recorded(
             ownership.check()
         if insurer_run_id:
             try:
+                args.phase_timer.finish('failed')
                 execution_ledger.finalize_insurer_run(
                     insurer_run_id,
                     status="failed",
                     error_code=safe_worker_error(exc)[0] if safe_diagnostics else classify_runner_error(exc),
                     error_message=safe_worker_error(exc)[1] if safe_diagnostics else str(exc)[:500],
+                    performance=args.phase_timer.serialize(),
                 )
             except Exception as ledger_error:
                 if safe_diagnostics:
