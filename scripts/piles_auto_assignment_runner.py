@@ -7815,7 +7815,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default="", help="Adopt a runner run record pre-created by an asynchronous launcher.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
-    parser.add_argument("--run-source", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUN_SOURCE")) or "manual", help="How this run was triggered, e.g. manual or schedule.")
+    parser.add_argument("--run-source", choices=[source.value for source in WorkSource], default="manual", help="Trusted invocation source supplied by the launcher.")
     parser.add_argument("--invocation-backend", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND")) or "local", help="Which compute backend launched this run, e.g. local or remote.")
     parser.add_argument("--effective-date", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_EFFECTIVE_DATE")), help="Override the local date used for weekend roster selection, e.g. 2026-05-23.")
     return parser.parse_args()

@@ -1,6 +1,10 @@
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import unittest
+import io
+import os
+from contextlib import redirect_stderr
+from unittest.mock import patch
 
 from scripts.piles_auto_assignment.domain import (
     InsurerCoverage,
@@ -204,6 +208,42 @@ class SchedulingConfigurationTests(unittest.TestCase):
         self.assertEqual(configured_max_concurrency({"PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY": "2"}), 2)
         with self.assertRaises(ValueError):
             configured_max_concurrency({"PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY": "4"})
+
+
+class InvocationSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from scripts.test_piles_auto_assignment_runner import runner
+        cls.runner = runner
+
+    def parse(self, *args):
+        with patch('sys.argv', ['runner', '--all-active', *args]):
+            return self.runner.parse_args()
+
+    def test_direct_cli_defaults_to_manual_despite_generic_environment(self):
+        for source in ('schedule', 'recovery', 'readiness', 'unknown'):
+            with self.subTest(source=source), patch.dict(os.environ, {'PILES_AUTO_ASSIGNMENT_RUN_SOURCE': source}):
+                self.assertEqual(self.parse().run_source, 'manual')
+
+    def test_cli_rejects_unsupported_sources_before_running(self):
+        for source in ('unknown', '', 'SCHEDULE', ' manual '):
+            with self.subTest(source=source), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    self.parse('--run-source', source)
+                self.assertEqual(error.exception.code, 2)
+
+    def test_all_trusted_cli_sources_reach_runner_persistence_unchanged(self):
+        for source in ('manual', 'schedule', 'readiness', 'recovery'):
+            with self.subTest(source=source):
+                args = self.parse('--run-source', source)
+                store = object.__new__(self.runner.DataStore)
+                store.mode = 'postgres'
+                writes = []
+                store._execute_postgres = lambda sql, params: writes.append(params)
+                store.create_runner_run(run_id='run', insurer_name='', run_scope='all-active',
+                    portal_environment='test', backend='local', run_source=args.run_source,
+                    months=['All'], year='All', mode='dry-run', details={})
+                self.assertEqual(writes[0][5], source)
 
 
 if __name__ == "__main__":

@@ -77,12 +77,29 @@ jobs:
 
       - name: Restart App via SSH
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          PILES_AUTO_ASSIGNMENT_DISPATCHER_V2: ${{ vars.PILES_AUTO_ASSIGNMENT_DISPATCHER_V2 }}
+          PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY: ${{ vars.PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: PILES_AUTO_ASSIGNMENT_DISPATCHER_V2,PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY
           script: |
+            set -eu
             cd ~/claims-dashboard
+            # Additive schema was applied and audited before code was copied.
+            # Empty configuration leaves v2 disabled and concurrency at one.
+            PILES_AUTO_ASSIGNMENT_DISPATCHER_V2="${PILES_AUTO_ASSIGNMENT_DISPATCHER_V2:-false}"
+            PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-1}"
+            case "$PILES_AUTO_ASSIGNMENT_DISPATCHER_V2" in
+              false|true) ;;
+              *) echo "PILES_AUTO_ASSIGNMENT_DISPATCHER_V2 must be false or true." >&2; exit 1 ;;
+            esac
+            case "$PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY" in
+              1|2) ;;
+              *) echo "PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY must be 1 or 2." >&2; exit 1 ;;
+            esac
             cat <<EOF > .env
             DATABASE_URL="${{ secrets.DATABASE_URL }}"
             NEXT_PUBLIC_SUPABASE_URL="${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}"
@@ -105,7 +122,8 @@ jobs:
             CURACEL_PORTAL_ENVIRONMENT="${{ vars.CURACEL_PORTAL_ENVIRONMENT }}"
             PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND="${{ vars.PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND }}"
             PILES_EXECUTION_LEDGER_ENABLED="${{ vars.PILES_EXECUTION_LEDGER_ENABLED }}"
-            PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="${{ vars.PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY }}"
+            PILES_AUTO_ASSIGNMENT_DISPATCHER_V2="$PILES_AUTO_ASSIGNMENT_DISPATCHER_V2"
+            PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="$PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY"
             PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python"
             PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
             ALLOW_PRODUCTION_ASSIGNMENTS="${{ vars.ALLOW_PRODUCTION_ASSIGNMENTS }}"

@@ -122,7 +122,7 @@ export async function POST(httpRequest) {
     if (backend === 'remote') {
       await queueRemote(request, runId);
     } else {
-      const args = buildRunnerArgs(request, { runId, backend });
+      const args = buildRunnerArgs(request, { runId, backend, source: 'manual' });
       startDetachedRunner({
         pythonBin: resolvePythonBin(), scriptPath: 'scripts/piles_auto_assignment_runner.py', args,
         cwd: process.cwd(), env: process.env,

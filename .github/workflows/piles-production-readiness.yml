@@ -53,6 +53,7 @@ jobs:
                 --portal-environment production \
                 --month All \
                 --year All \
+                --run-source readiness \
                 --read-only
             else
               if [ -z "$PROBE_INSURER" ]; then
@@ -64,5 +65,6 @@ jobs:
                 --portal-environment production \
                 --month All \
                 --year All \
+                --run-source readiness \
                 --read-only
             fi
