@@ -53,23 +53,23 @@ jobs:
           envs: CANARY_INSURER
           script: |
             set -eu
-            fail() { echo "Production canary safety precondition failed." >&2; exit 1; }
+            fail() { echo "Production canary safety precondition failed: $1." >&2; exit 1; }
             cd ~/claims-dashboard
             set -a
             . ./.env
             set +a
 
-            [ "${PILES_AUTO_ASSIGNMENT_DISPATCHER_V2:-}" = "true" ] || fail
-            [ "${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-}" = "1" ] || fail
-            [ "${ALLOW_PRODUCTION_ASSIGNMENTS:-}" = "false" ] || fail
-            [ "${PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE:-}" = "0 0 31 2 *" ] || fail
+            [ "${PILES_AUTO_ASSIGNMENT_DISPATCHER_V2:-}" = "true" ] || fail "dispatcher v2 is not enabled"
+            [ "${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-}" = "1" ] || fail "maximum concurrency is not one"
+            [ "${ALLOW_PRODUCTION_ASSIGNMENTS:-}" = "false" ] || fail "global assignments are not disabled"
+            [ "${PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE:-}" = "0 0 31 2 *" ] || fail "configured cron is not paused"
             cron_lines="$(crontab -l 2>/dev/null || true)"
             managed_count="$(printf '%s\n' "$cron_lines" | awk '/run-piles-auto-assignment[.]sh|# piles-auto-assignment$/ { count++ } END { print count + 0 }')"
             paused_count="$(printf '%s\n' "$cron_lines" | awk '$1 == "0" && $2 == "0" && $3 == "31" && $4 == "2" && $5 == "*" && /# piles-auto-assignment$/ { count++ } END { print count + 0 }')"
-            [ "$managed_count" = "1" ] || fail
-            [ "$paused_count" = "1" ] || fail
-            if pgrep -f '[p]iles_auto_assignment_runner[.]py.*--execute' >/dev/null 2>&1; then
-              fail
+            [ "$managed_count" = "1" ] || fail "installed managed cron count is not one"
+            [ "$paused_count" = "1" ] || fail "installed cron is not paused"
+            if ps -eo pid=,comm=,args= | awk '$2 ~ /^python([0-9.]*)?$/ && /piles_auto_assignment_runner[.]py/ && /--execute([[:space:]]|$)/ { found=1 } END { exit found ? 0 : 1 }'; then
+              fail "an active execute process already exists"
             fi
             node scripts/db-schema-audit.mjs
 
