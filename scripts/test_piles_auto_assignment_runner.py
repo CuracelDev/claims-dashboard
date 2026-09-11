@@ -4057,6 +4057,60 @@ class DispatcherMainTests(unittest.TestCase):
         self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"} for event in self.events))
         self.assertEqual(state.events, [])
 
+    def test_sigterm_after_successful_readiness_insurer_stops_before_next_context(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya", "Uganda")), []
+        original = signal.getsignal(signal.SIGTERM)
+
+        def probe(work, _context):
+            calls.append(work.insurer_name)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            return {"workflow_status": "completed"}
+
+        with self.assertRaises(runner.StandaloneProbeIncomplete) as raised:
+            self.invoke(state, probe, execute=False, read_only=True, run_source="readiness")
+
+        self.assertEqual(calls, ["Kenya"])
+        self.assertEqual(raised.exception.result.status, runner.ParentRunStatus.COMPLETED_WITH_ISSUES)
+        self.assertEqual(
+            [(item.insurer_name, item.status.value, item.error_code)
+             for item in raised.exception.result.outcomes],
+            [("Kenya", "completed", ""), ("Uganda", "failed", "dispatch_stopped")],
+        )
+        self.assertEqual(len(state.contexts), 1)
+        self.assertEqual((state.insurer_locks, state.slots), ({}, {}))
+        self.assertEqual(state.events, [])
+        self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"}
+                             for event in self.events))
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_sigterm_during_failed_readiness_insurer_stops_before_next_context(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya", "Uganda")), []
+        original = signal.getsignal(signal.SIGTERM)
+
+        def probe(work, _context):
+            calls.append(work.insurer_name)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            raise TimeoutError("private readiness fixture")
+
+        with self.assertRaises(runner.StandaloneProbeIncomplete) as raised:
+            self.invoke(state, probe, execute=False, read_only=True, run_source="readiness")
+
+        self.assertEqual(calls, ["Kenya"])
+        self.assertEqual(raised.exception.result.status, runner.ParentRunStatus.FAILED)
+        self.assertEqual(
+            [(item.insurer_name, item.status.value, item.error_code)
+             for item in raised.exception.result.outcomes],
+            [("Kenya", "failed", "portal_timeout"), ("Uganda", "failed", "dispatch_stopped")],
+        )
+        self.assertEqual(len(state.contexts), 1)
+        self.assertEqual((state.insurer_locks, state.slots), ({}, {}))
+        self.assertEqual(state.events, [])
+        self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"}
+                             for event in self.events))
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
     def test_standalone_readiness_classifies_actual_workflow_producers(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
 

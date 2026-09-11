@@ -9428,7 +9428,9 @@ def main_v2() -> DispatchResult:
                 outcomes = []
                 for insurer in insurers:
                     work = ProbeWork(insurer, canonical_insurer_key(insurer))
-                    outcome = execute_claimed_insurer(work, probe_context, run_one)
+                    outcome = execute_claimed_insurer(
+                        work, probe_context, run_one, stop_event=stopped,
+                    )
                     if outcome.error_code == "insurer_lock_unavailable":
                         outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
                     elif outcome.error_code == "worker_capacity_unavailable":
