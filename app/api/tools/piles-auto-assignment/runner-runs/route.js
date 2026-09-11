@@ -11,15 +11,28 @@ function normalizeLimit(value) {
   return Math.min(Math.max(Math.trunc(parsed), 1), 250);
 }
 
-// Both the PostgreSQL adapter and PostgREST support range. Stay below the
-// PostgREST response cap, with deterministic pages and a hard request budget.
+// Both adapters support bound id > cursor filters. UUID insertions behind the
+// cursor cannot shift a later page and duplicate/skip already-existing rows.
+// This is a live read, not a transaction snapshot; later inserts behind the
+// cursor become visible on the next history refresh. Stay below the hosted
+// response cap with a hard request budget.
 // Exceeding the budget fails rather than returning misleading partial counts.
 async function loadRows(query, maximum = 100000) {
   const rows = [];
-  for (let offset = 0; offset <= maximum; offset += 500) {
-    const response = await query().order('id', { ascending: true }).range(offset, offset + 499);
+  let cursor = null;
+  while (rows.length <= maximum) {
+    let pageQuery = query().order('id', { ascending: true }).limit(500);
+    if (cursor !== null) pageQuery = pageQuery.gt('id', cursor);
+    const response = await pageQuery;
     if (response.error) throw response.error;
     const page = response.data || [];
+    if (page.length > 500) throw new Error('History page budget exceeded');
+    for (const row of page) {
+      // Runner-produced IDs are immutable ASCII opaque values. Refuse malformed,
+      // repeated or out-of-order cursors instead of looping or double counting.
+      if (typeof row.id !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(row.id) || (cursor !== null && row.id <= cursor)) throw new Error('Invalid history cursor');
+      cursor = row.id;
+    }
     rows.push(...page);
     if (rows.length > maximum) throw new Error('History row budget exceeded');
     if (page.length < 500) return rows;
@@ -71,10 +84,10 @@ export async function GET(request) {
     if (insurerRunIds.length) {
       [contexts, batches] = await Promise.all([
         loadRows(() => supabase.from('piles_auto_assignment_scan_contexts')
-          .select('insurer_run_id,status,distinct_pile_count,unassigned_pile_count,claim_count')
+          .select('id,insurer_run_id,status,distinct_pile_count,unassigned_pile_count,claim_count')
           .in('insurer_run_id', insurerRunIds)),
         loadRows(() => supabase.from('piles_auto_assignment_batches')
-          .select('insurer_run_id,status,planned_pile_count,selected_pile_count,confirmed_pile_count,pending_pile_count,conflict_pile_count,failed_pile_count')
+          .select('id,insurer_run_id,status,planned_pile_count,selected_pile_count,confirmed_pile_count,pending_pile_count,conflict_pile_count,failed_pile_count')
           .in('insurer_run_id', insurerRunIds)),
       ]);
     }
