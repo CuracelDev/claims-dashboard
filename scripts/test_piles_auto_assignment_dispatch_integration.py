@@ -689,11 +689,9 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         worker = harness.store_type()()
         self.assertEqual(worker.try_acquire_runner_slot(1), 0)
         self.assertTrue(worker.try_acquire_insurer_lock("DEFMIS"))
-        ledger = runner.ExecutionLedger(harness.db.connect())
-        old_child = ledger.create_insurer_run("parent", worker.get_master_account("DEFMIS"))
         ownership_class = runner.execute_claimed_insurer.__globals__["ClaimOwnership"]
         old_owner = ownership_class(old_work, coordinator, worker.conn.pid, 0, 120)
-        old_owner.started(old_child)
+        old_child = old_owner.started(worker.get_master_account("DEFMIS"))
         attached = harness.db.rows(
             "SELECT details FROM piles_auto_assignment_insurer_runs WHERE id=?", (old_child,))[0]
         attachment = json.loads(attached["details"])
@@ -703,7 +701,6 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         # Abrupt process loss: no exception/finally path gets a chance to finish
         # either the child or work item; session-lock release is the only signal.
         worker.close()
-        ledger.close()
         harness.db.now += timedelta(seconds=121)
         with self.assertRaises(runner.WorkOwnershipLost):
             old_owner.check()
@@ -736,6 +733,73 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         self.assertIsNone(error, str(error))
         self.assertEqual(next_result.status, runner.ParentRunStatus.COMPLETED)
         self.assertEqual(len(harness.clicks), 2)
+
+    def test_process_loss_between_child_insert_and_attachment_commits_neither(self):
+        """No durable child may become visible before its fenced work attachment."""
+        harness = self.harness
+        harness.parent("parent", "DEFMIS", "manual")
+        harness.initial["DEFMIS"] = [harness.pile("after-atomic-retry")]
+        execute = SqlCursor.execute
+        inserted = False
+
+        class SimulatedProcessLoss(BaseException):
+            pass
+
+        def lose_process(cursor, sql, params=()):
+            nonlocal inserted
+            normalized = " ".join(sql.split())
+            if "INSERT INTO piles_auto_assignment_insurer_runs" in normalized:
+                inserted = True
+            if inserted and "UPDATE piles_auto_assignment_work_items AS work" in normalized:
+                raise SimulatedProcessLoss()
+            return execute(cursor, sql, params)
+
+        with patch.object(SqlCursor, "execute", lose_process):
+            with self.assertRaises(SimulatedProcessLoss):
+                harness.invoke(parent="parent", insurer="DEFMIS")
+        self.assertTrue(inserted)
+        self.assertEqual(harness.db.rows(
+            "SELECT id FROM piles_auto_assignment_insurer_runs WHERE runner_run_id=?", ("parent",)), [])
+        interrupted = harness.db.work("parent")[0]
+        self.assertEqual((interrupted["disposition"], interrupted["attempt_number"],
+                          interrupted["started_at"], interrupted["covered_by_insurer_run_id"]),
+                         ("claimed", 1, None, None))
+        self.assertEqual(harness.clicks, [])
+
+        harness.db.now += timedelta(seconds=121)
+        result, error = harness.invoke(parent="parent", insurer="DEFMIS")
+        self.assertIsNone(error, str(error))
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        self.assertEqual(harness.db.work("parent")[0]["attempt_number"], 2)
+        self.assertEqual(harness.clicks, [(interrupted["id"], "after-atomic-retry")])
+
+    def test_atomic_child_start_rejects_stale_token_and_lost_session_lock(self):
+        harness = self.harness
+        harness.parent("parent", "DEFMIS", "manual")
+        coordinator = runner.DispatchStore(harness.db.connect())
+        self.addCleanup(coordinator.close)
+        work = coordinator.claim_next("parent", "worker")
+        worker = harness.store_type()()
+        self.addCleanup(worker.close)
+        self.assertEqual(worker.try_acquire_runner_slot(1), 0)
+        self.assertTrue(worker.try_acquire_insurer_lock("DEFMIS"))
+        master = worker.get_master_account("DEFMIS")
+
+        self.assertEqual(coordinator.start_insurer_run(
+            work.id, "stale-token", worker.conn.pid, 0, master), "")
+        worker.release_insurer_lock("DEFMIS")
+        self.assertEqual(coordinator.start_insurer_run(
+            work.id, work.claim_token, worker.conn.pid, 0, master), "")
+        self.assertEqual(harness.db.rows(
+            "SELECT id FROM piles_auto_assignment_insurer_runs WHERE runner_run_id=?", ("parent",)), [])
+        self.assertEqual((harness.db.work("parent")[0]["started_at"],
+                          harness.db.work("parent")[0]["covered_by_insurer_run_id"]), (None, None))
+
+        self.assertTrue(worker.try_acquire_insurer_lock("DEFMIS"))
+        child = coordinator.start_insurer_run(
+            work.id, work.claim_token, worker.conn.pid, 0, master)
+        self.assertTrue(child)
+        self.assertEqual(harness.db.work("parent")[0]["covered_by_insurer_run_id"], child)
 
     def test_sigterm_during_claim_leaves_recoverable_work_then_resumes_once(self):
         # Break caught: the real main SIGTERM handler fails to fence a work item

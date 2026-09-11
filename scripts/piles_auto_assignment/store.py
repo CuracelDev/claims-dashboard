@@ -560,6 +560,75 @@ class DispatchStore:
         except ConcurrentStateChange:
             return False
 
+    def start_insurer_run(self, work_id: str, claim_token: str, owner_pid: int,
+                          capacity_slot: int, master: Any, lease_seconds: int = 120) -> str:
+        """Atomically create and attach a durable child to a fenced work attempt."""
+        lease_seconds = self._lease_seconds(lease_seconds)
+        if type(owner_pid) is not int or owner_pid <= 0 or type(capacity_slot) is not int or capacity_slot not in (0, 1):
+            raise ValueError("A valid lock-owning backend and capacity slot are required")
+        insurer_run_id = str(uuid.uuid4())
+        try:
+            with self._transaction() as cursor:
+                if not self._lock_claim(cursor, work_id, claim_token):
+                    return ""
+                cursor.execute(
+                    """
+                    SELECT parent_runner_run_id, insurer_name, canonical_insurer_name, attempt_number
+                    FROM piles_auto_assignment_work_items
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                    """, (work_id, claim_token),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return ""
+                parent_run_id, insurer_name, canonical_insurer_name, attempt_number = row
+                if (not parent_run_id or _insurer_lock_key(_value(master, "insurer_name", ""))
+                        != canonical_insurer_name):
+                    raise ValueError("Master account does not match claimed insurer work")
+                attachment = {
+                    "dispatch_protocol": "durable_work_v2",
+                    "dispatch_work_item_id": work_id,
+                    "dispatch_attempt_number": attempt_number,
+                }
+                cursor.execute(
+                    """
+                    INSERT INTO piles_auto_assignment_insurer_runs
+                        (id, runner_run_id, master_account_id, insurer_name,
+                         status, phase, heartbeat_at, started_at, details)
+                    VALUES (%s, %s, %s, %s, 'running', 'configuration',
+                            clock_timestamp(), clock_timestamp(), %s::jsonb)
+                    """,
+                    (insurer_run_id, parent_run_id, _value(master, "id"), insurer_name,
+                     _json(attachment)),
+                )
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_work_items AS work
+                    SET heartbeat_at = clock_timestamp(),
+                        lease_expires_at = clock_timestamp() + %s * interval '1 second',
+                        started_at = coalesce(started_at, clock_timestamp()),
+                        covered_by_insurer_run_id = %s, updated_at = clock_timestamp()
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                      AND covered_by_insurer_run_id IS NULL
+                      AND lease_expires_at > clock_timestamp()
+                      AND (SELECT count(DISTINCT ((classid::bigint << 32) | objid::bigint))
+                           FROM pg_locks WHERE locktype = 'advisory' AND pid = %s
+                             AND objsubid = 1 AND granted AND mode = 'ExclusiveLock'
+                             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                             AND ((classid::bigint << 32) | objid::bigint) IN (
+                               hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0),
+                               hashtextextended(%s, 0))) = 2
+                    RETURNING id
+                    """,
+                    (lease_seconds, insurer_run_id, work_id, claim_token, owner_pid,
+                     f"piles-capacity:{capacity_slot}"),
+                )
+                if cursor.fetchone() is None:
+                    raise ConcurrentStateChange("Insurer run start ownership changed")
+            return insurer_run_id
+        except ConcurrentStateChange:
+            return ""
+
     def release_claim(self, work_id: str, claim_token: str, reason_code: str) -> bool:
         """Return a never-started contention/shutdown attempt to claim recovery.
 

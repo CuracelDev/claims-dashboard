@@ -3464,7 +3464,7 @@ class ManualWorkflowOutcomeTests(unittest.TestCase):
             get_rule=lambda name: runner.AssignmentRule(name, "manual_override", 25, 60, 50, 60),
             log_runner_event=lambda **event: events.append(event),
         )
-        guard = types.SimpleNamespace(started=lambda _: None, check=lambda: None)
+        guard = types.SimpleNamespace(started=lambda _: "run", check=lambda: None)
         with TemporaryDirectory(prefix="piles-manual-test-") as directory, \
                 patch.object(runner, "CuracelPilesRunner", Portal), patch.object(sys, "stdout", io.StringIO()):
             args = types.SimpleNamespace(execute=True, all_active=False, slow_mo=0, effective_date="2026-09-10",
@@ -3495,7 +3495,7 @@ class ManualWorkflowOutcomeTests(unittest.TestCase):
         class Ledger(runner.ReadOnlyExecutionLedger):
             def finalize_insurer_run(self, run_id, **fields):
                 finals.append(fields)
-        guard = types.SimpleNamespace(started=lambda _: None, check=lambda: None)
+        guard = types.SimpleNamespace(started=lambda _: "run", check=lambda: None)
         store = types.SimpleNamespace(get_master_account=lambda name: {"insurer_name": name})
         with patch.object(runner, "run_for_insurer", lambda *_: {}):
             runner.run_insurer_recorded(store, types.SimpleNamespace(), "Kenya", ["All"], "2026", False,
@@ -3612,8 +3612,8 @@ class DispatcherRunnerFencingTests(unittest.TestCase):
         WorkOwnershipLost = runner.WorkOwnershipLost
         finals = []
         class Guard:
-            def started(self, run_id):
-                pass
+            def started(self, master):
+                return "run"
             def check(self, phase=""):
                 raise WorkOwnershipLost()
         class Ledger(runner.ReadOnlyExecutionLedger):
@@ -3630,8 +3630,8 @@ class DispatcherRunnerFencingTests(unittest.TestCase):
         finals = []
         class Guard:
             lost = False
-            def started(self, run_id):
-                pass
+            def started(self, master):
+                return "run"
             def check(self, phase=""):
                 if self.lost:
                     raise runner.WorkOwnershipLost()
@@ -3655,8 +3655,9 @@ class DispatcherRunnerFencingTests(unittest.TestCase):
         records, outputs = [], []
         class Guard:
             status = runner.InsurerRunStatus.COMPLETED
-            def started(self, run_id):
+            def started(self, master):
                 records.append("attached")
+                return "run-" + master["insurer_name"]
             def check(self, phase=""):
                 records.append("renewed")
         class Ledger(runner.ReadOnlyExecutionLedger):

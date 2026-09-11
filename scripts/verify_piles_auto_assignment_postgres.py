@@ -207,17 +207,11 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
             self.work.id, self.work.claim_token, "dispatch_stopped"))
 
     def test_reclaim_atomically_closes_attached_child_and_rotates_attempt(self):
-        child_id = "reclaimed-child-" + uuid.uuid4().hex
-        self.admin.query(
-            "INSERT INTO piles_auto_assignment_insurer_runs "
-            "(id,runner_run_id,insurer_name,status,phase,heartbeat_at,started_at) "
-            "VALUES (%s,%s,%s,'running','configuration',clock_timestamp(),clock_timestamp())",
-            [child_id, self.parent, self.insurer],
+        child_id = self.store.start_insurer_run(
+            self.work.id, self.work.claim_token, self.owner_pid, 0,
+            {"id": self.insurer, "insurer_name": self.insurer}, 120,
         )
-        self.assertTrue(self.store.heartbeat_claim(
-            self.work.id, self.work.claim_token, self.owner_pid, 0, 120,
-            insurer_run_id=child_id,
-        ))
+        self.assertTrue(child_id)
         self.admin.query(
             "UPDATE piles_auto_assignment_work_items SET lease_expires_at=clock_timestamp()-interval '1 second' "
             "WHERE id=%s", [self.work.id],
@@ -270,6 +264,73 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
                                  "status": "failed", "error_code": "worker_attempt_reclaimed", "finished": True})
         self.assertFalse(self.store.finish_claim(
             self.work.id, self.work.claim_token, dispatch.WorkDisposition.FAILED))
+
+    def test_atomic_child_start_rolls_back_insert_on_attachment_error(self):
+        trigger = "reject_attach_" + uuid.uuid4().hex
+        function = trigger + "_fn"
+        self.admin.query(f"""
+          CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW.covered_by_insurer_run_id IS NOT NULL THEN
+              RAISE EXCEPTION 'fixture attachment rejection';
+            END IF;
+            RETURN NEW;
+          END $$;
+          CREATE TRIGGER {trigger} BEFORE UPDATE ON piles_auto_assignment_work_items
+          FOR EACH ROW EXECUTE FUNCTION {function}()
+        """)
+        self.addCleanup(lambda: self.admin.query(f"DROP FUNCTION IF EXISTS {function}()"))
+        self.addCleanup(lambda: self.admin.query(f"DROP TRIGGER IF EXISTS {trigger} ON piles_auto_assignment_work_items"))
+        with self.assertRaisesRegex(RuntimeError, "fixture attachment rejection"):
+            self.store.start_insurer_run(
+                self.work.id, self.work.claim_token, self.owner_pid, 0,
+                {"id": self.insurer, "insurer_name": self.insurer}, 120,
+            )
+        children = self.admin.query(
+            "SELECT count(*)::integer AS count FROM piles_auto_assignment_insurer_runs WHERE runner_run_id=%s",
+            [self.parent],
+        )["rows"][0]["count"]
+        self.assertEqual(children, 0)
+        work = self.admin.query(
+            "SELECT started_at,covered_by_insurer_run_id FROM piles_auto_assignment_work_items WHERE id=%s",
+            [self.work.id],
+        )["rows"][0]
+        self.assertEqual(work, {"started_at": None, "covered_by_insurer_run_id": None})
+
+    def test_atomic_child_start_rechecks_session_locks_after_work_row_wait(self):
+        self.admin.query("BEGIN")
+        self.admin.query("SELECT id FROM piles_auto_assignment_work_items WHERE id=%s FOR UPDATE", [self.work.id])
+        result, errors = [], []
+        def start():
+            try:
+                result.append(self.store.start_insurer_run(
+                    self.work.id, self.work.claim_token, self.owner_pid, 0,
+                    {"id": self.insurer, "insurer_name": self.insurer}, 120,
+                ))
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=start)
+        thread.start()
+        try:
+            self.wait_until(lambda: errors or self.blocker.query(
+                "SELECT wait_event_type='Lock' AS blocked FROM pg_stat_activity WHERE pid=%s",
+                [self.worker_pid])["rows"][0]["blocked"])
+            self.assertEqual(errors, [])
+            self.lock_owner.query("SELECT pg_advisory_unlock(hashtextextended(%s,0))", [self.lock_key])
+        finally:
+            self.admin.commit()
+            thread.join(timeout=8)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [""])
+        self.assertEqual(self.blocker.query(
+            "SELECT count(*)::integer AS count FROM piles_auto_assignment_insurer_runs WHERE runner_run_id=%s",
+            [self.parent],
+        )["rows"][0]["count"], 0)
+        self.assertEqual(self.blocker.query(
+            "SELECT started_at,covered_by_insurer_run_id FROM piles_auto_assignment_work_items WHERE id=%s",
+            [self.work.id],
+        )["rows"][0], {"started_at": None, "covered_by_insurer_run_id": None})
 
     def test_work_scope_schema_applies_to_a_fresh_namespace_and_repeats(self):
         schema_name = "piles_scope_" + uuid.uuid4().hex

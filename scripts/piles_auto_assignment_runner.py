@@ -8928,9 +8928,10 @@ def run_insurer_recorded(
     try:
         if execution_ledger:
             master = store.get_master_account(insurer_name)
-            insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
             if ownership:
-                ownership.started(insurer_run_id)
+                insurer_run_id = ownership.started(master)
+            else:
+                insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
             execution_ledger.heartbeat(insurer_run_id, phase="login")
         result = run_for_insurer(
             store, args, insurer_name, month_labels, year_label, visible,

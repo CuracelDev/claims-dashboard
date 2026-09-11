@@ -106,6 +106,19 @@ class DispatchState:
                         state.rows[work_id] = replace(row, covered_by_insurer_run_id=insurer_run_id)
                     return valid
 
+            def start_insurer_run(self, work_id, token, owner_pid, slot, master, lease_seconds=120):
+                with state.mutex:
+                    row = state.rows[work_id]
+                    valid = (row.claim_token == token and row.disposition == WorkDisposition.CLAIMED
+                             and state.insurer_locks.get(row.canonical_insurer_name) == owner_pid
+                             and state.slots.get(slot) == owner_pid)
+                    state.events.append(("start_insurer_run", work_id, valid))
+                    if not valid:
+                        return ""
+                    run_id = "run-" + master["insurer_name"]
+                    state.rows[work_id] = replace(row, covered_by_insurer_run_id=run_id)
+                    return run_id
+
             def finish_claim(self, work_id, token, disposition, insurer_run_id=None, reason_code=""):
                 with state.mutex:
                     row = state.rows[work_id]

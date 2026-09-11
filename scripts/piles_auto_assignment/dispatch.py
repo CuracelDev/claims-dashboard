@@ -138,9 +138,19 @@ class ClaimOwnership:
             self.lost = True
             raise WorkOwnershipLost()
 
-    def started(self, insurer_run_id: str) -> None:
+    def started(self, master: Any) -> str:
+        try:
+            insurer_run_id = self.store.start_insurer_run(
+                self.work.id, self.work.claim_token, self.owner_pid, self.slot,
+                master, self.lease_seconds,
+            )
+        except Exception:
+            insurer_run_id = ""
+        if not insurer_run_id:
+            self.lost = True
+            raise WorkOwnershipLost()
         self.insurer_run_id = insurer_run_id
-        self.check(insurer_run_id=insurer_run_id)
+        return insurer_run_id
 
 
 def safe_worker_error(error: Exception) -> tuple[str, str]:
