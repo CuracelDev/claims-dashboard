@@ -214,6 +214,8 @@ class SqlCursor:
         sql = sql.replace("completed.months @> ?::jsonb", "json_contains(completed.months, ?)")
         sql = re.sub(r"jsonb_set\(coalesce\(details, '\{\}'::jsonb\), '\{(\w+)\}', \?::jsonb\)",
                      r"json_set(coalesce(details, '{}'), '$.\1', json(?))", sql)
+        sql = sql.replace("coalesce(details, '{}'::jsonb) || ?::jsonb",
+                          "json_patch(coalesce(details, '{}'), ?)")
         sql = re.sub(r"::(?:text|jsonb|integer|bigint)", "", sql)
         sql = re.sub(r"(now\(\)|clock_timestamp\(\)) \+ \? \* interval '1 second'", r"plus_seconds(\1, ?)", sql)
         sql = sql.replace("= ANY(?)", "IN (SELECT value FROM json_each(?))")
@@ -676,6 +678,64 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         self.assertEqual(harness.clicks, [(old_work.id, "recovered-once")])
         self.assertEqual(harness.results, [("parent", "recovered-once")])
         self.assertEqual(len(harness.deliveries), 1)
+
+    def test_crash_after_child_attachment_closes_old_attempt_before_reclaim(self):
+        """A SIGKILL-style loss must not leave a v2 child looking actively covered."""
+        harness = self.harness
+        harness.parent("parent", "DEFMIS", "manual")
+        coordinator = runner.DispatchStore(harness.db.connect())
+        self.addCleanup(coordinator.close)
+        old_work = coordinator.claim_next("parent", "crashed-worker")
+        worker = harness.store_type()()
+        self.assertEqual(worker.try_acquire_runner_slot(1), 0)
+        self.assertTrue(worker.try_acquire_insurer_lock("DEFMIS"))
+        ledger = runner.ExecutionLedger(harness.db.connect())
+        old_child = ledger.create_insurer_run("parent", worker.get_master_account("DEFMIS"))
+        ownership_class = runner.execute_claimed_insurer.__globals__["ClaimOwnership"]
+        old_owner = ownership_class(old_work, coordinator, worker.conn.pid, 0, 120)
+        old_owner.started(old_child)
+        attached = harness.db.rows(
+            "SELECT details FROM piles_auto_assignment_insurer_runs WHERE id=?", (old_child,))[0]
+        attachment = json.loads(attached["details"])
+        self.assertEqual(attachment.get("dispatch_protocol"), "durable_work_v2")
+        self.assertEqual(attachment.get("dispatch_work_item_id"), old_work.id)
+
+        # Abrupt process loss: no exception/finally path gets a chance to finish
+        # either the child or work item; session-lock release is the only signal.
+        worker.close()
+        ledger.close()
+        harness.db.now += timedelta(seconds=121)
+        with self.assertRaises(runner.WorkOwnershipLost):
+            old_owner.check()
+
+        harness.initial["DEFMIS"] = [harness.pile("recovered-after-start")]
+        result, error = harness.invoke(parent="parent", insurer="DEFMIS")
+        self.assertIsNone(error, str(error))
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        work = harness.db.work("parent")[0]
+        self.assertEqual((work["attempt_number"], work["disposition"]), (2, "completed"))
+        self.assertNotEqual(work["claim_token"], old_work.claim_token)
+        children = harness.db.rows(
+            "SELECT id,status,error_code,error_message,finished_at FROM piles_auto_assignment_insurer_runs "
+            "WHERE runner_run_id=? ORDER BY created_at,id", ("parent",))
+        self.assertEqual(len(children), 2)
+        self.assertEqual((children[0]["id"], children[0]["status"], children[0]["error_code"]),
+                         (old_child, "failed", "worker_attempt_reclaimed"))
+        self.assertEqual(children[0]["error_message"],
+                         "The expired worker attempt was superseded by a fenced reclaim.")
+        self.assertIsNotNone(children[0]["finished_at"])
+        self.assertEqual(children[1]["status"], "completed")
+        self.assertFalse(coordinator.finish_claim(old_work.id, old_work.claim_token, "failed"))
+
+        # The old v2 child cannot masquerade as legacy active coverage. A later
+        # request owns and executes a fresh generation normally.
+        decisions = harness.parent("next", "DEFMIS", "schedule")
+        self.assertEqual(decisions[0].disposition.value, "queued")
+        harness.initial["DEFMIS"] = [harness.pile("next-generation")]
+        next_result, error = harness.invoke(parent="next", insurer="DEFMIS")
+        self.assertIsNone(error, str(error))
+        self.assertEqual(next_result.status, runner.ParentRunStatus.COMPLETED)
+        self.assertEqual(len(harness.clicks), 2)
 
     def test_sigterm_during_claim_leaves_recoverable_work_then_resumes_once(self):
         # Break caught: the real main SIGTERM handler fails to fence a work item

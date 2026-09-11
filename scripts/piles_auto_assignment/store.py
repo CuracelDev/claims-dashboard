@@ -296,6 +296,7 @@ class DispatchStore:
                       JOIN piles_auto_assignment_runner_runs parent ON parent.id = run.runner_run_id
                       WHERE run.status IN ('queued','running')
                         AND parent.mode = 'execute'
+                        AND coalesce(run.details ->> 'dispatch_protocol', '') <> 'durable_work_v2'
                         AND CASE WHEN regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
                             ELSE regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') END = %s
                         AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items work
@@ -430,6 +431,37 @@ class DispatchStore:
             )
             rows = _rows(cursor)
             claimed = _claimed(rows[0]) if rows else None
+            if claimed is not None and claimed.reason_code == "expired_lease_reclaimed":
+                previous_run_id = claimed.covered_by_insurer_run_id
+                if previous_run_id:
+                    cursor.execute(
+                        """
+                        UPDATE piles_auto_assignment_insurer_runs
+                        SET status = 'failed', phase = 'complete',
+                            error_code = 'worker_attempt_reclaimed',
+                            error_message = 'The expired worker attempt was superseded by a fenced reclaim.',
+                            heartbeat_at = clock_timestamp(), finished_at = clock_timestamp(),
+                            updated_at = clock_timestamp()
+                        WHERE id = %s AND runner_run_id = %s AND status IN ('queued','running')
+                          AND CASE
+                            WHEN regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g')
+                          END = %s
+                        """,
+                        (previous_run_id, claimed.parent_runner_run_id, claimed.canonical_insurer_name),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_work_items
+                    SET covered_by_insurer_run_id = NULL, started_at = NULL, updated_at = clock_timestamp()
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                    RETURNING id
+                    """,
+                    (claimed.id, claimed.claim_token),
+                )
+                if cursor.fetchone() is None:
+                    raise ConcurrentStateChange("Reclaimed work attachment changed")
+                claimed = replace(claimed, covered_by_insurer_run_id=None, started_at=None)
         return claimed
 
     def renew_claim(self, work_id: str, claim_token: str, lease_seconds: int = 120) -> bool:
@@ -461,34 +493,72 @@ class DispatchStore:
         lease_seconds = self._lease_seconds(lease_seconds)
         if type(owner_pid) is not int or owner_pid <= 0 or type(capacity_slot) is not int or capacity_slot not in (0, 1):
             raise ValueError("A valid lock-owning backend and capacity slot are required")
-        with self._transaction() as cursor:
-            if not self._lock_claim(cursor, work_id, claim_token):
-                return False
-            cursor.execute(
-                """
-                UPDATE piles_auto_assignment_work_items AS work
-                SET heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp() + %s * interval '1 second',
-                    updated_at = clock_timestamp(),
-                    started_at = CASE WHEN %s::text IS NOT NULL THEN coalesce(started_at, clock_timestamp()) ELSE started_at END,
-                    covered_by_insurer_run_id = coalesce(%s, covered_by_insurer_run_id)
-                WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
-                  AND lease_expires_at > clock_timestamp()
-                  AND (%s::text IS NULL OR EXISTS (
-                    SELECT 1 FROM piles_auto_assignment_insurer_runs run
-                    WHERE run.id = %s AND run.runner_run_id = work.parent_runner_run_id))
-                  AND (SELECT count(DISTINCT ((classid::bigint << 32) | objid::bigint))
-                       FROM pg_locks WHERE locktype = 'advisory' AND pid = %s
-                         AND objsubid = 1 AND granted AND mode = 'ExclusiveLock'
-                         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-                         AND ((classid::bigint << 32) | objid::bigint) IN (
-                           hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0),
-                           hashtextextended(%s, 0))) = 2
-                RETURNING id
-                """, (lease_seconds, insurer_run_id, insurer_run_id, work_id, claim_token,
-                       insurer_run_id, insurer_run_id, owner_pid, f"piles-capacity:{capacity_slot}"),
-            )
-            renewed = cursor.fetchone() is not None
-        return renewed
+        try:
+            with self._transaction() as cursor:
+                if not self._lock_claim(cursor, work_id, claim_token):
+                    return False
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_work_items AS work
+                    SET heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp() + %s * interval '1 second',
+                        updated_at = clock_timestamp(),
+                        started_at = CASE WHEN %s::text IS NOT NULL THEN coalesce(started_at, clock_timestamp()) ELSE started_at END,
+                        covered_by_insurer_run_id = coalesce(%s, covered_by_insurer_run_id)
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                      AND lease_expires_at > clock_timestamp()
+                      AND (%s::text IS NULL OR EXISTS (
+                        SELECT 1 FROM piles_auto_assignment_insurer_runs run
+                        WHERE run.id = %s AND run.runner_run_id = work.parent_runner_run_id
+                          AND run.status = 'running'
+                          AND CASE
+                            WHEN regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g')
+                          END = work.canonical_insurer_name))
+                      AND (SELECT count(DISTINCT ((classid::bigint << 32) | objid::bigint))
+                           FROM pg_locks WHERE locktype = 'advisory' AND pid = %s
+                             AND objsubid = 1 AND granted AND mode = 'ExclusiveLock'
+                             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                             AND ((classid::bigint << 32) | objid::bigint) IN (
+                               hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0),
+                               hashtextextended(%s, 0))) = 2
+                    RETURNING parent_runner_run_id, canonical_insurer_name, attempt_number
+                    """, (lease_seconds, insurer_run_id, insurer_run_id, work_id, claim_token,
+                           insurer_run_id, insurer_run_id, owner_pid, f"piles-capacity:{capacity_slot}"),
+                )
+                attached_work = cursor.fetchone()
+                if attached_work is None:
+                    return False
+                if insurer_run_id:
+                    parent_run_id, canonical_insurer_name, attempt_number = attached_work
+                    attachment = _json({
+                        "dispatch_protocol": "durable_work_v2",
+                        "dispatch_work_item_id": work_id,
+                        "dispatch_attempt_number": attempt_number,
+                    })
+                    cursor.execute(
+                        """
+                        UPDATE piles_auto_assignment_insurer_runs
+                        SET details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                            updated_at = clock_timestamp()
+                        WHERE id = %s AND runner_run_id = %s AND status = 'running'
+                          AND CASE
+                            WHEN regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g')
+                          END = %s
+                          AND (coalesce(details ->> 'dispatch_protocol', '') = '' OR (
+                            details ->> 'dispatch_protocol' = 'durable_work_v2'
+                            AND details ->> 'dispatch_work_item_id' = %s
+                            AND details ->> 'dispatch_attempt_number' = %s))
+                        RETURNING id
+                        """,
+                        (attachment, insurer_run_id, parent_run_id, canonical_insurer_name,
+                         work_id, str(attempt_number)),
+                    )
+                    if cursor.fetchone() is None:
+                        raise ConcurrentStateChange("Insurer run attachment changed")
+            return True
+        except ConcurrentStateChange:
+            return False
 
     def release_claim(self, work_id: str, claim_token: str, reason_code: str) -> bool:
         """Return a never-started contention/shutdown attempt to claim recovery.

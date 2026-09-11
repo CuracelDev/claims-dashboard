@@ -126,7 +126,8 @@ class EnqueueSqlConnection:
                 details TEXT DEFAULT '{}', updated_at TEXT);
             CREATE TABLE piles_auto_assignment_insurer_runs(
                 id TEXT PRIMARY KEY, runner_run_id TEXT, insurer_name TEXT, status TEXT,
-                started_at TEXT, finished_at TEXT, created_at TEXT DEFAULT (now()));
+                started_at TEXT, finished_at TEXT, created_at TEXT DEFAULT (now()),
+                details TEXT DEFAULT '{}');
             CREATE TABLE piles_auto_assignment_work_items(
                 id TEXT PRIMARY KEY, parent_runner_run_id TEXT, insurer_name TEXT,
                 canonical_insurer_name TEXT, source TEXT, request_scope TEXT,
@@ -297,6 +298,16 @@ class LegacyCoverageSqlTests(unittest.TestCase):
         self.connection.commit()
         self.assertEqual(self.enqueue("request-1").disposition, WorkDisposition.QUEUED)
 
+    def test_detached_v2_child_is_not_reintroduced_as_legacy_coverage(self):
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_insurer_runs SET details=? WHERE id='legacy-insurer'",
+            (json.dumps({"dispatch_protocol": "durable_work_v2",
+                         "dispatch_work_item_id": "missing-work",
+                         "dispatch_attempt_number": 1}),),
+        )
+        self.connection.commit()
+        self.assertEqual(self.enqueue("request-1").disposition, WorkDisposition.QUEUED)
+
     def test_readiness_probe_does_not_create_work_alongside_execute_cycle(self):
         with self.assertRaises(ValueError):
             self.enqueue("request-1", WorkSource.READINESS)
@@ -363,17 +374,23 @@ class LeaseSqlConnection:
         self.database.create_function("current_database", 0, lambda: "fixture")
         self.database.create_function("hashtextextended", 2,
                                       lambda key, seed: {"piles-insurer:OLD MUTUAL": 11, "piles-capacity:0": 12}.get(key, 99))
+        self.database.create_function("btrim", 1, lambda value: value.strip() if value else value)
+        self.database.create_function("regexp_replace", 4,
+                                      lambda value, pattern, replacement, flags: re.sub(pattern, replacement, value))
         self.database.executescript("""
             CREATE TABLE piles_auto_assignment_work_items(
                 id TEXT PRIMARY KEY, parent_runner_run_id TEXT, canonical_insurer_name TEXT,
                 disposition TEXT, claim_token TEXT, lease_expires_at INTEGER, heartbeat_at INTEGER,
                 started_at INTEGER, finished_at INTEGER, updated_at INTEGER,
-                covered_by_insurer_run_id TEXT, reason_code TEXT);
+                covered_by_insurer_run_id TEXT, reason_code TEXT, attempt_number INTEGER DEFAULT 1);
             INSERT INTO piles_auto_assignment_work_items
                 (id,parent_runner_run_id,canonical_insurer_name,disposition,claim_token,lease_expires_at)
                 VALUES ('work','parent','OLD MUTUAL','claimed','current',1120);
-            CREATE TABLE piles_auto_assignment_insurer_runs(id TEXT, runner_run_id TEXT);
-            INSERT INTO piles_auto_assignment_insurer_runs VALUES ('run','parent'),('foreign','other');
+            CREATE TABLE piles_auto_assignment_insurer_runs(
+                id TEXT, runner_run_id TEXT, insurer_name TEXT, status TEXT,
+                details TEXT DEFAULT '{}', updated_at INTEGER);
+            INSERT INTO piles_auto_assignment_insurer_runs(id,runner_run_id,insurer_name,status)
+                VALUES ('run','parent','OLD MUTUAL','running'),('foreign','other','OLD MUTUAL','running');
             CREATE TABLE pg_database(oid INTEGER, datname TEXT);
             INSERT INTO pg_database VALUES (1,'fixture');
             CREATE TABLE pg_locks(locktype TEXT, pid INTEGER, classid INTEGER, objid INTEGER,
@@ -391,6 +408,8 @@ class LeaseSqlConnection:
             def __exit__(self, *_):
                 self.raw.close()
             def execute(self, sql, params=()):
+                sql = sql.replace("coalesce(details, '{}'::jsonb) || %s::jsonb",
+                                  "json_patch(coalesce(details, '{}'), %s)")
                 sql = sql.replace("%s", "?").replace("::bigint", "").replace("::text", "")
                 sql = sql.replace("* interval '1 second'", "").replace(" FOR UPDATE", "")
                 self.raw.execute(sql, params)
@@ -422,7 +441,27 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.assertEqual(self.connection.database.execute(
             "SELECT lease_expires_at,started_at,covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
         ).fetchone(), (1060, 1000, "run"))
+        details = json.loads(self.connection.database.execute(
+            "SELECT details FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone()[0])
+        self.assertEqual(details, {"dispatch_protocol": "durable_work_v2",
+                                   "dispatch_work_item_id": "work", "dispatch_attempt_number": 1})
         self.assertFalse(self.heartbeat(run_id="foreign"))
+
+    def test_conflicting_child_attachment_rolls_back_work_heartbeat(self):
+        conflicting = json.dumps({"dispatch_protocol": "durable_work_v2",
+                                  "dispatch_work_item_id": "different-work",
+                                  "dispatch_attempt_number": 1})
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_insurer_runs SET details=? WHERE id='run'", (conflicting,))
+        self.connection.database.commit()
+        before = self.connection.database.execute(
+            "SELECT heartbeat_at,lease_expires_at,started_at,covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
+        ).fetchone()
+        self.assertFalse(self.heartbeat(run_id="run"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT heartbeat_at,lease_expires_at,started_at,covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
+        ).fetchone(), before)
 
     def test_heartbeat_uses_fresh_clock_not_transaction_start_to_fence_expiry(self):
         self.connection.wall_time = 1121

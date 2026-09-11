@@ -206,6 +206,71 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
         self.assert_expired_transition_fenced(lambda: self.store.release_claim(
             self.work.id, self.work.claim_token, "dispatch_stopped"))
 
+    def test_reclaim_atomically_closes_attached_child_and_rotates_attempt(self):
+        child_id = "reclaimed-child-" + uuid.uuid4().hex
+        self.admin.query(
+            "INSERT INTO piles_auto_assignment_insurer_runs "
+            "(id,runner_run_id,insurer_name,status,phase,heartbeat_at,started_at) "
+            "VALUES (%s,%s,%s,'running','configuration',clock_timestamp(),clock_timestamp())",
+            [child_id, self.parent, self.insurer],
+        )
+        self.assertTrue(self.store.heartbeat_claim(
+            self.work.id, self.work.claim_token, self.owner_pid, 0, 120,
+            insurer_run_id=child_id,
+        ))
+        self.admin.query(
+            "UPDATE piles_auto_assignment_work_items SET lease_expires_at=clock_timestamp()-interval '1 second' "
+            "WHERE id=%s", [self.work.id],
+        )
+        for key in (self.lock_key, "piles-capacity:0"):
+            self.lock_owner.query("SELECT pg_advisory_unlock(hashtextextended(%s,0))", [key])
+
+        # Hold the child row after the claimant has selected the expired work.
+        # A third session must observe either both old values or both new values,
+        # never a cleared work attachment with a still-running orphan.
+        self.admin.query("BEGIN")
+        self.admin.query("SELECT id FROM piles_auto_assignment_insurer_runs WHERE id=%s FOR UPDATE", [child_id])
+        reclaim_store = runner.DispatchStore(self.blocker)
+        blocker_pid = self.blocker.query("SELECT pg_backend_pid() AS pid")["rows"][0]["pid"]
+        result, errors = [], []
+        def reclaim():
+            try:
+                result.append(reclaim_store.claim_next(self.parent, "replacement-worker"))
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=reclaim)
+        thread.start()
+        try:
+            self.wait_until(lambda: errors or self.lock_owner.query(
+                "SELECT wait_event_type='Lock' AS blocked FROM pg_stat_activity WHERE pid=%s",
+                [blocker_pid])["rows"][0]["blocked"])
+            self.assertEqual(errors, [])
+            before = self.lock_owner.query(
+                "SELECT work.covered_by_insurer_run_id,run.status FROM piles_auto_assignment_work_items work "
+                "JOIN piles_auto_assignment_insurer_runs run ON run.id=%s WHERE work.id=%s",
+                [child_id, self.work.id],
+            )["rows"][0]
+            self.assertEqual(before, {"covered_by_insurer_run_id": child_id, "status": "running"})
+        finally:
+            self.admin.commit()
+            thread.join(timeout=8)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result), 1)
+        reclaimed = result[0]
+        self.assertEqual(reclaimed.attempt_number, 2)
+        self.assertIsNone(reclaimed.covered_by_insurer_run_id)
+        self.assertIsNone(reclaimed.started_at)
+        after = self.lock_owner.query(
+            "SELECT work.covered_by_insurer_run_id,work.attempt_number,run.status,run.error_code,run.finished_at IS NOT NULL AS finished "
+            "FROM piles_auto_assignment_work_items work JOIN piles_auto_assignment_insurer_runs run ON run.id=%s "
+            "WHERE work.id=%s", [child_id, self.work.id],
+        )["rows"][0]
+        self.assertEqual(after, {"covered_by_insurer_run_id": None, "attempt_number": 2,
+                                 "status": "failed", "error_code": "worker_attempt_reclaimed", "finished": True})
+        self.assertFalse(self.store.finish_claim(
+            self.work.id, self.work.claim_token, dispatch.WorkDisposition.FAILED))
+
     def test_work_scope_schema_applies_to_a_fresh_namespace_and_repeats(self):
         schema_name = "piles_scope_" + uuid.uuid4().hex
         connection = Connection(self.bridge)
