@@ -338,6 +338,114 @@ process.stdout.write(JSON.stringify(eval('(' + script + ')')(controls)));
         self.assertEqual(events, ['dispose'] * 3 + ['resolve'] * 3 + ['evaluate'])
         self.assertEqual(len(browser._filter_observation_handles), 3)
 
+    def test_fallback_layout_changed_and_noop_scan_use_semantic_status_control(self):
+        clock = self.Clock()
+        browser = runner.CuracelPilesRunner()
+        opened = [None]
+        observations = []
+        class Control:
+            def __init__(self, name, text, options, x):
+                self.name, self.text, self.options, self.x = name, text, options, x
+            def inner_text(self): return self.text
+            def get_attribute(self, _): return ''  # No semantic labels in this layout.
+            def bounding_box(self): return {'x': self.x, 'y': 100}
+            def is_visible(self): return True
+            def element_handle(self, **_): return self
+            def dispose(self): pass
+        month = Control('month', 'All', ['All', 'Jan', 'Feb', 'Mar'], 0)
+        year = Control('year', '2026', ['2025', '2026'], 100)
+        status = Control('status', 'Audit Pending', runner.TARGET_STATUSES, 200)
+        visible_controls = [month, year, status]
+        class Collection:
+            def __init__(self, values): self.values = values
+            first = property(lambda self: self.values[0] if self.values else self)
+            def count(self): return len(self.values)
+            def nth(self, index): return self.values[index]
+        class Page:
+            def locator(self, selector):
+                return Collection(visible_controls if selector == '.p-select.p-component' else [])
+            def wait_for_timeout(self, ms): clock.advance(ms)
+            def evaluate(self, script, handles=None):
+                # Honor the actual locators passed by production. Returning
+                # expected control names here would conceal the fallback bug.
+                texts = {key: node.inner_text() if node is not None else None
+                         for key, node in (handles or {}).items()}
+                if handles:
+                    observations.append({key: node.name if node is not None else None
+                                         for key, node in handles.items()})
+                harness = r"""
+const fs = require('node:fs');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const node = (innerText) => ({innerText, isConnected: true,
+  getBoundingClientRect: () => ({width: 10, height: 10})});
+const cell = node('No Data Found');
+const table = {...node(''), querySelector: () => ({}),
+  querySelectorAll: (selector) => selector === 'tbody td' ? [cell] : []};
+global.window = {getComputedStyle: () => ({display: 'block', visibility: 'visible'})};
+global.document = {querySelectorAll: (selector) => selector === 'table' ? [table] : []};
+const controls = Object.fromEntries(Object.entries(input.texts).map(([key, text]) =>
+  [key, text === null ? null : node(text)]));
+process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(controls)));
+"""
+                result = subprocess.run(['node', '-e', harness],
+                                        input=runner.json.dumps({'script': script, 'texts': texts}),
+                                        text=True, capture_output=True, check=True)
+                return runner.json.loads(result.stdout)
+        browser.page = Page()
+        browser._reset_pagination_to_first_page = lambda: None
+        browser._table_preview_fingerprint = lambda: ()
+        browser._open_select = lambda control: opened.__setitem__(0, control) or True
+        browser._dropdown_option_texts = lambda control=None: (control or opened[0]).options
+        browser._close_dropdown = lambda: None
+        def choose(value, control=None):
+            if value not in control.options: return None
+            control.text = value
+            return value
+        browser._choose_option_from_open_dropdown = choose
+        browser._filter_state.update(year='2026')
+        browser._settled_year_control, browser._settled_year_display = year, '2026'
+        browser._filter_network_state = lambda *_, **__: ('succeeded', {
+            'authoritative': True, 'authoritative_empty': True, 'item_count': 0})
+
+        self.assertEqual(self.run_filters(browser, clock, ['Vetting Pending'], scan=True), [[]])
+        self.assertEqual(clock.ns, 1_500_000_000)
+        self.assertEqual(self.run_filters(browser, clock, ['Vetting Pending'], scan=True), [[]])
+        self.assertEqual(clock.ns, 1_800_000_000)
+        browser._settled_status_control = None
+        self.assertEqual(self.run_filters(browser, clock, ['Vetting Pending'], scan=True), [[]])
+        self.assertEqual(clock.ns, 2_100_000_000)
+        # Month must also retain its validated identity for status-only changes,
+        # even if a fallback layout now puts the year control first.
+        month.x, year.x = 100, 0
+        self.assertEqual(self.run_filters(browser, clock, ['Audit Ongoing'], scan=True), [[]])
+        self.assertEqual(clock.ns, 3_600_000_000)
+        self.assertEqual(self.run_filters(browser, clock, ['Audit Ongoing'], scan=True), [[]])
+        self.assertEqual(clock.ns, 3_900_000_000)
+        self.assertTrue(observations)
+        self.assertTrue(all(observation == {'month': 'month', 'year': 'year', 'status': 'status'}
+                            for observation in observations))
+        # A reused locator may resolve to the wrong node after a DOM rerender.
+        # The joint JS must inspect that actual node, not the cached label.
+        status.element_handle = lambda **_: month
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Audit Ongoing'], scan=True)
+        self.assertEqual(clock.ns, 9_900_000_000)
+        self.assertEqual(observations[-1]['status'], 'month')
+        status.options = ['All']
+        self.assertIsNone(browser._direct_status_control(month))
+
+    def test_filter_invalidation_discards_all_validated_control_locators(self):
+        browser = runner.CuracelPilesRunner()
+        browser._settled_month_control = object()
+        browser._settled_year_control = object()
+        browser._settled_status_control = object()
+        browser._settled_year_display = '2026'
+        browser._invalidate_filter_state()
+        self.assertIsNone(browser._settled_month_control)
+        self.assertIsNone(browser._settled_year_control)
+        self.assertIsNone(browser._settled_status_control)
+        self.assertEqual(browser._settled_year_display, '')
+
     def test_response_json_callback_cannot_accept_prior_dom_and_prior_response(self):
         browser, clock = self.fixture()
         snapshot = browser._table_context_snapshot()

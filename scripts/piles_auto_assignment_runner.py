@@ -3585,7 +3585,9 @@ class CuracelPilesRunner:
             "page_size": None,
         }
         self._table_headers_cache = []
+        self._settled_month_control = None
         self._settled_year_control = None
+        self._settled_status_control = None
         self._settled_year_display = ''
 
     def _capture_piles_request(self, request: Any) -> None:
@@ -4379,12 +4381,9 @@ class CuracelPilesRunner:
         self._append_unique_select(candidates, self._select_by_label("Filter by Vetting Status"))
         if candidates:
             return candidates[0]
-        visible = self._visible_selects()
-        for select in visible:
-            if month_select is not None and select is month_select:
-                continue
-            self._append_unique_select(candidates, select)
-        return candidates[0] if candidates else self._find_select_with_options(TARGET_STATUSES)
+        # An unlabeled first select is not evidence of a status control. In
+        # fallback layouts month/year precede it; prove its role by options.
+        return self._find_select_with_options(TARGET_STATUSES)
 
     def _select_candidates_for_year(self, year_label: str) -> list[Any]:
         multiselects = self._visible_multiselects()
@@ -4780,11 +4779,12 @@ class CuracelPilesRunner:
         status_changed = self._filter_state["status"] != status_label
 
         if not month_changed and not year_changed and not status_changed:
+            month_control = getattr(self, '_settled_month_control', None) or self._direct_month_control()
             return self._wait_for_filter_settlement(
                 filter_response_marker, month_label, year_label, status_label,
-                {'month': self._direct_month_control(),
+                {'month': month_control,
                  'year': getattr(self, '_settled_year_control', None),
-                 'status': self._direct_status_control(None)},
+                 'status': getattr(self, '_settled_status_control', None) or self._direct_status_control(month_control)},
                 confirmed_year_display=confirmed_year_display, initial_snapshot={},
                 request_marker=self._piles_request_sequence, selection_changed=False)
 
@@ -4804,7 +4804,8 @@ class CuracelPilesRunner:
             initial_snapshot = self._table_context_snapshot()
             filter_response_marker = self._piles_response_sequence
             filter_request_marker = self._piles_request_sequence
-            month_select = None
+            month_select = (getattr(self, '_settled_month_control', None) or self._direct_month_control()
+                            if not month_changed else None)
             if month_changed:
                 direct_month = self._direct_month_control()
                 if direct_month is not None and self._set_select_value(direct_month, month_label):
@@ -4889,7 +4890,11 @@ class CuracelPilesRunner:
             historical_marker=(self._page_open_response_marker if not filter_state_was_initialized else None),
         )
         self._filter_state.update(month=month_label, year=desired_year_state, status=status_label)
+        # Cache only controls that passed the atomic context observation. Their
+        # current connected/visible values are still revalidated on every reuse.
+        self._settled_month_control = final_month_select
         self._settled_year_control = final_year_select or getattr(self, '_settled_year_control', None)
+        self._settled_status_control = final_status_select
         self._settled_year_display = confirmed_year_display
         return evidence
 
