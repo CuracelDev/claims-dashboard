@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "test:piles": "python3 -m unittest discover -s scripts -p 'test_piles_auto_assignment*.py' && node --test lib/piles-auto-assignment*.test.mjs",
+    "test:piles:acceptance": "python3 -m unittest scripts/test_piles_auto_assignment_dispatch_integration.py -v",
     "test:piles:domain": "python3 -m unittest scripts/test_piles_auto_assignment_domain.py",
     "test:piles:rules": "node --test lib/piles-auto-assignment-rules.test.mjs",
     "audit:piles-readiness": "node scripts/audit-piles-auto-assignment-readiness.mjs",

@@ -136,6 +136,13 @@ class DispatchState:
                     status = derive_parent_status(owned or (["covered_by_active_cycle"] if state.references else []), insurer_statuses)
                     state.events.append(("parent", status, threading.get_ident()))
                     return status
+
+            def notification_collection_complete(self, parent_id, work_ids, _fingerprints=()):
+                with state.mutex:
+                    expected = {row.id for row in state.rows.values()
+                                if row.parent_runner_run_id == parent_id
+                                and row.disposition not in {WorkDisposition.INACTIVE, WorkDisposition.COVERED_BY_ACTIVE_CYCLE}}
+                    return len(work_ids) == len(set(work_ids)) and set(work_ids) == expected
         return Store()
 
     @contextmanager

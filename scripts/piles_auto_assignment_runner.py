@@ -8714,6 +8714,8 @@ def _run_for_insurer_once(
     notification_items: list[NotificationItem] = []
     if args.execute:
         for item in applied:
+            if getattr(args, "worker_safe_diagnostics", False) and not (item.verified_on_table and item.matched_planned_assignee):
+                continue
             planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
             owner_name = planned_assignee.owner_name if planned_assignee else item.actual_assignee_name
             owner_info = team_slack_map.get(owner_name.lower(), {})
@@ -8726,6 +8728,8 @@ def _run_for_insurer_once(
                 bot_name=planned_assignee.portal_name if planned_assignee else item.actual_assignee_name,
             ))
         for item in reassignment_applied:
+            if getattr(args, "worker_safe_diagnostics", False) and not (item.verified_on_table and item.matched_planned_assignee):
+                continue
             planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
             owner_name = planned_assignee.owner_name if planned_assignee else item.actual_assignee_name
             owner_info = team_slack_map.get(owner_name.lower(), {})
@@ -9104,14 +9108,22 @@ def main_v2() -> DispatchResult:
                         store.release_insurer_lock("__weekend_state__")
                 result = dispatch_parent(run_id, work_items, maximum, factory, run_one,
                                          store=coordinator, stop_event=stopped)
-                notify_dispatch_result(args, result)
-                if restored:
+                if result.status == ParentRunStatus.RUNNING:
+                    raise WorkerUnavailable("dispatch_work_pending")
+                try:
+                    collection_complete = coordinator.notification_collection_complete(
+                        run_id, result.finalized_work_ids, result.notification_fingerprints)
+                except Exception:
+                    collection_complete = False
+                if collection_complete:
+                    notify_dispatch_result(args, result)
+                else:
+                    print("WARNING: parent_notification_incomplete; notification requires operational review.")
+                if restored and collection_complete:
                     try:
                         send_weekend_restore_update(restored, safe_diagnostics=True)
                     except Exception:
                         print("WARNING: weekend roster notification failed.")
-                if result.status == ParentRunStatus.RUNNING:
-                    raise WorkerUnavailable("dispatch_work_pending")
                 if any(outcome.status == InsurerRunStatus.FAILED for outcome in result.outcomes):
                     raise RuntimeError("One or more insurers failed; inspect the normalized insurer outcomes.")
                 return result

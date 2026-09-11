@@ -16,8 +16,8 @@ The runner must account for every expected month/year/status context and every p
 6. Run a read-only portal probe for one active insurer, then all active insurers:
 
    ```bash
-   python3 scripts/piles_auto_assignment_runner.py --insurer "DEFMIS" --portal-environment production --month All --year All --read-only
-   python3 scripts/piles_auto_assignment_runner.py --all-active --portal-environment production --month All --year All --read-only
+   "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py --insurer "DEFMIS" --portal-environment production --month All --year All --run-source readiness --read-only
+   "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py --all-active --portal-environment production --month All --year All --run-source readiness --read-only
    ```
 
    On the production host, these probes can also be run from the **Piles Production Readiness** GitHub Actions workflow. It always uses `--read-only` and cannot click **Assign Claims**.
@@ -26,6 +26,29 @@ The runner must account for every expected month/year/status context and every p
 8. A live one-insurer canary requires separate explicit approval and `ALLOW_PRODUCTION_ASSIGNMENTS=true`. Remove that variable after the canary.
 
 The additive schema must be applied and audited before deploying code that consumes work-item leases or `cancelled_legacy`, including the recovery scripts. Leave these additions in place on rollback. The fresh migration script tolerates a source database that does not yet have those additive tables; it is not an incident recovery tool.
+
+## Dispatcher acceptance checklist
+
+This checklist is an approval record, not authorization to deploy, activate flags, run a live canary, or recover work. Complete the offline gates before requesting production approval. Record the commit, operator, timestamp, aggregate counts and inspection/workflow links for each stage; do not retain credentials, claim identities, raw plan files or portal HTML.
+
+- [ ] Offline gate: run `npm run test:piles:acceptance`, `python3 -m py_compile scripts/piles_auto_assignment_runner.py scripts/piles_auto_assignment/*.py`, `sh -n scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh`, `npm run test:piles`, `npm run build`, `npm audit --audit-level=high`, and `git diff --check`. The full Piles discovery includes acceptance automatically. The offline acceptance suite uses actual scheduler/dispatcher/store/ledger/runner logic with fake PostgreSQL dialect/session locks and fake portal/delivery boundaries; it never performs real assignments. It does not replace the separate real-PostgreSQL row-wait/lease race gate. Compare audit findings with the recorded branch baseline (7 moderate, 8 high, 1 critical), requiring zero newly introduced findings and no unresolved high/critical finding in a production dependency changed for this work.
+- [ ] Schema first: back up the target database; stage only the additive schema and audit scripts from the approved commit; apply with `npm run db:piles-auto-assignment`; run `npm run db:audit` and `npm run audit:piles-readiness -- --mode database`. Inspect legacy requests using `node scripts/audit-piles-legacy-requests.mjs`; any exact-row cancellation remains separately approved. Only then deploy the matching app/worker code with ledger `true`, dispatcher v2 `false`, concurrency `1`. Verify installed cron/source, Python executable, deployed commit and app health without printing environment values.
+- [ ] Inspection baseline: in the authorized host shell and exported environment described under Incident response, run `node scripts/inspect-piles-runner-incidents.mjs --hours 24` and `node scripts/recover-piles-stale-runs.mjs`. Resolve duplicates, stale/free-lock work, failed contexts and unexplained legacy backlog before continuing. Elapsed duration alone is not a stale-work finding.
+- [ ] Read-only one-insurer probes: run the commands below for Jubilee Tanzania and Jubilee Uganda, followed by all-active at concurrency one. Confirm every expected context is complete/empty, provenance is `readiness`, and probes create no assignment attempts or execute work. A same-insurer lock conflict must return the explicit blocked code; do not force the lock. Retain aggregate evidence only.
+
+  ```bash
+  "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py --insurer "Jubilee Tanzania" --portal-environment production --month All --year All --run-source readiness --read-only
+  "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py --insurer "Jubilee Uganda" --portal-environment production --month All --year All --run-source readiness --read-only
+  PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1 "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py --all-active --portal-environment production --month All --year All --run-source readiness --read-only
+  ```
+
+- [ ] Dispatcher v2/concurrency-one approval: explicitly approve activation, keep concurrency `1`, repeat the read-only gates, then approve a one-insurer canary using ordinary queued production work. Do not create synthetic claims. Observe a normal scheduled all-active execute cycle; source must be `schedule`, every owned generation executes once, later insurers are reached, overlap requests are covered, manual follow-up is exactly one separately owned generation, and parents become terminal only after their owned work settles.
+- [ ] Portal/evidence check: reconcile submitted totals against confirmed-visible, confirmed-reconciled, pending, conflict and failed/manual outcomes. Verify confirmation against the normal authorized portal view without copying claim identifiers. Confirm late arrivals from initially empty contexts are handled once; pending/submitted rows are reconciled without blind resubmission. One failing insurer must not stop the others. An uninterrupted parent sends one confirmed-only aggregate after collection, with no duplicate owner item; pending/conflict/manual/unmatched items are never announced as confirmed assignments.
+- [ ] Concurrency-two approval: only after the preceding cycle is healthy, obtain separate approval for `PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=2`. Repeat the all-active read-only command with `2`, then observe a normal execute cycle. The read-only all-active path remains sequential, so its configured ceiling is not proof of parallel portal safety: the execute evidence must demonstrate at most two different insurer sessions, no simultaneous canonical alias, no cross-session interference, stable host CPU/memory and truthful ordered parent outcomes.
+- [ ] Queue drain: inspect the exact cycle with `node scripts/inspect-piles-runner-incidents.mjs --run-id PARENT_RUN_ID --hours 24` and rerun readiness. All owned work is terminal; no queued/follow-up generation is left without a live owner; no expired lease with a free lock is unexplained; pending reconciliation remains visible rather than relabeled success. Confirm a manual follow-up belongs to its requesting parent and reused requests are acknowledgements, not extra execution.
+- [ ] Sign off the deployed commit, approvals, inspection links, context/work/attempt counts, concurrency evidence and rollback decision. If any safety check fails, pause new launches and follow Rollback. Production acceptance remains incomplete until these external evidence gates are explicitly authorized and recorded.
+
+Parent notification limitation: SIGTERM drains active work at a safe evidence boundary and leaves remaining work recoverable. A `running` parent emits no assignment, external-assignment or weekend-restore summary. A resumed parent can have durable confirmed assignments from a prior process but no reconstructable prior notification payload: batches record portal action rather than new-assignment/reassignment kind, and immutable owner/previous-owner/provider notification metadata is incomplete. V2 compares all owned executable generation IDs with its current completed collection, excluding inactive/coverage acknowledgements and foreign references. It also compares exact confirmed-visible/confirmed-reconciled identities with returned verified notification items using ephemeral per-generation hashes, never logged, serialized or persisted. Checks are bounded to 256 generations and 10,000 confirmations. On missing/extra/duplicate identities, malformed/oversized evidence or database failure, it emits only the fixed `parent_notification_incomplete` warning and sends none of those parent summaries. This also catches a worker failing after confirmation or final reconciliation confirming an item absent from its notification payload. Portal and ledger outcomes remain authoritative; repair notifications separately under operator approval. There is no durable notification outbox or exactly-once delivery guarantee across a crash after parent finalization/during transport. Replaying a terminal parent never reassigns or automatically renotifies it. Insurer-local weekend roster scheduling updates remain unchanged: they report configuration changes applied within that insurer workflow, not parent assignment confirmation.
 
 ## Required configuration
 
@@ -167,5 +190,19 @@ Exit 0 means the selected operation completed; read-only counts may still report
 ## Rollback
 
 Stop new scheduled/manual launches, return concurrency to `1`, then set `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false` for future launches. Remove `ALLOW_PRODUCTION_ASSIGNMENTS` from future process configuration; changing an environment file does not stop an already-running process. Let active workers reach a safe evidence boundary, then inspect leases, locks, and submission state. Keep `PILES_EXECUTION_LEDGER_ENABLED=true`: disabling it removes per-pile reconciliation protection and is not a normal dispatcher rollback.
+
+In the authorized host shell, the exact process-local rollback settings and read-only checks are:
+
+```bash
+export PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1
+export PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false
+export PILES_EXECUTION_LEDGER_ENABLED=true
+unset ALLOW_PRODUCTION_ASSIGNMENTS
+node scripts/inspect-piles-runner-incidents.mjs --hours 24
+node scripts/recover-piles-stale-runs.mjs
+npm run audit:piles-readiness -- --mode database
+```
+
+Persist those same flag values and remove production-assignment approval in the approved deployment configuration and host `.env` before any new launcher starts; shell exports alone do not change cron, Runner Control, remote workers or an existing process. Keep launches paused while configuration is reconciled. These commands intentionally do not restart a worker, modify queues, force-unlock an insurer, or resubmit an assignment. Exact guarded recovery commands are listed above and still need their separate target/confirmation approval.
 
 Roll back application and worker together while retaining additive tables, queue rows and all submitted/reconciliation evidence. Use only the exact guarded operations above for expired/free-lock work. A committed requeue is not undone by restoring an old token, and a legacy cancellation must not be changed blindly back to `pending` (a newer request may now own the unique pending slot). Keep launches paused, preserve the audit trail, and obtain a reviewed repair/new request if a committed operational change was mistaken. Never drop ledger tables, delete attempts, or run a destructive fresh migration during an incident.

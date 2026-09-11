@@ -14,7 +14,7 @@ from typing import Any, Callable, ContextManager, Iterator
 
 from .domain import InsurerRunStatus, ParentRunStatus, WorkDisposition
 from .orchestrator import InsurerOutcome, classify_runner_error
-from .store import ClaimedWork, ParentWorkPending
+from .store import ClaimedWork, ParentWorkPending, notification_fingerprint
 
 
 class ContextOutputRouter:
@@ -207,6 +207,8 @@ class DispatchResult:
     outcomes: tuple[InsurerOutcome, ...]
     notification_items: tuple[Any, ...] = field(default=(), repr=False)
     external_notification_items: tuple[Any, ...] = field(default=(), repr=False)
+    finalized_work_ids: tuple[str, ...] = field(default=(), repr=False)
+    notification_fingerprints: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,8 @@ def dispatch_parent(parent_id, work_items, max_workers, context_factory, run_one
     order = {item.insurer_name: index for index, item in reversed(list(enumerate(work_items)))}
     stopped = stop_event if stop_event is not None else threading.Event()
     outcomes = []
+    finalized_work_ids = []
+    work_by_outcome = {}
     for item in work_items:
         disposition = getattr(item, "disposition", None)
         status = {WorkDisposition.INACTIVE: InsurerRunStatus.SKIPPED_INACTIVE,
@@ -300,13 +304,26 @@ def dispatch_parent(parent_id, work_items, max_workers, context_factory, run_one
                         if not store.finish_claim(work.id, work.claim_token, disposition,
                                                   run_id or None, outcome.error_code):
                             lost_ownership = True
+                        else:
+                            finalized_work_ids.append(work.id)
                     outcomes.append(outcome)
+                    work_by_outcome[id(outcome)] = work.id
                 if contended:
                     stopped.wait(poll_interval)
     ordered = tuple(sorted(outcomes, key=lambda outcome: order.get(outcome.insurer_name, len(order))))
-    notifications, external = [], []
+    notifications, external, fingerprints = [], [], []
     for outcome in ordered:
         if isinstance(outcome.value, WorkerResult) and isinstance(outcome.value.result, dict):
-            notifications.extend(outcome.value.result.get("notification_items", ()))
+            items = outcome.value.result.get("notification_items", ())
+            notifications.extend(items)
+            for item in items:
+                if len(fingerprints) > 10000:
+                    break
+                plan = getattr(item, "plan", None)
+                fingerprints.append(notification_fingerprint(
+                    work_by_outcome.get(id(outcome), ""), getattr(plan, "insurer_name", None),
+                    getattr(plan, "tracking_key", None),
+                ))
             external.extend(outcome.value.result.get("external_notification_items", ()))
-    return DispatchResult(status, ordered, tuple(notifications), tuple(external))
+    return DispatchResult(status, ordered, tuple(notifications), tuple(external),
+                          tuple(finalized_work_ids), tuple(fingerprints))

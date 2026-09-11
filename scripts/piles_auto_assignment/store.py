@@ -49,6 +49,16 @@ def _insurer_lock_key(value: Any) -> str:
     return "OLD MUTUAL" if label in {"uapom", "old mutual"} else label
 
 
+def notification_fingerprint(work_id: str, insurer_name: str, tracking_key: str) -> str:
+    """Ephemeral exact identity evidence, never diagnostic or persisted data."""
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 8192
+           for value in (work_id, insurer_name, tracking_key)):
+        return ""
+    return hashlib.sha256(json.dumps(
+        [work_id, _insurer_lock_key(insurer_name), tracking_key], separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class ClaimedWork:
     """A lease snapshot, not permission to bypass the insurer advisory lock."""
@@ -544,6 +554,67 @@ class DispatchStore:
                 """, (status.value, parent_id),
             )
         return status
+
+    def notification_collection_complete(self, parent_id: str, work_ids: Iterable[str],
+                                         notification_fingerprints: Iterable[str] = ()) -> bool:
+        """Read-only, bounded proof of this invocation's generation collection.
+
+        Resumed parents can contain completed generations whose notification
+        payloads existed only in a prior process. Never announce a partial parent
+        aggregate. Keys are read only to hash exact confirmed identities in this
+        scope; no raw evidence, key or fingerprint is returned, logged or saved.
+        """
+        def valid_id(value):
+            return isinstance(value, str) and re.fullmatch(
+                r"(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})", value) is not None
+
+        collected = []
+        for value in work_ids:
+            if len(collected) >= 256 or not valid_id(value) or value in collected:
+                return False
+            collected.append(value)
+        supplied_fingerprints = set()
+        for value in notification_fingerprints:
+            if (len(supplied_fingerprints) >= 10000 or not isinstance(value, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", value) is None or value in supplied_fingerprints):
+                return False
+            supplied_fingerprints.add(value)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT id, disposition FROM piles_auto_assignment_work_items
+                WHERE parent_runner_run_id = %s
+                  AND disposition NOT IN ('covered_by_active_cycle', 'inactive')
+                ORDER BY id LIMIT 257
+                """, (parent_id,),
+            )
+            rows = _rows(cursor)
+            expected = [row["id"] for row in rows]
+            if not (len(expected) <= 256 and len(set(expected)) == len(expected)
+                    and all(valid_id(value) for value in expected)
+                    and all(row["disposition"] in {"completed", "failed", "cancelled"} for row in rows)
+                    and set(expected) == set(collected)):
+                return False
+            cursor.execute(
+                """
+                SELECT work.id, attempt.insurer_name, attempt.tracking_key
+                FROM piles_auto_assignment_insurer_runs run
+                JOIN piles_auto_assignment_attempts attempt ON attempt.insurer_run_id = run.id
+                LEFT JOIN piles_auto_assignment_work_items work
+                  ON work.covered_by_insurer_run_id = run.id
+                  AND work.parent_runner_run_id = run.runner_run_id
+                  AND work.disposition IN ('completed', 'failed', 'cancelled')
+                WHERE run.runner_run_id = %s
+                  AND attempt.status IN ('confirmed_visible', 'confirmed_reconciled')
+                ORDER BY run.id, attempt.id LIMIT 10001
+                """, (parent_id,),
+            )
+            confirmations = _rows(cursor)
+        fingerprints = [notification_fingerprint(row["id"], row["insurer_name"], row["tracking_key"])
+                        for row in confirmations]
+        return (len(fingerprints) <= 10000 and "" not in fingerprints
+                and len(set(fingerprints)) == len(fingerprints)
+                and set(fingerprints) == supplied_fingerprints)
 
 
 class ExecutionLedger:
