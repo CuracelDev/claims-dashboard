@@ -9200,6 +9200,16 @@ def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
     }
 
 
+def preview_parent_status(
+    diagnostics: list[dict[str, Any]], *, interrupted: bool = False,
+) -> str:
+    """Aggregate preview truth, treating unfinished requested work as a failure signal."""
+    statuses = [InsurerRunStatus(item["status"]) for item in diagnostics]
+    if interrupted:
+        statuses.append(InsurerRunStatus.FAILED)
+    return derive_parent_status((), statuses).value
+
+
 def run_durable_preview(
     args: argparse.Namespace,
     store: DataStore,
@@ -9266,11 +9276,9 @@ def run_durable_preview(
                     parent_error = "dispatch_stopped"
                     break
             if parent_error == "dispatch_stopped":
-                status = "completed_with_issues" if diagnostics else "failed"
+                status = preview_parent_status(diagnostics, interrupted=True)
             else:
-                status = derive_parent_status((), (
-                    InsurerRunStatus(item["status"]) for item in diagnostics
-                )).value
+                status = preview_parent_status(diagnostics)
             error_code = parent_error or next((item["error_code"] for item in diagnostics if item["error_code"]), "")
             if not store.finalize_preview_runner_run(
                 args.run_id, token, status=status, outcomes=diagnostics, error_code=error_code,
@@ -9286,7 +9294,7 @@ def run_durable_preview(
                 code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
                 try:
                     store.finalize_preview_runner_run(
-                        args.run_id, token, status="completed_with_issues" if diagnostics else "failed",
+                        args.run_id, token, status=preview_parent_status(diagnostics, interrupted=True),
                         outcomes=diagnostics, error_code=code,
                     )
                 except Exception:

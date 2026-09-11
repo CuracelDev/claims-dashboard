@@ -3845,7 +3845,7 @@ class DispatcherMainTests(unittest.TestCase):
     def invoke(self, state, run_one, *, execute=True, read_only=None, adopt_preview=False,
                run_source="schedule", flag="true", maximum=2, terminal_replay=False,
                preview_claim_error=None, preview_lock=True, discovery_error=None,
-               restored_rows=()):
+               preview_heartbeat_error_after=None, restored_rows=()):
         now = datetime(2026, 9, 10, tzinfo=timezone.utc)
         self.args = types.SimpleNamespace(read_only=not execute if read_only is None else read_only,
             adopt_preview_run=adopt_preview, execute=execute, portal_environment="test",
@@ -3853,6 +3853,7 @@ class DispatcherMainTests(unittest.TestCase):
             invocation_backend="local", run_source=run_source, effective_date="", slow_mo=0,
             out="tmp/unused.json")
         self.events = []
+        preview_heartbeat_count = 0
         owner = self
         class ParentStore:
             def __init__(self, **options):
@@ -3876,7 +3877,12 @@ class DispatcherMainTests(unittest.TestCase):
             def release_preview_parent_lock(self, run_id):
                 owner.events.append(("preview_unlock", run_id))
             def heartbeat_preview_runner_run(self, run_id, token, phase):
+                nonlocal preview_heartbeat_count
+                preview_heartbeat_count += 1
                 owner.events.append(("preview_heartbeat", run_id, token, phase))
+                if (preview_heartbeat_error_after is not None
+                        and preview_heartbeat_count > preview_heartbeat_error_after):
+                    raise RuntimeError("private preview heartbeat failure")
                 return True
             def finalize_preview_runner_run(self, run_id, token, **fields):
                 owner.events.append(("preview_finalized", run_id, token, fields))
@@ -4097,6 +4103,23 @@ class DispatcherMainTests(unittest.TestCase):
         def portal(work, _context):
             calls.append(work.insurer_name)
             signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            raise RuntimeError("interrupted insurer did not complete")
+        with self.assertRaisesRegex(RuntimeError, "dispatch_stopped"):
+            self.invoke(state, portal, execute=False, read_only=False,
+                        adopt_preview=True, run_source="manual")
+        self.assertEqual(calls, ["Kenya"])
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "failed")
+        self.assertEqual(finalized[3]["error_code"], "dispatch_stopped")
+        self.assertEqual([item["status"] for item in finalized[3]["outcomes"]], ["failed"])
+        self.assertEqual(state.events, [])
+
+    def test_sigterm_after_completed_preview_insurer_is_partial(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya", "Uganda")), []
+        def portal(work, _context):
+            calls.append(work.insurer_name)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
             return {"unassigned": [], "plans": [], "reassignment_plans": []}
         with self.assertRaisesRegex(RuntimeError, "dispatch_stopped"):
             self.invoke(state, portal, execute=False, read_only=False,
@@ -4104,8 +4127,20 @@ class DispatcherMainTests(unittest.TestCase):
         self.assertEqual(calls, ["Kenya"])
         finalized = next(event for event in self.events if event[0] == "preview_finalized")
         self.assertEqual(finalized[3]["status"], "completed_with_issues")
-        self.assertEqual(finalized[3]["error_code"], "dispatch_stopped")
-        self.assertEqual(state.events, [])
+        self.assertEqual([item["status"] for item in finalized[3]["outcomes"]], ["completed"])
+
+    def test_exception_after_completed_preview_insurer_is_partial(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya", "Uganda")), []
+        with self.assertRaisesRegex(RuntimeError, "unexpected_error"):
+            self.invoke(state, lambda work, _context: calls.append(work.insurer_name) or {},
+                        execute=False, read_only=False, adopt_preview=True, run_source="manual",
+                        preview_heartbeat_error_after=1)
+        self.assertEqual(calls, ["Kenya"])
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "completed_with_issues")
+        self.assertEqual(finalized[3]["error_code"], "unexpected_error")
+        self.assertEqual([item["status"] for item in finalized[3]["outcomes"]], ["completed"])
 
     def test_preview_claim_precedes_all_active_discovery_and_discovery_failure_is_terminal(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
