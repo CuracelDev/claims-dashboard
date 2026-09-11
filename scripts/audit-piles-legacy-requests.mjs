@@ -5,6 +5,25 @@ import {
 } from './recover-piles-stale-runs.mjs';
 import { canonicalInsurerLockKey } from './piles-auto-assignment-locks.mjs';
 
+// Only the persisted array encoding with known labels is evidence of scope.
+// Empty/null/scalar/unknown values are not the runner CLI's implicit All default.
+// Column names below are module-owned SQL identifiers, never operator input.
+function monthScopeSql(column) {
+  return `SELECT count(*) BETWEEN 1 AND 12
+      AND bool_and(jsonb_typeof(value) = 'string' AND month = ANY(
+        ARRAY['all','jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec']))
+      AND (NOT bool_or(month = 'all') OR count(DISTINCT month) = 1) AS valid,
+      array_agg(DISTINCT month) AS months
+    FROM (SELECT value, CASE lower(btrim(value #>> '{}'))
+      WHEN 'january' THEN 'jan' WHEN 'february' THEN 'feb' WHEN 'march' THEN 'mar'
+      WHEN 'april' THEN 'apr' WHEN 'june' THEN 'jun' WHEN 'july' THEN 'jul'
+      WHEN 'august' THEN 'aug' WHEN 'september' THEN 'sep' WHEN 'october' THEN 'oct'
+      WHEN 'november' THEN 'nov' WHEN 'december' THEN 'dec'
+      ELSE lower(btrim(value #>> '{}')) END AS month
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(${column}) = 'array'
+        THEN ${column} ELSE '[]'::jsonb END) AS elements(value)) normalized`;
+}
+
 // Age alone is not obsolescence: require a terminal scheduled all-active execute
 // owner and a later clean completed insurer cycle that supersedes the request.
 const obsolete = `request.status = 'pending' AND request.claimed_by_runner_run_id IS NULL
@@ -18,8 +37,18 @@ const obsolete = `request.status = 'pending' AND request.claimed_by_runner_run_i
     WHERE work.parent_runner_run_id = parent.id AND work.disposition IN ('queued', 'claimed', 'follow_up_queued'))
   AND EXISTS (SELECT 1 FROM piles_auto_assignment_insurer_runs successor
     JOIN piles_auto_assignment_runner_runs successor_parent ON successor_parent.id = successor.runner_run_id
+    CROSS JOIN LATERAL (${monthScopeSql('parent.months')}) requested_months
+    CROSS JOIN LATERAL (${monthScopeSql('successor_parent.months')}) successor_months
     WHERE ${canonicalRecoverySql('successor.insurer_name')} = ${canonicalRecoverySql('request.insurer_name')}
       AND successor.runner_run_id <> parent.id AND successor_parent.mode = 'execute'
+      AND lower(btrim(parent.portal_environment)) IN ('production', 'test')
+      AND lower(btrim(successor_parent.portal_environment)) = lower(btrim(parent.portal_environment))
+      AND requested_months.valid AND successor_months.valid
+      AND (successor_months.months = ARRAY['all'] OR successor_months.months @> requested_months.months)
+      AND lower(btrim(parent.year)) ~ '^(all|20[0-9]{2})$'
+      AND lower(btrim(successor_parent.year)) ~ '^(all|20[0-9]{2})$'
+      AND (lower(btrim(successor_parent.year)) = 'all'
+        OR lower(btrim(successor_parent.year)) = lower(btrim(parent.year)))
       AND successor.status = 'completed' AND successor.started_at >= request.requested_at
       AND successor.finished_at IS NOT NULL AND successor.finished_at <= clock_timestamp()
       AND successor.reconciliation_pending_pile_count = 0 AND successor.conflict_pile_count = 0

@@ -22,7 +22,7 @@ on:
         required: false
         type: string
       claim_token:
-        description: Current claim token (work-item recover only; never printed by these scripts)
+        description: Current claim token (work-item recover only; workflow input metadata is not a secret store)
         required: false
         type: string
       insurer_run_id:
@@ -48,27 +48,35 @@ concurrency:
 jobs:
   recover:
     runs-on: ubuntu-latest
-    env:
-      RECOVERY_ACTION: ${{ inputs.action }}
-      RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
-      RECOVERY_WORK_ID: ${{ inputs.work_id }}
-      RECOVERY_CLAIM_TOKEN: ${{ inputs.claim_token }}
-      RECOVERY_INSURER_RUN_ID: ${{ inputs.insurer_run_id }}
-      RECOVERY_PARENT_RUN_ID: ${{ inputs.parent_run_id }}
-      RECOVERY_REQUEST_ID: ${{ inputs.request_id }}
     steps:
-      - name: Validate inputs before SSH and mask ownership token
+      - name: Privately load inputs, mask ownership token, then export validated values
         shell: bash
         run: |
           set -eu
-          fail() { echo "Invalid recovery input." >&2; exit 1; }
-          case "$RECOVERY_ACTION" in inspect|recover|legacy-audit|legacy-apply) ;; *) fail ;; esac
-          case "$RECOVERY_CONFIRMATION" in ''|RECOVER_STALE_RUNS|CANCEL_OBSOLETE_LEGACY_REQUESTS) ;; *) fail ;; esac
-          for value in "$RECOVERY_WORK_ID" "$RECOVERY_CLAIM_TOKEN" "$RECOVERY_INSURER_RUN_ID" "$RECOVERY_PARENT_RUN_ID" "$RECOVERY_REQUEST_ID"; do
-            [ "${#value}" -le 200 ] || fail
-            case "$value" in *[!a-zA-Z0-9._-]*) fail ;; esac
-          done
-          if [ -n "$RECOVERY_CLAIM_TOKEN" ]; then printf '::add-mask::%s\n' "$RECOVERY_CLAIM_TOKEN"; fi
+          # No input expressions or token environment exist in this step's preamble.
+          # Read the event privately; register masking before any later step sees it.
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          try {
+            const inputs = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).inputs;
+            if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error();
+            const token = inputs.claim_token ?? '';
+            if (typeof token !== 'string') throw new Error();
+            if (token) process.stdout.write(`::add-mask::${token.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}\n`);
+            const names = ['action', 'confirmation', 'work_id', 'claim_token', 'insurer_run_id', 'parent_run_id', 'request_id'];
+            const values = Object.fromEntries(names.map((name) => [name, inputs[name] ?? '']));
+            if (Object.values(values).some((value) => typeof value !== 'string')) throw new Error();
+            if (!['inspect', 'recover', 'legacy-audit', 'legacy-apply'].includes(values.action)) throw new Error();
+            if (!['', 'RECOVER_STALE_RUNS', 'CANCEL_OBSOLETE_LEGACY_REQUESTS'].includes(values.confirmation)) throw new Error();
+            for (const name of names.slice(2)) {
+              if (!/^[A-Za-z0-9._-]{0,200}$/.test(values[name])) throw new Error();
+            }
+            appendFileSync(process.env.GITHUB_ENV, names.map((name) => `RECOVERY_${name.toUpperCase()}=${values[name]}\n`).join(''));
+          } catch {
+            console.error('Invalid recovery input.');
+            process.exitCode = 1;
+          }
+          NODE
       - name: Inspect or recover stale Piles runs
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
