@@ -1397,6 +1397,21 @@ class WeekendRestoreTests(unittest.TestCase):
         bot_update_sql, _params = executions[0]
         self.assertNotIn("is_active =", bot_update_sql)
 
+    def test_restore_scope_excludes_other_insurers(self):
+        store = object.__new__(runner.DataStore)
+        store.mode = "postgres"
+        store._fetchall_postgres = lambda *_args, **_kwargs: [
+            {"id": "kenya", "bot_account_id": "bot-1", "insurer_name": "Jubilee Kenya"},
+            {"id": "uganda", "bot_account_id": "bot-2", "insurer_name": "Jubilee Uganda"},
+        ]
+        executions = []
+        store._execute_postgres = lambda sql, params=(): executions.append((sql, params))
+
+        restored = store.restore_due_weekend_bot_states("2026-07-06", ["Jubilee Uganda"])
+
+        self.assertEqual([row["id"] for row in restored], ["uganda"])
+        self.assertTrue(all(params == ("bot-2",) or params == ("uganda",) for _sql, params in executions))
+
 
 class RunnerConcurrencyTests(unittest.TestCase):
     def test_database_lock_result_controls_whether_a_runner_may_start(self):
@@ -3854,13 +3869,14 @@ class DispatcherMainTests(unittest.TestCase):
     def invoke(self, state, run_one, *, execute=True, read_only=None, adopt_preview=False,
                run_source="schedule", flag="true", maximum=2, terminal_replay=False,
                preview_claim_error=None, preview_lock=True, discovery_error=None,
-               preview_heartbeat_error_after=None, restored_rows=()):
+               preview_heartbeat_error_after=None, restored_rows=(), all_active=True, insurer=None,
+               require_execution=False):
         now = datetime(2026, 9, 10, tzinfo=timezone.utc)
         self.args = types.SimpleNamespace(read_only=not execute if read_only is None else read_only,
             adopt_preview_run=adopt_preview, execute=execute, portal_environment="test",
-            month="All", year="2026", visible=False, all_active=True, insurer=None, run_id="parent",
+            month="All", year="2026", visible=False, all_active=all_active, insurer=insurer, run_id="parent",
             invocation_backend="local", run_source=run_source, effective_date="", slow_mo=0,
-            out="tmp/unused.json")
+            out="tmp/unused.json", require_execution=require_execution)
         self.events = []
         preview_heartbeat_count = 0
         owner = self
@@ -3900,7 +3916,8 @@ class DispatcherMainTests(unittest.TestCase):
                 return name == "__weekend_state__" and bool(restored_rows)
             def release_insurer_lock(self, name):
                 pass
-            def restore_due_weekend_bot_states(self, effective_date):
+            def restore_due_weekend_bot_states(self, effective_date, insurer_names=None):
+                owner.events.append(("restore_scope", tuple(insurer_names or ())))
                 return list(restored_rows)
             def try_acquire_runner_slot(self, maximum):
                 return -1
@@ -3983,6 +4000,22 @@ class DispatcherMainTests(unittest.TestCase):
         self.assertEqual([event[1] for event in state.events if event[0] == "parent"],
                          [runner.ParentRunStatus.COVERED_BY_ACTIVE_CYCLE])
         self.assertFalse(any(event[0] in {"notification", "legacy_finalized"} for event in self.events))
+
+    def test_explicit_single_execute_fails_when_requested_insurer_did_not_execute(self):
+        from dataclasses import replace
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Jubilee Uganda",))
+        state.rows = {key: replace(row, disposition="covered_by_active_cycle") for key, row in state.rows.items()}
+        with self.assertRaisesRegex(RuntimeError, "requested_insurer_not_executed"):
+            self.invoke(
+                state,
+                lambda *_: self.fail("covered work cannot execute"),
+                all_active=False,
+                insurer="Jubilee Uganda",
+                maximum=1,
+                run_source="manual",
+                require_execution=True,
+            )
 
     def test_manual_results_flow_through_insurer_work_and_mixed_or_all_manual_parent(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState

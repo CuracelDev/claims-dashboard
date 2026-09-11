@@ -44,7 +44,7 @@ from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeout
 
 try:
     from piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
-        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
+        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork, WorkerResult,
         dispatch_parent, execute_claimed_insurer)
     from piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
         ParentAlreadyTerminal, ParentScopeMismatch)
@@ -62,7 +62,7 @@ try:
     from piles_auto_assignment.scheduling import configured_max_concurrency
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
-        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
+        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork, WorkerResult,
         dispatch_parent, execute_claimed_insurer)
     from scripts.piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
         ParentAlreadyTerminal, ParentScopeMismatch)
@@ -2078,13 +2078,25 @@ class DataStore:
 
         return policy.eligible_bots, paused_bots, inserted_count
 
-    def restore_due_weekend_bot_states(self, effective_date: str) -> list[dict[str, Any]]:
+    def restore_due_weekend_bot_states(
+        self,
+        effective_date: str,
+        insurer_names: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
         try:
             target_date = datetime.strptime(effective_date, "%Y-%m-%d").date()
         except Exception:
             return []
         if target_date.weekday() in {5, 6}:
             return []
+        insurer_scope = None if insurer_names is None else {
+            canonical_insurer_key(name) for name in insurer_names if canonical_insurer_key(name)
+        }
+        if insurer_scope == set():
+            return []
+
+        def in_scope(row: dict[str, Any]) -> bool:
+            return insurer_scope is None or canonical_insurer_key(row.get("insurer_name")) in insurer_scope
 
         if self.mode == "postgres":
             snapshots = self._fetchall_postgres(
@@ -2098,6 +2110,7 @@ class DataStore:
                 """,
                 (effective_date,),
             )
+            snapshots = [row for row in snapshots if in_scope(row)]
             for row in snapshots:
                 self.update_bot_with_history(
                     str(row["bot_account_id"]),
@@ -2129,7 +2142,7 @@ class DataStore:
             return []
         snapshots = [
             row for row in self._fetchall_supabase("piles_auto_assignment_weekend_bot_state_snapshots")
-            if str(row.get("roster_id")) in roster_ids and not row.get("restored_at")
+            if str(row.get("roster_id")) in roster_ids and not row.get("restored_at") and in_scope(row)
         ]
         for row in snapshots:
             self.update_bot_with_history(
@@ -7950,6 +7963,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
     parser.add_argument("--read-only", action="store_true", help="Use an in-memory execution ledger instead of writing new reliability state.")
     parser.add_argument("--adopt-preview-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--require-execution", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--run-id", default="", help="Adopt a runner run record pre-created by an asynchronous launcher.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
@@ -9458,13 +9472,24 @@ def main_v2() -> DispatchResult:
                 restored = []
                 if store.try_acquire_insurer_lock("__weekend_state__"):
                     try:
-                        restored = store.restore_due_weekend_bot_states(runner_effective_date(args))
+                        restored = store.restore_due_weekend_bot_states(runner_effective_date(args), insurers)
                     finally:
                         store.release_insurer_lock("__weekend_state__")
                 result = dispatch_parent(run_id, work_items, maximum, factory, run_one,
                                          store=coordinator, stop_event=stopped)
                 if result.status == ParentRunStatus.RUNNING:
                     raise WorkerUnavailable("dispatch_work_pending")
+                if getattr(args, "require_execution", False):
+                    if not args.execute or not args.insurer:
+                        raise WorkerUnavailable("required_execution_scope_invalid")
+                    requested = next(
+                        (outcome for outcome in result.outcomes
+                         if canonical_insurer_key(outcome.insurer_name) == canonical_insurer_key(args.insurer)),
+                        None,
+                    )
+                    value = getattr(requested, "value", None)
+                    if not isinstance(value, WorkerResult) or not norm(value.insurer_run_id):
+                        raise WorkerUnavailable("requested_insurer_not_executed")
                 try:
                     collection_complete = coordinator.notification_collection_complete(
                         run_id, result.finalized_work_ids, result.notification_fingerprints)
@@ -9544,10 +9569,13 @@ def main() -> None:
 
         store = DataStore(read_only=bool(args.read_only))
         max_concurrency = configured_max_concurrency()
+        insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
+        if not insurers:
+            raise RuntimeError("No active insurer master accounts were found to run.")
         restored_weekend_rows = []
         if args.execute and store.try_acquire_insurer_lock("__weekend_state__"):
             try:
-                restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args))
+                restored_weekend_rows = store.restore_due_weekend_bot_states(runner_effective_date(args), insurers)
             finally:
                 store.release_insurer_lock("__weekend_state__")
         if restored_weekend_rows:
@@ -9566,10 +9594,6 @@ def main() -> None:
                     },
                 )
             send_weekend_restore_update(restored_weekend_rows)
-        insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
-        if not insurers:
-            raise RuntimeError("No active insurer master accounts were found to run.")
-
         run_details = {
             "portal_environment": PORTAL_ENVIRONMENT,
             "portal_url": CURACEL_BASE_URL,

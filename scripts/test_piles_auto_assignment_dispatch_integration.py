@@ -313,7 +313,7 @@ class AcceptanceHarness:
                 return next((slot for slot in range(maximum) if self.conn.acquire(f"piles-capacity:{slot}")), -1)
             def release_runner_slot(self, slot):
                 self.conn.release(f"piles-capacity:{slot}")
-            def restore_due_weekend_bot_states(self, _):
+            def restore_due_weekend_bot_states(self, _, insurer_names=None):
                 restored, harness.restored = harness.restored, []
                 return restored
             def get_bot_accounts(self, _): return []
