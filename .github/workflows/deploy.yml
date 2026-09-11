@@ -133,6 +133,11 @@ jobs:
             PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE="${{ vars.PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE }}"
             PILES_WEEKEND_ROSTER_TOKEN="${{ secrets.PILES_WEEKEND_ROSTER_TOKEN }}"
             EOF
+            # The cron installer reads its schedule from the process environment.
+            # Load the exact file written above so it cannot silently use its hourly default.
+            set -a
+            . ./.env
+            set +a
             export PATH="$HOME/.local/bin:$PATH"
             export PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
             sh ./scripts/prepare-piles-production-runtime.sh
