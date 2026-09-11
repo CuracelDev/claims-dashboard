@@ -3,6 +3,7 @@ import io
 import os
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import types
@@ -62,6 +63,10 @@ class EvidenceTimingTests(unittest.TestCase):
         controls = {'month': 'All', 'year': '2026', 'status': 'Vetting Pending'}
         selection_at = None
 
+        class Control(str):
+            def element_handle(self, **_): return self
+            def dispose(self): pass
+
         class Locator:
             first = property(lambda self: self)
             def count(self): return 0
@@ -73,8 +78,8 @@ class EvidenceTimingTests(unittest.TestCase):
         browser.page = Page()
         browser._reset_pagination_to_first_page = lambda: None
         browser._table_preview_fingerprint = lambda: ()
-        browser._direct_month_control = lambda: 'month'
-        browser._direct_status_control = lambda _: 'status'
+        browser._direct_month_control = lambda: Control('month')
+        browser._direct_status_control = lambda _: Control('status')
         browser._read_select_text = lambda control: controls.get(control, '')
         browser._read_year_chip_text = lambda: controls['year']
         def select(control, value, **_):
@@ -83,7 +88,9 @@ class EvidenceTimingTests(unittest.TestCase):
             if control == 'status': selection_at = clock.ns
             return True
         browser._set_select_value = select
-        browser._apply_year_filter = lambda value: 'year' if select('year', value) else None
+        browser._apply_year_filter = lambda value: Control('year') if select('year', value) else None
+        browser._settled_year_control = Control('year')
+        browser._settled_year_display = '2026'
         source_snapshot = snapshot or (lambda: {
             'headers': [], 'rows': [], 'loading': False, 'table_visible': True, 'explicit_empty': True})
         def read_snapshot():
@@ -92,6 +99,11 @@ class EvidenceTimingTests(unittest.TestCase):
                 value['loading'] = True
             return value
         browser._table_context_snapshot = read_snapshot
+        def joint_snapshot(_):
+            value = runner.deepcopy(browser._table_context_snapshot())
+            value['filter_controls'] = {key: browser._read_select_text(key) for key in controls}
+            return value
+        browser._filter_context_snapshot = joint_snapshot
         if network:
             browser._filter_network_state = lambda *_, **__: network(clock)
         return browser, clock
@@ -143,6 +155,188 @@ class EvidenceTimingTests(unittest.TestCase):
         self.assertEqual([row.key for row in result], ['pile-1'])
         self.assertGreaterEqual(clock.ns, 2_300_000_000)
         self.assertLess(clock.ns, 3_000_000_000)
+
+    def test_live_target_http_failure_survives_terminal_request_history_churn(self):
+        browser, clock = self.fixture()
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
+        target = types.SimpleNamespace(method='GET', url=url)
+        select = browser._set_select_value
+        def set_control(control, value, **kwargs):
+            if control == 'status':
+                browser._capture_piles_request(target)
+                for index in range(101):
+                    other = types.SimpleNamespace(method='GET', url=url + '&per_page=' + str(index))
+                    browser._capture_piles_request(other)
+                    browser._finish_piles_request(other)
+            return select(control, value, **kwargs)
+        browser._set_select_value = set_control
+        def tick(ms):
+            clock.advance(ms)
+            if clock.ns == 1_000_000_000:
+                browser._capture_piles_response(types.SimpleNamespace(request=target, url=url, status=500))
+                browser._finish_piles_request(target)
+        browser.page.wait_for_timeout = tick
+        with self.assertRaisesRegex(RuntimeError, 'filter_response_failed'):
+            self.run_filters(browser, clock, ['Vetting Pending'], scan=True)
+        self.assertEqual(browser._filter_state['status'], '')
+
+    def test_live_request_metadata_is_separate_from_bounded_terminal_history(self):
+        browser = runner.CuracelPilesRunner()
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1'
+        target = types.SimpleNamespace(method='GET', url=url)
+        browser._capture_piles_request(target)
+        started = browser._piles_request_sequence
+        for _ in range(200):
+            other = types.SimpleNamespace(method='GET', url=url)
+            browser._capture_piles_request(other)
+            browser._finish_piles_request(other)
+        browser._capture_piles_response(types.SimpleNamespace(request=target, url=url, status=500))
+        self.assertEqual(browser._piles_response_request_starts[browser._piles_response_sequence], started)
+        self.assertEqual(len(browser._piles_pending_requests), 1)
+        self.assertLessEqual(len(browser._piles_request_starts), 100)
+        browser._finish_piles_request(target)
+        self.assertEqual(len(browser._piles_pending_requests), 0)
+        self.assertLessEqual(len(browser._piles_request_starts), 100)
+
+    def test_active_tracking_overflow_stays_guarded_after_known_requests_drain(self):
+        browser = runner.CuracelPilesRunner()
+        requests = [types.SimpleNamespace(method='GET', url='https://api.health.curacel.co/api/piles?year=2026')
+                    for _ in range(101)]
+        for request in requests:
+            browser._capture_piles_request(request)
+        self.assertEqual(len(browser._piles_pending_requests), 100)
+        self.assertEqual(len(browser._piles_request_starts), 0)
+        self.assertTrue(browser._piles_request_overflow)
+        for request in requests:
+            browser._finish_piles_request(request)
+        self.assertEqual(len(browser._piles_pending_requests), 0)
+        self.assertEqual(len(browser._piles_request_starts), 100)
+        self.assertEqual(len(browser._piles_request_events), 100)
+        browser._invalidate_filter_state()
+        self.assertEqual(browser._filter_request_state(0, 'All', '2026', 'All'), 'pending')
+
+    def test_uncorrelated_response_disables_fresh_empty_shortcut(self):
+        browser, clock = self.fixture()
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
+        request = types.SimpleNamespace(method='GET', url=url)
+        def tick(ms):
+            clock.advance(ms)
+            if clock.ns == 500_000_000:
+                browser._capture_piles_response(types.SimpleNamespace(request=request, url=url, status=500))
+        browser.page.wait_for_timeout = tick
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'], scan=True)
+        self.assertTrue(browser._piles_request_overflow)
+        self.assertEqual(clock.ns, 30_000_000_000)
+
+    def test_joint_browser_script_reads_all_controls_and_table_in_one_turn(self):
+        browser = runner.CuracelPilesRunner()
+        calls = []
+        def evaluate(script, controls):
+            calls.append(controls)
+            # Execute the production browser function, not a reimplementation of
+            # its observations. This tiny DOM has an explicit-empty table.
+            harness = r"""
+const fs = require('node:fs');
+const script = fs.readFileSync(0, 'utf8');
+const node = (innerText) => ({innerText, isConnected: true,
+  getBoundingClientRect: () => ({width: 10, height: 10})});
+const cell = node('No Data Found');
+const table = {...node(''), querySelector: () => ({}),
+  querySelectorAll: (selector) => selector === 'tbody td' ? [cell] : []};
+global.window = {getComputedStyle: () => ({display: 'block', visibility: 'visible'})};
+global.document = {querySelectorAll: (selector) => selector === 'table' ? [table] : []};
+const controls = {month: node('September'), year: node('2026'), status: node('Vetting Pending')};
+controls.year.isConnected = false;
+process.stdout.write(JSON.stringify(eval('(' + script + ')')(controls)));
+"""
+            result = subprocess.run(['node', '-e', harness], input=script, text=True,
+                                    capture_output=True, check=True)
+            return runner.json.loads(result.stdout)
+        browser.page = types.SimpleNamespace(evaluate=evaluate)
+        snapshot = browser._browser_context_snapshot({'month': 'm', 'year': 'y', 'status': 's'})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(snapshot['filter_controls'], {'month': 'September', 'year': None, 'status': 'Vetting Pending'})
+        self.assertTrue(snapshot['explicit_empty'])
+        self.assertEqual(snapshot['rows'], [])
+
+    def test_scan_rejects_year_mutation_at_actual_table_evaluate_boundary(self):
+        browser, clock = self.fixture(network=lambda _: ('succeeded', {
+            'authoritative': True, 'authoritative_empty': True, 'item_count': 0}))
+        read_control = browser._read_select_text
+        year = ['2026']
+        tick_reads = {}
+        browser._read_select_text = lambda control: year[0] if control == 'year' else read_control(control)
+        def evaluate(_script, *args):
+            # This callback boundary is the last browser read in the old loop.
+            # Its table stays identical while the actual year control changes.
+            tick_reads[clock.ns] = tick_reads.get(clock.ns, 0) + 1
+            if clock.ns >= 1_500_000_000 and (args or tick_reads[clock.ns] >= 2):
+                year[0] = '2025'
+            snapshot = {'headers': [], 'rows': [], 'loading': False, 'table_visible': True,
+                        'explicit_empty': True}
+            if args:
+                snapshot['filter_controls'] = {'month': 'All', 'year': year[0], 'status': 'Vetting Pending'}
+            return snapshot
+        browser.page.evaluate = evaluate
+        browser._table_context_snapshot = types.MethodType(runner.CuracelPilesRunner._table_context_snapshot, browser)
+        browser._filter_context_snapshot = types.MethodType(runner.CuracelPilesRunner._filter_context_snapshot, browser)
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'], scan=True)
+        self.assertEqual(clock.ns, 30_000_000_000)
+
+    def test_atomic_observation_checks_each_control_on_changed_and_noop_filters(self):
+        for noop in (False, True):
+            for changed, value in [('month', 'September'), ('year', '2025'), ('status', 'Audit Pending')]:
+                with self.subTest(noop=noop, control=changed):
+                    browser, clock = self.fixture(network=lambda _: ('succeeded', {
+                        'authoritative': True, 'authoritative_empty': True, 'item_count': 0}))
+                    if noop:
+                        browser._filter_state.update(month='All', year='2026', status='Vetting Pending')
+                    def evaluate(_script, handles=None):
+                        controls = {'month': 'All', 'year': '2026', 'status': 'Vetting Pending'}
+                        if clock.ns >= 200_000_000:
+                            controls[changed] = value
+                        return {'headers': [], 'rows': [], 'loading': False, 'table_visible': True,
+                                'explicit_empty': True, 'filter_controls': controls}
+                    browser.page.evaluate = evaluate
+                    browser._filter_context_snapshot = types.MethodType(runner.CuracelPilesRunner._filter_context_snapshot, browser)
+                    with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+                        self.run_filters(browser, clock, ['Vetting Pending'], scan=True)
+                    self.assertEqual(clock.ns, (6 if noop else 30) * 1_000_000_000)
+
+    def test_actual_atomic_evaluate_retains_fresh_empty_grace(self):
+        browser, clock = self.fixture()
+        def evaluate(_script, handles=None):
+            return {'headers': [], 'rows': [], 'loading': bool(handles) and clock.ns < 200_000_000,
+                    'table_visible': True, 'explicit_empty': True,
+                    'filter_controls': {'month': 'All', 'year': '2026', 'status': 'Vetting Pending'}}
+        browser.page.evaluate = evaluate
+        browser._table_context_snapshot = types.MethodType(runner.CuracelPilesRunner._table_context_snapshot, browser)
+        browser._filter_context_snapshot = types.MethodType(runner.CuracelPilesRunner._filter_context_snapshot, browser)
+        self.assertEqual(self.run_filters(browser, clock, ['Vetting Pending'], scan=True), [[]])
+        self.assertEqual(clock.ns, 1_500_000_000)
+
+    def test_atomic_handle_cleanup_precedes_observation_and_is_bounded(self):
+        browser = runner.CuracelPilesRunner()
+        events = []
+        class Handle:
+            def dispose(self): events.append('dispose')
+        class Control:
+            def element_handle(self, **_):
+                events.append('resolve')
+                return Handle()
+        def evaluate(*_):
+            events.append('evaluate')
+            return {'rows': []}
+        browser.page = types.SimpleNamespace(evaluate=evaluate)
+        controls = {name: Control() for name in ('month', 'year', 'status')}
+        browser._filter_context_snapshot(controls)
+        self.assertEqual(events, ['resolve'] * 3 + ['evaluate'])
+        events.clear()
+        browser._filter_context_snapshot(controls)
+        self.assertEqual(events, ['dispose'] * 3 + ['resolve'] * 3 + ['evaluate'])
+        self.assertEqual(len(browser._filter_observation_handles), 3)
 
     def test_response_json_callback_cannot_accept_prior_dom_and_prior_response(self):
         browser, clock = self.fixture()
@@ -274,6 +468,7 @@ class EvidenceTimingTests(unittest.TestCase):
         url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
         request = types.SimpleNamespace(method='GET', url=url)
         failed = types.SimpleNamespace(request=request, url=url, status=500)
+        browser._capture_piles_request(request)
         class Response:
             status = 200
             def json(self):
@@ -283,13 +478,17 @@ class EvidenceTimingTests(unittest.TestCase):
         response = Response()
         response.request, response.url = request, url
         injected = False
-        def table_ready(**_):
+        read_snapshot = browser._filter_context_snapshot
+        def table_ready(controls):
             nonlocal injected
             if not injected:
                 injected = True
                 browser._capture_piles_response(response)
-            return state[0]
-        browser.wait_for_table_ready = table_ready
+            snapshot = read_snapshot(controls)
+            if state[0] == 'stable':
+                snapshot.update(rows=[['new row']], explicit_empty=False)
+            return snapshot
+        browser._filter_context_snapshot = table_ready
         with self.assertRaisesRegex(RuntimeError, 'filter_response_failed'):
             self.run_filters(browser, clock, ['Vetting Pending'])
 
@@ -2253,27 +2452,15 @@ class YearFilterScanningTests(unittest.TestCase):
             )
 
     def test_matching_controls_and_stable_table_do_not_require_new_network_event(self):
-        portal_runner = object.__new__(runner.CuracelPilesRunner)
-        portal_runner.page = object()
-        portal_runner._filter_state = {
-            "month": "All",
-            "year": "2025",
-            "status": "Vetting Pending",
-            "page_size": None,
-        }
-        portal_runner._piles_response_sequence = 4
-        portal_runner._piles_response_events = []
-        portal_runner.wait_for_table_ready = lambda **_kwargs: "stable"
-
-        evidence = runner.CuracelPilesRunner.apply_filters(
-            portal_runner,
-            "All",
-            "2025",
-            "Vetting Pending",
-        )
+        timing = EvidenceTimingTests()
+        portal_runner, clock = timing.fixture(snapshot=lambda: {
+            'headers': [], 'rows': [['existing row']], 'loading': False, 'table_visible': True})
+        portal_runner._filter_state.update(month='All', year='2026', status='Vetting Pending')
+        evidence = timing.run_filters(portal_runner, clock, ['Vetting Pending'])[0]
 
         self.assertEqual(evidence.network_state, "not_observed")
         self.assertEqual(evidence.table_state, "stable")
+        self.assertEqual(clock.ns, 300_000_000)
 
     def test_filter_network_state_reports_explicit_http_failure(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
