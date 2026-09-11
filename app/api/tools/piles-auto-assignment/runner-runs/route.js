@@ -5,9 +5,26 @@ import { toRunnerProgressView } from '../../../../../lib/piles-auto-assignment-v
 export const dynamic = 'force-dynamic';
 
 function normalizeLimit(value) {
+  if (value == null || value === '') return 100;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 100;
   return Math.min(Math.max(Math.trunc(parsed), 1), 250);
+}
+
+// Both the PostgreSQL adapter and PostgREST support range. Stay below the
+// PostgREST response cap, with deterministic pages and a hard request budget.
+// Exceeding the budget fails rather than returning misleading partial counts.
+async function loadRows(query, maximum = 100000) {
+  const rows = [];
+  for (let offset = 0; offset <= maximum; offset += 500) {
+    const response = await query().order('id', { ascending: true }).range(offset, offset + 499);
+    if (response.error) throw response.error;
+    const page = response.data || [];
+    rows.push(...page);
+    if (rows.length > maximum) throw new Error('History row budget exceeded');
+    if (page.length < 500) return rows;
+  }
+  throw new Error('History row budget exceeded');
 }
 
 export async function GET(request) {
@@ -19,7 +36,8 @@ export async function GET(request) {
 
     let runQuery = supabase
       .from('piles_auto_assignment_runner_runs')
-      .select('id,insurer_name,run_scope,portal_environment,backend,run_source,months,year,mode,status,started_at,finished_at,duration_ms,created_at,updated_at')
+      // Details are inspected only for bounded opaque dispatch references.
+      .select('id,insurer_name,run_scope,portal_environment,backend,run_source,months,year,mode,status,started_at,finished_at,duration_ms,details')
       .order('started_at', { ascending: false })
       .limit(runId ? 1 : limit);
     if (runId) runQuery = runQuery.eq('id', runId);
@@ -29,34 +47,41 @@ export async function GET(request) {
     const runIds = runs.map((run) => run.id);
     if (!runIds.length) return NextResponse.json({ success: true, runs: [] });
 
-    const insurerResponse = await supabase
+    const insurerRuns = await loadRows(() => supabase
       .from('piles_auto_assignment_insurer_runs')
-      .select('id,runner_run_id,insurer_name,status,phase,error_code,error_message,heartbeat_at,started_at,finished_at')
-      .in('runner_run_id', runIds)
-      .order('created_at', { ascending: true });
-    if (insurerResponse.error) throw insurerResponse.error;
-    const insurerRuns = insurerResponse.data || [];
+      .select('id,runner_run_id,insurer_name,status,phase,error_code,error_message,heartbeat_at,started_at,finished_at,discovered_pile_count,discovered_claim_count,planned_pile_count,submitted_pile_count,confirmed_pile_count,reconciliation_pending_pile_count,conflict_pile_count,failed_pile_count,details')
+      .in('runner_run_id', runIds), 64000);
     const insurerRunIds = insurerRuns.map((item) => item.id);
+
+    let workItems = [];
+    let workItemsAvailable = true;
+    try {
+      workItems = await loadRows(() => supabase.from('piles_auto_assignment_work_items')
+        .select('id,parent_runner_run_id,insurer_name,source,request_scope,disposition,covered_by_insurer_run_id,heartbeat_at,started_at,finished_at,reason_code')
+        .in('parent_runner_run_id', runIds), 64000);
+    } catch (error) {
+      // Table feature detection on the exact optional-table read, for pg and
+      // PostgREST. Permission, missing-column, and network errors remain errors.
+      if (!['42P01', 'PGRST205'].includes(error.code)) throw error;
+      workItemsAvailable = false;
+    }
 
     let contexts = [];
     let batches = [];
     if (insurerRunIds.length) {
-      const [contextResponse, batchResponse] = await Promise.all([
-        supabase.from('piles_auto_assignment_scan_contexts')
+      [contexts, batches] = await Promise.all([
+        loadRows(() => supabase.from('piles_auto_assignment_scan_contexts')
           .select('insurer_run_id,status,distinct_pile_count,unassigned_pile_count,claim_count')
-          .in('insurer_run_id', insurerRunIds),
-        supabase.from('piles_auto_assignment_batches')
-          .select('insurer_run_id,status,planned_pile_count,confirmed_pile_count,pending_pile_count,conflict_pile_count,failed_pile_count')
-          .in('insurer_run_id', insurerRunIds),
+          .in('insurer_run_id', insurerRunIds)),
+        loadRows(() => supabase.from('piles_auto_assignment_batches')
+          .select('insurer_run_id,status,planned_pile_count,selected_pile_count,confirmed_pile_count,pending_pile_count,conflict_pile_count,failed_pile_count')
+          .in('insurer_run_id', insurerRunIds)),
       ]);
-      if (contextResponse.error) throw contextResponse.error;
-      if (batchResponse.error) throw batchResponse.error;
-      contexts = contextResponse.data || [];
-      batches = batchResponse.data || [];
     }
 
     return NextResponse.json({
       success: true,
+      work_items_available: workItemsAvailable,
       runs: runs.map((run) => {
         const ownInsurers = insurerRuns.filter((item) => item.runner_run_id === run.id);
         const ownIds = new Set(ownInsurers.map((item) => item.id));
@@ -65,10 +90,11 @@ export async function GET(request) {
           ownInsurers,
           contexts.filter((item) => ownIds.has(item.insurer_run_id)),
           batches.filter((item) => ownIds.has(item.insurer_run_id)),
+          workItems.filter((item) => item.parent_runner_run_id === run.id),
         );
       }),
     });
-  } catch (error) {
-    return NextResponse.json({ success: false, error: error.message || 'Failed to load runner history.' }, { status: 500 });
+  } catch {
+    return NextResponse.json({ success: false, error: 'Failed to load runner history.' }, { status: 500 });
   }
 }
