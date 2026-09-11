@@ -225,6 +225,20 @@ export function buildIncidentReport({ hours, runId, workItemsAvailable, sections
   return report;
 }
 
+export function poolConfigForDatabaseUrl(databaseUrl, environment = process.env) {
+  let ssl;
+  if (environment.DATABASE_SSL !== 'false') {
+    try {
+      if (new URL(databaseUrl).searchParams.get('sslmode') !== 'disable') {
+        ssl = { rejectUnauthorized: environment.DATABASE_SSL_REJECT_UNAUTHORIZED === 'true' };
+      }
+    } catch {
+      ssl = { rejectUnauthorized: environment.DATABASE_SSL_REJECT_UNAUTHORIZED === 'true' };
+    }
+  }
+  return { connectionString: databaseUrl, ssl, max: 1 };
+}
+
 export async function inspectIncidents(client, options) {
   try {
     await client.query('BEGIN READ ONLY');
@@ -245,7 +259,7 @@ export async function inspectIncidents(client, options) {
 }
 
 export async function runInspector(databaseUrl, options) {
-  const pool = new Pool({ connectionString: databaseUrl, max: 1 });
+  const pool = new Pool(poolConfigForDatabaseUrl(databaseUrl));
   let client;
   try {
     client = await pool.connect();
