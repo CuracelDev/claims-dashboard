@@ -3196,6 +3196,47 @@ class RunnerRunAdoptionTests(unittest.TestCase):
         self.assertEqual(inserts, [])
         self.assertEqual(updates[0][3]["details"]["idempotency_key"], "key-1")
 
+    def test_preview_parent_claim_is_exact_and_token_fenced(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "postgres"
+        calls = []
+        responses = iter([[{"id": "preview-parent"}], [{"id": "preview-parent"}], []])
+        def fetch(sql, params=()):
+            calls.append((" ".join(sql.split()), params))
+            return next(responses)
+        store._fetchall_postgres = fetch
+        token = store.claim_preview_runner_run(
+            run_id="preview-parent", insurer_name="DEFMIS", run_scope="single",
+            portal_environment="test", backend="local", run_source="manual",
+            months=["All"], year="2026", mode="dry-run",
+        )
+        self.assertRegex(token, r"^[0-9a-f-]{36}$")
+        self.assertIn("status = 'queued'", calls[0][0])
+        self.assertIn("mode = 'dry-run'", calls[0][0])
+        self.assertIn("run_source = 'manual'", calls[0][0])
+        self.assertTrue(store.finalize_preview_runner_run(
+            "preview-parent", token, status="completed", outcomes=[], error_code=""))
+        self.assertFalse(store.finalize_preview_runner_run(
+            "preview-parent", "stale-token", status="failed", outcomes=[], error_code="unexpected_error"))
+        self.assertIn("details ->> 'preview_claim_token'", calls[1][0])
+
+    def test_preview_parent_scope_mismatch_never_claims_foreign_record(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "postgres"
+        responses = iter([[], [{
+            "id": "preview-parent", "status": "queued", "mode": "dry-run",
+            "run_source": "manual", "run_scope": "single", "insurer_name": "DEFMIS",
+            "portal_environment": "production", "backend": "local", "months": ["All"],
+            "year": "2026",
+        }]])
+        store._fetchall_postgres = lambda *_args, **_kwargs: next(responses)
+        with self.assertRaises(runner.ParentScopeMismatch):
+            store.claim_preview_runner_run(
+                run_id="preview-parent", insurer_name="DEFMIS", run_scope="single",
+                portal_environment="test", backend="local", run_source="manual",
+                months=["All"], year="2026", mode="dry-run",
+            )
+
 
 class AssignmentRuleLoadingTests(unittest.TestCase):
     def test_inactive_rule_is_not_applied(self):
@@ -3785,11 +3826,14 @@ class DispatcherNotificationPrivacyTests(unittest.TestCase):
 
 
 class DispatcherMainTests(unittest.TestCase):
-    def invoke(self, state, run_one, *, execute=True, flag="true", maximum=2, terminal_replay=False, restored_rows=()):
+    def invoke(self, state, run_one, *, execute=True, read_only=None, adopt_preview=False,
+               run_source="schedule", flag="true", maximum=2, terminal_replay=False,
+               preview_claim_error=None, restored_rows=()):
         now = datetime(2026, 9, 10, tzinfo=timezone.utc)
-        self.args = types.SimpleNamespace(read_only=not execute, execute=execute, portal_environment="test",
+        self.args = types.SimpleNamespace(read_only=not execute if read_only is None else read_only,
+            adopt_preview_run=adopt_preview, execute=execute, portal_environment="test",
             month="All", year="2026", visible=False, all_active=True, insurer=None, run_id="parent",
-            invocation_backend="local", run_source="schedule", effective_date="", slow_mo=0,
+            invocation_backend="local", run_source=run_source, effective_date="", slow_mo=0,
             out="tmp/unused.json")
         self.events = []
         owner = self
@@ -3801,6 +3845,17 @@ class DispatcherMainTests(unittest.TestCase):
             def create_runner_run(self, **fields):
                 owner.events.append(("created", fields["run_source"]))
                 return "parent"
+            def claim_preview_runner_run(self, **fields):
+                owner.events.append(("preview_claim", fields))
+                if preview_claim_error:
+                    raise preview_claim_error
+                return "preview-token"
+            def heartbeat_preview_runner_run(self, run_id, token, phase):
+                owner.events.append(("preview_heartbeat", run_id, token, phase))
+                return True
+            def finalize_preview_runner_run(self, run_id, token, **fields):
+                owner.events.append(("preview_finalized", run_id, token, fields))
+                return True
             def try_acquire_insurer_lock(self, name):
                 return name == "__weekend_state__" and bool(restored_rows)
             def release_insurer_lock(self, name):
@@ -3926,7 +3981,8 @@ class DispatcherMainTests(unittest.TestCase):
         state = DispatchState(("Kenya",))
         state.insurer_locks["kenya"] = "foreign"
         with self.assertRaisesRegex(RuntimeError, "probe_blocked_by_active_insurer"):
-            self.invoke(state, lambda *_: self.fail("blocked probe cannot run"), execute=False)
+            self.invoke(state, lambda *_: self.fail("blocked probe cannot run"), execute=False,
+                        read_only=True, run_source="readiness")
         self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"} for event in self.events))
         self.assertEqual(state.events, [])
 
@@ -3947,10 +4003,83 @@ class DispatcherMainTests(unittest.TestCase):
     def test_unblocked_probe_is_one_pass_without_queue_or_parent_writes(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
         state, calls = DispatchState(("Kenya",)), []
-        result = self.invoke(state, lambda work, context: calls.append(work.insurer_name) or {}, execute=False)
+        result = self.invoke(state, lambda work, context: calls.append(work.insurer_name) or {}, execute=False,
+                             read_only=True, run_source="readiness")
         self.assertEqual(calls, ["Kenya"])
         self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
         self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"} for event in self.events))
+        self.assertEqual(state.events, [])
+
+    def test_api_preview_adopts_and_terminalizes_exact_parent_without_executable_work(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya",)), []
+        result = self.invoke(
+            state,
+            lambda work, context: calls.append(work.insurer_name) or {
+                "unassigned": [types.SimpleNamespace(remaining_claims=17)],
+                "plans": [types.SimpleNamespace(remaining_claims=17)],
+                "reassignment_plans": [],
+                "late_arrival_detection": {"count": 0, "claims": 0},
+            },
+            execute=False, read_only=False, adopt_preview=True, run_source="manual",
+        )
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        self.assertEqual(calls, ["Kenya"])
+        self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"}
+                             for event in self.events))
+        self.assertEqual(state.events, [])
+        claim = next(event for event in self.events if event[0] == "preview_claim")
+        self.assertEqual((claim[1]["run_id"], claim[1]["run_source"], claim[1]["mode"]),
+                         ("parent", "manual", "dry-run"))
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "completed")
+        self.assertEqual(finalized[3]["error_code"], "")
+        self.assertEqual(finalized[3]["outcomes"], [{
+            "insurer_name": "Kenya", "status": "completed", "phase": "complete",
+            "error_code": "", "discovered_piles": 1, "discovered_claims": 17,
+            "planned_piles": 1, "planned_claims": 17,
+        }])
+
+    def test_api_preview_failure_terminalizes_parent_with_safe_diagnostics(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        hostile = RuntimeError('password="SECRET" <html>patient</html>')
+        with self.assertRaisesRegex(RuntimeError, "unexpected_error"):
+            self.invoke(state, lambda *_: (_ for _ in ()).throw(hostile), execute=False,
+                        read_only=False, adopt_preview=True, run_source="manual")
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "failed")
+        self.assertEqual(finalized[3]["error_code"], "unexpected_error")
+        self.assertEqual(finalized[3]["outcomes"][0]["error_code"], "unexpected_error")
+        self.assertNotIn("SECRET", repr(finalized))
+        self.assertNotIn("patient", repr(finalized))
+        self.assertEqual(state.events, [])
+
+    def test_api_preview_cannot_adopt_a_parent_with_different_persisted_scope(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        mismatch = runner.ParentScopeMismatch("persisted scope differs")
+        with self.assertRaisesRegex(RuntimeError, "parent_scope_mismatch"):
+            self.invoke(state, lambda *_: self.fail("mismatched preview cannot reach portal"),
+                        execute=False, read_only=False, adopt_preview=True, run_source="manual",
+                        preview_claim_error=mismatch)
+        self.assertFalse(any(event[0] == "preview_finalized" for event in self.events))
+        self.assertEqual(state.events, [])
+
+    def test_sigterm_terminalizes_claimed_preview_without_starting_the_next_insurer(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state, calls = DispatchState(("Kenya", "Uganda")), []
+        def portal(work, _context):
+            calls.append(work.insurer_name)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            return {"unassigned": [], "plans": [], "reassignment_plans": []}
+        with self.assertRaisesRegex(RuntimeError, "dispatch_stopped"):
+            self.invoke(state, portal, execute=False, read_only=False,
+                        adopt_preview=True, run_source="manual")
+        self.assertEqual(calls, ["Kenya"])
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "completed_with_issues")
+        self.assertEqual(finalized[3]["error_code"], "dispatch_stopped")
         self.assertEqual(state.events, [])
 
     def test_shutdown_signal_finishes_active_work_and_leaves_next_work_queued(self):

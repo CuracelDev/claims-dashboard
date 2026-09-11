@@ -76,6 +76,7 @@ async function queueRemote(request, runId) {
       portal_environment: request.portalEnvironment, months: request.months, year: request.year,
       effective_date: request.effectiveDate, visible_browser: request.visible,
       finalize_assignments: request.finalizeAssignments, run_source: 'manual', invocation_backend: 'remote',
+      adopt_preview_run: !request.finalizeAssignments,
     }),
   });
   if (!response.ok) throw new Error(`Remote runner queue failed with HTTP ${response.status}.`);

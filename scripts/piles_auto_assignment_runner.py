@@ -3328,6 +3328,123 @@ class DataStore:
                 self._insert_supabase("piles_auto_assignment_runner_runs", payload)
         return run_id
 
+    def claim_preview_runner_run(
+        self,
+        *,
+        run_id: str,
+        insurer_name: str,
+        run_scope: str,
+        portal_environment: str,
+        backend: str,
+        run_source: str,
+        months: list[str],
+        year: str,
+        mode: str,
+    ) -> str:
+        """Atomically adopt one API-created preview parent and fence its writer."""
+        if self.mode != "postgres" or getattr(self, "read_only", False):
+            raise RuntimeError("Durable preview adoption requires a writable PostgreSQL connection.")
+        if not norm(run_id) or run_source != "manual" or mode != "dry-run":
+            raise ParentScopeMismatch("Durable previews require an authorized manual dry-run parent.")
+        token = str(uuid.uuid4())
+        protocol = json.dumps({
+            "preview_protocol": "durable_preview_v1",
+            "preview_claim_token": token,
+            "preview_phase": "configuration",
+            "preview_outcomes": [],
+        })
+        claimed = self._fetchall_postgres(
+            """
+            update piles_auto_assignment_runner_runs
+            set status = 'running', started_at = clock_timestamp(), finished_at = null,
+                duration_ms = 0, stdout = null, stderr = null,
+                details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                updated_at = clock_timestamp()
+            where id = %s and status = 'queued' and mode = 'dry-run'
+              and run_source = 'manual' and run_scope = %s
+              and coalesce(insurer_name, '') = %s
+              and portal_environment = %s and backend = %s
+              and months = %s::jsonb and year is not distinct from %s
+            returning id
+            """,
+            (protocol, run_id, run_scope, insurer_name or "", portal_environment,
+             backend, json.dumps(months), year),
+        )
+        if claimed:
+            return token
+        rows = self._fetchall_postgres(
+            """
+            select id, status, mode, run_source, run_scope, coalesce(insurer_name, '') as insurer_name,
+                   portal_environment, backend, months, year
+            from piles_auto_assignment_runner_runs where id = %s
+            """,
+            (run_id,),
+        )
+        if not rows:
+            raise ParentScopeMismatch("The preview parent does not exist.")
+        row = rows[0]
+        expected = {
+            "mode": mode, "run_source": run_source, "run_scope": run_scope,
+            "insurer_name": insurer_name or "", "portal_environment": portal_environment,
+            "backend": backend, "months": months, "year": year,
+        }
+        if any(row.get(key) != value for key, value in expected.items()):
+            raise ParentScopeMismatch("Invocation scope does not match persisted preview scope.")
+        if row.get("status") in {"completed", "completed_with_issues", "failed", "cancelled"}:
+            raise ParentAlreadyTerminal("The preview parent is already terminal.")
+        raise WorkerUnavailable("preview_parent_unavailable")
+
+    def heartbeat_preview_runner_run(self, run_id: str, token: str, phase: str) -> bool:
+        phase = phase if phase in {"configuration", "login", "navigation", "scan", "plan", "reconcile", "final_rescan", "complete"} else "configuration"
+        rows = self._fetchall_postgres(
+            """
+            update piles_auto_assignment_runner_runs
+            set details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                updated_at = clock_timestamp()
+            where id = %s and status = 'running' and mode = 'dry-run'
+              and run_source = 'manual' and details ->> 'preview_protocol' = 'durable_preview_v1'
+              and details ->> 'preview_claim_token' = %s
+            returning id
+            """,
+            (json.dumps({"preview_phase": phase}), run_id, token),
+        )
+        return bool(rows)
+
+    def finalize_preview_runner_run(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        status: str,
+        outcomes: list[dict[str, Any]],
+        error_code: str = "",
+    ) -> bool:
+        if status not in {"completed", "completed_with_issues", "failed", "cancelled"}:
+            raise ValueError("Unsupported preview terminal status.")
+        safe_outcomes = list(outcomes[:64])
+        details = json.dumps({
+            "preview_phase": "complete",
+            "preview_outcomes": safe_outcomes,
+            "preview_error_code": norm(error_code)[:100] or None,
+        })
+        rows = self._fetchall_postgres(
+            """
+            update piles_auto_assignment_runner_runs
+            set status = %s, finished_at = clock_timestamp(),
+                duration_ms = least(2147483647, greatest(0,
+                    extract(epoch from (clock_timestamp() - started_at)) * 1000)),
+                stderr = nullif(%s, ''),
+                details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                updated_at = clock_timestamp()
+            where id = %s and status = 'running' and mode = 'dry-run'
+              and run_source = 'manual' and details ->> 'preview_protocol' = 'durable_preview_v1'
+              and details ->> 'preview_claim_token' = %s
+            returning id
+            """,
+            (status, norm(error_code)[:100], details, run_id, token),
+        )
+        return bool(rows)
+
     def finalize_runner_run(
         self,
         run_id: str,
@@ -7814,6 +7931,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visible", action="store_true", help="Run with a visible browser")
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
     parser.add_argument("--read-only", action="store_true", help="Use an in-memory execution ledger instead of writing new reliability state.")
+    parser.add_argument("--adopt-preview-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--run-id", default="", help="Adopt a runner run record pre-created by an asynchronous launcher.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
@@ -9036,19 +9154,135 @@ def notify_dispatch_result(args: argparse.Namespace, result: DispatchResult) -> 
         print("WARNING: assignment summary notification failed.")
 
 
+def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
+    """Project a probe result into bounded, non-identifying parent diagnostics."""
+    value = getattr(outcome, "value", None)
+    result = getattr(value, "result", None) if value is not None else None
+    result = result if isinstance(result, dict) else {}
+    status = getattr(getattr(outcome, "status", None), "value", "failed")
+    error_code = norm(getattr(outcome, "error_code", ""))[:100]
+    if status == "completed":
+        workflow_status = norm(result.get("workflow_status"))
+        manual_count = safe_int(result.get("manual_action_required_count"), 0)
+        if workflow_status == "manual_action_required" or manual_count:
+            status, error_code = "manual_action_required", "manual_action_required"
+        elif workflow_status == "completed_with_issues":
+            status, error_code = "completed_with_issues", "assignment_follow_up_required"
+    unassigned = list(result.get("unassigned") or [])
+    plans = [*list(result.get("reassignment_plans") or []), *list(result.get("plans") or [])]
+    return {
+        "insurer_name": norm(getattr(outcome, "insurer_name", ""))[:160],
+        "status": status if status in {"completed", "completed_with_issues", "manual_action_required", "failed"} else "failed",
+        "phase": "complete",
+        "error_code": error_code,
+        "discovered_piles": len(unassigned),
+        "discovered_claims": sum(max(safe_int(getattr(item, "remaining_claims", 0), 0), 0) for item in unassigned),
+        "planned_piles": len(plans),
+        "planned_claims": sum(max(safe_int(getattr(item, "remaining_claims", 0), 0), 0) for item in plans),
+    }
+
+
+def run_durable_preview(
+    args: argparse.Namespace,
+    store: DataStore,
+    insurers: list[str],
+    months: list[str],
+    year: str,
+    visible: bool,
+    router: ContextOutputRouter,
+    stopped: threading.Event,
+) -> DispatchResult:
+    """Run an API preview with read-only workers and one fenced parent writer."""
+    scope = "all-active" if args.all_active else "single"
+    token = store.claim_preview_runner_run(
+        run_id=args.run_id, insurer_name=args.insurer or "", run_scope=scope,
+        portal_environment=PORTAL_ENVIRONMENT, backend=norm(args.invocation_backend) or "local",
+        run_source=norm(args.run_source), months=months, year=year, mode="dry-run",
+    )
+    finalized = False
+    outcomes = []
+    diagnostics: list[dict[str, Any]] = []
+    parent_error = ""
+    try:
+        probe_args = deepcopy(args)
+        probe_args.read_only = True
+        probe_args.worker_safe_diagnostics = True
+        def preview_heartbeat(phase="scan"):
+            if stopped.is_set():
+                raise WorkerUnavailable("dispatch_stopped")
+            if not store.heartbeat_preview_runner_run(args.run_id, token, phase):
+                raise WorkerUnavailable("preview_parent_ownership_lost")
+        probe_args.work_heartbeat = preview_heartbeat
+        factory = worker_context_factory(probe_args, router, max_concurrency=1, durable_claims=False)
+        @contextmanager
+        def probe_context(work):
+            with factory(work) as context:
+                yield replace(context, dispatch_store=None, ownership=None)
+        def run_one(work, context):
+            return run_claimed_insurer_once(work, context, probe_args, months, year, visible)
+        for insurer in insurers:
+            if stopped.is_set():
+                parent_error = "dispatch_stopped"
+                break
+            if not store.heartbeat_preview_runner_run(args.run_id, token, "scan"):
+                raise WorkerUnavailable("preview_parent_ownership_lost")
+            work = ProbeWork(insurer, canonical_insurer_key(insurer))
+            outcome = execute_claimed_insurer(work, probe_context, run_one, stop_event=stopped)
+            if outcome.error_code == "insurer_lock_unavailable":
+                outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
+            elif outcome.error_code == "worker_capacity_unavailable":
+                outcome = replace(outcome, error_code="probe_blocked_by_capacity")
+            outcomes.append(outcome)
+            diagnostic = preview_diagnostic_outcome(outcome)
+            diagnostics.append(diagnostic)
+            if diagnostic["status"] == "failed" and not parent_error:
+                parent_error = diagnostic["error_code"] or "unexpected_error"
+            if stopped.is_set() and len(outcomes) < len(insurers):
+                parent_error = "dispatch_stopped"
+                break
+        issue = parent_error or any(item["status"] != "completed" for item in diagnostics)
+        successful = any(item["status"] == "completed" for item in diagnostics)
+        status = "completed_with_issues" if issue and successful else "failed" if issue else "completed"
+        if not store.finalize_preview_runner_run(
+            args.run_id, token, status=status, outcomes=diagnostics,
+            error_code=parent_error or next((item["error_code"] for item in diagnostics if item["error_code"]), ""),
+        ):
+            raise WorkerUnavailable("preview_parent_ownership_lost")
+        finalized = True
+        result = DispatchResult(ParentRunStatus(status), tuple(outcomes))
+        if issue:
+            raise WorkerUnavailable(parent_error or "preview_completed_with_issues")
+        return result
+    except Exception as error:
+        if not finalized:
+            code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
+            try:
+                store.finalize_preview_runner_run(
+                    args.run_id, token, status="completed_with_issues" if diagnostics else "failed",
+                    outcomes=diagnostics, error_code=code,
+                )
+            except Exception:
+                pass
+        raise
+
+
 def main_v2() -> DispatchResult:
     """Default-disabled composition root; no legacy follow-up or parent writer."""
     args = parse_args()
     if args.read_only and args.execute:
         raise RuntimeError("--read-only cannot be combined with --execute.")
+    if args.adopt_preview_run and (args.execute or args.read_only or not norm(args.run_id)
+                                   or norm(args.run_source) != "manual"):
+        raise ParentScopeMismatch("Durable preview adoption requires an API-created manual preview parent.")
     configure_portal_environment(args.portal_environment)
     months, year = parse_month_labels(args.month), parse_year_label(args.year)
     visible = args.visible or not env_bool("HEADLESS", True)
     maximum = configured_max_concurrency()
     if args.execute and not is_test_portal(CURACEL_BASE_URL) and not env_bool("ALLOW_PRODUCTION_ASSIGNMENTS", False):
         raise RuntimeError("Execute mode is blocked outside the test portal without explicit production approval.")
-    # Non-execute v2 invocations are probes: no parent/queue/assignment writes.
-    if not args.execute:
+    durable_preview = bool(not args.execute and args.adopt_preview_run)
+    # Standalone non-execute invocations are probes: no parent/queue/assignment writes.
+    if not args.execute and not durable_preview:
         args = deepcopy(args)
         args.read_only = True
     run_id, coordinator = "", None
@@ -9065,6 +9299,13 @@ def main_v2() -> DispatchResult:
         if not insurers:
             raise RuntimeError("No active insurer master accounts were found to run.")
         with ContextOutputRouter.installed() as router:
+            if durable_preview:
+                try:
+                    return run_durable_preview(args, store, insurers, months, year, visible, router, stopped)
+                except ParentAlreadyTerminal:
+                    return DispatchResult(ParentRunStatus.COMPLETED, ())
+                except ParentScopeMismatch:
+                    raise WorkerUnavailable("parent_scope_mismatch") from None
             factory = worker_context_factory(args, router, max_concurrency=maximum, durable_claims=bool(args.execute))
             def run_one(work, context):
                 return run_claimed_insurer_once(work, context, args, months, year, visible)

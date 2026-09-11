@@ -265,6 +265,37 @@ async function repairParent(client, options, report) {
   // the current owned work's outcome. Legacy parents have no work linkage.
   const ownedOutcomes = children.filter((row) => row.aggregate_outcome !== false);
   let outcome = parentOutcome(work, ownedOutcomes, !work.length && !children.length && references.length > 0);
+  if (!outcome && !work.length && !children.length && !references.length
+      && parent.details?.preview_protocol === 'durable_preview_v1') {
+    const evidence = await recoveryQuery(client, 'recovery-preview-parent-evidence', `
+      SELECT status = 'running' AND mode = 'dry-run' AND run_source = 'manual'
+        AND details->>'preview_protocol' = 'durable_preview_v1'
+        AND updated_at < clock_timestamp() - interval '15 minutes' AS eligible
+      FROM piles_auto_assignment_runner_runs WHERE id = $1
+    `, [options.id]);
+    if (evidence[0]?.eligible !== true) return false;
+    const recovered = await recoveryQuery(client, 'recovery-preview-parent-update', `
+      UPDATE piles_auto_assignment_runner_runs parent
+      SET status = 'failed', finished_at = clock_timestamp(), updated_at = clock_timestamp(),
+        duration_ms = least(2147483647, greatest(0,
+          extract(epoch FROM (clock_timestamp() - started_at)) * 1000))::integer,
+        stderr = 'preview_stale_recovered',
+        details = (coalesce(details, '{}'::jsonb) - 'preview_claim_token')
+          || '{"preview_phase":"complete","preview_error_code":"preview_stale_recovered"}'::jsonb
+      WHERE parent.id = $1 AND parent.status = 'running' AND parent.mode = 'dry-run'
+        AND parent.run_source = 'manual'
+        AND parent.details->>'preview_protocol' = 'durable_preview_v1'
+        AND parent.updated_at < clock_timestamp() - interval '15 minutes'
+        AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items work
+          WHERE work.parent_runner_run_id = parent.id)
+        AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_insurer_runs child
+          WHERE child.runner_run_id = parent.id)
+      RETURNING id
+    `, [options.id]);
+    if (recovered.length !== 1) throw new Error('Guarded preview recovery state changed.');
+    report.parent_runs_repaired = 1;
+    return true;
+  }
   if (!outcome) return false;
   const pending = await recoveryQuery(client, 'recovery-parent-pending-evidence', `
     SELECT (EXISTS (SELECT 1 FROM piles_auto_assignment_attempts attempt

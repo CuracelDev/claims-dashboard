@@ -352,6 +352,47 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
         self.assertIn("piles_auto_assignment_work_items_queued_generation_idx",
                       {row["indexname"] for row in indexes["rows"]})
 
+    def test_preview_parent_claim_and_terminalization_are_exact_and_token_fenced(self):
+        preview = "preview-parent-" + uuid.uuid4().hex
+        self.admin.query("""
+          INSERT INTO piles_auto_assignment_runner_runs
+            (id,insurer_name,run_scope,portal_environment,backend,run_source,months,year,mode,status,details)
+          VALUES (%s,%s,'single','test','local','manual','[\"All\"]'::jsonb,'2026','dry-run','queued','{}'::jsonb)
+        """, [preview, self.insurer])
+        parent_store = runner.DataStore.__new__(runner.DataStore)
+        parent_store.mode, parent_store.read_only, parent_store.conn = "postgres", False, self.worker
+        token = parent_store.claim_preview_runner_run(
+            run_id=preview, insurer_name=self.insurer, run_scope="single",
+            portal_environment="test", backend="local", run_source="manual",
+            months=["All"], year="2026", mode="dry-run")
+        self.assertFalse(parent_store.finalize_preview_runner_run(
+            preview, "stale-token", status="failed", outcomes=[], error_code="unexpected_error"))
+        self.assertTrue(parent_store.heartbeat_preview_runner_run(preview, token, "scan"))
+        outcomes = [{"insurer_name": self.insurer, "status": "completed", "phase": "complete",
+                     "error_code": "", "discovered_piles": 2, "discovered_claims": 20,
+                     "planned_piles": 2, "planned_claims": 20}]
+        self.assertTrue(parent_store.finalize_preview_runner_run(
+            preview, token, status="completed", outcomes=outcomes, error_code=""))
+        # The bridge models explicit transactions; production DataStore enables
+        # psycopg autocommit before invoking these single-statement CAS methods.
+        self.worker.commit()
+        row = self.admin.query("""
+          SELECT status,finished_at IS NOT NULL AS finished,duration_ms,
+                 details->>'preview_phase' AS phase,
+                 jsonb_array_length(details->'preview_outcomes') AS outcome_count
+          FROM piles_auto_assignment_runner_runs WHERE id=%s
+        """, [preview])["rows"][0]
+        self.assertEqual(row["status"], "completed")
+        self.assertTrue(row["finished"])
+        self.assertGreaterEqual(row["duration_ms"], 0)
+        self.assertEqual((row["phase"], row["outcome_count"]), ("complete", 1))
+        self.assertEqual(self.admin.query(
+            "SELECT count(*)::integer AS count FROM piles_auto_assignment_work_items WHERE parent_runner_run_id=%s",
+            [preview])["rows"][0]["count"], 0)
+        self.assertEqual(self.admin.query(
+            "SELECT count(*)::integer AS count FROM piles_auto_assignment_insurer_runs WHERE runner_run_id=%s",
+            [preview])["rows"][0]["count"], 0)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

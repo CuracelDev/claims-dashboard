@@ -643,6 +643,7 @@ function HistoryDisposition({ C, disposition }) {
   const special = {
     legacy: 'Legacy record — work disposition was not recorded.',
     mixed: 'Mixed dispositions — review each insurer below.',
+    diagnostic_preview: 'Diagnostic preview — no executable work items or assignment attempts were created.',
   };
   const presentation = statusPresentation(disposition === 'claimed' ? 'running' : disposition === 'inactive' ? 'skipped_inactive' : disposition);
   return (

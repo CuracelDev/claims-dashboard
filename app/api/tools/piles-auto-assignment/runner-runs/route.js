@@ -50,7 +50,7 @@ export async function GET(request) {
     let runQuery = supabase
       .from('piles_auto_assignment_runner_runs')
       // Details are inspected only for bounded opaque dispatch references.
-      .select('id,insurer_name,run_scope,portal_environment,backend,run_source,months,year,mode,status,started_at,finished_at,duration_ms,details')
+      .select('id,insurer_name,run_scope,portal_environment,backend,run_source,months,year,mode,status,started_at,finished_at,duration_ms,updated_at,details')
       .order('started_at', { ascending: false })
       .limit(runId ? 1 : limit);
     if (runId) runQuery = runQuery.eq('id', runId);
