@@ -1,0 +1,95 @@
+name: Piles Production Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      insurer:
+        description: Exact active insurer name for this single-insurer canary
+        required: true
+        type: string
+      confirmation:
+        description: Type RUN_ONE_INSURER_PRODUCTION_CANARY
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Validate exact canary approval
+        shell: bash
+        run: |
+          set -eu
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          try {
+            const inputs = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).inputs;
+            const insurer = inputs?.insurer;
+            const confirmation = inputs?.confirmation;
+            if (confirmation !== 'RUN_ONE_INSURER_PRODUCTION_CANARY') throw new Error();
+            if (typeof insurer !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9 .&'()_-]{0,159}$/.test(insurer)) throw new Error();
+            appendFileSync(process.env.GITHUB_ENV, `CANARY_INSURER=${insurer}\n`);
+          } catch {
+            console.error('Invalid production canary input or confirmation.');
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Run one production insurer canary
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 80m
+          envs: CANARY_INSURER
+          script: |
+            set -eu
+            fail() { echo "Production canary safety precondition failed." >&2; exit 1; }
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+
+            [ "${PILES_AUTO_ASSIGNMENT_DISPATCHER_V2:-}" = "true" ] || fail
+            [ "${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-}" = "1" ] || fail
+            [ "${ALLOW_PRODUCTION_ASSIGNMENTS:-}" = "false" ] || fail
+            [ "${PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE:-}" = "0 0 31 2 *" ] || fail
+            cron_lines="$(crontab -l 2>/dev/null || true)"
+            managed_count="$(printf '%s\n' "$cron_lines" | awk '/run-piles-auto-assignment[.]sh|# piles-auto-assignment$/ { count++ } END { print count + 0 }')"
+            paused_count="$(printf '%s\n' "$cron_lines" | awk '$1 == "0" && $2 == "0" && $3 == "31" && $4 == "2" && $5 == "*" && /# piles-auto-assignment$/ { count++ } END { print count + 0 }')"
+            [ "$managed_count" = "1" ] || fail
+            [ "$paused_count" = "1" ] || fail
+            if pgrep -f '[p]iles_auto_assignment_runner[.]py.*--execute' >/dev/null 2>&1; then
+              fail
+            fi
+            node scripts/db-schema-audit.mjs
+
+            "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
+              --insurer "$CANARY_INSURER" \
+              --portal-environment production \
+              --month All \
+              --year All \
+              --run-source readiness \
+              --invocation-backend server \
+              --read-only
+
+            ALLOW_PRODUCTION_ASSIGNMENTS=true \
+              "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
+                --insurer "$CANARY_INSURER" \
+                --portal-environment production \
+                --month All \
+                --year All \
+                --run-source manual \
+                --invocation-backend server \
+                --require-execution \
+                --execute
+            echo "Single-insurer production canary completed."
