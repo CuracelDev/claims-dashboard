@@ -58,7 +58,9 @@ class EvidenceTimingTests(unittest.TestCase):
     def fixture(self, snapshot=None, network=None):
         clock = self.Clock()
         browser = runner.CuracelPilesRunner()
+        browser._piles_request_tracking = True  # Installed page request/response hooks.
         controls = {'month': 'All', 'year': '2026', 'status': 'Vetting Pending'}
+        selection_at = None
 
         class Locator:
             first = property(lambda self: self)
@@ -76,22 +78,264 @@ class EvidenceTimingTests(unittest.TestCase):
         browser._read_select_text = lambda control: controls.get(control, '')
         browser._read_year_chip_text = lambda: controls['year']
         def select(control, value, **_):
+            nonlocal selection_at
             controls[control] = value
+            if control == 'status': selection_at = clock.ns
             return True
         browser._set_select_value = select
         browser._apply_year_filter = lambda value: 'year' if select('year', value) else None
-        browser._table_context_snapshot = snapshot or (lambda: {
+        source_snapshot = snapshot or (lambda: {
             'headers': [], 'rows': [], 'loading': False, 'table_visible': True, 'explicit_empty': True})
+        def read_snapshot():
+            value = runner.deepcopy(source_snapshot())
+            if selection_at is not None and clock.ns - selection_at < 200_000_000:
+                value['loading'] = True
+            return value
+        browser._table_context_snapshot = read_snapshot
         if network:
             browser._filter_network_state = lambda *_, **__: network(clock)
         return browser, clock
 
-    def run_filters(self, browser, clock, statuses):
+    def run_filters(self, browser, clock, statuses, *, scan=False):
         with patch.object(runner.time, 'monotonic_ns', side_effect=lambda: clock.ns), \
              patch.object(runner.time, 'time', side_effect=lambda: clock.ns / 1e9), \
              patch.object(runner.time, 'sleep', side_effect=lambda _: self.fail('unconditional sleep')), \
              patch('sys.stdout', new_callable=io.StringIO):
-            return [browser.apply_filters('All', '2026', status) for status in statuses]
+            action = browser.scan_status if scan else browser.apply_filters
+            return [action('All', '2026', status) for status in statuses]
+
+    def test_previous_empty_context_waits_for_delayed_nonempty_generation(self):
+        browser, clock = self.fixture()
+        empty = browser._table_context_snapshot()
+        rows = {
+            'headers': ['Provider', 'Claims', 'Month', 'Provider Bill', 'Submitted Date', 'Status'],
+            'rows': [['A', '10', 'Sep', '1000', '2026-09-09', 'Vetting Pending']],
+            'loading': False, 'table_visible': True, 'explicit_empty': False}
+        browser._table_context_snapshot = lambda: empty if clock.ns < 2_000_000_000 else rows
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&month=0&status%5Bcode%5D=VETTING_PENDING'
+        request = types.SimpleNamespace(method='GET', url=url)
+        class Response:
+            status = 200
+            def json(self):
+                return {'data': [{'provider': {'name': 'A'}, 'submitted_claims_count': 10,
+                                 'month': 'Sep', 'amount_requested': 1000,
+                                 'last_claim_submitted_at': '2026-09-09T10:00:00Z'}], 'total': 1}
+        response = Response()
+        response.request, response.url = request, url
+        select = browser._set_select_value
+        def set_control(control, value, **kwargs):
+            if control == 'status':
+                getattr(browser, '_capture_piles_request', lambda _: None)(request)
+            return select(control, value, **kwargs)
+        browser._set_select_value = set_control
+        def tick(ms):
+            clock.advance(ms)
+            if clock.ns == 2_000_000_000:
+                browser._capture_piles_response(response)
+                getattr(browser, '_finish_piles_request', lambda _: None)(request)
+        browser.page.wait_for_timeout = tick
+        browser.try_set_page_size = lambda _: None
+        browser.wait_for_table_ready = lambda **_: 'stable'
+        pile = runner.replace(make_pile(1), month='Sep', submitted_date='2026-09-09', filter_month='All')
+        browser.rows_on_current_page = lambda *_: [pile] if clock.ns >= 2_000_000_000 else []
+        browser.goto_next_page = lambda *_, **__: False
+        result = self.run_filters(browser, clock, ['Vetting Pending'], scan=True)[0]
+        self.assertEqual([row.key for row in result], ['pile-1'])
+        self.assertGreaterEqual(clock.ns, 2_300_000_000)
+        self.assertLess(clock.ns, 3_000_000_000)
+
+    def test_response_json_callback_cannot_accept_prior_dom_and_prior_response(self):
+        browser, clock = self.fixture()
+        snapshot = browser._table_context_snapshot()
+        browser._table_context_snapshot = lambda: runner.deepcopy(snapshot)
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&month=0&status%5Bcode%5D=VETTING_PENDING'
+        request = types.SimpleNamespace(method='GET', url=url)
+        failed_request = types.SimpleNamespace(method='GET', url=url)
+        failed = types.SimpleNamespace(request=failed_request, url=url, status=500)
+        class Response:
+            status = 200
+            def json(self):
+                if clock.ns >= 1_500_000_000 and not snapshot['rows']:
+                    snapshot['rows'] = [['new row']]
+                    snapshot['explicit_empty'] = False
+                    browser._capture_piles_request(failed_request)
+                    browser._capture_piles_response(failed)
+                    browser._finish_piles_request(failed_request)
+                return {'data': [], 'total': 0}
+        response = Response()
+        response.request, response.url = request, url
+        select = browser._set_select_value
+        def set_control(control, value, **kwargs):
+            if control == 'status':
+                browser._capture_piles_request(request)
+                browser._capture_piles_response(response)
+                browser._finish_piles_request(request)
+            return select(control, value, **kwargs)
+        browser._set_select_value = set_control
+        with self.assertRaisesRegex(RuntimeError, 'filter_response_failed'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertEqual(browser._filter_state['status'], '')
+
+    def test_unchanged_empty_without_request_or_dom_transition_is_unknown(self):
+        browser, clock = self.fixture()
+        snapshot = browser._table_context_snapshot()
+        browser._table_context_snapshot = lambda: snapshot
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertEqual(clock.ns, 30_000_000_000)
+
+    def test_pending_request_blocks_fresh_dom_until_request_lifecycle_settles(self):
+        browser, clock = self.fixture()
+        self.assertTrue(hasattr(browser, '_capture_piles_request'), 'request lifecycle capture missing')
+        request = types.SimpleNamespace(method='GET', url='https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING')
+        select = browser._set_select_value
+        def set_control(control, value, **kwargs):
+            if control == 'status': browser._capture_piles_request(request)
+            return select(control, value, **kwargs)
+        browser._set_select_value = set_control
+        def tick(ms):
+            clock.advance(ms)
+            if clock.ns == 2_000_000_000: browser._finish_piles_request(request)
+        browser.page.wait_for_timeout = tick
+        result = self.run_filters(browser, clock, ['Vetting Pending'])[0]
+        self.assertEqual(result.table_state, 'empty')
+        self.assertGreaterEqual(clock.ns, 2_000_000_000)
+        self.assertLessEqual(clock.ns, 2_400_000_000)
+
+    def test_request_completion_alone_cannot_relabel_unchanged_empty_dom(self):
+        browser, clock = self.fixture()
+        snapshot = browser._table_context_snapshot()
+        browser._table_context_snapshot = lambda: snapshot
+        request = types.SimpleNamespace(method='GET', url='https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING')
+        select = browser._set_select_value
+        def set_control(control, value, **kwargs):
+            if control == 'status':
+                browser._capture_piles_request(request)
+                browser._finish_piles_request(request)
+            return select(control, value, **kwargs)
+        browser._set_select_value = set_control
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+
+    def test_old_request_response_cannot_replace_current_generation_response(self):
+        browser = runner.CuracelPilesRunner()
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
+        old = types.SimpleNamespace(method='GET', url=url)
+        current = types.SimpleNamespace(method='GET', url=url)
+        browser._capture_piles_request(old)
+        request_marker = browser._piles_request_sequence
+        browser._capture_piles_request(current)
+        browser._capture_piles_response(types.SimpleNamespace(request=current, url=url, status=200,
+            json=lambda: {'data': [{'id': 'new-row'}], 'total': 1}))
+        browser._finish_piles_request(current)
+        browser._capture_piles_response(types.SimpleNamespace(request=old, url=url, status=200,
+            json=lambda: {'data': [], 'total': 0}))
+        browser._finish_piles_request(old)
+        state, details = browser._filter_network_state(0, 'All', '2026', 'Vetting Pending',
+                                                      page_number=1, request_marker=request_marker)
+        self.assertEqual(state, 'succeeded')
+        self.assertEqual(details['item_count'], 1)
+
+    def test_page_open_fallback_cannot_reintroduce_late_old_generation_response(self):
+        browser, clock = self.fixture()
+        snapshot = browser._table_context_snapshot()
+        browser._table_context_snapshot = lambda: snapshot
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
+        request = types.SimpleNamespace(method='GET', url=url)
+        browser._capture_piles_request(request)
+        response = types.SimpleNamespace(request=request, url=url, status=200,
+                                         json=lambda: {'data': [], 'total': 0})
+        def tick(ms):
+            clock.advance(ms)
+            if clock.ns == 1_000_000_000:
+                browser._capture_piles_response(response)
+                browser._finish_piles_request(request)
+        browser.page.wait_for_timeout = tick
+        with self.assertRaisesRegex(RuntimeError, 'filter_settlement_timeout'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+
+    def test_response_json_dom_mutation_without_new_network_event_is_revalidated(self):
+        browser, clock = self.fixture()
+        snapshot = browser._table_context_snapshot()
+        browser._table_context_snapshot = lambda: runner.deepcopy(snapshot)
+        def network(*_, **__):
+            if clock.ns >= 1_500_000_000:
+                snapshot['rows'] = [['unexpected row']]
+                snapshot['explicit_empty'] = False
+            return 'succeeded', {'authoritative': True, 'authoritative_empty': True, 'item_count': 0}
+        browser._filter_network_state = network
+        with self.assertRaisesRegex(RuntimeError, 'filter_dom_response_mismatch'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+
+    def test_noop_filter_also_fences_callback_mutated_network_and_dom(self):
+        browser, clock = self.fixture()
+        browser._filter_state.update(month='All', year='2026', status='Vetting Pending')
+        state = ['empty']
+        url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
+        request = types.SimpleNamespace(method='GET', url=url)
+        failed = types.SimpleNamespace(request=request, url=url, status=500)
+        class Response:
+            status = 200
+            def json(self):
+                state[0] = 'stable'
+                browser._capture_piles_response(failed)
+                return {'data': [], 'total': 0}
+        response = Response()
+        response.request, response.url = request, url
+        injected = False
+        def table_ready(**_):
+            nonlocal injected
+            if not injected:
+                injected = True
+                browser._capture_piles_response(response)
+            return state[0]
+        browser.wait_for_table_ready = table_ready
+        with self.assertRaisesRegex(RuntimeError, 'filter_response_failed'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+
+    def test_request_failure_vetoes_fresh_empty_without_exposing_error(self):
+        browser, clock = self.fixture()
+        request = types.SimpleNamespace(method='GET', url='https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING', failure='secret https://fixture/patient')
+        select = browser._set_select_value
+        def set_control(control, value, **kwargs):
+            if control == 'status':
+                browser._capture_piles_request(request)
+                browser._fail_piles_request(request)
+            return select(control, value, **kwargs)
+        browser._set_select_value = set_control
+        with self.assertRaisesRegex(RuntimeError, '^Piles filters were not confirmed: filter_response_failed.$'):
+            self.run_filters(browser, clock, ['Vetting Pending'])
+        self.assertNotIn('secret', runner.json.dumps(browser.phase_timer.serialize()))
+
+    def test_current_generation_authoritative_rows_and_empty_still_settle_at_grace(self):
+        for populated in (False, True):
+            with self.subTest(populated=populated):
+                snapshot = {
+                    'headers': ['Provider', 'Claims', 'Month', 'Provider Bill', 'Submitted Date', 'Status'],
+                    'rows': [['A', '10', 'Sep', '1000', '2026-09-09', 'Vetting Pending']] if populated else [],
+                    'loading': False, 'table_visible': True, 'explicit_empty': not populated}
+                browser, clock = self.fixture(snapshot=lambda: snapshot)
+                url = 'https://api.health.curacel.co/api/piles?year=2026&page=1&status%5Bcode%5D=VETTING_PENDING'
+                request = types.SimpleNamespace(method='GET', url=url)
+                payload = {'data': [{'provider': {'name': 'A'}, 'submitted_claims_count': 10,
+                                    'month': 'Sep', 'amount_requested': 1000,
+                                    'last_claim_submitted_at': '2026-09-09T10:00:00Z'}] if populated else [],
+                           'total': 1 if populated else 0}
+                response = types.SimpleNamespace(request=request, url=url, status=200, json=lambda: payload)
+                select = browser._set_select_value
+                def set_control(control, value, **kwargs):
+                    if control == 'status': browser._capture_piles_request(request)
+                    return select(control, value, **kwargs)
+                browser._set_select_value = set_control
+                def tick(ms):
+                    clock.advance(ms)
+                    if clock.ns == 200_000_000:
+                        browser._capture_piles_response(response)
+                        browser._finish_piles_request(request)
+                browser.page.wait_for_timeout = tick
+                result = self.run_filters(browser, clock, ['Vetting Pending'])[0]
+                self.assertEqual(result.table_state, 'stable' if populated else 'empty')
+                self.assertEqual(clock.ns, 1_500_000_000)
 
     def test_five_explicit_empty_statuses_settle_near_grace_without_sleep(self):
         browser, clock = self.fixture()

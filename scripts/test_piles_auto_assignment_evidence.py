@@ -18,11 +18,13 @@ class FilterEvidenceTests(unittest.TestCase):
     def test_positive_dom_evidence_requires_grace_and_stability(self):
         for state in ('empty', 'stable'):
             evidence = FilterEvidence(True, True, True, state, 'not_observed',
-                                      {'selection_changed': True, 'positive_dom': True})
+                                      {'selection_changed': True, 'positive_dom': True, 'generation_fresh': True})
             self.assertEqual(self.wait(evidence, 1499), 'continue')
             self.assertEqual(self.wait(evidence, 1500), 'accept')
             self.assertEqual(self.wait(replace(evidence, year_matches=False), 1500), 'continue')
             self.assertEqual(self.wait(replace(evidence, details={'selection_changed': True}), 1500), 'continue')
+            self.assertEqual(self.wait(replace(evidence, details={'selection_changed': True, 'positive_dom': True}), 1500), 'continue')
+            self.assertEqual(self.wait(replace(evidence, details={'positive_dom': True}), 1500), 'continue')
 
     def test_unknown_evidence_waits_until_cap_then_retries(self):
         for state in ('unreadable', 'loading', 'structurally_empty'):

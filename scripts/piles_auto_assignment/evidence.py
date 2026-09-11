@@ -80,7 +80,8 @@ def decide_filter_wait(evidence: FilterEvidence, elapsed_ms: float,
             return WaitDecision('fail', 'empty_ui_conflicts_with_response')
         if evidence.details.get('dom_matches_response') is False:
             return WaitDecision('fail', 'filter_dom_response_mismatch')
-    positive = evidence.details.get('positive_dom') is True
+    positive = (evidence.details.get('positive_dom') is True
+                and evidence.details.get('generation_fresh') is True)
     coherent = (evidence.network_state == 'succeeded' and authoritative
                 and evidence.details.get('dom_matches_response') is True)
     if decision.accepted and (coherent or (evidence.network_state == 'not_observed' and positive)):
@@ -96,6 +97,8 @@ def evaluate_filter_evidence(evidence: FilterEvidence) -> EvidenceDecision:
         return EvidenceDecision(False, "filter_response_failed")
     if not evidence.controls_match:
         return EvidenceDecision(False, "controls_not_confirmed")
+    if evidence.details.get('request_pending') is True:
+        return EvidenceDecision(False, 'filter_request_pending')
     selection_changed = evidence.details.get("selection_changed") is True
     network_details = evidence.details.get("network", {})
     authoritative_empty = (
@@ -104,6 +107,7 @@ def evaluate_filter_evidence(evidence: FilterEvidence) -> EvidenceDecision:
     )
     if (evidence.network_state == 'not_observed'
             and evidence.details.get('positive_dom') is True
+            and evidence.details.get('generation_fresh') is True
             and evidence.table_state in {'stable', 'empty'}):
         return EvidenceDecision(True, 'confirmed_positive_dom')
     if selection_changed and evidence.network_state != "succeeded":

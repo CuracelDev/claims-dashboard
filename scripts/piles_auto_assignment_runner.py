@@ -3488,6 +3488,13 @@ class CuracelPilesRunner:
         self._table_headers_cache: list[str] = []
         self._piles_response_events: list[tuple[int, int, str, Any]] = []
         self._piles_response_sequence = 0
+        self._piles_request_sequence = 0
+        self._piles_pending_requests = {}
+        self._piles_request_events = []
+        self._piles_request_overflow = False
+        self._piles_request_starts = {}
+        self._piles_response_request_starts = {}
+        self._piles_request_tracking = False
         self._page_open_response_marker = 0
         self.year_filter_confirmation_timeout_ms = 5000
         self.execution_ledger: Any = None
@@ -3547,6 +3554,10 @@ class CuracelPilesRunner:
                 self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
             self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
             self.page.on("response", self._capture_piles_response)
+            self.page.on("request", self._capture_piles_request)
+            self.page.on("requestfinished", self._finish_piles_request)
+            self.page.on("requestfailed", self._fail_piles_request)
+            self._piles_request_tracking = True
         except BaseException:
             # A failed __enter__ does not receive a context-manager __exit__.
             self.__exit__(*sys.exc_info())
@@ -3577,6 +3588,50 @@ class CuracelPilesRunner:
         self._settled_year_control = None
         self._settled_year_display = ''
 
+    def _capture_piles_request(self, request: Any) -> None:
+        self._record_piles_request(request, 'pending')
+
+    def _finish_piles_request(self, request: Any) -> None:
+        self._record_piles_request(request, 'finished')
+
+    def _fail_piles_request(self, request: Any) -> None:
+        self._record_piles_request(request, 'failed')
+
+    def _record_piles_request(self, request: Any, state: str) -> None:
+        if norm(request.method).upper() != 'GET' or not piles_response_matches_filter_year(request.url, 'All'):
+            return
+        self._piles_request_sequence += 1
+        sequence = self._piles_request_sequence
+        key = id(request)
+        if state == 'pending':
+            self._piles_request_starts[key] = (request, sequence)
+            if len(self._piles_request_starts) > 100:
+                del self._piles_request_starts[next(iter(self._piles_request_starts))]
+            if len(self._piles_pending_requests) >= 100:
+                # Lost lifecycle tracking must never grant the DOM shortcut.
+                self._piles_request_overflow = True
+            else:
+                self._piles_pending_requests[key] = (sequence, request)
+            started = sequence
+        else:
+            started, _ = self._piles_pending_requests.pop(key, (0, None))
+        self._piles_request_events.append((sequence, state, norm(request.url), started))
+        self._piles_request_events = self._piles_request_events[-100:]
+
+    def _filter_request_state(self, marker, month, year, status):
+        matching = [(state, started) for sequence, state, url, started in self._piles_request_events
+                    if sequence > marker and piles_response_matches_context(url, month, year, status, page_number=1)]
+        if any(state == 'failed' for state, _ in matching):
+            return 'failed'
+        if self._piles_pending_requests or self._piles_request_overflow:
+            return 'pending'
+        if any(state == 'finished' and started > marker for state, started in matching):
+            return 'finished'
+        return 'not_observed'
+
+    def _filter_observation_generation(self):
+        return (self._piles_response_sequence, getattr(self, '_piles_request_sequence', 0))
+
     def _capture_piles_response(self, response: Any) -> None:
         try:
             if norm(response.request.method).upper() != "GET":
@@ -3584,6 +3639,13 @@ class CuracelPilesRunner:
             if not piles_response_matches_filter_year(response.url, "All"):
                 return
             self._piles_response_sequence = getattr(self, "_piles_response_sequence", 0) + 1
+            starts = getattr(self, '_piles_request_starts', {})
+            request_start = starts.get(id(response.request), (None, 0))[1]
+            response_starts = getattr(self, '_piles_response_request_starts', {})
+            response_starts[self._piles_response_sequence] = request_start
+            self._piles_response_request_starts = {
+                sequence: started for sequence, started in response_starts.items()
+                if sequence > self._piles_response_sequence - 100}
             self._piles_response_events.append((
                 self._piles_response_sequence,
                 safe_int(response.status, 0),
@@ -3645,11 +3707,18 @@ class CuracelPilesRunner:
         *,
         page_number: int | None = None,
         page_size: int | None = None,
+        request_marker: int | None = None,
+        response_ceiling: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         matching_events = [
             (sequence, status, response)
             for sequence, status, url, response in self._piles_response_events
             if sequence > marker
+            and (response_ceiling is None or sequence <= response_ceiling)
+            and (request_marker is None
+                 or getattr(self, '_piles_response_request_starts', {}).get(sequence, 0) > request_marker
+                 or (not getattr(self, '_piles_request_tracking', False)
+                     and not getattr(self, '_piles_response_request_starts', {}).get(sequence, 0)))
             and piles_response_matches_context(
                 url,
                 month_label,
@@ -4699,13 +4768,20 @@ class CuracelPilesRunner:
         status_changed = self._filter_state["status"] != status_label
 
         if not month_changed and not year_changed and not status_changed:
-            table_state = self.wait_for_table_ready(timeout_ms=6000)
-            network_state, network_details = self._filter_network_state(
-                filter_response_marker,
-                month_label,
-                year_label,
-                status_label,
-            )
+            deadline = time.monotonic_ns() + 6_000_000_000
+            while True:
+                generation = self._filter_observation_generation()
+                network_state, network_details = self._filter_network_state(
+                    filter_response_marker, month_label, year_label, status_label)
+                # Keep the existing no-op readiness budget, but never return a
+                # table observation taken before callback-capable JSON parsing.
+                remaining_ms = max(1, int((deadline - time.monotonic_ns()) / 1_000_000))
+                table_state = self.wait_for_table_ready(timeout_ms=remaining_ms)
+                if generation == self._filter_observation_generation():
+                    break
+                if time.monotonic_ns() >= deadline:
+                    raise RuntimeError('Piles filters were not confirmed: filter_settlement_timeout.')
+                self.page.wait_for_timeout(100)
             evidence = FilterEvidence(
                 month_matches=True,
                 year_matches=True,
@@ -4739,6 +4815,9 @@ class CuracelPilesRunner:
                     pass
                 time.sleep(1.2)
 
+            initial_snapshot = self._table_context_snapshot()
+            filter_response_marker = self._piles_response_sequence
+            filter_request_marker = self._piles_request_sequence
             month_select = None
             if month_changed:
                 direct_month = self._direct_month_control()
@@ -4828,6 +4907,7 @@ class CuracelPilesRunner:
 
         evidence = self._wait_for_filter_settlement(
             filter_response_marker, month_label, year_label, status_label, controls_match,
+            initial_snapshot=initial_snapshot, request_marker=filter_request_marker,
             historical_marker=(self._page_open_response_marker if not filter_state_was_initialized else None),
         )
         self._filter_state.update(month=month_label, year=desired_year_state, status=status_label)
@@ -4836,17 +4916,47 @@ class CuracelPilesRunner:
         return evidence
 
     def _wait_for_filter_settlement(self, marker, month_label, year_label, status_label,
-                                    controls_match, *, historical_marker=None):
+                                    controls_match, *, initial_snapshot, request_marker, historical_marker=None):
         """Poll DOM and network together, pumping Playwright events during the grace."""
         start = time.monotonic_ns()
         stable_since = start
         previous = None
+        generation_fresh = False
         while True:
             self._heartbeat('scan')
-            snapshot = self._table_context_snapshot()
+            generation = self._filter_observation_generation()
+            network_state, network = self._filter_network_state(
+                marker, month_label, year_label, status_label, page_number=1, request_marker=request_marker)
+            if network_state == 'not_observed' and historical_marker is not None:
+                historical_state, historical = self._filter_network_state(
+                    historical_marker, month_label, year_label, status_label,
+                    page_number=1, response_ceiling=marker)
+                if historical_state == 'succeeded' and historical.get('authoritative') is True:
+                    network_state, network = historical_state, historical
+            # response.json(), locator reads, and evaluate all pump Playwright
+            # callbacks. Never join evidence sampled on opposite sides of one.
+            first_controls = controls_match()
+            first_snapshot = self._table_context_snapshot()
             controls = controls_match()
+            snapshot = self._table_context_snapshot()
             now = time.monotonic_ns()
-            fingerprint = (snapshot, controls)
+            if (generation != self._filter_observation_generation()
+                    or first_controls != controls or first_snapshot != snapshot):
+                previous = None
+                if now - start >= 30_000_000_000:
+                    raise RuntimeError('Piles filters were not confirmed: filter_settlement_timeout.')
+                self.page.wait_for_timeout(100)
+                continue
+            request_state = self._filter_request_state(request_marker, month_label, year_label, status_label)
+            if request_state == 'failed':
+                network_state = 'failed'
+            # Ignore decorative row attributes: freshness must change actual
+            # table content/readiness, not focus/checkbox metadata. Request
+            # completion alone does not prove that Vue has committed its DOM.
+            fresh_fields = ('rows', 'loading', 'table_visible', 'explicit_empty')
+            if all(controls) and any(snapshot.get(key) != initial_snapshot.get(key) for key in fresh_fields):
+                generation_fresh = True
+            fingerprint = (snapshot, controls, generation, request_state)
             if fingerprint != previous:
                 previous = deepcopy(fingerprint)
                 stable_since = now
@@ -4857,13 +4967,6 @@ class CuracelPilesRunner:
             if ready and stable:
                 table_state = ('stable' if rows else
                                'empty' if snapshot.get('explicit_empty') is True else 'structurally_empty')
-            network_state, network = self._filter_network_state(
-                marker, month_label, year_label, status_label, page_number=1)
-            if network_state == 'not_observed' and historical_marker is not None:
-                historical_state, historical = self._filter_network_state(
-                    historical_marker, month_label, year_label, status_label, page_number=1)
-                if historical_state == 'succeeded' and historical.get('authoritative') is True:
-                    network_state, network = historical_state, historical
             # Preserve the authoritative-empty fallback for portal versions that
             # omit table markup entirely when no rows exist. Absence alone is unknown.
             if (stable and not rows and snapshot.get('loading') is False
@@ -4875,6 +4978,7 @@ class CuracelPilesRunner:
                     snapshot, len(rows), month_label, year_label, status_label, [],
                     require_response_identity=False))
             details = {'selection_changed': True, 'positive_dom': positive_dom,
+                       'generation_fresh': generation_fresh, 'request_pending': request_state == 'pending',
                        'network': {key: value for key, value in network.items()
                                    if key not in {'row_identity_candidates', 'row_id_hashes'}}}
             if network.get('authoritative') is True and table_state != 'unreadable':
