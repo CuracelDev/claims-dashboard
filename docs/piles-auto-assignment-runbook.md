@@ -27,6 +27,8 @@ The runner must account for every expected month/year/status context and every p
 
 The additive schema must be applied and audited before deploying code that consumes work-item leases or `cancelled_legacy`, including the recovery scripts. Leave these additions in place on rollback. The fresh migration script tolerates a source database that does not yet have those additive tables; it is not an incident recovery tool.
 
+Expanded legacy status checks are added with PostgreSQL's `NOT VALID` form only inside the schema transaction, then explicitly validated before that transaction completes. This keeps the constraint replacement safe for existing rows without permitting an application rollout against an unvalidated contract. A validation failure aborts the schema step; `npm run db:audit` also reports an exact-but-unvalidated required check separately from a changed or weakened expression. Do not continue to the application-copy stage until both apply and audit pass.
+
 ## Dispatcher acceptance checklist
 
 This checklist is an approval record, not authorization to deploy, activate flags, run a live canary, or recover work. Complete the offline gates before requesting production approval. Record the commit, operator, timestamp, aggregate counts and inspection/workflow links for each stage; do not retain credentials, claim identities, raw plan files or portal HTML.

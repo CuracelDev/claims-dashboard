@@ -264,6 +264,7 @@ async function getCheckConstraints(pool) {
         relation.relname as table_name,
         constraint_record.conname as constraint_name,
         pg_get_constraintdef(constraint_record.oid) as definition,
+        constraint_record.convalidated as is_validated,
         array_remove(array_agg(attribute.attname order by constraint_key.ordinality), null) as columns
       from pg_constraint constraint_record
       join pg_class relation on relation.oid = constraint_record.conrelid
@@ -389,6 +390,13 @@ function normalizeIndexColumn(value) {
   return normalizeSqlExpression(value);
 }
 
+function checkDefinitionExpression(value) {
+  // pg_get_constraintdef appends this catalog annotation after the complete
+  // CHECK expression for an unvalidated constraint. Validation is audited
+  // separately; it must not be mistaken for part of the boolean expression.
+  return String(value || '').replace(/\s+NOT\s+VALID\s*$/i, '');
+}
+
 function normalizeSqlExpression(value) {
   const sql = String(value || '').trim();
   let normalized = '';
@@ -453,12 +461,12 @@ function predicateMatches(actual, requirement) {
   return false;
 }
 
-function enumCheckMatches(checkConstraints, requirement) {
-  return checkConstraints.some((constraint) => {
+function matchingEnumCheck(checkConstraints, requirement) {
+  return checkConstraints.find((constraint) => {
     if (!normalizeConstraintColumns(constraint.columns).includes(requirement.column)) return false;
     const actualValues = sqlStringValues(constraint.definition);
     if (!sameValues(actualValues, requirement.values)) return false;
-    const normalized = normalizeSqlExpression(constraint.definition).replace(/^check/, '');
+    const normalized = normalizeSqlExpression(checkDefinitionExpression(constraint.definition)).replace(/^check/, '');
     const column = normalizeIndexColumn(requirement.column);
     const orderedValues = actualValues.map((value) => `'${value}'`).join(',');
     return normalized === `${column}=anyarray[${orderedValues}]`
@@ -466,10 +474,10 @@ function enumCheckMatches(checkConstraints, requirement) {
   });
 }
 
-function expressionCheckMatches(checkConstraints, requirement) {
-  return checkConstraints.some((constraint) => (
+function matchingExpressionCheck(checkConstraints, requirement) {
+  return checkConstraints.find((constraint) => (
     normalizeConstraintColumns(constraint.columns).includes(requirement.column)
-    && normalizeSqlExpression(constraint.definition).replace(/^check/, '') === requirement.normalized
+    && normalizeSqlExpression(checkDefinitionExpression(constraint.definition)).replace(/^check/, '') === requirement.normalized
   ));
 }
 
@@ -527,14 +535,20 @@ export function evaluateTable(
   }
 
   for (const requirement of expected.requiredEnumChecks || []) {
-    if (!enumCheckMatches(checkConstraints, requirement)) {
+    const constraint = matchingEnumCheck(checkConstraints, requirement);
+    if (!constraint) {
       issues.push(`${requirement.column} CHECK must accept exactly: ${requirement.values.join(', ')}`);
+    } else if (constraint.is_validated === false) {
+      issues.push(`${requirement.column} CHECK constraint must be VALIDATED`);
     }
   }
 
   for (const requirement of expected.requiredExpressionChecks || []) {
-    if (!expressionCheckMatches(checkConstraints, requirement)) {
+    const constraint = matchingExpressionCheck(checkConstraints, requirement);
+    if (!constraint) {
       issues.push(`${requirement.column} CHECK expression is missing or weakened`);
+    } else if (constraint.is_validated === false) {
+      issues.push(`${requirement.column} CHECK constraint must be VALIDATED`);
     }
   }
 

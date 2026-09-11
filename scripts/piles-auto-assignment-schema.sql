@@ -371,6 +371,9 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+ALTER TABLE piles_auto_assignment_runner_runs
+  VALIDATE CONSTRAINT piles_auto_assignment_runner_runs_status_check;
+
 DO $$ BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_constraint
@@ -394,6 +397,9 @@ DO $$ BEGIN
       )) NOT VALID;
   END IF;
 END $$;
+
+ALTER TABLE piles_auto_assignment_insurer_runs
+  VALIDATE CONSTRAINT piles_auto_assignment_insurer_runs_status_check;
 
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_scan_contexts (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
@@ -688,6 +694,9 @@ DO $$ BEGIN
       ) NOT VALID;
   END IF;
 END $$;
+
+ALTER TABLE piles_auto_assignment_schedule_requests
+  VALIDATE CONSTRAINT piles_auto_assignment_schedule_requests_status_check;
 
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_work_items (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
