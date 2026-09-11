@@ -597,7 +597,9 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
 }
 
 function HistoryBadge({ C, presentation }) {
-  const color = { success: C.success, warning: C.warn, danger: C.danger, info: C.blue, neutral: C.sub }[presentation.tone] || C.sub;
+  const color = C.historyBadgeText?.[presentation.tone]
+    || { success: C.success, warning: C.warn, danger: C.danger, info: C.blue, neutral: C.sub }[presentation.tone]
+    || C.sub;
   return <span data-tone={presentation.tone} style={{ color, fontWeight: 700, fontSize: 12 }}>{presentation.label}</span>;
 }
 
