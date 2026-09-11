@@ -45,8 +45,10 @@ jobs:
             set +a
 
             node scripts/db-schema-audit.mjs
-            node scripts/audit-piles-auto-assignment-readiness.mjs --mode database
+            readiness_status=0
+            node scripts/audit-piles-auto-assignment-readiness.mjs --mode database || readiness_status=$?
 
+            probe_status=0
             if [ "$PROBE_SCOPE" = "all-active" ]; then
               "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
                 --all-active \
@@ -54,7 +56,7 @@ jobs:
                 --month All \
                 --year All \
                 --run-source readiness \
-                --read-only
+                --read-only || probe_status=$?
             else
               if [ -z "$PROBE_INSURER" ]; then
                 echo "insurer is required for a one-insurer probe" >&2
@@ -66,5 +68,10 @@ jobs:
                 --month All \
                 --year All \
                 --run-source readiness \
-                --read-only
+                --read-only || probe_status=$?
             fi
+
+            if [ "$probe_status" -ne 0 ]; then
+              exit "$probe_status"
+            fi
+            exit "$readiness_status"
