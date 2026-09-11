@@ -904,8 +904,9 @@ class LateArrivalWorkflowTests(unittest.TestCase):
 
     def workflow(self, initial, late, *, attempts=(), v2=True, years=("2026",),
                  supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
-                 after_initial=None):
-        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[])
+                 after_initial=None, configured_bots=(), execute=True):
+        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[],
+                                      execute_modes=[])
         pending = [dict(item) for item in attempts]
 
         class Ledger(runner.ReadOnlyExecutionLedger):
@@ -958,16 +959,20 @@ class LateArrivalWorkflowTests(unittest.TestCase):
             def discover_portal_assignees(self, *args):
                 state.mapping.append(args)
                 return [runner.PortalAssignee("Daniel", "primary", 1, 1)]
-            def execute_assignment_plan(self, months, year, plans, **_):
+            def execute_assignment_plan(self, months, year, plans, **options):
                 state.applied.append(list(plans))
+                state.execute_modes.append(bool(options.get("execute")))
                 return {}, []
 
         store = types.SimpleNamespace(
             get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
-            get_bot_accounts=lambda _: [], get_weekend_roster_policy=lambda **_: None,
+            get_bot_accounts=lambda _: list(configured_bots), get_weekend_roster_policy=lambda **_: None,
             get_bot_metrics=lambda _: {}, get_team_slack_map=lambda: {},
+            get_active_tracked_piles=lambda _: [],
+            refresh_bot_metrics_from_tracking=lambda _name, _bots, metrics: metrics,
             get_all_tracked_tracking_keys=lambda _: set(), get_active_external_assignments=lambda _: [],
             sync_external_assignments_for_insurer=lambda *_: None,
+            log_assignment=lambda *_args, **_kwargs: None,
             get_rule=lambda name: runner.AssignmentRule(name, "manual_override", 25, 60, 50, 60) if manual else None,
             log_runner_event=lambda **event: state.events.append(event),
         )
@@ -975,7 +980,7 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 patch.object(runner, "CuracelPilesRunner", Portal), \
                 patch.object(runner, "is_test_portal", lambda _: True), \
                 patch.object(sys, "stdout", io.StringIO()):
-            args = types.SimpleNamespace(execute=True, all_active=False, slow_mo=0, effective_date="2026-09-10",
+            args = types.SimpleNamespace(execute=execute, all_active=False, slow_mo=0, effective_date="2026-09-10",
                                          out=str(Path(directory) / "plan.json"), worker_safe_diagnostics=v2,
                                          work_heartbeat=guard)
             try:
@@ -4035,15 +4040,98 @@ class DispatcherMainTests(unittest.TestCase):
         self.assertIn(("legacy_finalized", "skipped_overlap"), self.events)
         self.assertFalse(any(event[0] == "enqueued" for event in self.events))
 
-    def test_unblocked_probe_is_one_pass_without_queue_or_parent_writes(self):
+    def test_unconfirmed_probe_fails_after_collecting_every_requested_insurer(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
-        state, calls = DispatchState(("Kenya",)), []
-        result = self.invoke(state, lambda work, context: calls.append(work.insurer_name) or {}, execute=False,
-                             read_only=True, run_source="readiness")
-        self.assertEqual(calls, ["Kenya"])
-        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        state, calls = DispatchState(("Kenya", "Uganda")), []
+        def probe(work, context):
+            calls.append(work.insurer_name)
+            return {} if work.insurer_name == "Kenya" else {"workflow_status": "completed"}
+        with self.assertRaisesRegex(RuntimeError, "workflow_outcome_unconfirmed") as raised:
+            self.invoke(state, probe, execute=False, read_only=True, run_source="readiness")
+        self.assertEqual(calls, ["Kenya", "Uganda"])
+        self.assertEqual(raised.exception.result.status, runner.ParentRunStatus.COMPLETED_WITH_ISSUES)
+        self.assertEqual(
+            [(item.status.value, item.error_code) for item in raised.exception.result.outcomes],
+            [("completed_with_issues", "workflow_outcome_unconfirmed"), ("completed", "")],
+        )
         self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"} for event in self.events))
         self.assertEqual(state.events, [])
+
+    def test_standalone_readiness_classifies_actual_workflow_producers(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+
+        workflow = LateArrivalWorkflowTests().workflow
+        scanned = workflow(
+            {("Jul", "2026", "Vetting Pending"): [make_pile(2)]}, {}, v2=True, execute=False,
+        )
+        empty_state = workflow({}, {}, v2=True, execute=False)
+        empty = empty_state.result
+        manual = workflow(
+            {}, {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, manual=True, v2=True, execute=False,
+        )
+        warning_state = workflow(
+            {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, {}, v2=True,
+            configured_bots=(make_bot("Daniel", "primary"), make_bot("Missing", "support")), execute=False,
+        )
+        manual_result = manual.result
+        warning = warning_state.result
+        self.assertEqual(scanned.result["workflow_status"], "completed")
+        self.assertEqual(scanned.result["scan_context_summary"], {
+            "total": 5, "complete": 5, "empty": 4, "failed": 0, "pending": 0,
+        })
+        self.assertEqual(empty["scan_context_summary"], {
+            "total": 5, "complete": 5, "empty": 5, "failed": 0, "pending": 0,
+        })
+        self.assertEqual(manual_result["workflow_status"], "manual_action_required")
+        self.assertTrue(warning["portal_mapping_warnings"])
+        self.assertTrue(all(mode is False for state in (scanned, empty_state, manual, warning_state)
+                            for mode in state.execute_modes))
+
+        policy = runner.WeekendRosterPolicy(
+            roster_id="roster-fixture", weekend_start="2026-09-12", weekend_end="2026-09-13",
+            effective_date="2026-09-12", on_shift_owner_names=["Fixture Owner"],
+            off_duty_owner_names=[], eligible_bots=[], missing_reason="Roster mapping unavailable.",
+        )
+        producer_store = types.SimpleNamespace(
+            get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
+            get_bot_accounts=lambda _: [], get_weekend_roster_policy=lambda **_: policy,
+            log_runner_event=lambda **_: None,
+        )
+        producer_args = types.SimpleNamespace(
+            execute=False, effective_date="2026-09-12", worker_safe_diagnostics=True,
+        )
+        with patch.object(runner, "CuracelPilesRunner", side_effect=AssertionError("roster skip cannot open a browser")):
+            missing_roster = runner._run_for_insurer_once(
+                producer_store, producer_args, "Roster", ["All"], "All", False,
+            )
+
+        results = {
+            "Scanned": scanned.result,
+            "Empty": empty,
+            "Manual": manual_result,
+            "Warning": warning,
+            "Roster": missing_roster,
+        }
+        state = DispatchState(tuple(results))
+        with self.assertRaisesRegex(RuntimeError, "manual_action_required") as raised:
+            self.invoke(
+                state, lambda work, _context: results[work.insurer_name],
+                execute=False, read_only=True, run_source="readiness",
+            )
+        self.assertEqual(raised.exception.result.status, runner.ParentRunStatus.COMPLETED_WITH_ISSUES)
+        self.assertEqual(
+            [(item.insurer_name, item.status.value, item.error_code)
+             for item in raised.exception.result.outcomes],
+            [
+                ("Scanned", "completed", ""),
+                ("Empty", "completed", ""),
+                ("Manual", "manual_action_required", "manual_action_required"),
+                ("Warning", "completed_with_issues", "assignment_follow_up_required"),
+                ("Roster", "completed_with_issues", "workflow_outcome_unconfirmed"),
+            ],
+        )
+        self.assertFalse(any(event[0] in {"enqueued", "created", "legacy_finalized", "notification"}
+                             for event in self.events))
 
     def test_api_preview_adopts_and_terminalizes_exact_parent_without_executable_work(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState

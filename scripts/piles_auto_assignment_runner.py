@@ -9197,6 +9197,41 @@ def classify_workflow_outcome(
     return "completed", ""
 
 
+def normalize_standalone_probe_outcome(outcome: Any) -> Any:
+    """Apply workflow evidence semantics after a read-only probe transport succeeds."""
+    if getattr(outcome, "status", None) != InsurerRunStatus.COMPLETED:
+        return outcome
+    value = getattr(outcome, "value", None)
+    result = getattr(value, "result", None) if value is not None else None
+    status, error_code = classify_workflow_outcome(result)
+    return replace(outcome, status=InsurerRunStatus(status), error_code=error_code)
+
+
+class StandaloneProbeIncomplete(WorkerUnavailable):
+    """Bounded CLI failure that retains normalized outcomes for trusted callers."""
+
+    def __init__(self, result: DispatchResult) -> None:
+        self.result = result
+        first_issue = next(
+            (outcome.error_code for outcome in result.outcomes
+             if outcome.status != InsurerRunStatus.COMPLETED and outcome.error_code),
+            "readiness_probe_incomplete",
+        )
+        super().__init__(first_issue)
+
+
+def finalize_standalone_probe(outcomes: Iterable[Any]) -> DispatchResult:
+    """Derive probe truth and fail unless every requested insurer is confirmed complete."""
+    normalized = tuple(normalize_standalone_probe_outcome(outcome) for outcome in outcomes)
+    result = DispatchResult(
+        derive_parent_status((), (outcome.status for outcome in normalized)),
+        normalized,
+    )
+    if any(outcome.status != InsurerRunStatus.COMPLETED for outcome in normalized):
+        raise StandaloneProbeIncomplete(result)
+    return result
+
+
 def preview_context_diagnostics(result: dict[str, Any]) -> dict[str, int | None]:
     """Accept only internally consistent measured scan-context aggregates."""
     keys = ("total", "complete", "empty", "failed", "pending")
@@ -9399,10 +9434,7 @@ def main_v2() -> DispatchResult:
                     elif outcome.error_code == "worker_capacity_unavailable":
                         outcome = replace(outcome, error_code="probe_blocked_by_capacity")
                     outcomes.append(outcome)
-                failures = [outcome.error_code for outcome in outcomes if outcome.status == InsurerRunStatus.FAILED]
-                if failures:
-                    raise WorkerUnavailable(failures[0])
-                return DispatchResult(ParentRunStatus.COMPLETED, tuple(outcomes))
+                return finalize_standalone_probe(outcomes)
             try:
                 coordinator = build_dispatch_store(store)
                 resources.callback(coordinator.close)
@@ -9464,6 +9496,10 @@ def main() -> None:
     if dispatcher_v2_enabled():
         try:
             return main_v2()
+        except StandaloneProbeIncomplete:
+            # The exception string is already a bounded code; retain normalized
+            # outcomes for trusted in-process readiness callers.
+            raise
         except Exception as error:
             code, _ = safe_worker_error(error)
             raise RuntimeError(f"Dispatcher could not complete ({code}).") from None
