@@ -8199,6 +8199,7 @@ def _run_for_insurer_once(
     reconciliation_manual_count = 0
     reconciliation_manual_keys: set[str] = set()
     prior_attempt_keys: set[str] = set()
+    scan_context_summary: dict[str, int] | None = None
 
     print("=" * 72)
     print("Piles Auto-Assignment Runner")
@@ -8646,6 +8647,14 @@ def _run_for_insurer_once(
         v2 = bool(getattr(args, "worker_safe_diagnostics", False))
         if v2:
             snapshots = tuple(getattr(runner, "initial_scan_results", {}).values())
+            scan_context_summary = {
+                "total": len(snapshots),
+                "complete": sum(result.status in {ContextStatus.COMPLETE, ContextStatus.EMPTY} for result in snapshots),
+                "empty": sum(result.status == ContextStatus.EMPTY for result in snapshots),
+                "failed": sum(result.status == ContextStatus.FAILED for result in snapshots),
+                "pending": sum(result.status not in {ContextStatus.COMPLETE, ContextStatus.EMPTY, ContextStatus.FAILED}
+                               for result in snapshots),
+            }
             initial_observed_keys.update(expanded_tracking_key_set(
                 key for result in snapshots for row in result.rows
                 for key in (row.tracking_key, row.legacy_tracking_key, row.key)
@@ -9004,6 +9013,8 @@ def _run_for_insurer_once(
         ):
             result["workflow_status"] = "completed_with_issues"
         result["manual_action_required_count"] = manual_action_count
+        if scan_context_summary is not None:
+            result["scan_context_summary"] = scan_context_summary
     return result
 
 
@@ -9079,15 +9090,7 @@ def run_insurer_recorded(
             if ownership:
                 ownership.check()
                 summary = execution_ledger.summarize_insurer_run(insurer_run_id)
-                workflow_status = result.get("workflow_status") if isinstance(result, dict) else None
-                manual_count = safe_int(result.get("manual_action_required_count"), 0) if isinstance(result, dict) else 0
-                if workflow_status == "manual_action_required" or manual_count or summary.get("manual_action_required", 0):
-                    status, error_code = "manual_action_required", "manual_action_required"
-                elif workflow_status not in {"completed", "completed_with_issues"}:
-                    status, error_code = "completed_with_issues", "workflow_outcome_unconfirmed"
-                elif workflow_status == "completed_with_issues" or any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed")):
-                    status = "completed_with_issues"
-                    error_code = "assignment_follow_up_required"
+                status, error_code = classify_workflow_outcome(result, summary)
                 ownership.status = InsurerRunStatus(status)
                 ownership.error_code = error_code
                 ownership.check()
@@ -9172,6 +9175,45 @@ def notify_dispatch_result(args: argparse.Namespace, result: DispatchResult) -> 
         print("WARNING: assignment summary notification failed.")
 
 
+def classify_workflow_outcome(
+    result: Any, summary: Any = None,
+) -> tuple[str, str]:
+    """Require explicit workflow evidence before declaring an insurer complete."""
+    result = result if isinstance(result, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    workflow_status = norm(result.get("workflow_status"))
+    manual_count = safe_int(result.get("manual_action_required_count"), 0)
+    if workflow_status == "manual_action_required" or manual_count or summary.get("manual_action_required", 0):
+        return "manual_action_required", "manual_action_required"
+    if workflow_status not in {"completed", "completed_with_issues"}:
+        return "completed_with_issues", "workflow_outcome_unconfirmed"
+    has_follow_up = (
+        workflow_status == "completed_with_issues"
+        or bool(result.get("portal_mapping_warnings"))
+        or any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed"))
+    )
+    if has_follow_up:
+        return "completed_with_issues", "assignment_follow_up_required"
+    return "completed", ""
+
+
+def preview_context_diagnostics(result: dict[str, Any]) -> dict[str, int | None]:
+    """Accept only internally consistent measured scan-context aggregates."""
+    keys = ("total", "complete", "empty", "failed", "pending")
+    raw = result.get("scan_context_summary")
+    unknown = {f"contexts_{key}": None for key in keys}
+    if not isinstance(raw, dict):
+        return unknown
+    values = {key: raw.get(key) for key in keys}
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 100000
+           for value in values.values()):
+        return unknown
+    if (values["empty"] > values["complete"]
+            or values["complete"] + values["failed"] + values["pending"] != values["total"]):
+        return unknown
+    return {f"contexts_{key}": value for key, value in values.items()}
+
+
 def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
     """Project a probe result into bounded, non-identifying parent diagnostics."""
     value = getattr(outcome, "value", None)
@@ -9180,12 +9222,7 @@ def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
     status = getattr(getattr(outcome, "status", None), "value", "failed")
     error_code = norm(getattr(outcome, "error_code", ""))[:100]
     if status == "completed":
-        workflow_status = norm(result.get("workflow_status"))
-        manual_count = safe_int(result.get("manual_action_required_count"), 0)
-        if workflow_status == "manual_action_required" or manual_count:
-            status, error_code = "manual_action_required", "manual_action_required"
-        elif workflow_status == "completed_with_issues":
-            status, error_code = "completed_with_issues", "assignment_follow_up_required"
+        status, error_code = classify_workflow_outcome(result)
     unassigned = list(result.get("unassigned") or [])
     plans = [*list(result.get("reassignment_plans") or []), *list(result.get("plans") or [])]
     return {
@@ -9197,6 +9234,7 @@ def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
         "discovered_claims": sum(max(safe_int(getattr(item, "remaining_claims", 0), 0), 0) for item in unassigned),
         "planned_piles": len(plans),
         "planned_claims": sum(max(safe_int(getattr(item, "remaining_claims", 0), 0), 0) for item in plans),
+        **preview_context_diagnostics(result),
     }
 
 

@@ -994,6 +994,10 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 self.assertEqual(state.scans.count(context), 2)
                 self.assertEqual([[plan.pile_key for plan in batch] for batch in state.applied], [["pile-2"]])
                 self.assertEqual(state.result["late_arrival_detection"]["count"], 1)
+                self.assertEqual(state.result["scan_context_summary"], {
+                    "total": 5, "complete": 5, "empty": 5 - int(bool(rows)),
+                    "failed": 0, "pending": 0,
+                })
 
     def test_actual_flow_preserves_concrete_and_all_year_contexts(self):
         for multiple, expected in ((False, {"2026", "2025"}), (True, {"All"})):
@@ -4047,9 +4051,13 @@ class DispatcherMainTests(unittest.TestCase):
         result = self.invoke(
             state,
             lambda work, context: calls.append(work.insurer_name) or {
+                "workflow_status": "completed",
                 "unassigned": [types.SimpleNamespace(remaining_claims=17)],
                 "plans": [types.SimpleNamespace(remaining_claims=17)],
                 "reassignment_plans": [],
+                "scan_context_summary": {
+                    "total": 5, "complete": 5, "empty": 5, "failed": 0, "pending": 0,
+                },
                 "late_arrival_detection": {"count": 0, "claims": 0},
             },
             execute=False, read_only=False, adopt_preview=True, run_source="manual",
@@ -4069,7 +4077,68 @@ class DispatcherMainTests(unittest.TestCase):
             "insurer_name": "Kenya", "status": "completed", "phase": "complete",
             "error_code": "", "discovered_piles": 1, "discovered_claims": 17,
             "planned_piles": 1, "planned_claims": 17,
+            "contexts_total": 5, "contexts_complete": 5, "contexts_empty": 5,
+            "contexts_failed": 0, "contexts_pending": 0,
         }])
+
+    def test_actual_weekend_mapping_skip_cannot_complete_a_durable_preview(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        events = []
+        policy = runner.WeekendRosterPolicy(
+            roster_id="roster-fixture", weekend_start="2026-09-12", weekend_end="2026-09-13",
+            effective_date="2026-09-12", on_shift_owner_names=["Fixture Owner"],
+            off_duty_owner_names=[], eligible_bots=[],
+            missing_reason="Weekend roster has no matching active bot.",
+        )
+        producer_store = types.SimpleNamespace(
+            get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
+            get_bot_accounts=lambda _: [], get_weekend_roster_policy=lambda **_: policy,
+            log_runner_event=lambda **event: events.append(event),
+        )
+        producer_args = types.SimpleNamespace(
+            execute=False, effective_date="2026-09-12", worker_safe_diagnostics=True,
+        )
+        with patch.object(runner, "CuracelPilesRunner", side_effect=AssertionError("skip cannot open portal")):
+            with self.assertRaisesRegex(RuntimeError, "workflow_outcome_unconfirmed"):
+                self.invoke(
+                    state,
+                    lambda *_: runner._run_for_insurer_once(
+                        producer_store, producer_args, "Kenya", ["All"], "All", False,
+                    ),
+                    execute=False, read_only=False, adopt_preview=True, run_source="manual",
+                )
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "completed_with_issues")
+        self.assertEqual(finalized[3]["error_code"], "workflow_outcome_unconfirmed")
+        self.assertEqual(finalized[3]["outcomes"], [{
+            "insurer_name": "Kenya", "status": "completed_with_issues", "phase": "complete",
+            "error_code": "workflow_outcome_unconfirmed", "discovered_piles": 0,
+            "discovered_claims": 0, "planned_piles": 0, "planned_claims": 0,
+            "contexts_total": None, "contexts_complete": None, "contexts_empty": None,
+            "contexts_failed": None, "contexts_pending": None,
+        }])
+        self.assertEqual([event["event_type"] for event in events], [
+            "weekend_roster_missing_mapping", "weekend_roster_skipped_insurer",
+        ])
+
+    def test_preview_completion_classifier_fails_closed_without_positive_evidence(self):
+        outcomes = []
+        for result in ({}, {"workflow_status": "skipped"},
+                       {"workflow_status": "completed", "portal_mapping_warnings": ["warning"]}):
+            outcome = types.SimpleNamespace(
+                insurer_name="Kenya", status=types.SimpleNamespace(value="completed"),
+                error_code="", value=types.SimpleNamespace(result=result),
+            )
+            outcomes.append(runner.preview_diagnostic_outcome(outcome))
+        self.assertEqual(
+            [(item["status"], item["error_code"]) for item in outcomes],
+            [
+                ("completed_with_issues", "workflow_outcome_unconfirmed"),
+                ("completed_with_issues", "workflow_outcome_unconfirmed"),
+                ("completed_with_issues", "assignment_follow_up_required"),
+            ],
+        )
 
     def test_api_preview_failure_terminalizes_parent_with_safe_diagnostics(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
@@ -4120,7 +4189,7 @@ class DispatcherMainTests(unittest.TestCase):
         def portal(work, _context):
             calls.append(work.insurer_name)
             signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
-            return {"unassigned": [], "plans": [], "reassignment_plans": []}
+            return {"workflow_status": "completed", "unassigned": [], "plans": [], "reassignment_plans": []}
         with self.assertRaisesRegex(RuntimeError, "dispatch_stopped"):
             self.invoke(state, portal, execute=False, read_only=False,
                         adopt_preview=True, run_source="manual")
@@ -4133,7 +4202,7 @@ class DispatcherMainTests(unittest.TestCase):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
         state, calls = DispatchState(("Kenya", "Uganda")), []
         with self.assertRaisesRegex(RuntimeError, "unexpected_error"):
-            self.invoke(state, lambda work, _context: calls.append(work.insurer_name) or {},
+            self.invoke(state, lambda work, _context: calls.append(work.insurer_name) or {"workflow_status": "completed"},
                         execute=False, read_only=False, adopt_preview=True, run_source="manual",
                         preview_heartbeat_error_after=1)
         self.assertEqual(calls, ["Kenya"])
