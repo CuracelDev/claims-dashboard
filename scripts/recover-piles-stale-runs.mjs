@@ -47,6 +47,13 @@ export async function recoveryParentLock(client, id) {
     'SELECT id, status, details FROM piles_auto_assignment_runner_runs WHERE id = $1 FOR UPDATE', [id]))[0];
 }
 
+async function recoveryPreviewParentLock(client, id) {
+  const rows = await recoveryQuery(client, 'recovery-preview-parent-lock',
+    'SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired',
+    [`piles-preview-parent:${id}`]);
+  return rows[0]?.acquired === true;
+}
+
 export function terminalRecoveryParent(parent) { return TERMINAL.has(parent?.status); }
 
 // Identifiers below are module-owned SQL, never operator input.
@@ -267,9 +274,12 @@ async function repairParent(client, options, report) {
   let outcome = parentOutcome(work, ownedOutcomes, !work.length && !children.length && references.length > 0);
   if (!outcome && !work.length && !children.length && !references.length
       && parent.details?.preview_protocol === 'durable_preview_v1') {
+    if (!await recoveryPreviewParentLock(client, options.id)) return false;
     const evidence = await recoveryQuery(client, 'recovery-preview-parent-evidence', `
       SELECT status = 'running' AND mode = 'dry-run' AND run_source = 'manual'
         AND details->>'preview_protocol' = 'durable_preview_v1'
+        AND details->>'preview_claim_token' ~
+          '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
         AND updated_at < clock_timestamp() - interval '15 minutes' AS eligible
       FROM piles_auto_assignment_runner_runs WHERE id = $1
     `, [options.id]);
@@ -285,6 +295,8 @@ async function repairParent(client, options, report) {
       WHERE parent.id = $1 AND parent.status = 'running' AND parent.mode = 'dry-run'
         AND parent.run_source = 'manual'
         AND parent.details->>'preview_protocol' = 'durable_preview_v1'
+        AND parent.details->>'preview_claim_token' ~
+          '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
         AND parent.updated_at < clock_timestamp() - interval '15 minutes'
         AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items work
           WHERE work.parent_runner_run_id = parent.id)

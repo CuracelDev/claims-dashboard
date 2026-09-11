@@ -361,6 +361,14 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
         """, [preview, self.insurer])
         parent_store = runner.DataStore.__new__(runner.DataStore)
         parent_store.mode, parent_store.read_only, parent_store.conn = "postgres", False, self.worker
+        contender = runner.DataStore.__new__(runner.DataStore)
+        contender.mode, contender.read_only, contender.conn = "postgres", False, self.blocker
+        self.assertTrue(parent_store.try_acquire_preview_parent_lock(preview))
+        self.assertFalse(contender.try_acquire_preview_parent_lock(preview))
+        parent_store.release_preview_parent_lock(preview)
+        self.assertTrue(contender.try_acquire_preview_parent_lock(preview))
+        contender.release_preview_parent_lock(preview)
+        self.assertTrue(parent_store.try_acquire_preview_parent_lock(preview))
         token = parent_store.claim_preview_runner_run(
             run_id=preview, insurer_name=self.insurer, run_scope="single",
             portal_environment="test", backend="local", run_source="manual",
@@ -392,6 +400,22 @@ class FinalAssignmentPostgresTests(unittest.TestCase):
         self.assertEqual(self.admin.query(
             "SELECT count(*)::integer AS count FROM piles_auto_assignment_insurer_runs WHERE runner_run_id=%s",
             [preview])["rows"][0]["count"], 0)
+        parent_store.release_preview_parent_lock(preview)
+
+    def test_preview_parent_session_lock_is_released_by_process_connection_loss(self):
+        preview = "preview-crash-" + uuid.uuid4().hex
+        crashed = Connection(self.bridge)
+        observer = runner.DataStore.__new__(runner.DataStore)
+        observer.mode, observer.read_only, observer.conn = "postgres", False, self.blocker
+        owner = runner.DataStore.__new__(runner.DataStore)
+        owner.mode, owner.read_only, owner.conn = "postgres", False, crashed
+        try:
+            self.assertTrue(owner.try_acquire_preview_parent_lock(preview))
+            self.assertFalse(observer.try_acquire_preview_parent_lock(preview))
+        finally:
+            crashed.close()
+        self.assertTrue(observer.try_acquire_preview_parent_lock(preview))
+        observer.release_preview_parent_lock(preview)
 
 
 if __name__ == "__main__":

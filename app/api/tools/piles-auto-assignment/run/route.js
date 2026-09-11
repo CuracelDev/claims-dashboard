@@ -110,6 +110,9 @@ export async function POST(httpRequest) {
       queued_at: now,
       finalize_assignments: request.finalizeAssignments,
       insurers: request.runAll ? [] : [request.insurerName],
+      ...(request.finalizeAssignments ? {} : {
+        preview_protocol: 'durable_preview_v1', preview_phase: 'configuration', preview_outcomes: [],
+      }),
     };
     const { error: insertError } = await supabase.from('piles_auto_assignment_runner_runs').insert({
       id: runId, insurer_name: request.runAll ? '' : request.insurerName,

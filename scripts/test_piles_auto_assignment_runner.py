@@ -3237,6 +3237,22 @@ class RunnerRunAdoptionTests(unittest.TestCase):
                 months=["All"], year="2026", mode="dry-run",
             )
 
+    def test_preview_parent_advisory_lock_uses_a_domain_separated_exact_id(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "postgres"
+        calls = []
+        responses = iter([[{"acquired": True}], [{"released": True}]])
+        store._fetchall_postgres = lambda sql, params=(): calls.append((" ".join(sql.split()), params)) or next(responses)
+        self.assertTrue(store.try_acquire_preview_parent_lock("preview-parent"))
+        store.release_preview_parent_lock("preview-parent")
+        self.assertEqual([params for _sql, params in calls], [
+            ("piles-preview-parent:preview-parent",),
+            ("piles-preview-parent:preview-parent",),
+        ])
+        self.assertIn("pg_try_advisory_lock", calls[0][0])
+        self.assertIn("pg_advisory_unlock", calls[1][0])
+        self.assertFalse(store.try_acquire_preview_parent_lock("invalid/id"))
+
 
 class AssignmentRuleLoadingTests(unittest.TestCase):
     def test_inactive_rule_is_not_applied(self):
@@ -3828,7 +3844,8 @@ class DispatcherNotificationPrivacyTests(unittest.TestCase):
 class DispatcherMainTests(unittest.TestCase):
     def invoke(self, state, run_one, *, execute=True, read_only=None, adopt_preview=False,
                run_source="schedule", flag="true", maximum=2, terminal_replay=False,
-               preview_claim_error=None, restored_rows=()):
+               preview_claim_error=None, preview_lock=True, discovery_error=None,
+               restored_rows=()):
         now = datetime(2026, 9, 10, tzinfo=timezone.utc)
         self.args = types.SimpleNamespace(read_only=not execute if read_only is None else read_only,
             adopt_preview_run=adopt_preview, execute=execute, portal_environment="test",
@@ -3841,6 +3858,9 @@ class DispatcherMainTests(unittest.TestCase):
             def __init__(self, **options):
                 owner.events.append(("store", options))
             def get_active_master_accounts(self):
+                owner.events.append(("accounts",))
+                if discovery_error:
+                    raise discovery_error
                 return [types.SimpleNamespace(insurer_name=row.insurer_name) for row in state.rows.values()]
             def create_runner_run(self, **fields):
                 owner.events.append(("created", fields["run_source"]))
@@ -3850,6 +3870,11 @@ class DispatcherMainTests(unittest.TestCase):
                 if preview_claim_error:
                     raise preview_claim_error
                 return "preview-token"
+            def try_acquire_preview_parent_lock(self, run_id):
+                owner.events.append(("preview_lock", run_id))
+                return preview_lock
+            def release_preview_parent_lock(self, run_id):
+                owner.events.append(("preview_unlock", run_id))
             def heartbeat_preview_runner_run(self, run_id, token, phase):
                 owner.events.append(("preview_heartbeat", run_id, token, phase))
                 return True
@@ -4081,6 +4106,46 @@ class DispatcherMainTests(unittest.TestCase):
         self.assertEqual(finalized[3]["status"], "completed_with_issues")
         self.assertEqual(finalized[3]["error_code"], "dispatch_stopped")
         self.assertEqual(state.events, [])
+
+    def test_preview_claim_precedes_all_active_discovery_and_discovery_failure_is_terminal(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        with self.assertRaisesRegex(RuntimeError, "unexpected_error"):
+            self.invoke(state, lambda *_: self.fail("discovery failure cannot reach portal"),
+                        execute=False, read_only=False, adopt_preview=True, run_source="manual",
+                        discovery_error=RuntimeError("private database diagnostic"))
+        kinds = [event[0] for event in self.events]
+        self.assertLess(kinds.index("preview_lock"), kinds.index("preview_claim"))
+        self.assertLess(kinds.index("preview_claim"), kinds.index("accounts"))
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual((finalized[3]["status"], finalized[3]["error_code"]), ("failed", "unexpected_error"))
+        self.assertLess(kinds.index("preview_unlock"), kinds.index("closed"))
+        self.assertNotIn("private database diagnostic", repr(self.events))
+
+    def test_live_preview_parent_lock_prevents_adoption_without_mutating_parent(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya",))
+        with self.assertRaisesRegex(RuntimeError, "preview_parent_unavailable"):
+            self.invoke(state, lambda *_: self.fail("held parent lock cannot reach portal"),
+                        execute=False, read_only=False, adopt_preview=True, run_source="manual",
+                        preview_lock=False)
+        self.assertEqual([event[0] for event in self.events], ["store", "preview_lock", "closed"])
+
+    def test_preview_issue_and_failure_aggregate_like_execute_parent(self):
+        from scripts.test_piles_auto_assignment_dispatch import DispatchState
+        state = DispatchState(("Kenya", "Uganda"))
+        def portal(work, _context):
+            if work.insurer_name == "Uganda":
+                raise TimeoutError("private timeout")
+            return {"workflow_status": "manual_action_required", "manual_action_required_count": 2,
+                    "unassigned": [], "plans": [], "reassignment_plans": []}
+        with self.assertRaisesRegex(RuntimeError, "portal_timeout"):
+            self.invoke(state, portal, execute=False, read_only=False,
+                        adopt_preview=True, run_source="manual")
+        finalized = next(event for event in self.events if event[0] == "preview_finalized")
+        self.assertEqual(finalized[3]["status"], "completed_with_issues")
+        self.assertEqual([item["status"] for item in finalized[3]["outcomes"]],
+                         ["manual_action_required", "failed"])
 
     def test_shutdown_signal_finishes_active_work_and_leaves_next_work_queued(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState

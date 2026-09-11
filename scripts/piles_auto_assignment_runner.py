@@ -58,7 +58,7 @@ try:
         plan_assignments,
     )
     from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
-    from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
     from piles_auto_assignment.scheduling import configured_max_concurrency
 except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
@@ -76,7 +76,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         plan_assignments,
     )
     from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
-    from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
     from scripts.piles_auto_assignment.scheduling import configured_max_concurrency
 
 
@@ -3393,6 +3393,24 @@ class DataStore:
         if row.get("status") in {"completed", "completed_with_issues", "failed", "cancelled"}:
             raise ParentAlreadyTerminal("The preview parent is already terminal.")
         raise WorkerUnavailable("preview_parent_unavailable")
+
+    def try_acquire_preview_parent_lock(self, run_id: str) -> bool:
+        run_id = norm(run_id)
+        if self.mode != "postgres" or not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", run_id):
+            return False
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+            (f"piles-preview-parent:{run_id}",),
+        )
+        return bool(rows and rows[0].get("acquired"))
+
+    def release_preview_parent_lock(self, run_id: str) -> None:
+        run_id = norm(run_id)
+        if self.mode == "postgres" and re.fullmatch(r"[A-Za-z0-9._-]{1,200}", run_id):
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-preview-parent:{run_id}",),
+            )
 
     def heartbeat_preview_runner_run(self, run_id: str, token: str, phase: str) -> bool:
         phase = phase if phase in {"configuration", "login", "navigation", "scan", "plan", "reconcile", "final_rescan", "complete"} else "configuration"
@@ -9185,7 +9203,6 @@ def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
 def run_durable_preview(
     args: argparse.Namespace,
     store: DataStore,
-    insurers: list[str],
     months: list[str],
     year: str,
     visible: bool,
@@ -9194,76 +9211,89 @@ def run_durable_preview(
 ) -> DispatchResult:
     """Run an API preview with read-only workers and one fenced parent writer."""
     scope = "all-active" if args.all_active else "single"
-    token = store.claim_preview_runner_run(
-        run_id=args.run_id, insurer_name=args.insurer or "", run_scope=scope,
-        portal_environment=PORTAL_ENVIRONMENT, backend=norm(args.invocation_backend) or "local",
-        run_source=norm(args.run_source), months=months, year=year, mode="dry-run",
-    )
-    finalized = False
-    outcomes = []
-    diagnostics: list[dict[str, Any]] = []
-    parent_error = ""
+    if not store.try_acquire_preview_parent_lock(args.run_id):
+        raise WorkerUnavailable("preview_parent_unavailable")
     try:
-        probe_args = deepcopy(args)
-        probe_args.read_only = True
-        probe_args.worker_safe_diagnostics = True
-        def preview_heartbeat(phase="scan"):
-            if stopped.is_set():
-                raise WorkerUnavailable("dispatch_stopped")
-            if not store.heartbeat_preview_runner_run(args.run_id, token, phase):
+        token = store.claim_preview_runner_run(
+            run_id=args.run_id, insurer_name=args.insurer or "", run_scope=scope,
+            portal_environment=PORTAL_ENVIRONMENT, backend=norm(args.invocation_backend) or "local",
+            run_source=norm(args.run_source), months=months, year=year, mode="dry-run",
+        )
+        finalized = False
+        outcomes = []
+        diagnostics: list[dict[str, Any]] = []
+        parent_error = ""
+        try:
+            insurers = [args.insurer] if args.insurer else [
+                account.insurer_name for account in store.get_active_master_accounts()
+            ]
+            if not insurers:
+                raise RuntimeError("No active insurer master accounts were found to preview.")
+            probe_args = deepcopy(args)
+            probe_args.read_only = True
+            probe_args.worker_safe_diagnostics = True
+            def preview_heartbeat(phase="scan"):
+                if stopped.is_set():
+                    raise WorkerUnavailable("dispatch_stopped")
+                if not store.heartbeat_preview_runner_run(args.run_id, token, phase):
+                    raise WorkerUnavailable("preview_parent_ownership_lost")
+            probe_args.work_heartbeat = preview_heartbeat
+            factory = worker_context_factory(probe_args, router, max_concurrency=1, durable_claims=False)
+            @contextmanager
+            def probe_context(work):
+                with factory(work) as context:
+                    yield replace(context, dispatch_store=None, ownership=None)
+            def run_one(work, context):
+                return run_claimed_insurer_once(work, context, probe_args, months, year, visible)
+            for insurer in insurers:
+                if stopped.is_set():
+                    parent_error = "dispatch_stopped"
+                    break
+                if not store.heartbeat_preview_runner_run(args.run_id, token, "scan"):
+                    raise WorkerUnavailable("preview_parent_ownership_lost")
+                work = ProbeWork(insurer, canonical_insurer_key(insurer))
+                outcome = execute_claimed_insurer(work, probe_context, run_one, stop_event=stopped)
+                if outcome.error_code == "insurer_lock_unavailable":
+                    outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
+                elif outcome.error_code == "worker_capacity_unavailable":
+                    outcome = replace(outcome, error_code="probe_blocked_by_capacity")
+                outcomes.append(outcome)
+                diagnostic = preview_diagnostic_outcome(outcome)
+                diagnostics.append(diagnostic)
+                if diagnostic["status"] == "failed" and not parent_error:
+                    parent_error = diagnostic["error_code"] or "unexpected_error"
+                if stopped.is_set() and len(outcomes) < len(insurers):
+                    parent_error = "dispatch_stopped"
+                    break
+            if parent_error == "dispatch_stopped":
+                status = "completed_with_issues" if diagnostics else "failed"
+            else:
+                status = derive_parent_status((), (
+                    InsurerRunStatus(item["status"]) for item in diagnostics
+                )).value
+            error_code = parent_error or next((item["error_code"] for item in diagnostics if item["error_code"]), "")
+            if not store.finalize_preview_runner_run(
+                args.run_id, token, status=status, outcomes=diagnostics, error_code=error_code,
+            ):
                 raise WorkerUnavailable("preview_parent_ownership_lost")
-        probe_args.work_heartbeat = preview_heartbeat
-        factory = worker_context_factory(probe_args, router, max_concurrency=1, durable_claims=False)
-        @contextmanager
-        def probe_context(work):
-            with factory(work) as context:
-                yield replace(context, dispatch_store=None, ownership=None)
-        def run_one(work, context):
-            return run_claimed_insurer_once(work, context, probe_args, months, year, visible)
-        for insurer in insurers:
-            if stopped.is_set():
-                parent_error = "dispatch_stopped"
-                break
-            if not store.heartbeat_preview_runner_run(args.run_id, token, "scan"):
-                raise WorkerUnavailable("preview_parent_ownership_lost")
-            work = ProbeWork(insurer, canonical_insurer_key(insurer))
-            outcome = execute_claimed_insurer(work, probe_context, run_one, stop_event=stopped)
-            if outcome.error_code == "insurer_lock_unavailable":
-                outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
-            elif outcome.error_code == "worker_capacity_unavailable":
-                outcome = replace(outcome, error_code="probe_blocked_by_capacity")
-            outcomes.append(outcome)
-            diagnostic = preview_diagnostic_outcome(outcome)
-            diagnostics.append(diagnostic)
-            if diagnostic["status"] == "failed" and not parent_error:
-                parent_error = diagnostic["error_code"] or "unexpected_error"
-            if stopped.is_set() and len(outcomes) < len(insurers):
-                parent_error = "dispatch_stopped"
-                break
-        issue = parent_error or any(item["status"] != "completed" for item in diagnostics)
-        successful = any(item["status"] == "completed" for item in diagnostics)
-        status = "completed_with_issues" if issue and successful else "failed" if issue else "completed"
-        if not store.finalize_preview_runner_run(
-            args.run_id, token, status=status, outcomes=diagnostics,
-            error_code=parent_error or next((item["error_code"] for item in diagnostics if item["error_code"]), ""),
-        ):
-            raise WorkerUnavailable("preview_parent_ownership_lost")
-        finalized = True
-        result = DispatchResult(ParentRunStatus(status), tuple(outcomes))
-        if issue:
-            raise WorkerUnavailable(parent_error or "preview_completed_with_issues")
-        return result
-    except Exception as error:
-        if not finalized:
-            code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
-            try:
-                store.finalize_preview_runner_run(
-                    args.run_id, token, status="completed_with_issues" if diagnostics else "failed",
-                    outcomes=diagnostics, error_code=code,
-                )
-            except Exception:
-                pass
-        raise
+            finalized = True
+            result = DispatchResult(ParentRunStatus(status), tuple(outcomes))
+            if status != "completed":
+                raise WorkerUnavailable(error_code or "preview_completed_with_issues")
+            return result
+        except Exception as error:
+            if not finalized:
+                code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
+                try:
+                    store.finalize_preview_runner_run(
+                        args.run_id, token, status="completed_with_issues" if diagnostics else "failed",
+                        outcomes=diagnostics, error_code=code,
+                    )
+                except Exception:
+                    pass
+            raise
+    finally:
+        store.release_preview_parent_lock(args.run_id)
 
 
 def main_v2() -> DispatchResult:
@@ -9295,17 +9325,17 @@ def main_v2() -> DispatchResult:
             resources.callback(signal.signal, shutdown_signal, original)
         store = DataStore(read_only=bool(args.read_only))
         resources.callback(store.close)
-        insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
-        if not insurers:
-            raise RuntimeError("No active insurer master accounts were found to run.")
         with ContextOutputRouter.installed() as router:
             if durable_preview:
                 try:
-                    return run_durable_preview(args, store, insurers, months, year, visible, router, stopped)
+                    return run_durable_preview(args, store, months, year, visible, router, stopped)
                 except ParentAlreadyTerminal:
                     return DispatchResult(ParentRunStatus.COMPLETED, ())
                 except ParentScopeMismatch:
                     raise WorkerUnavailable("parent_scope_mismatch") from None
+            insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
+            if not insurers:
+                raise RuntimeError("No active insurer master accounts were found to run.")
             factory = worker_context_factory(args, router, max_concurrency=maximum, durable_claims=bool(args.execute))
             def run_one(work, context):
                 return run_claimed_insurer_once(work, context, args, months, year, visible)
