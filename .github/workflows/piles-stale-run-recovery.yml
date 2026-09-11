@@ -4,17 +4,42 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Inspect is read-only; recover finalizes only stale runs whose insurer lock is free
+        description: Inspect and legacy-audit are read-only; each mutation requires one exact target and confirmation
         required: true
         default: inspect
         type: choice
         options:
           - inspect
           - recover
+          - legacy-audit
+          - legacy-apply
       confirmation:
-        description: Type RECOVER_STALE_RUNS when action is recover
+        description: RECOVER_STALE_RUNS for recover; CANCEL_OBSOLETE_LEGACY_REQUESTS for legacy-apply; otherwise blank
         required: false
         type: string
+      work_id:
+        description: Exact work item ID (inspect/recover only)
+        required: false
+        type: string
+      claim_token:
+        description: Current claim token (work-item recover only; workflow input metadata is not a secret store)
+        required: false
+        type: string
+      insurer_run_id:
+        description: Exact stale insurer run ID (inspect/recover only; cannot combine with work or parent ID)
+        required: false
+        type: string
+      parent_run_id:
+        description: Exact parent ID to inspect/repair (cannot combine with work or insurer run ID)
+        required: false
+        type: string
+      request_id:
+        description: Exact legacy request ID (legacy-audit/legacy-apply only)
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 concurrency:
   group: piles-production-host
@@ -24,28 +49,92 @@ jobs:
   recover:
     runs-on: ubuntu-latest
     steps:
+      - name: Privately load inputs, mask ownership token, then export validated values
+        shell: bash
+        run: |
+          set -eu
+          # No input expressions or token environment exist in this step's preamble.
+          # Read the event privately; register masking before any later step sees it.
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          try {
+            const inputs = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).inputs;
+            if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error();
+            const token = inputs.claim_token ?? '';
+            if (typeof token !== 'string') throw new Error();
+            if (token) process.stdout.write(`::add-mask::${token.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}\n`);
+            const names = ['action', 'confirmation', 'work_id', 'claim_token', 'insurer_run_id', 'parent_run_id', 'request_id'];
+            const values = Object.fromEntries(names.map((name) => [name, inputs[name] ?? '']));
+            if (Object.values(values).some((value) => typeof value !== 'string')) throw new Error();
+            if (!['inspect', 'recover', 'legacy-audit', 'legacy-apply'].includes(values.action)) throw new Error();
+            if (!['', 'RECOVER_STALE_RUNS', 'CANCEL_OBSOLETE_LEGACY_REQUESTS'].includes(values.confirmation)) throw new Error();
+            for (const name of names.slice(2)) {
+              if (!/^[A-Za-z0-9._-]{0,200}$/.test(values[name])) throw new Error();
+            }
+            appendFileSync(process.env.GITHUB_ENV, names.map((name) => `RECOVERY_${name.toUpperCase()}=${values[name]}\n`).join(''));
+          } catch {
+            console.error('Invalid recovery input.');
+            process.exitCode = 1;
+          }
+          NODE
       - name: Inspect or recover stale Piles runs
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
-        env:
-          RECOVERY_ACTION: ${{ inputs.action }}
-          RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: RECOVERY_ACTION,RECOVERY_CONFIRMATION
+          envs: RECOVERY_ACTION,RECOVERY_CONFIRMATION,RECOVERY_WORK_ID,RECOVERY_CLAIM_TOKEN,RECOVERY_INSURER_RUN_ID,RECOVERY_PARENT_RUN_ID,RECOVERY_REQUEST_ID
           script: |
             set -eu
+            # Never enable shell tracing: IDs/tokens and .env must not be echoed.
+            fail() { echo "Invalid recovery action, target or confirmation." >&2; exit 1; }
+            set --
+            case "$RECOVERY_ACTION" in
+              inspect|recover)
+                [ -z "$RECOVERY_REQUEST_ID" ] || fail
+                target_count=0
+                if [ -n "$RECOVERY_WORK_ID" ]; then
+                  set -- "$@" --work-id "$RECOVERY_WORK_ID"
+                  target_count=$((target_count + 1))
+                fi
+                if [ -n "$RECOVERY_INSURER_RUN_ID" ]; then
+                  set -- "$@" --insurer-run-id "$RECOVERY_INSURER_RUN_ID"
+                  target_count=$((target_count + 1))
+                fi
+                if [ -n "$RECOVERY_PARENT_RUN_ID" ]; then
+                  set -- "$@" --parent-run-id "$RECOVERY_PARENT_RUN_ID"
+                  target_count=$((target_count + 1))
+                fi
+                [ "$target_count" -le 1 ] || fail
+                if [ "$RECOVERY_ACTION" = recover ]; then
+                  [ "$target_count" -eq 1 ] && [ "$RECOVERY_CONFIRMATION" = RECOVER_STALE_RUNS ] || fail
+                  set -- "$@" --apply --confirmation "$RECOVERY_CONFIRMATION"
+                  if [ -n "$RECOVERY_WORK_ID" ]; then
+                    [ -n "$RECOVERY_CLAIM_TOKEN" ] || fail
+                    set -- "$@" --claim-token "$RECOVERY_CLAIM_TOKEN"
+                  else
+                    [ -z "$RECOVERY_CLAIM_TOKEN" ] || fail
+                  fi
+                else
+                  [ -z "$RECOVERY_CONFIRMATION" ] && [ -z "$RECOVERY_CLAIM_TOKEN" ] || fail
+                fi
+                operation_script=scripts/recover-piles-stale-runs.mjs
+                ;;
+              legacy-audit|legacy-apply)
+                [ -z "$RECOVERY_WORK_ID" ] && [ -z "$RECOVERY_CLAIM_TOKEN" ] && [ -z "$RECOVERY_INSURER_RUN_ID" ] && [ -z "$RECOVERY_PARENT_RUN_ID" ] || fail
+                if [ -n "$RECOVERY_REQUEST_ID" ]; then set -- --request-id "$RECOVERY_REQUEST_ID"; fi
+                if [ "$RECOVERY_ACTION" = legacy-apply ]; then
+                  [ -n "$RECOVERY_REQUEST_ID" ] && [ "$RECOVERY_CONFIRMATION" = CANCEL_OBSOLETE_LEGACY_REQUESTS ] || fail
+                  set -- "$@" --apply --confirmation "$RECOVERY_CONFIRMATION"
+                else
+                  [ -z "$RECOVERY_CONFIRMATION" ] || fail
+                fi
+                operation_script=scripts/audit-piles-legacy-requests.mjs
+                ;;
+              *) fail ;;
+            esac
             cd ~/claims-dashboard
             set -a
             . ./.env
             set +a
-            if [ "$RECOVERY_ACTION" = "recover" ]; then
-              if [ "$RECOVERY_CONFIRMATION" != "RECOVER_STALE_RUNS" ]; then
-                echo "Exact recovery confirmation is required." >&2
-                exit 1
-              fi
-              node scripts/recover-piles-stale-runs.mjs --apply
-            else
-              node scripts/recover-piles-stale-runs.mjs
-            fi
+            node "$operation_script" "$@"

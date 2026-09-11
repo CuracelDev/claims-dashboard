@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 from typing import Any, Mapping
 
-from .domain import AttemptStatus, FilterEvidence
+from .domain import AttemptStatus, FilterEvidence, WaitDecision
 
 
 @dataclass(frozen=True)
@@ -67,17 +67,49 @@ def classify_assignment_observations(
     return tuple(decisions)
 
 
+def decide_filter_wait(evidence: FilterEvidence, elapsed_ms: float,
+                       response_grace_ms: float = 1500) -> WaitDecision:
+    """Positive evidence may settle early; unknown evidence never means empty."""
+    decision = evaluate_filter_evidence(evidence)
+    network = evidence.details.get('network', {})
+    authoritative = isinstance(network, Mapping) and network.get('authoritative') is True
+    if evidence.network_state == 'failed':
+        return WaitDecision('fail', 'filter_response_failed')
+    if evidence.network_state == 'succeeded' and authoritative:
+        if evidence.table_state == 'empty' and network.get('authoritative_empty') is not True:
+            return WaitDecision('fail', 'empty_ui_conflicts_with_response')
+        if evidence.details.get('dom_matches_response') is False:
+            return WaitDecision('fail', 'filter_dom_response_mismatch')
+    positive = (evidence.details.get('positive_dom') is True
+                and evidence.details.get('generation_fresh') is True)
+    coherent = (evidence.network_state == 'succeeded' and authoritative
+                and evidence.details.get('dom_matches_response') is True)
+    if decision.accepted and (coherent or (evidence.network_state == 'not_observed' and positive)):
+        if elapsed_ms >= response_grace_ms:
+            return WaitDecision('accept', decision.code)
+    if elapsed_ms >= 30000:
+        return WaitDecision('retry', 'filter_settlement_timeout')
+    return WaitDecision('continue', 'filter_settlement_pending')
+
+
 def evaluate_filter_evidence(evidence: FilterEvidence) -> EvidenceDecision:
     if evidence.network_state == "failed":
         return EvidenceDecision(False, "filter_response_failed")
     if not evidence.controls_match:
         return EvidenceDecision(False, "controls_not_confirmed")
+    if evidence.details.get('request_pending') is True:
+        return EvidenceDecision(False, 'filter_request_pending')
     selection_changed = evidence.details.get("selection_changed") is True
     network_details = evidence.details.get("network", {})
     authoritative_empty = (
         isinstance(network_details, Mapping)
         and network_details.get("authoritative_empty") is True
     )
+    if (evidence.network_state == 'not_observed'
+            and evidence.details.get('positive_dom') is True
+            and evidence.details.get('generation_fresh') is True
+            and evidence.table_state in {'stable', 'empty'}):
+        return EvidenceDecision(True, 'confirmed_positive_dom')
     if selection_changed and evidence.network_state != "succeeded":
         return EvidenceDecision(False, "filter_response_not_confirmed")
     if (

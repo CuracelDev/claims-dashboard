@@ -2,16 +2,39 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import uuid
-from dataclasses import asdict, is_dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
-from .domain import AttemptStatus, can_transition_attempt
+from .domain import (
+    AttemptStatus, DispatchDecision, InsurerCoverage, ParentRunStatus,
+    RequestScope, WorkDisposition, WorkRequest, WorkSource, can_transition_attempt,
+    execution_scope_contains,
+)
+from .orchestrator import derive_parent_status
+from .scheduling import decide_dispatch
+from .timing import sanitize_performance
 
 
 class ConcurrentStateChange(RuntimeError):
     """Raised when another worker changed an attempt before our CAS update."""
+
+
+class ParentWorkPending(ValueError):
+    """Owned or referenced work is still live; this is not a parent failure."""
+
+
+class ParentAlreadyTerminal(ValueError):
+    """A replay must return the saved parent outcome without new work."""
+
+
+class ParentScopeMismatch(ValueError):
+    """The invocation does not match the immutable persisted parent scope."""
 
 
 def _value(record: Any, name: str, default: Any = None) -> Any:
@@ -29,6 +52,763 @@ def _json(value: Any) -> str:
 def _insurer_lock_key(value: Any) -> str:
     label = " ".join(str(value or "").strip().lower().split())
     return "OLD MUTUAL" if label in {"uapom", "old mutual"} else label
+
+
+def notification_fingerprint(work_id: str, insurer_name: str, tracking_key: str) -> str:
+    """Ephemeral exact identity evidence, never diagnostic or persisted data."""
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 8192
+           for value in (work_id, insurer_name, tracking_key)):
+        return ""
+    return hashlib.sha256(json.dumps(
+        [work_id, _insurer_lock_key(insurer_name), tracking_key], separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class ClaimedWork:
+    """A lease snapshot, not permission to bypass the insurer advisory lock."""
+
+    id: str
+    parent_runner_run_id: Optional[str]
+    insurer_name: str
+    canonical_insurer_name: str
+    source: WorkSource
+    request_scope: RequestScope
+    disposition: WorkDisposition
+    claim_token: str
+    worker_id: str
+    attempt_number: int
+    generation_requested_at: datetime
+    requested_at: datetime
+    lease_expires_at: datetime
+    heartbeat_at: datetime
+    claimed_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    covered_by_insurer_run_id: Optional[str] = None
+    reason_code: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for name, enum in (("source", WorkSource), ("request_scope", RequestScope), ("disposition", WorkDisposition)):
+            object.__setattr__(self, name, enum(getattr(self, name)))
+        for name in ("generation_requested_at", "requested_at", "lease_expires_at", "heartbeat_at", "claimed_at", "started_at", "finished_at"):
+            value = getattr(self, name)
+            if value is None and name in {"started_at", "finished_at"}:
+                continue
+            if not isinstance(value, datetime) or value.utcoffset() is None:
+                raise ValueError(f"{name} must be timezone-aware")
+
+
+def _rows(cursor: Any) -> list[dict[str, Any]]:
+    columns = [item[0] for item in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _claimed(row: Mapping[str, Any]) -> ClaimedWork:
+    return ClaimedWork(**{field.name: row[field.name] for field in fields(ClaimedWork)})
+
+
+class DispatchStore:
+    """Own an independent, non-autocommit connection; never share with a ledger.
+
+    The composition root supplies a newly opened PostgreSQL connection per store.
+    Canonical dispatch locks serialize enqueue/claim decisions across parents;
+    insurer locks remain the authority for browser execution and stale recovery.
+    """
+
+    def __init__(self, connection: Any) -> None:
+        if connection.autocommit:
+            raise ValueError("DispatchStore requires a non-autocommit connection")
+        self.connection = connection
+
+    def close(self) -> None:
+        self.connection.close()
+
+    @contextmanager
+    def _transaction(self):
+        try:
+            with self.connection.cursor() as cursor:
+                yield cursor
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    @staticmethod
+    def _lease_seconds(value: int) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError("lease_seconds must be a positive integer")
+        return value
+
+    @staticmethod
+    def _lock_claim(cursor: Any, work_id: str, claim_token: str) -> bool:
+        # Acquire the potentially contended row before sampling *any* lease
+        # or advisory-lock evidence. An UPDATE can evaluate its predicates
+        # before waiting; even pg_locks evidence then outlives lock loss.
+        # Every following mutation still rechecks token/state plus fresh time.
+        cursor.execute(
+            "SELECT id FROM piles_auto_assignment_work_items "
+            "WHERE id = %s AND claim_token = %s AND disposition = 'claimed' FOR UPDATE",
+            (work_id, claim_token),
+        )
+        return cursor.fetchone() is not None
+
+    @staticmethod
+    def _lock_parent(cursor: Any, parent_id: str) -> dict[str, Any]:
+        cursor.execute(
+            "SELECT status, details, portal_environment, months, year FROM piles_auto_assignment_runner_runs WHERE id = %s FOR UPDATE",
+            (parent_id,),
+        )
+        rows = _rows(cursor)
+        if not rows:
+            raise ValueError("Parent run does not exist")
+        return rows[0]
+
+    @staticmethod
+    def _references(parent: Mapping[str, Any]) -> list[dict[str, str]]:
+        references = (parent.get("details") or {}).get("dispatch_requests", [])
+        if not isinstance(references, list) or len(references) > 256:
+            raise ValueError("Invalid dispatch request references")
+        for reference in references:
+            if not isinstance(reference, dict) or set(reference) != {"request_id", "work_item_id", "disposition"}:
+                raise ValueError("Invalid dispatch request reference")
+            for key in ("request_id", "work_item_id"):
+                if not isinstance(reference[key], str) or re.fullmatch(r"[A-Za-z0-9._-]{1,200}", reference[key]) is None:
+                    raise ValueError("Invalid dispatch reference identifier")
+            WorkDisposition(reference["disposition"])
+        return list(references)
+
+    def parent_requested_at(self, parent_id: str) -> datetime:
+        """Reuse the immutable parent timestamp when a launcher retries its ID."""
+        with self._transaction() as cursor:
+            cursor.execute("SELECT created_at FROM piles_auto_assignment_runner_runs WHERE id = %s", (parent_id,))
+            row = cursor.fetchone()
+            if not row or not isinstance(row[0], datetime) or row[0].utcoffset() is None:
+                raise ValueError("Parent request timestamp is missing or invalid")
+            requested_at = row[0]
+        return requested_at
+
+    def fail_parent_setup(self, parent_id: str) -> bool:
+        """Only an empty parent can fail setup; never overwrite waiting work."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_runner_runs AS parent
+                SET status = 'failed', finished_at = now(), updated_at = now()
+                WHERE id = %s AND status IN ('queued','started','running')
+                  AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items
+                                  WHERE parent_runner_run_id = parent.id)
+                  AND coalesce(details ->> 'dispatch_requests', '[]') = '[]'
+                RETURNING id
+                """, (parent_id,),
+            )
+            failed = cursor.fetchone() is not None
+        return failed
+
+    def enqueue_parent_work(self, parent_id: str, requests: Iterable[WorkRequest]) -> list[DispatchDecision]:
+        requests = tuple(requests)
+        if len(requests) > 256:
+            raise ValueError("At most 256 dispatch requests are allowed per parent")
+        if any(request.source == WorkSource.READINESS for request in requests):
+            raise ValueError("Read-only probes cannot enqueue execute work")
+        decisions = []
+        with self._transaction() as cursor:
+            parent = self._lock_parent(cursor, parent_id)
+            if parent["status"] not in {"queued", "started", "running"}:
+                raise ParentAlreadyTerminal("Cannot enqueue work for a terminal parent")
+            references = self._references(parent)
+            # Take all locks in canonical order before reading coverage, avoiding
+            # cross-parent deadlocks and stale statement snapshots after waits.
+            for canonical in sorted({_insurer_lock_key(r.insurer_name) for r in requests}):
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"piles-dispatch:{canonical}",))
+            for request in requests:
+                canonical = _insurer_lock_key(request.insurer_name)
+                persisted_request = replace(
+                    request,
+                    portal_environment=parent.get("portal_environment") or "production",
+                    months=tuple(parent.get("months") or ("All",)),
+                    year=parent.get("year") or "All",
+                )
+                if (
+                    request.portal_environment,
+                    request.months,
+                    request.year,
+                ) != (
+                    persisted_request.portal_environment,
+                    persisted_request.months,
+                    persisted_request.year,
+                ):
+                    raise ParentScopeMismatch("Invocation scope does not match persisted parent scope")
+                request = persisted_request
+                request_id = hashlib.sha256(_json([
+                    canonical, request.source.value, request.request_scope.value,
+                    request.portal_environment, request.months, request.year,
+                    request.requested_at.astimezone(timezone.utc).isoformat(),
+                ]).encode()).hexdigest()
+                previous = next((ref for ref in references if ref["request_id"] == request_id), None)
+                if previous is not None:
+                    decisions.append(DispatchDecision(
+                        request.insurer_name, request.source, request.request_scope,
+                        WorkDisposition(previous["disposition"]), request.requested_at,
+                        create_work_item=False,
+                    ))
+                    continue
+                if len(references) >= 256:
+                    raise ValueError("At most 256 dispatch references are allowed per parent")
+                cursor.execute(
+                    """
+                    SELECT is_active FROM piles_auto_assignment_master_accounts
+                    WHERE CASE
+                      WHEN regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g') IN ('uapom', 'old mutual') THEN 'OLD MUTUAL'
+                      ELSE regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g')
+                    END = %s
+                    """, (canonical,),
+                )
+                masters = _rows(cursor)
+                if not masters:
+                    raise ValueError("Insurer configuration does not exist")
+                cursor.execute(
+                    """
+                    SELECT * FROM (
+                      SELECT id, disposition, request_scope, covered_by_insurer_run_id,
+                             started_at, finished_at, requested_at,
+                             portal_environment, months, year
+                      FROM piles_auto_assignment_work_items
+                      WHERE canonical_insurer_name = %s
+                        AND (disposition IN ('queued','claimed','follow_up_queued')
+                          OR id = (
+                            SELECT completed.id FROM piles_auto_assignment_work_items completed
+                            WHERE completed.canonical_insurer_name = %s
+                              AND completed.disposition = 'completed'
+                              AND completed.finished_at >= %s
+                              AND completed.portal_environment = %s
+                              AND (completed.year = 'All' OR completed.year = %s)
+                              AND (completed.months = '["All"]'::jsonb OR completed.months @> %s::jsonb)
+                            ORDER BY completed.finished_at DESC, completed.id
+                            LIMIT 1
+                          ))
+                      UNION ALL
+                      SELECT run.id, 'running',
+                             CASE WHEN parent.run_scope = 'all-active' THEN 'all_active' ELSE 'single_insurer' END,
+                             run.id, run.started_at, run.finished_at, run.created_at,
+                             parent.portal_environment, parent.months, parent.year
+                      FROM piles_auto_assignment_insurer_runs run
+                      JOIN piles_auto_assignment_runner_runs parent ON parent.id = run.runner_run_id
+                      WHERE run.status IN ('queued','running')
+                        AND parent.mode = 'execute'
+                        AND coalesce(run.details ->> 'dispatch_protocol', '') <> 'durable_work_v2'
+                        AND CASE WHEN regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') END = %s
+                        AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items work
+                                        WHERE work.covered_by_insurer_run_id = run.id
+                                          AND work.parent_runner_run_id = run.runner_run_id
+                                          AND work.disposition IN ('claimed','completed','failed','cancelled'))
+                    ) coverage
+                    ORDER BY CASE disposition WHEN 'claimed' THEN 0 WHEN 'running' THEN 0 WHEN 'queued' THEN 1
+                        WHEN 'follow_up_queued' THEN 2 ELSE 3 END,
+                        finished_at DESC NULLS LAST, requested_at, id
+                    """, (
+                        canonical, canonical, request.requested_at,
+                        request.portal_environment, request.year, _json(request.months), canonical,
+                    ),
+                )
+                existing = _rows(cursor)
+                compatible = []
+                for row in existing:
+                    candidate = InsurerCoverage(
+                        state=row["disposition"],
+                        portal_environment=row.get("portal_environment") or "production",
+                        months=tuple(row.get("months") or ("All",)),
+                        year=row.get("year") or "All",
+                    )
+                    if execution_scope_contains(candidate, request):
+                        compatible.append(row)
+                active = compatible[0] if compatible else {}
+                follow_up = next((row for row in compatible if row["disposition"] == "follow_up_queued"), None)
+                coverage = InsurerCoverage(
+                    state=active.get("disposition", "idle") if any(row["is_active"] for row in masters) else "inactive",
+                    active_started_at=active.get("started_at"),
+                    active_finished_at=active.get("finished_at"),
+                    active_run_id=active.get("covered_by_insurer_run_id") or "",
+                    active_request_scope=active.get("request_scope", "all_active"),
+                    follow_up_queued=follow_up is not None,
+                    portal_environment=active.get("portal_environment") or request.portal_environment,
+                    months=tuple(active.get("months") or request.months),
+                    year=active.get("year") or request.year,
+                )
+                decision = decide_dispatch(request, coverage)
+                if decision.create_work_item:
+                    work_id = str(uuid.uuid4())
+                    conflict = ""
+                    if decision.disposition == WorkDisposition.QUEUED:
+                        conflict = "ON CONFLICT (canonical_insurer_name, source, request_scope, portal_environment, months, year) WHERE disposition = 'queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
+                    elif decision.disposition == WorkDisposition.FOLLOW_UP_QUEUED:
+                        conflict = "ON CONFLICT (canonical_insurer_name, portal_environment, months, year) WHERE disposition = 'follow_up_queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
+                    cursor.execute(
+                        """
+                        INSERT INTO piles_auto_assignment_work_items
+                          (id, parent_runner_run_id, insurer_name, canonical_insurer_name,
+                           source, request_scope, portal_environment, months, year,
+                           disposition, generation_requested_at,
+                           covered_by_insurer_run_id, requested_at, finished_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,now(),
+                          CASE WHEN %s THEN now() ELSE NULL END)
+                        """ + conflict + " RETURNING id",
+                        (work_id, parent_id, request.insurer_name, canonical,
+                         decision.source.value, decision.request_scope.value,
+                         request.portal_environment, _json(request.months), request.year,
+                         decision.disposition.value,
+                         decision.generation_requested_at, decision.covered_by_insurer_run_id or None,
+                         decision.disposition in {WorkDisposition.INACTIVE, WorkDisposition.COVERED_BY_ACTIVE_CYCLE}),
+                    )
+                    returned_id = str(cursor.fetchone()[0])
+                    if returned_id != work_id and conflict:
+                        decision = replace(decision, create_work_item=False)
+                    work_id = returned_id
+                else:
+                    reused = follow_up if decision.disposition == WorkDisposition.FOLLOW_UP_QUEUED else active
+                    work_id = reused["id"]
+                decisions.append(decision)
+                references.append({
+                    "request_id": request_id,
+                    "disposition": decision.disposition.value, "work_item_id": work_id,
+                })
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_runner_runs
+                SET details = jsonb_set(coalesce(details, '{}'::jsonb), '{dispatch_requests}', %s::jsonb),
+                    updated_at = now() WHERE id = %s
+                """, (json.dumps(references, sort_keys=True), parent_id),
+            )
+        return decisions
+
+    def claim_next(self, parent_id: str, worker_id: str, lease_seconds: int = 120) -> Optional[ClaimedWork]:
+        lease_seconds = self._lease_seconds(lease_seconds)
+        if not worker_id:
+            raise ValueError("worker_id must not be empty")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT canonical_insurer_name,
+                    pg_try_advisory_xact_lock(hashtextextended('piles-dispatch:' || canonical_insurer_name, 0)) AS locked
+                FROM (SELECT DISTINCT canonical_insurer_name FROM piles_auto_assignment_work_items
+                      WHERE parent_runner_run_id = %s
+                        AND disposition IN ('queued','follow_up_queued','claimed')
+                      ORDER BY canonical_insurer_name) insurers
+                """, (parent_id,),
+            )
+            canonicals = [row["canonical_insurer_name"] for row in _rows(cursor) if row["locked"]]
+            cursor.execute(
+                """
+                WITH candidate AS MATERIALIZED (
+                  SELECT work.id, work.claim_token, work.canonical_insurer_name
+                  FROM piles_auto_assignment_work_items work
+                  WHERE work.parent_runner_run_id = %s
+                    AND work.canonical_insurer_name = ANY(%s)
+                    AND work.source <> 'readiness'
+                    AND (work.disposition IN ('queued','follow_up_queued')
+                         OR (work.disposition = 'claimed' AND work.lease_expires_at <= now()))
+                    AND NOT EXISTS (
+                      SELECT 1 FROM piles_auto_assignment_work_items other
+                      WHERE other.canonical_insurer_name = work.canonical_insurer_name
+                        AND other.id <> work.id AND other.disposition = 'claimed')
+                    AND pg_try_advisory_xact_lock(hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0))
+                  ORDER BY work.generation_requested_at, work.requested_at, work.id
+                  LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                UPDATE piles_auto_assignment_work_items work
+                SET disposition = 'claimed', worker_id = %s, claim_token = %s,
+                    attempt_number = work.attempt_number + 1,
+                    lease_expires_at = now() + %s * interval '1 second',
+                    heartbeat_at = now(), claimed_at = now(), updated_at = now(),
+                    reason_code = CASE WHEN work.disposition = 'claimed' THEN 'expired_lease_reclaimed' ELSE NULL END
+                FROM candidate
+                WHERE work.id = candidate.id
+                  AND work.claim_token IS NOT DISTINCT FROM candidate.claim_token
+                  AND pg_try_advisory_xact_lock(hashtextextended('piles-insurer:' || candidate.canonical_insurer_name, 0))
+                RETURNING work.*
+                """, (parent_id, canonicals, worker_id, str(uuid.uuid4()), lease_seconds),
+            )
+            rows = _rows(cursor)
+            claimed = _claimed(rows[0]) if rows else None
+            if claimed is not None and claimed.reason_code == "expired_lease_reclaimed":
+                previous_run_id = claimed.covered_by_insurer_run_id
+                if previous_run_id:
+                    cursor.execute(
+                        """
+                        UPDATE piles_auto_assignment_insurer_runs
+                        SET status = 'failed', phase = 'complete',
+                            error_code = 'worker_attempt_reclaimed',
+                            error_message = 'The expired worker attempt was superseded by a fenced reclaim.',
+                            heartbeat_at = clock_timestamp(), finished_at = clock_timestamp(),
+                            updated_at = clock_timestamp()
+                        WHERE id = %s AND runner_run_id = %s AND status IN ('queued','running')
+                          AND CASE
+                            WHEN regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g')
+                          END = %s
+                        """,
+                        (previous_run_id, claimed.parent_runner_run_id, claimed.canonical_insurer_name),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_work_items
+                    SET covered_by_insurer_run_id = NULL, started_at = NULL, updated_at = clock_timestamp()
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                    RETURNING id
+                    """,
+                    (claimed.id, claimed.claim_token),
+                )
+                if cursor.fetchone() is None:
+                    raise ConcurrentStateChange("Reclaimed work attachment changed")
+                claimed = replace(claimed, covered_by_insurer_run_id=None, started_at=None)
+        return claimed
+
+    def renew_claim(self, work_id: str, claim_token: str, lease_seconds: int = 120) -> bool:
+        lease_seconds = self._lease_seconds(lease_seconds)
+        with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_work_items
+                SET heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp() + %s * interval '1 second', updated_at = clock_timestamp()
+                WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                  AND lease_expires_at > clock_timestamp() RETURNING id
+                """, (lease_seconds, work_id, claim_token),
+            )
+            renewed = cursor.fetchone() is not None
+        return renewed
+
+    def heartbeat_claim(self, work_id: str, claim_token: str, owner_pid: int,
+                        capacity_slot: int, lease_seconds: int = 120,
+                        insurer_run_id: Optional[str] = None) -> bool:
+        """Renew only while the live token AND both session locks still belong here.
+
+        Inspect pg_locks, never reacquire a lost advisory lock. This connection is
+        independent of the worker's lock-owning DataStore and execution ledger.
+        A start attachment also verifies that the insurer run belongs to this
+        parent. Call immediately before every final portal assignment click.
+        """
+        lease_seconds = self._lease_seconds(lease_seconds)
+        if type(owner_pid) is not int or owner_pid <= 0 or type(capacity_slot) is not int or capacity_slot not in (0, 1):
+            raise ValueError("A valid lock-owning backend and capacity slot are required")
+        try:
+            with self._transaction() as cursor:
+                if not self._lock_claim(cursor, work_id, claim_token):
+                    return False
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_work_items AS work
+                    SET heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp() + %s * interval '1 second',
+                        updated_at = clock_timestamp(),
+                        started_at = CASE WHEN %s::text IS NOT NULL THEN coalesce(started_at, clock_timestamp()) ELSE started_at END,
+                        covered_by_insurer_run_id = coalesce(%s, covered_by_insurer_run_id)
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                      AND lease_expires_at > clock_timestamp()
+                      AND (%s::text IS NULL OR EXISTS (
+                        SELECT 1 FROM piles_auto_assignment_insurer_runs run
+                        WHERE run.id = %s AND run.runner_run_id = work.parent_runner_run_id
+                          AND run.status = 'running'
+                          AND CASE
+                            WHEN regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(run.insurer_name)), '\\s+', ' ', 'g')
+                          END = work.canonical_insurer_name))
+                      AND (SELECT count(DISTINCT ((classid::bigint << 32) | objid::bigint))
+                           FROM pg_locks WHERE locktype = 'advisory' AND pid = %s
+                             AND objsubid = 1 AND granted AND mode = 'ExclusiveLock'
+                             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                             AND ((classid::bigint << 32) | objid::bigint) IN (
+                               hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0),
+                               hashtextextended(%s, 0))) = 2
+                    RETURNING parent_runner_run_id, canonical_insurer_name, attempt_number
+                    """, (lease_seconds, insurer_run_id, insurer_run_id, work_id, claim_token,
+                           insurer_run_id, insurer_run_id, owner_pid, f"piles-capacity:{capacity_slot}"),
+                )
+                attached_work = cursor.fetchone()
+                if attached_work is None:
+                    return False
+                if insurer_run_id:
+                    parent_run_id, canonical_insurer_name, attempt_number = attached_work
+                    attachment = _json({
+                        "dispatch_protocol": "durable_work_v2",
+                        "dispatch_work_item_id": work_id,
+                        "dispatch_attempt_number": attempt_number,
+                    })
+                    cursor.execute(
+                        """
+                        UPDATE piles_auto_assignment_insurer_runs
+                        SET details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                            updated_at = clock_timestamp()
+                        WHERE id = %s AND runner_run_id = %s AND status = 'running'
+                          AND CASE
+                            WHEN regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g') IN ('uapom','old mutual') THEN 'OLD MUTUAL'
+                            ELSE regexp_replace(lower(btrim(insurer_name)), '\\s+', ' ', 'g')
+                          END = %s
+                          AND (coalesce(details ->> 'dispatch_protocol', '') = '' OR (
+                            details ->> 'dispatch_protocol' = 'durable_work_v2'
+                            AND details ->> 'dispatch_work_item_id' = %s
+                            AND details ->> 'dispatch_attempt_number' = %s))
+                        RETURNING id
+                        """,
+                        (attachment, insurer_run_id, parent_run_id, canonical_insurer_name,
+                         work_id, str(attempt_number)),
+                    )
+                    if cursor.fetchone() is None:
+                        raise ConcurrentStateChange("Insurer run attachment changed")
+            return True
+        except ConcurrentStateChange:
+            return False
+
+    def start_insurer_run(self, work_id: str, claim_token: str, owner_pid: int,
+                          capacity_slot: int, master: Any, lease_seconds: int = 120) -> str:
+        """Atomically create and attach a durable child to a fenced work attempt."""
+        lease_seconds = self._lease_seconds(lease_seconds)
+        if type(owner_pid) is not int or owner_pid <= 0 or type(capacity_slot) is not int or capacity_slot not in (0, 1):
+            raise ValueError("A valid lock-owning backend and capacity slot are required")
+        insurer_run_id = str(uuid.uuid4())
+        try:
+            with self._transaction() as cursor:
+                if not self._lock_claim(cursor, work_id, claim_token):
+                    return ""
+                cursor.execute(
+                    """
+                    SELECT parent_runner_run_id, insurer_name, canonical_insurer_name, attempt_number
+                    FROM piles_auto_assignment_work_items
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                    """, (work_id, claim_token),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return ""
+                parent_run_id, insurer_name, canonical_insurer_name, attempt_number = row
+                if (not parent_run_id or _insurer_lock_key(_value(master, "insurer_name", ""))
+                        != canonical_insurer_name):
+                    raise ValueError("Master account does not match claimed insurer work")
+                attachment = {
+                    "dispatch_protocol": "durable_work_v2",
+                    "dispatch_work_item_id": work_id,
+                    "dispatch_attempt_number": attempt_number,
+                }
+                cursor.execute(
+                    """
+                    INSERT INTO piles_auto_assignment_insurer_runs
+                        (id, runner_run_id, master_account_id, insurer_name,
+                         status, phase, heartbeat_at, started_at, details)
+                    VALUES (%s, %s, %s, %s, 'running', 'configuration',
+                            clock_timestamp(), clock_timestamp(), %s::jsonb)
+                    """,
+                    (insurer_run_id, parent_run_id, _value(master, "id"), insurer_name,
+                     _json(attachment)),
+                )
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_work_items AS work
+                    SET heartbeat_at = clock_timestamp(),
+                        lease_expires_at = clock_timestamp() + %s * interval '1 second',
+                        started_at = coalesce(started_at, clock_timestamp()),
+                        covered_by_insurer_run_id = %s, updated_at = clock_timestamp()
+                    WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                      AND covered_by_insurer_run_id IS NULL
+                      AND lease_expires_at > clock_timestamp()
+                      AND (SELECT count(DISTINCT ((classid::bigint << 32) | objid::bigint))
+                           FROM pg_locks WHERE locktype = 'advisory' AND pid = %s
+                             AND objsubid = 1 AND granted AND mode = 'ExclusiveLock'
+                             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                             AND ((classid::bigint << 32) | objid::bigint) IN (
+                               hashtextextended('piles-insurer:' || work.canonical_insurer_name, 0),
+                               hashtextextended(%s, 0))) = 2
+                    RETURNING id
+                    """,
+                    (lease_seconds, insurer_run_id, work_id, claim_token, owner_pid,
+                     f"piles-capacity:{capacity_slot}"),
+                )
+                if cursor.fetchone() is None:
+                    raise ConcurrentStateChange("Insurer run start ownership changed")
+            return insurer_run_id
+        except ConcurrentStateChange:
+            return ""
+
+    def release_claim(self, work_id: str, claim_token: str, reason_code: str) -> bool:
+        """Return a never-started contention/shutdown attempt to claim recovery.
+
+        Keep the same row, owner and generation. Expiring its lease avoids a
+        queued/follow-up unique-index collision with a later legitimate request;
+        claim_next still checks insurer-lock freedom and rotates the token.
+        """
+        if reason_code not in {"worker_capacity_unavailable", "insurer_lock_unavailable", "dispatch_stopped"}:
+            raise ValueError("Only pre-execution contention or shutdown may release a claim")
+        with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_work_items
+                SET lease_expires_at = clock_timestamp(), heartbeat_at = clock_timestamp(), updated_at = clock_timestamp(), reason_code = %s
+                WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                  AND lease_expires_at > clock_timestamp() AND started_at IS NULL
+                RETURNING id
+                """, (reason_code, work_id, claim_token),
+            )
+            released = cursor.fetchone() is not None
+        return released
+
+    def finish_claim(self, work_id: str, claim_token: str, disposition: WorkDisposition,
+                     insurer_run_id: Optional[str] = None, reason_code: str = "") -> bool:
+        disposition = WorkDisposition(disposition)
+        if disposition not in {WorkDisposition.COMPLETED, WorkDisposition.FAILED, WorkDisposition.CANCELLED}:
+            raise ValueError("Claims must finish with a terminal execution disposition")
+        if reason_code and (len(reason_code) > 80 or re.fullmatch(r"[a-z0-9._-]+", reason_code) is None):
+            raise ValueError("reason_code must be a bounded sanitized code")
+        with self._transaction() as cursor:
+            if not self._lock_claim(cursor, work_id, claim_token):
+                return False
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_work_items
+                SET disposition = %s, covered_by_insurer_run_id = %s, reason_code = %s,
+                    finished_at = clock_timestamp(), heartbeat_at = clock_timestamp(), lease_expires_at = NULL, updated_at = clock_timestamp()
+                WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
+                  AND lease_expires_at > clock_timestamp()
+                RETURNING id
+                """, (disposition.value, insurer_run_id, reason_code or None, work_id, claim_token),
+            )
+            finished = cursor.fetchone() is not None
+        return finished
+
+    def recoverable_expired_work(self) -> list[ClaimedWork]:
+        """Inspect candidates only; claim_next must recheck expiry and lock freedom."""
+        recoverable = []
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM piles_auto_assignment_work_items
+                WHERE disposition = 'claimed' AND lease_expires_at <= now()
+                ORDER BY canonical_insurer_name, lease_expires_at, id
+                """,
+            )
+            for row in _rows(cursor):
+                cursor.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))", (f"piles-insurer:{row['canonical_insurer_name']}",))
+                if cursor.fetchone()[0]:
+                    recoverable.append(_claimed(row))
+        return recoverable
+
+    def finalize_parent(self, parent_id: str) -> ParentRunStatus:
+        with self._transaction() as cursor:
+            parent = self._lock_parent(cursor, parent_id)
+            if parent["status"] not in {"queued", "started", "running"}:
+                return ParentRunStatus(parent["status"])
+            references = self._references(parent)
+            cursor.execute(
+                """
+                SELECT work.disposition, run.status AS insurer_status
+                FROM piles_auto_assignment_work_items work
+                LEFT JOIN piles_auto_assignment_insurer_runs run
+                  ON run.id = work.covered_by_insurer_run_id
+                  AND run.runner_run_id = work.parent_runner_run_id
+                WHERE work.parent_runner_run_id = %s
+                FOR UPDATE OF work
+                """, (parent_id,),
+            )
+            rows = _rows(cursor)
+            acknowledgements = []
+            if references:
+                reference_ids = sorted({ref["work_item_id"] for ref in references})
+                cursor.execute(
+                    """
+                    SELECT id, disposition FROM piles_auto_assignment_work_items
+                    WHERE id = ANY(%s)
+                    """, (reference_ids,),
+                )
+                referenced = _rows(cursor)
+                if {row["id"] for row in referenced} != set(reference_ids):
+                    raise ValueError("A referenced dispatch generation is missing")
+                if any(row["disposition"] in {"queued", "claimed", "follow_up_queued"} for row in referenced):
+                    raise ParentWorkPending("Referenced dispatch work is nonterminal")
+                # This validates completion only. Foreign insurer outcomes never
+                # become an owned success/failure of the requesting parent.
+                # Terminal work is immutable; a plain read avoids cross-parent
+                # lock cycles when parents reference each other's generations.
+                derive_parent_status((row["disposition"] for row in referenced), [])
+                if not rows:
+                    acknowledgements.append(WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+            if any(row["disposition"] in {"queued", "claimed", "follow_up_queued"}
+                   or row["insurer_status"] in {"queued", "running"} for row in rows):
+                raise ParentWorkPending("Owned dispatch work is nonterminal")
+            status = derive_parent_status(
+                [row["disposition"] for row in rows] + acknowledgements,
+                (row["insurer_status"] for row in rows if row["insurer_status"] is not None),
+            )
+            cursor.execute(
+                """
+                UPDATE piles_auto_assignment_runner_runs
+                SET status = %s, finished_at = now(), updated_at = now(),
+                    duration_ms = least(2147483647, greatest(0, extract(epoch FROM (now() - started_at)) * 1000))::integer
+                WHERE id = %s RETURNING id
+                """, (status.value, parent_id),
+            )
+        return status
+
+    def notification_collection_complete(self, parent_id: str, work_ids: Iterable[str],
+                                         notification_fingerprints: Iterable[str] = ()) -> bool:
+        """Read-only, bounded proof of this invocation's generation collection.
+
+        Resumed parents can contain completed generations whose notification
+        payloads existed only in a prior process. Never announce a partial parent
+        aggregate. Keys are read only to hash exact confirmed identities in this
+        scope; no raw evidence, key or fingerprint is returned, logged or saved.
+        """
+        def valid_id(value):
+            return isinstance(value, str) and re.fullmatch(
+                r"(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})", value) is not None
+
+        collected = []
+        for value in work_ids:
+            if len(collected) >= 256 or not valid_id(value) or value in collected:
+                return False
+            collected.append(value)
+        supplied_fingerprints = set()
+        for value in notification_fingerprints:
+            if (len(supplied_fingerprints) >= 10000 or not isinstance(value, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", value) is None or value in supplied_fingerprints):
+                return False
+            supplied_fingerprints.add(value)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT id, disposition FROM piles_auto_assignment_work_items
+                WHERE parent_runner_run_id = %s
+                  AND disposition NOT IN ('covered_by_active_cycle', 'inactive')
+                ORDER BY id LIMIT 257
+                """, (parent_id,),
+            )
+            rows = _rows(cursor)
+            expected = [row["id"] for row in rows]
+            if not (len(expected) <= 256 and len(set(expected)) == len(expected)
+                    and all(valid_id(value) for value in expected)
+                    and all(row["disposition"] in {"completed", "failed", "cancelled"} for row in rows)
+                    and set(expected) == set(collected)):
+                return False
+            cursor.execute(
+                """
+                SELECT work.id, attempt.insurer_name, attempt.tracking_key
+                FROM piles_auto_assignment_insurer_runs run
+                JOIN piles_auto_assignment_attempts attempt ON attempt.insurer_run_id = run.id
+                LEFT JOIN piles_auto_assignment_work_items work
+                  ON work.covered_by_insurer_run_id = run.id
+                  AND work.parent_runner_run_id = run.runner_run_id
+                  AND work.disposition IN ('completed', 'failed', 'cancelled')
+                WHERE run.runner_run_id = %s
+                  AND attempt.status IN ('confirmed_visible', 'confirmed_reconciled')
+                ORDER BY run.id, attempt.id LIMIT 10001
+                """, (parent_id,),
+            )
+            confirmations = _rows(cursor)
+        fingerprints = [notification_fingerprint(row["id"], row["insurer_name"], row["tracking_key"])
+                        for row in confirmations]
+        return (len(fingerprints) <= 10000 and "" not in fingerprints
+                and len(set(fingerprints)) == len(fingerprints)
+                and set(fingerprints) == supplied_fingerprints)
 
 
 class ExecutionLedger:
@@ -481,6 +1261,7 @@ class ExecutionLedger:
         status: str,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        performance: Optional[list] = None,
     ) -> None:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -523,10 +1304,11 @@ class ExecutionLedger:
                 UPDATE piles_auto_assignment_insurer_runs
                 SET status = %s, phase = 'complete', error_code = %s,
                     error_message = %s, heartbeat_at = now(), finished_at = now(),
+                    details = jsonb_set(coalesce(details, '{}'::jsonb), '{performance}', %s::jsonb),
                     updated_at = now()
                 WHERE id = %s
                 """,
-                (status, error_code, error_message, insurer_run_id),
+                (status, error_code, error_message, json.dumps(sanitize_performance(performance)), insurer_run_id),
             )
         self.connection.commit()
 
@@ -538,18 +1320,22 @@ class ExecutionLedger:
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) AS confirmed,
                     count(*) FILTER (WHERE status = 'reconciliation_pending') AS reconciliation_pending,
                     count(*) FILTER (WHERE status = 'conflict') AS conflict,
-                    count(*) FILTER (WHERE status = 'failed') AS failed
+                    count(*) FILTER (WHERE status = 'failed') AS failed,
+                    count(*) FILTER (WHERE status = 'submitted') AS submitted,
+                    count(*) FILTER (WHERE status = 'manual_action_required') AS manual_action_required
                 FROM piles_auto_assignment_attempts
                 WHERE insurer_run_id = %s
                 """,
                 (insurer_run_id,),
             )
-            row = cursor.fetchone() or (0, 0, 0, 0)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0)
         return {
             "confirmed": int(row[0] or 0),
             "reconciliation_pending": int(row[1] or 0),
             "conflict": int(row[2] or 0),
             "failed": int(row[3] or 0),
+            "submitted": int(row[4] or 0),
+            "manual_action_required": int(row[5] or 0),
         }
 
 
@@ -608,8 +1394,8 @@ class ReadOnlyExecutionLedger:
     def heartbeat(self, _insurer_run_id: str, *, phase: str) -> None:
         del phase
 
-    def finalize_insurer_run(self, _insurer_run_id: str, *, status: str, error_code: Optional[str] = None, error_message: Optional[str] = None) -> None:
-        del status, error_code, error_message
+    def finalize_insurer_run(self, _insurer_run_id: str, *, status: str, error_code: Optional[str] = None, error_message: Optional[str] = None, performance: Optional[list] = None) -> None:
+        del status, error_code, error_message, performance
 
     def summarize_insurer_run(self, _insurer_run_id: str) -> dict[str, int]:
         return {"confirmed": 0, "reconciliation_pending": 0, "conflict": 0, "failed": 0}

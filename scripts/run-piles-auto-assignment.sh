@@ -19,7 +19,6 @@ MONTH_VALUE="${PILES_AUTO_ASSIGNMENT_SCHEDULE_MONTH:-All}"
 YEAR_VALUE="${PILES_AUTO_ASSIGNMENT_SCHEDULE_YEAR:-All}"
 INSURER_VALUE="${PILES_AUTO_ASSIGNMENT_SCHEDULE_INSURER:-}"
 
-RUN_SOURCE="${PILES_AUTO_ASSIGNMENT_RUN_SOURCE:-schedule}"
 INVOCATION_BACKEND="${PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND:-local}"
 MAX_CONCURRENCY="${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-1}"
 
@@ -32,7 +31,7 @@ set -- -u scripts/piles_auto_assignment_runner.py \
   --portal-environment "$PORTAL_ENVIRONMENT" \
   --month "$MONTH_VALUE" \
   --year "$YEAR_VALUE" \
-  --run-source "$RUN_SOURCE" \
+  --run-source schedule \
   --invocation-backend "$INVOCATION_BACKEND"
 
 if [ "$RUN_MODE" = "one-insurer" ]; then

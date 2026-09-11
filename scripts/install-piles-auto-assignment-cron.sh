@@ -26,7 +26,16 @@ trap 'rm -f "$TMP_FILE"' EXIT
   | (grep -v "$MARKER" || true) \
   > "$TMP_FILE"
 
-CRON_COMMAND="/bin/sh -lc 'cd $ROOT_DIR && set -a && . $ENV_FILE && set +a && ./scripts/run-piles-auto-assignment.sh >> $LOG_FILE 2>&1'"
+# Quote both the inner shell paths and the outer shell command. Cron interprets
+# percent before shell quoting, so escape it only after constructing the command.
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+CRON_SCRIPT="cd $(shell_quote "$ROOT_DIR") && set -a && . $(shell_quote "$ENV_FILE") && set +a && ./scripts/run-piles-auto-assignment.sh --run-source schedule >> $(shell_quote "$LOG_FILE") 2>&1"
+CRON_COMMAND="/bin/sh -c $(shell_quote "$CRON_SCRIPT")"
+CRON_COMMAND="$(printf '%s' "$CRON_COMMAND" | sed 's/%/\\%/g')"
 printf '%s %s %s\n' "$SCHEDULE" "$CRON_COMMAND" "$MARKER" >> "$TMP_FILE"
 
 crontab "$TMP_FILE"

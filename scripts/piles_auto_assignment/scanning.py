@@ -30,6 +30,22 @@ def _identity(row: Any) -> Tuple[str, str, int, str]:
 
 
 @dataclass(frozen=True)
+class FilterContext:
+    filter_month: str
+    requested_year: str
+    status_bucket: str
+
+
+def late_arrival_contexts(scan_results: Iterable["ScanResult"]) -> tuple[FilterContext, ...]:
+    """Select settled initial contexts, independent of their row/plan counts."""
+    return tuple(sorted({
+        result.context for result in scan_results
+        if result.context is not None
+        and result.status in {ContextStatus.COMPLETE, ContextStatus.EMPTY}
+    }, key=lambda context: (context.filter_month, context.requested_year, context.status_bucket)))
+
+
+@dataclass(frozen=True)
 class ScanResult:
     status: ContextStatus
     rows: tuple[Any, ...]
@@ -38,6 +54,7 @@ class ScanResult:
     unassigned_pile_count: int
     claim_count: int
     page_fingerprints: tuple[tuple[Tuple[str, str, int, str], ...], ...]
+    context: FilterContext | None = None
 
 
 class ScanAccumulator:

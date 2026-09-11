@@ -1,3 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
 const ADMINER_URL = process.env.ADMINER_URL || 'https://db.crl.to';
 const ADMINER_SERVER = process.env.ADMINER_SERVER || '10.189.80.3';
 const ADMINER_DRIVER = process.env.ADMINER_DRIVER || 'pgsql';
@@ -24,21 +28,22 @@ const TABLES = [
   'metric_definitions',
   'okr_entries',
   'platform_settings',
-  'piles_auto_assignment_bot_accounts',
-  'piles_auto_assignment_bot_metrics',
-  'piles_auto_assignment_external_assignments',
   'piles_auto_assignment_master_accounts',
-  'piles_auto_assignment_pile_snapshots',
+  'piles_auto_assignment_bot_accounts',
+  'piles_auto_assignment_rules',
+  'piles_auto_assignment_bot_metrics',
   'piles_auto_assignment_runner_runs',
-  'piles_auto_assignment_schedule_requests',
   'piles_auto_assignment_insurer_runs',
   'piles_auto_assignment_scan_contexts',
   'piles_auto_assignment_batches',
+  'piles_auto_assignment_tracked_piles',
+  'piles_auto_assignment_pile_snapshots',
+  'piles_auto_assignment_external_assignments',
   'piles_auto_assignment_attempts',
   'piles_auto_assignment_bot_account_history',
+  'piles_auto_assignment_schedule_requests',
+  'piles_auto_assignment_work_items',
   'piles_auto_assignment_logs',
-  'piles_auto_assignment_rules',
-  'piles_auto_assignment_tracked_piles',
   'prism_conversations',
   'prism_logs',
   'prism_messages',
@@ -186,6 +191,17 @@ const TABLE_COLUMNS = {
     ['conflict_pile_count', 'integer'], ['failed_pile_count', 'integer'], ['error_code', 'text'], ['error_message', 'text'],
     ['heartbeat_at', 'timestamptz'], ['started_at', 'timestamptz'], ['finished_at', 'timestamptz'],
     ['details', 'jsonb'], ['created_at', 'timestamptz'], ['updated_at', 'timestamptz'],
+  ],
+  piles_auto_assignment_work_items: [
+    ['id', 'text'], ['parent_runner_run_id', 'text'], ['insurer_name', 'text'],
+    ['canonical_insurer_name', 'text'], ['source', 'text'], ['request_scope', 'text'],
+    ['portal_environment', 'text'], ['months', 'jsonb'], ['year', 'text'],
+    ['disposition', 'text'], ['covered_by_insurer_run_id', 'text'], ['worker_id', 'text'],
+    ['claim_token', 'text'], ['lease_expires_at', 'timestamptz'], ['heartbeat_at', 'timestamptz'],
+    ['generation_requested_at', 'timestamptz'], ['attempt_number', 'integer'],
+    ['requested_at', 'timestamptz'], ['claimed_at', 'timestamptz'], ['started_at', 'timestamptz'],
+    ['finished_at', 'timestamptz'], ['reason_code', 'text'], ['created_at', 'timestamptz'],
+    ['updated_at', 'timestamptz'],
   ],
   piles_auto_assignment_schedule_requests: [
     ['id', 'text'], ['insurer_name', 'text'], ['requested_runner_run_id', 'text'], ['status', 'text'],
@@ -586,7 +602,7 @@ const CREATE_TABLE_SQL = {
       months jsonb DEFAULT '[]'::jsonb,
       year text,
       mode text NOT NULL DEFAULT 'dry-run',
-      status text NOT NULL DEFAULT 'started',
+      status text NOT NULL DEFAULT 'started' CHECK (status IN ('queued','started','running','completed','completed_with_issues','failed','covered_by_active_cycle','cancelled','manual_action_required','partial','skipped_overlap')),
       started_at timestamptz DEFAULT now(),
       finished_at timestamptz,
       duration_ms integer DEFAULT 0,
@@ -602,7 +618,7 @@ const CREATE_TABLE_SQL = {
       runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
       master_account_id text REFERENCES piles_auto_assignment_master_accounts(id) ON DELETE SET NULL,
       insurer_name text NOT NULL,
-      status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','partial','failed','manual_action_required','skipped_inactive','skipped_overlap')),
+      status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','completed_with_issues','partial','failed','manual_action_required','skipped_inactive','skipped_overlap','covered_by_active_cycle','cancelled')),
       phase text NOT NULL DEFAULT 'configuration' CHECK (phase IN ('configuration','login','scan','plan','apply','reconcile','complete')),
       discovered_pile_count integer NOT NULL DEFAULT 0 CHECK (discovered_pile_count >= 0),
       discovered_claim_count integer NOT NULL DEFAULT 0 CHECK (discovered_claim_count >= 0),
@@ -622,6 +638,37 @@ const CREATE_TABLE_SQL = {
       started_at timestamptz,
       finished_at timestamptz,
       details jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
+  piles_auto_assignment_work_items: `
+    CREATE TABLE piles_auto_assignment_work_items (
+      id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+      parent_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
+      insurer_name text NOT NULL,
+      canonical_insurer_name text NOT NULL CHECK (btrim(canonical_insurer_name) <> ''),
+      source text NOT NULL CHECK (source IN ('schedule','manual','readiness','recovery')),
+      request_scope text NOT NULL CHECK (request_scope IN ('all_active','single_insurer')),
+      portal_environment text NOT NULL DEFAULT 'production' CHECK (portal_environment IN ('production','test')),
+      months jsonb NOT NULL DEFAULT '["All"]'::jsonb CHECK (
+        jsonb_typeof(months) = 'array' AND jsonb_array_length(months) > 0
+        AND months <@ '["All","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]'::jsonb
+        AND (NOT months ? 'All' OR months = '["All"]'::jsonb)
+      ),
+      year text NOT NULL DEFAULT 'All' CHECK (year = 'All' OR year ~ '^20[0-9]{2}$'),
+      disposition text NOT NULL DEFAULT 'queued' CHECK (disposition IN ('queued','claimed','covered_by_active_cycle','follow_up_queued','inactive','completed','failed','cancelled')),
+      covered_by_insurer_run_id text REFERENCES piles_auto_assignment_insurer_runs(id) ON DELETE SET NULL,
+      worker_id text,
+      claim_token text,
+      lease_expires_at timestamptz,
+      heartbeat_at timestamptz,
+      generation_requested_at timestamptz NOT NULL DEFAULT now(),
+      attempt_number integer NOT NULL DEFAULT 0 CHECK (attempt_number >= 0),
+      requested_at timestamptz NOT NULL DEFAULT now(),
+      claimed_at timestamptz,
+      started_at timestamptz,
+      finished_at timestamptz,
+      reason_code text CHECK (reason_code IS NULL OR (char_length(reason_code) <= 80 AND reason_code ~ '^[a-z0-9._-]+$')),
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
     )`,
@@ -733,7 +780,7 @@ const CREATE_TABLE_SQL = {
       id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
       insurer_name text NOT NULL,
       requested_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
-      status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed')),
+      status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed', 'cancelled_legacy')),
       claimed_by_runner_run_id text REFERENCES piles_auto_assignment_runner_runs(id) ON DELETE SET NULL,
       requested_at timestamptz NOT NULL DEFAULT now(),
       claimed_at timestamptz,
@@ -906,6 +953,11 @@ const INDEX_SQL = [
   'CREATE INDEX piles_auto_assignment_attempts_run_idx ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at)',
   'CREATE INDEX piles_auto_assignment_bot_account_history_bot_idx ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC)',
   "CREATE UNIQUE INDEX piles_auto_assignment_schedule_requests_pending_idx ON piles_auto_assignment_schedule_requests (lower(insurer_name)) WHERE status = 'pending'",
+  "CREATE UNIQUE INDEX piles_auto_assignment_work_items_queued_generation_idx ON piles_auto_assignment_work_items (canonical_insurer_name, source, request_scope, portal_environment, months, year) WHERE disposition = 'queued'",
+  "CREATE UNIQUE INDEX piles_auto_assignment_work_items_follow_up_idx ON piles_auto_assignment_work_items (canonical_insurer_name, portal_environment, months, year) WHERE disposition = 'follow_up_queued'",
+  "CREATE INDEX piles_auto_assignment_work_items_completed_scope_idx ON piles_auto_assignment_work_items (canonical_insurer_name, portal_environment, year, finished_at DESC, id) WHERE disposition = 'completed'",
+  "CREATE INDEX piles_auto_assignment_work_items_claim_order_idx ON piles_auto_assignment_work_items (parent_runner_run_id, disposition, generation_requested_at, requested_at, id) WHERE disposition IN ('queued', 'follow_up_queued')",
+  "CREATE INDEX piles_auto_assignment_work_items_expired_lease_idx ON piles_auto_assignment_work_items (lease_expires_at, canonical_insurer_name) WHERE disposition = 'claimed'",
   'CREATE INDEX tasks_assigned_to_idx ON tasks (assigned_to)',
   'CREATE INDEX target_logs_target_id_idx ON target_logs (target_id)',
   'CREATE INDEX team_leave_member_dates_idx ON team_leave (team_member_id, start_date, end_date)',
@@ -1017,7 +1069,7 @@ function insertSql(table, rows) {
   return `INSERT INTO "${table}" (${names}) VALUES\n${values.join(',\n')};`;
 }
 
-function createSchemaSql(backupSchema) {
+export function buildFreshSchemaSql(backupSchema) {
   const dropSql = TABLES.map((table) => `DROP TABLE IF EXISTS "${table}" CASCADE;`).join('\n');
   const createSql = TABLES.map((table) => `${CREATE_TABLE_SQL[table]};`).join('\n\n');
   const indexes = INDEX_SQL.map((statement) => `${statement};`).join('\n');
@@ -1074,6 +1126,7 @@ async function supabaseFetchTable(table) {
         'piles_auto_assignment_insurer_runs', 'piles_auto_assignment_scan_contexts',
         'piles_auto_assignment_batches', 'piles_auto_assignment_attempts',
         'piles_auto_assignment_bot_account_history', 'piles_auto_assignment_schedule_requests',
+        'piles_auto_assignment_work_items',
       ]);
       if (res.status === 404 && additiveTables.has(table)) return [];
       throw new Error(`Supabase fetch failed for ${table}: ${res.status} ${body}`);
@@ -1213,7 +1266,7 @@ async function main() {
   await adminerLogin(cookies);
 
   console.log(`Backing up current production tables to ${backupSchema} and recreating schema...`);
-  await execSql(cookies, createSchemaSql(backupSchema), 'backup and create schema');
+  await execSql(cookies, buildFreshSchemaSql(backupSchema), 'backup and create schema');
 
   for (const table of TABLES) {
     const tableChunks = chunks(sourceData[table], INSERT_CHUNK_SIZE);
@@ -1245,8 +1298,9 @@ async function main() {
   console.log(`Fresh migration complete. Backup schema: ${backupSchema}`);
 }
 
-main().catch((err) => {
-  console.error(err.message);
-  process.exit(1);
-});
-import { readFileSync } from 'node:fs';
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error(err.message);
+    process.exit(1);
+  });
+}

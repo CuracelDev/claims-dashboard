@@ -1,8 +1,66 @@
 """Persistence-safe states and evidence values for Piles assignment runs."""
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_MONTH_ALIASES = {
+    alias.lower(): short
+    for short, long_name in zip(
+        _MONTHS,
+        ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"),
+    )
+    for alias in (short, long_name)
+}
+
+
+def _normalize_execution_scope(portal_environment: Any, months: Any, year: Any) -> tuple[str, tuple[str, ...], str]:
+    portal = str(portal_environment or "").strip().lower()
+    if portal not in {"production", "test"}:
+        raise ValueError("portal_environment must be production or test")
+    if isinstance(months, (str, bytes)) or not isinstance(months, Iterable):
+        raise ValueError("months must be a non-empty collection")
+    normalized_months: set[str] = set()
+    for month in months:
+        label = str(month or "").strip().lower()
+        if label == "all":
+            normalized_months.add("All")
+        elif label in _MONTH_ALIASES:
+            normalized_months.add(_MONTH_ALIASES[label])
+        else:
+            raise ValueError(f"Unsupported month: {month!r}")
+    if not normalized_months or ("All" in normalized_months and len(normalized_months) != 1):
+        raise ValueError("months must contain either All or one or more named months")
+    ordered_months = ("All",) if "All" in normalized_months else tuple(
+        month for month in _MONTHS if month in normalized_months
+    )
+    normalized_year = str(year or "").strip()
+    if normalized_year.lower() == "all":
+        normalized_year = "All"
+    elif not (len(normalized_year) == 4 and normalized_year.startswith("20") and normalized_year.isdigit()):
+        raise ValueError("year must be All or a four-digit year")
+    return portal, ordered_months, normalized_year
+
+
+def execution_scope_contains(covering: Any, requested: Any) -> bool:
+    """Return whether one normalized scan scope fully contains another."""
+    if covering.portal_environment != requested.portal_environment:
+        return False
+    if covering.year != "All" and covering.year != requested.year:
+        return False
+    return covering.months == ("All",) or set(covering.months).issuperset(requested.months)
+
+
+def _require_timezone_aware(name: str, value: datetime) -> None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{name} must be timezone-aware")
 
 
 class AttemptStatus(str, Enum):
@@ -42,11 +100,144 @@ class InsurerRunStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
+    COMPLETED_WITH_ISSUES = "completed_with_issues"
     PARTIAL = "partial"
     FAILED = "failed"
     MANUAL_ACTION_REQUIRED = "manual_action_required"
     SKIPPED_INACTIVE = "skipped_inactive"
     SKIPPED_OVERLAP = "skipped_overlap"
+    COVERED_BY_ACTIVE_CYCLE = "covered_by_active_cycle"
+    CANCELLED = "cancelled"
+
+
+class WorkSource(str, Enum):
+    SCHEDULE = "schedule"
+    MANUAL = "manual"
+    READINESS = "readiness"
+    RECOVERY = "recovery"
+
+
+class RequestScope(str, Enum):
+    ALL_ACTIVE = "all_active"
+    SINGLE_INSURER = "single_insurer"
+
+
+class WorkDisposition(str, Enum):
+    QUEUED = "queued"
+    CLAIMED = "claimed"
+    COVERED_BY_ACTIVE_CYCLE = "covered_by_active_cycle"
+    FOLLOW_UP_QUEUED = "follow_up_queued"
+    INACTIVE = "inactive"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ParentRunStatus(str, Enum):
+    QUEUED = "queued"
+    STARTED = "started"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPLETED_WITH_ISSUES = "completed_with_issues"
+    FAILED = "failed"
+    COVERED_BY_ACTIVE_CYCLE = "covered_by_active_cycle"
+    CANCELLED = "cancelled"
+    MANUAL_ACTION_REQUIRED = "manual_action_required"
+    PARTIAL = "partial"
+    SKIPPED_OVERLAP = "skipped_overlap"
+
+
+@dataclass(frozen=True)
+class WorkRequest:
+    """An immutable request whose timestamp is an absolute point in time."""
+
+    insurer_name: str
+    source: WorkSource
+    requested_at: datetime
+    request_scope: Optional[RequestScope] = None
+    portal_environment: str = "production"
+    months: tuple[str, ...] = ("All",)
+    year: str = "All"
+
+    def __post_init__(self) -> None:
+        _require_timezone_aware("requested_at", self.requested_at)
+        insurer_name = self.insurer_name.strip()
+        if not insurer_name:
+            raise ValueError("insurer_name must not be empty")
+        source = WorkSource(self.source)
+        scope = self.request_scope
+        if scope is None:
+            scope = (
+                RequestScope.ALL_ACTIVE
+                if source == WorkSource.SCHEDULE
+                else RequestScope.SINGLE_INSURER
+            )
+        object.__setattr__(self, "insurer_name", insurer_name)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "request_scope", RequestScope(scope))
+        portal, months, year = _normalize_execution_scope(self.portal_environment, self.months, self.year)
+        object.__setattr__(self, "portal_environment", portal)
+        object.__setattr__(self, "months", months)
+        object.__setattr__(self, "year", year)
+
+
+@dataclass(frozen=True)
+class InsurerCoverage:
+    """Immutable coverage evidence with timezone-aware lifecycle timestamps."""
+
+    state: str = "idle"
+    active_started_at: Optional[datetime] = None
+    active_finished_at: Optional[datetime] = None
+    active_run_id: str = ""
+    active_request_scope: RequestScope = RequestScope.ALL_ACTIVE
+    follow_up_queued: bool = False
+    portal_environment: str = "production"
+    months: tuple[str, ...] = ("All",)
+    year: str = "All"
+
+    def __post_init__(self) -> None:
+        for name in ("active_started_at", "active_finished_at"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_timezone_aware(name, value)
+        state = str(self.state).strip().lower()
+        if state not in {
+            "idle",
+            "queued",
+            "claimed",
+            "running",
+            "completed",
+            "follow_up_queued",
+            "inactive",
+        }:
+            raise ValueError(f"Unsupported insurer coverage state: {self.state!r}")
+        object.__setattr__(self, "state", state)
+        object.__setattr__(
+            self,
+            "active_request_scope",
+            RequestScope(self.active_request_scope),
+        )
+        portal, months, year = _normalize_execution_scope(self.portal_environment, self.months, self.year)
+        object.__setattr__(self, "portal_environment", portal)
+        object.__setattr__(self, "months", months)
+        object.__setattr__(self, "year", year)
+
+
+@dataclass(frozen=True)
+class DispatchDecision:
+    insurer_name: str
+    source: WorkSource
+    request_scope: RequestScope
+    disposition: WorkDisposition
+    generation_requested_at: datetime
+    create_work_item: bool = True
+    covered_by_insurer_run_id: str = ""
+
+
+@dataclass(frozen=True)
+class WaitDecision:
+    decision: str
+    code: str
 
 
 @dataclass(frozen=True)

@@ -17,11 +17,16 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import uuid
+from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
@@ -38,28 +43,40 @@ from dotenv import load_dotenv
 from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 try:
-    from piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
-    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
-    from piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
+        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
+        dispatch_parent, execute_claimed_insurer)
+    from piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
+        ParentAlreadyTerminal, ParentScopeMismatch)
+    from piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
+        ParentRunStatus, RequestScope, WorkRequest, WorkSource)
+    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
+    from piles_auto_assignment.timing import PhaseTimer, timed_operation
+    from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
     )
     from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
-    from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
     from piles_auto_assignment.scheduling import configured_max_concurrency
 except ModuleNotFoundError:  # Repository-level unittest import path.
-    from scripts.piles_auto_assignment.store import ExecutionLedger, ReadOnlyExecutionLedger
-    from scripts.piles_auto_assignment.domain import AttemptStatus, FilterEvidence, InsurerRunStatus
-    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence
-    from scripts.piles_auto_assignment.scanning import IncompleteScan, ScanAccumulator
+    from scripts.piles_auto_assignment.dispatch import (ContextOutputRouter, WorkerContext, safe_worker_error,
+        AssignmentSubmissionUncertain, WorkOwnershipLost, WorkerUnavailable, DispatchResult, ProbeWork,
+        dispatch_parent, execute_claimed_insurer)
+    from scripts.piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
+        ParentAlreadyTerminal, ParentScopeMismatch)
+    from scripts.piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
+        ParentRunStatus, RequestScope, WorkRequest, WorkSource)
+    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
+    from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
+    from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from scripts.piles_auto_assignment.planning import (
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
     )
     from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
-    from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status
+    from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
     from scripts.piles_auto_assignment.scheduling import configured_max_concurrency
 
 
@@ -132,6 +149,11 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def dispatcher_v2_enabled(environ=os.environ) -> bool:
+    """Explicit opt-in; the coordinator integration is separate from this adapter."""
+    return str(environ.get("PILES_AUTO_ASSIGNMENT_DISPATCHER_V2", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_test_portal(url: str) -> bool:
@@ -728,6 +750,8 @@ def table_snapshot_matches_filter_context(
     status_label: str,
     response_identity_candidates: list[list[str]],
     response_row_id_hashes: list[str] | None = None,
+    *,
+    require_response_identity: bool = True,
 ) -> bool:
     """Validate an atomic DOM snapshot against the requested filter context."""
     if snapshot.get("loading") is not False:
@@ -800,6 +824,8 @@ def table_snapshot_matches_filter_context(
             if len(row_attributes) > len(visible_id_candidates) else set()
         )
 
+    if not require_response_identity:
+        return True
     expected_id_hashes = response_row_id_hashes or []
     if len(expected_id_hashes) == len(rows) and all(expected_id_hashes):
         unmatched = list(visible_id_candidates)
@@ -888,7 +914,7 @@ def send_weekend_schedule_update(
         print(f"\n⚠️ Slack weekend schedule update failed for {insurer_name}: {exc}")
 
 
-def send_weekend_restore_update(restored_rows: list[dict[str, Any]]) -> None:
+def send_weekend_restore_update(restored_rows: list[dict[str, Any]], *, safe_diagnostics: bool = False) -> None:
     if not restored_rows or not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return
     by_insurer: dict[str, list[str]] = {}
@@ -905,7 +931,10 @@ def send_weekend_restore_update(restored_rows: list[dict[str, Any]]) -> None:
     try:
         slack_post_message(SLACK_PRISM_BOT_TOKEN, SLACK_ALERTS_CHANNEL_ID, text)
     except Exception as exc:
-        print(f"\n⚠️ Slack weekend restore update failed: {exc}")
+        if safe_diagnostics:
+            print("WARNING: weekend roster notification failed.")
+        else:
+            print(f"\n⚠️ Slack weekend restore update failed: {exc}")
 
 
 def create_assignment_thread(
@@ -916,6 +945,7 @@ def create_assignment_thread(
     reassigned_piles: int,
     reassigned_claims: int,
     insurer_names: list[str] | None = None,
+    *, safe_diagnostics: bool = False,
 ) -> str | None:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return None
@@ -965,11 +995,14 @@ def create_assignment_thread(
         )
         return str(result.get("ts") or "")
     except Exception as exc:
-        print(f"\n⚠️ Slack thread creation failed for {scope_label}: {exc}")
+        if safe_diagnostics:
+            print("WARNING: assignment summary notification failed.")
+        else:
+            print(f"\n⚠️ Slack thread creation failed for {scope_label}: {exc}")
         return None
 
 
-def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts: str) -> bool:
+def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts: str, *, safe_diagnostics: bool = False) -> bool:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID and thread_ts):
         return False
     if not owner_items:
@@ -1075,7 +1108,10 @@ def send_assignment_owner_reply(owner_items: list["NotificationItem"], thread_ts
         )
         return True
     except Exception as exc:
-        print(f"   ⚠️ Slack owner summary failed for {owner_name}: {exc}")
+        if safe_diagnostics:
+            print("WARNING: assignment owner notification failed.")
+        else:
+            print(f"   ⚠️ Slack owner summary failed for {owner_name}: {exc}")
         return False
 
 
@@ -1083,6 +1119,7 @@ def send_external_assignment_alert(
     items: list["ExternalNotificationItem"],
     portal_environment: str,
     run_source: str,
+    *, safe_diagnostics: bool = False,
 ) -> bool:
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return False
@@ -1135,7 +1172,10 @@ def send_external_assignment_alert(
         )
         return True
     except Exception as exc:
-        print(f"\n⚠️ Slack external-assignment alert failed: {exc}")
+        if safe_diagnostics:
+            print("WARNING: external assignment notification failed.")
+        else:
+            print(f"\n⚠️ Slack external-assignment alert failed: {exc}")
         return False
 
 
@@ -3221,6 +3261,7 @@ class DataStore:
         year: str,
         mode: str,
         details: dict[str, Any],
+        preserve_existing: bool = False,
     ) -> str:
         run_id = norm(run_id) or str(uuid.uuid4())
         payload = {
@@ -3238,8 +3279,7 @@ class DataStore:
             "details": details,
         }
         if self.mode == "postgres" and norm(run_id):
-            self._execute_postgres(
-                """
+            sql = """
                 insert into piles_auto_assignment_runner_runs
                 (id, insurer_name, run_scope, portal_environment, backend, run_source, months, year, mode, status, started_at, details)
                 values (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
@@ -3256,7 +3296,11 @@ class DataStore:
                   started_at = excluded.started_at,
                   details = coalesce(piles_auto_assignment_runner_runs.details, '{}'::jsonb) || excluded.details,
                   updated_at = now()
-                """,
+                """
+            if preserve_existing:
+                sql = sql.partition("on conflict")[0] + "on conflict (id) do nothing"
+            self._execute_postgres(
+                sql,
                 (
                     payload["id"],
                     payload["insurer_name"],
@@ -3283,6 +3327,141 @@ class DataStore:
             else:
                 self._insert_supabase("piles_auto_assignment_runner_runs", payload)
         return run_id
+
+    def claim_preview_runner_run(
+        self,
+        *,
+        run_id: str,
+        insurer_name: str,
+        run_scope: str,
+        portal_environment: str,
+        backend: str,
+        run_source: str,
+        months: list[str],
+        year: str,
+        mode: str,
+    ) -> str:
+        """Atomically adopt one API-created preview parent and fence its writer."""
+        if self.mode != "postgres" or getattr(self, "read_only", False):
+            raise RuntimeError("Durable preview adoption requires a writable PostgreSQL connection.")
+        if not norm(run_id) or run_source != "manual" or mode != "dry-run":
+            raise ParentScopeMismatch("Durable previews require an authorized manual dry-run parent.")
+        token = str(uuid.uuid4())
+        protocol = json.dumps({
+            "preview_protocol": "durable_preview_v1",
+            "preview_claim_token": token,
+            "preview_phase": "configuration",
+            "preview_outcomes": [],
+        })
+        claimed = self._fetchall_postgres(
+            """
+            update piles_auto_assignment_runner_runs
+            set status = 'running', started_at = clock_timestamp(), finished_at = null,
+                duration_ms = 0, stdout = null, stderr = null,
+                details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                updated_at = clock_timestamp()
+            where id = %s and status = 'queued' and mode = 'dry-run'
+              and run_source = 'manual' and run_scope = %s
+              and coalesce(insurer_name, '') = %s
+              and portal_environment = %s and backend = %s
+              and months = %s::jsonb and year is not distinct from %s
+            returning id
+            """,
+            (protocol, run_id, run_scope, insurer_name or "", portal_environment,
+             backend, json.dumps(months), year),
+        )
+        if claimed:
+            return token
+        rows = self._fetchall_postgres(
+            """
+            select id, status, mode, run_source, run_scope, coalesce(insurer_name, '') as insurer_name,
+                   portal_environment, backend, months, year
+            from piles_auto_assignment_runner_runs where id = %s
+            """,
+            (run_id,),
+        )
+        if not rows:
+            raise ParentScopeMismatch("The preview parent does not exist.")
+        row = rows[0]
+        expected = {
+            "mode": mode, "run_source": run_source, "run_scope": run_scope,
+            "insurer_name": insurer_name or "", "portal_environment": portal_environment,
+            "backend": backend, "months": months, "year": year,
+        }
+        if any(row.get(key) != value for key, value in expected.items()):
+            raise ParentScopeMismatch("Invocation scope does not match persisted preview scope.")
+        if row.get("status") in {"completed", "completed_with_issues", "failed", "cancelled"}:
+            raise ParentAlreadyTerminal("The preview parent is already terminal.")
+        raise WorkerUnavailable("preview_parent_unavailable")
+
+    def try_acquire_preview_parent_lock(self, run_id: str) -> bool:
+        run_id = norm(run_id)
+        if self.mode != "postgres" or not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", run_id):
+            return False
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+            (f"piles-preview-parent:{run_id}",),
+        )
+        return bool(rows and rows[0].get("acquired"))
+
+    def release_preview_parent_lock(self, run_id: str) -> None:
+        run_id = norm(run_id)
+        if self.mode == "postgres" and re.fullmatch(r"[A-Za-z0-9._-]{1,200}", run_id):
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-preview-parent:{run_id}",),
+            )
+
+    def heartbeat_preview_runner_run(self, run_id: str, token: str, phase: str) -> bool:
+        phase = phase if phase in {"configuration", "login", "navigation", "scan", "plan", "reconcile", "final_rescan", "complete"} else "configuration"
+        rows = self._fetchall_postgres(
+            """
+            update piles_auto_assignment_runner_runs
+            set details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                updated_at = clock_timestamp()
+            where id = %s and status = 'running' and mode = 'dry-run'
+              and run_source = 'manual' and details ->> 'preview_protocol' = 'durable_preview_v1'
+              and details ->> 'preview_claim_token' = %s
+            returning id
+            """,
+            (json.dumps({"preview_phase": phase}), run_id, token),
+        )
+        return bool(rows)
+
+    def finalize_preview_runner_run(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        status: str,
+        outcomes: list[dict[str, Any]],
+        error_code: str = "",
+    ) -> bool:
+        if status not in {"completed", "completed_with_issues", "failed", "cancelled"}:
+            raise ValueError("Unsupported preview terminal status.")
+        safe_outcomes = list(outcomes[:64])
+        details = json.dumps({
+            "preview_phase": "complete",
+            "preview_outcomes": safe_outcomes,
+            "preview_error_code": norm(error_code)[:100] or None,
+        })
+        rows = self._fetchall_postgres(
+            """
+            update piles_auto_assignment_runner_runs
+            set status = %s, finished_at = clock_timestamp(),
+                duration_ms = least(2147483647, greatest(0,
+                    extract(epoch from (clock_timestamp() - started_at)) * 1000)),
+                stderr = nullif(%s, ''),
+                details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                updated_at = clock_timestamp()
+            where id = %s and status = 'running' and mode = 'dry-run'
+              and run_source = 'manual' and details ->> 'preview_protocol' = 'durable_preview_v1'
+              and details ->> 'preview_claim_token' = %s
+            returning id
+            """,
+            (status, norm(error_code)[:100], details, run_id, token),
+        )
+        return bool(rows)
 
     def finalize_runner_run(
         self,
@@ -3370,11 +3549,11 @@ class DataStore:
             self._update_supabase("piles_auto_assignment_bot_accounts", "id", bot_id, payload)
 
 
-def build_execution_ledger(store: DataStore, args: argparse.Namespace) -> Any:
+def build_execution_ledger(store: DataStore, args: argparse.Namespace, *, required: bool = False) -> Any:
     """Build the optional durable ledger without sharing DataStore autocommit state."""
     if bool(getattr(args, "read_only", False)):
         return ReadOnlyExecutionLedger()
-    if not env_bool("PILES_EXECUTION_LEDGER_ENABLED", False):
+    if not required and not env_bool("PILES_EXECUTION_LEDGER_ENABLED", False):
         return None
     if store.mode != "postgres" or not store.database_url:
         raise RuntimeError(
@@ -3383,6 +3562,42 @@ def build_execution_ledger(store: DataStore, args: argparse.Namespace) -> Any:
     connection = psycopg2.connect(store.database_url)
     connection.autocommit = False
     return ExecutionLedger(connection)
+
+
+def build_dispatch_store(store: DataStore) -> DispatchStore:
+    if store.mode != "postgres" or not store.database_url:
+        raise RuntimeError("Dispatcher v2 requires DATABASE_URL")
+    connection = psycopg2.connect(store.database_url)
+    connection.autocommit = False
+    return DispatchStore(connection)
+
+
+def worker_context_factory(args: argparse.Namespace, output_router: ContextOutputRouter, *,
+                           max_concurrency: int = 1, durable_claims: bool = False):
+    """Build fresh resources on the calling worker; never share parent stores.
+
+    V2 always needs a durable execution ledger (or the read-only probe ledger),
+    independently of the optional legacy ledger flag. The coordinator installs
+    output_router before creating threads and keeps it installed until they join.
+    """
+    if type(max_concurrency) is not int or max_concurrency not in (1, 2):
+        raise ValueError("Worker concurrency must be exactly 1 or 2.")
+    @contextmanager
+    def create(work):
+        with output_router.bind(work.insurer_name) as output:
+            with ExitStack() as resources:
+                resources.callback(output.close)
+                store = DataStore(read_only=bool(args.read_only))
+                resources.callback(store.close)
+                ledger = build_execution_ledger(store, args, required=True)
+                resources.callback(ledger.close)
+                dispatch_store = build_dispatch_store(store) if durable_claims else None
+                if dispatch_store:
+                    resources.callback(dispatch_store.close)
+                output_dir = resources.enter_context(tempfile.TemporaryDirectory(prefix="piles-work-"))
+                yield WorkerContext(store, ledger, output, work.worker_id, max_concurrency,
+                                    dispatch_store=dispatch_store, output_path=str(Path(output_dir) / "plan.json"))
+    return create
 
 
 def ensure_runner_lock_available(store: DataStore) -> None:
@@ -3410,6 +3625,13 @@ class CuracelPilesRunner:
         self._table_headers_cache: list[str] = []
         self._piles_response_events: list[tuple[int, int, str, Any]] = []
         self._piles_response_sequence = 0
+        self._piles_request_sequence = 0
+        self._piles_pending_requests = {}
+        self._piles_request_events = []
+        self._piles_request_overflow = False
+        self._piles_request_starts = {}  # Bounded terminal history; live starts stay in pending.
+        self._piles_response_request_starts = {}
+        self._piles_request_tracking = False
         self._page_open_response_marker = 0
         self.year_filter_confirmation_timeout_ms = 5000
         self.execution_ledger: Any = None
@@ -3420,8 +3642,17 @@ class CuracelPilesRunner:
         self.scan_context_ids: dict[tuple[str, str, str], str] = {}
         self.assignment_attempt_ids: dict[str, str] = {}
         self.retry_attempt_numbers: dict[str, int] = {}
+        self.phase_timer = PhaseTimer()
 
     def _heartbeat(self, phase: str) -> None:
+        work_heartbeat = getattr(self, "work_heartbeat", None)
+        if work_heartbeat:
+            # Ownership loss is fatal even if the optional ledger heartbeat is
+            # absent, throttled, or failing. Never swallow this callback.
+            work_heartbeat(phase)
+        timer = getattr(self, 'phase_timer', None)
+        if timer:
+            timer.enter_phase(phase)
         ledger = getattr(self, "execution_ledger", None)
         insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
         if not ledger or not insurer_run_id:
@@ -3450,22 +3681,38 @@ class CuracelPilesRunner:
     def __enter__(self) -> "CuracelPilesRunner":
         self.playwright = sync_playwright().start()
         try:
-            self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
-        except Exception as error:
-            message = str(error)
-            if "Executable doesn't exist" not in message:
-                raise
-            self._ensure_playwright_browsers()
-            self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
-        self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
-        self.page.on("response", self._capture_piles_response)
+            try:
+                self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
+            except Exception as error:
+                message = str(error)
+                if "Executable doesn't exist" not in message:
+                    raise
+                self._ensure_playwright_browsers()
+                self.browser = self.playwright.chromium.launch(headless=not self.visible, slow_mo=self.slow_mo)
+            self.page = self.browser.new_page(viewport={"width": 1500, "height": 950})
+            self.page.on("response", self._capture_piles_response)
+            self.page.on("request", self._capture_piles_request)
+            self.page.on("requestfinished", self._finish_piles_request)
+            self.page.on("requestfailed", self._fail_piles_request)
+            self._piles_request_tracking = True
+        except BaseException:
+            # A failed __enter__ does not receive a context-manager __exit__.
+            self.__exit__(*sys.exc_info())
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
+        try:
+            try:
+                if self.browser:
+                    self.browser.close()
+            finally:
+                if self.playwright:
+                    self.playwright.stop()
+        except Exception:
+            # Preserve the portal/startup error that controls retry safety.
+            if exc_type is None:
+                raise
 
     def _invalidate_filter_state(self) -> None:
         self._filter_state = {
@@ -3475,6 +3722,59 @@ class CuracelPilesRunner:
             "page_size": None,
         }
         self._table_headers_cache = []
+        self._settled_month_control = None
+        self._settled_year_control = None
+        self._settled_status_control = None
+        self._settled_year_display = ''
+
+    def _capture_piles_request(self, request: Any) -> None:
+        self._record_piles_request(request, 'pending')
+
+    def _finish_piles_request(self, request: Any) -> None:
+        self._record_piles_request(request, 'finished')
+
+    def _fail_piles_request(self, request: Any) -> None:
+        self._record_piles_request(request, 'failed')
+
+    def _record_piles_request(self, request: Any, state: str) -> None:
+        if norm(request.method).upper() != 'GET' or not piles_response_matches_filter_year(request.url, 'All'):
+            return
+        self._piles_request_sequence += 1
+        sequence = self._piles_request_sequence
+        key = id(request)
+        if state == 'pending':
+            if len(self._piles_pending_requests) >= 100:
+                # Lost lifecycle tracking must never grant the DOM shortcut.
+                self._piles_request_overflow = True
+            else:
+                self._piles_pending_requests[key] = (sequence, request)
+            started = sequence
+        else:
+            started, _ = self._piles_pending_requests.pop(key, (0, None))
+            if not started:
+                self._piles_request_overflow = True
+            else:
+                # Only terminal metadata is evictable. A slow live request must
+                # retain its generation through arbitrary completed-request churn.
+                self._piles_request_starts[key] = (request, started)
+                if len(self._piles_request_starts) > 100:
+                    del self._piles_request_starts[next(iter(self._piles_request_starts))]
+        self._piles_request_events.append((sequence, state, norm(request.url), started))
+        self._piles_request_events = self._piles_request_events[-100:]
+
+    def _filter_request_state(self, marker, month, year, status):
+        matching = [(state, started) for sequence, state, url, started in self._piles_request_events
+                    if sequence > marker and piles_response_matches_context(url, month, year, status, page_number=1)]
+        if any(state == 'failed' for state, _ in matching):
+            return 'failed'
+        if self._piles_pending_requests or self._piles_request_overflow:
+            return 'pending'
+        if any(state == 'finished' and started > marker for state, started in matching):
+            return 'finished'
+        return 'not_observed'
+
+    def _filter_observation_generation(self):
+        return (self._piles_response_sequence, getattr(self, '_piles_request_sequence', 0))
 
     def _capture_piles_response(self, response: Any) -> None:
         try:
@@ -3483,6 +3783,20 @@ class CuracelPilesRunner:
             if not piles_response_matches_filter_year(response.url, "All"):
                 return
             self._piles_response_sequence = getattr(self, "_piles_response_sequence", 0) + 1
+            starts = getattr(self, '_piles_request_starts', {})
+            key = id(response.request)
+            request_start = getattr(self, '_piles_pending_requests', {}).get(key, (0, None))[0]
+            request_start = request_start or starts.get(key, (None, 0))[1]
+            if not request_start and getattr(self, '_piles_request_tracking', False):
+                # Correlation loss is sticky until a new runner installs fresh
+                # page hooks. Draining tracked requests cannot prove that an
+                # untracked request has drained too.
+                self._piles_request_overflow = True
+            response_starts = getattr(self, '_piles_response_request_starts', {})
+            response_starts[self._piles_response_sequence] = request_start
+            self._piles_response_request_starts = {
+                sequence: started for sequence, started in response_starts.items()
+                if sequence > self._piles_response_sequence - 100}
             self._piles_response_events.append((
                 self._piles_response_sequence,
                 safe_int(response.status, 0),
@@ -3544,11 +3858,18 @@ class CuracelPilesRunner:
         *,
         page_number: int | None = None,
         page_size: int | None = None,
+        request_marker: int | None = None,
+        response_ceiling: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         matching_events = [
             (sequence, status, response)
             for sequence, status, url, response in self._piles_response_events
             if sequence > marker
+            and (response_ceiling is None or sequence <= response_ceiling)
+            and (request_marker is None
+                 or getattr(self, '_piles_response_request_starts', {}).get(sequence, 0) > request_marker
+                 or (not getattr(self, '_piles_request_tracking', False)
+                     and not getattr(self, '_piles_response_request_starts', {}).get(sequence, 0)))
             and piles_response_matches_context(
                 url,
                 month_label,
@@ -3658,7 +3979,7 @@ class CuracelPilesRunner:
                 return None
             time.sleep(0.25)
 
-    def _wait_for_login_or_app_ready(self, timeout_ms: int = 20000) -> str:
+    def _wait_for_login_or_app_ready(self, timeout_ms: int = 20000, *, require_app: bool = False) -> str:
         assert self.page
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
@@ -3688,13 +4009,14 @@ class CuracelPilesRunner:
                         'input[type="password"]',
                     ]
                 )
-                if login_input and password_input:
+                if login_input and password_input and not require_app:
                     return "login"
             except Exception:
                 pass
-            time.sleep(0.35)
+            self.page.wait_for_timeout(350)
         raise RuntimeError("Login page did not become ready.")
 
+    @timed_operation('login', 'login')
     def login(self, username: str, password: str) -> None:
         assert self.page
         last_error: Exception | None = None
@@ -3743,9 +4065,8 @@ class CuracelPilesRunner:
                 login_input.fill(username)
                 password_input.fill(password)
                 submit_button.click()
-                time.sleep(4)
                 self._dismiss_popup()
-                post_state = self._wait_for_login_or_app_ready(timeout_ms=15000)
+                post_state = self._wait_for_login_or_app_ready(timeout_ms=15000, require_app=True)
                 if post_state == "app":
                     return
                 raise RuntimeError("Login failed; still on auth page.")
@@ -3794,6 +4115,7 @@ class CuracelPilesRunner:
         time.sleep(3)
         self._dismiss_popup()
 
+    @timed_operation('navigation', 'open_piles')
     def open_piles(self) -> None:
         assert self.page
         last_error: Exception | None = None
@@ -4000,7 +4322,8 @@ class CuracelPilesRunner:
                 option_texts.append((text, option))
             if label_key(text) == label_key(desired_text):
                 option.click()
-                time.sleep(0.8)
+                if control is None:  # Assignment dropdown timing is unchanged.
+                    time.sleep(0.8)
                 return text
         if self.allow_test_any_assignee:
             for text, option in option_texts:
@@ -4195,12 +4518,9 @@ class CuracelPilesRunner:
         self._append_unique_select(candidates, self._select_by_label("Filter by Vetting Status"))
         if candidates:
             return candidates[0]
-        visible = self._visible_selects()
-        for select in visible:
-            if month_select is not None and select is month_select:
-                continue
-            self._append_unique_select(candidates, select)
-        return candidates[0] if candidates else self._find_select_with_options(TARGET_STATUSES)
+        # An unlabeled first select is not evidence of a status control. In
+        # fallback layouts month/year precede it; prove its role by options.
+        return self._find_select_with_options(TARGET_STATUSES)
 
     def _select_candidates_for_year(self, year_label: str) -> list[Any]:
         multiselects = self._visible_multiselects()
@@ -4578,12 +4898,14 @@ class CuracelPilesRunner:
                 continue
         return ""
 
+    @timed_operation('scan', 'filter')
     def apply_filters(self, month_label: str, year_label: str, status_label: str) -> FilterEvidence:
         assert self.page
         last_error: Exception | None = None
         final_month_select = None
         final_year_select = None
         final_status_select = None
+        confirmed_year_display = getattr(self, '_settled_year_display', '')
         filter_response_marker = self._piles_response_sequence
         filter_state_was_initialized = all(
             norm(self._filter_state.get(key)) for key in ("month", "year", "status")
@@ -4594,35 +4916,16 @@ class CuracelPilesRunner:
         status_changed = self._filter_state["status"] != status_label
 
         if not month_changed and not year_changed and not status_changed:
-            table_state = self.wait_for_table_ready(timeout_ms=6000)
-            network_state, network_details = self._filter_network_state(
-                filter_response_marker,
-                month_label,
-                year_label,
-                status_label,
-            )
-            evidence = FilterEvidence(
-                month_matches=True,
-                year_matches=True,
-                status_matches=True,
-                table_state=table_state,
-                network_state=network_state,
-                details={
-                    "network": {
-                        key: value
-                        for key, value in network_details.items()
-                        if key not in {"row_identity_candidates", "row_id_hashes"}
-                    },
-                    "selection_changed": False,
-                },
-            )
-            decision = evaluate_filter_evidence(evidence)
-            if not decision.accepted:
-                raise RuntimeError(f"Piles filters were not confirmed: {decision.code}.")
-            return evidence
+            month_control = getattr(self, '_settled_month_control', None) or self._direct_month_control()
+            return self._wait_for_filter_settlement(
+                filter_response_marker, month_label, year_label, status_label,
+                {'month': month_control,
+                 'year': getattr(self, '_settled_year_control', None),
+                 'status': getattr(self, '_settled_status_control', None) or self._direct_status_control(month_control)},
+                confirmed_year_display=confirmed_year_display, initial_snapshot={},
+                request_marker=self._piles_request_sequence, selection_changed=False)
 
         self._reset_pagination_to_first_page()
-        previous_fingerprint = self._table_preview_fingerprint()
         filter_response_marker = self._piles_response_sequence
 
         for attempt in range(1, 4):
@@ -4635,7 +4938,11 @@ class CuracelPilesRunner:
                     pass
                 time.sleep(1.2)
 
-            month_select = None
+            initial_snapshot = self._table_context_snapshot()
+            filter_response_marker = self._piles_response_sequence
+            filter_request_marker = self._piles_request_sequence
+            month_select = (getattr(self, '_settled_month_control', None) or self._direct_month_control()
+                            if not month_changed else None)
             if month_changed:
                 direct_month = self._direct_month_control()
                 if direct_month is not None and self._set_select_value(direct_month, month_label):
@@ -4653,6 +4960,7 @@ class CuracelPilesRunner:
             year_select = None
             if year_changed:
                 year_select = self._apply_year_filter(year_label)
+                confirmed_year_display = self._read_select_text(year_select) or self._read_year_chip_text()
 
             status_select = None
             if month_changed or year_changed or status_changed:
@@ -4691,10 +4999,6 @@ class CuracelPilesRunner:
         if final_status_select is None:
             raise last_error or RuntimeError(f"Could not set filter to '{status_label}'.")
 
-        self._filter_state["month"] = month_label
-        self._filter_state["year"] = desired_year_state
-        self._filter_state["status"] = status_label
-
         month_display = self._read_select_text(final_month_select) or month_label
         year_display = self._read_select_text(final_year_select) or self._read_year_chip_text() or year_label
 
@@ -4713,93 +5017,113 @@ class CuracelPilesRunner:
                     break
             except Exception:
                 continue
-        time.sleep(0.4 if status_changed and not month_changed and not year_changed else 0.8)
-        network_state, network_details = self._filter_network_state(
-            filter_response_marker,
-            month_label,
-            year_label,
-            status_label,
-            page_number=1,
+        evidence = self._wait_for_filter_settlement(
+            filter_response_marker, month_label, year_label, status_label,
+            {'month': final_month_select or self._direct_month_control(),
+             'year': final_year_select or getattr(self, '_settled_year_control', None),
+             'status': final_status_select},
+            confirmed_year_display=confirmed_year_display,
+            initial_snapshot=initial_snapshot, request_marker=filter_request_marker,
+            historical_marker=(self._page_open_response_marker if not filter_state_was_initialized else None),
         )
-        response_requires_dom_transition = True
-        if network_state == "not_observed" and not filter_state_was_initialized:
-            historical_state, historical_details = self._filter_network_state(
-                getattr(self, "_page_open_response_marker", filter_response_marker),
-                month_label,
-                year_label,
-                status_label,
-                page_number=1,
-            )
-            if (
-                historical_state == "succeeded"
-                and historical_details.get("authoritative") is True
-            ):
-                network_state = historical_state
-                network_details = historical_details
-                response_requires_dom_transition = False
-        if network_state == "not_observed":
-            self._wait_for_piles_filter_response(
-                filter_response_marker,
-                month_label,
-                year_label,
-                status_label,
-                timeout_ms=30000,
-                page_number=1,
-            )
-            network_state, network_details = self._filter_network_state(
-                filter_response_marker,
-                month_label,
-                year_label,
-                status_label,
-                page_number=1,
-            )
-        if network_details.get("authoritative") is True:
-            table_state, dom_matches_response = self._wait_for_table_response_coherence(
-                safe_int(network_details.get("item_count"), -1),
-                previous_fingerprint,
-                timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000,
-                require_transition=response_requires_dom_transition,
-                month_label=month_label,
-                year_label=year_label,
-                status_label=status_label,
-                response_identity_candidates=network_details.get("row_identity_candidates") or [],
-                response_row_id_hashes=network_details.get("row_id_hashes") or [],
-            )
-        else:
-            table_state = self.wait_for_table_ready(
-                timeout_ms=8000 if status_changed and not month_changed and not year_changed else 10000
-            )
-            dom_matches_response = False
-        evidence = FilterEvidence(
-            month_matches=(not month_changed or final_month_select is not None),
-            year_matches=(not year_changed or final_year_select is not None),
-            status_matches=final_status_select is not None,
-            table_state=table_state,
-            network_state=network_state,
-            details={
-                "network": {
-                    key: value
-                    for key, value in network_details.items()
-                    if key not in {"row_identity_candidates", "row_id_hashes"}
-                },
-                "selection_changed": True,
-                "dom_matches_response": dom_matches_response,
-            },
-        )
-        decision = evaluate_filter_evidence(evidence)
-        if not decision.accepted:
-            raise RuntimeError(
-                f"Piles filters were not confirmed: {decision.code}. "
-                "Safe evidence: "
-                f"table_state={table_state}, "
-                f"expected_rows={network_details.get('item_count', 'unknown')}, "
-                f"visible_rows={self._visible_table_row_count()}, "
-                f"http_status={network_details.get('http_status', 'not_observed')}, "
-                f"dom_matches_response={dom_matches_response}, "
-                f"response_fields={network_details.get('row_fields', [])}, "
-                f"table_headers={self._table_headers()}."
-            )
+        self._filter_state.update(month=month_label, year=desired_year_state, status=status_label)
+        # Cache only controls that passed the atomic context observation. Their
+        # current connected/visible values are still revalidated on every reuse.
+        self._settled_month_control = final_month_select
+        self._settled_year_control = final_year_select or getattr(self, '_settled_year_control', None)
+        self._settled_status_control = final_status_select
+        self._settled_year_display = confirmed_year_display
         return evidence
+
+    def _wait_for_filter_settlement(self, marker, month_label, year_label, status_label,
+                                    filter_controls, *, confirmed_year_display, initial_snapshot,
+                                    request_marker, historical_marker=None, selection_changed=True):
+        """Poll DOM and network together, pumping Playwright events during the grace."""
+        start = time.monotonic_ns()
+        stable_since = start
+        previous = None
+        generation_fresh = False
+        cap_ns = 30_000_000_000 if selection_changed else 6_000_000_000
+        while True:
+            self._heartbeat('scan')
+            generation = self._filter_observation_generation()
+            network_state, network = self._filter_network_state(
+                marker, month_label, year_label, status_label, page_number=1,
+                request_marker=request_marker if selection_changed else None)
+            if network_state == 'not_observed' and historical_marker is not None:
+                historical_state, historical = self._filter_network_state(
+                    historical_marker, month_label, year_label, status_label,
+                    page_number=1, response_ceiling=marker)
+                if historical_state == 'succeeded' and historical.get('authoritative') is True:
+                    network_state, network = historical_state, historical
+            # Handle resolution/JSON parsing may pump callbacks; the final DOM
+            # observation itself is one synchronous browser event-loop turn.
+            snapshot = self._filter_context_snapshot(filter_controls)
+            observed = snapshot.get('filter_controls') or {}
+            controls = (
+                label_key(observed.get('month')) == label_key(month_label),
+                bool(confirmed_year_display) and norm(observed.get('year')) == confirmed_year_display,
+                label_key(observed.get('status')) == label_key(status_label),
+            )
+            now = time.monotonic_ns()
+            if generation != self._filter_observation_generation():
+                previous = None
+                if now - start >= cap_ns:
+                    raise RuntimeError('Piles filters were not confirmed: filter_settlement_timeout.')
+                self.page.wait_for_timeout(100)
+                continue
+            request_state = self._filter_request_state(request_marker, month_label, year_label, status_label)
+            if request_state == 'failed':
+                network_state = 'failed'
+            # Ignore decorative row attributes: freshness must change actual
+            # table content/readiness, not focus/checkbox metadata. Request
+            # completion alone does not prove that Vue has committed its DOM.
+            fresh_fields = ('rows', 'loading', 'table_visible', 'explicit_empty')
+            if all(controls) and any(snapshot.get(key) != initial_snapshot.get(key) for key in fresh_fields):
+                generation_fresh = True
+            fingerprint = (snapshot, controls, generation, request_state)
+            if fingerprint != previous:
+                previous = deepcopy(fingerprint)
+                stable_since = now
+            stable = now - stable_since >= 300_000_000
+            rows = snapshot.get('rows') or []
+            ready = snapshot.get('table_visible') is True and snapshot.get('loading') is False
+            table_state = 'unreadable'
+            if ready and stable:
+                table_state = ('stable' if rows else
+                               'empty' if snapshot.get('explicit_empty') is True else 'structurally_empty')
+            # Preserve the authoritative-empty fallback for portal versions that
+            # omit table markup entirely when no rows exist. Absence alone is unknown.
+            if (stable and not rows and snapshot.get('loading') is False
+                    and network_state == 'succeeded' and network.get('authoritative') is True
+                    and network.get('authoritative_empty') is True and table_state == 'unreadable'):
+                table_state = 'structurally_empty'
+            positive_dom = table_state == 'empty' or (
+                table_state == 'stable' and table_snapshot_matches_filter_context(
+                    snapshot, len(rows), month_label, year_label, status_label, [],
+                    require_response_identity=False))
+            details = {'selection_changed': selection_changed, 'positive_dom': positive_dom,
+                       'generation_fresh': generation_fresh, 'request_pending': request_state == 'pending',
+                       'network': {key: value for key, value in network.items()
+                                   if key not in {'row_identity_candidates', 'row_id_hashes'}}}
+            if network.get('authoritative') is True and table_state != 'unreadable':
+                details['dom_matches_response'] = (
+                    (network.get('authoritative_empty') is True and not rows)
+                    or (table_state == 'stable' and table_snapshot_matches_filter_context(
+                        snapshot, safe_int(network.get('item_count'), -1), month_label,
+                        year_label, status_label, network.get('row_identity_candidates') or [],
+                        network.get('row_id_hashes') or [])))
+            evidence = FilterEvidence(*controls, table_state, network_state, details)
+            decision = decide_filter_wait(evidence, (time.monotonic_ns() - start) / 1_000_000)
+            if decision.decision == 'accept':
+                return evidence
+            if decision.decision in {'fail', 'retry'}:
+                raise RuntimeError(f'Piles filters were not confirmed: {decision.code}.')
+            if not selection_changed and evaluate_filter_evidence(evidence).accepted:
+                return evidence
+            if now - start >= cap_ns:
+                raise RuntimeError('Piles filters were not confirmed: filter_settlement_timeout.')
+            self.page.wait_for_timeout(100)
 
     def try_set_page_size(self, page_size: int = 100) -> None:
         assert self.page
@@ -5044,10 +5368,31 @@ class CuracelPilesRunner:
 
     def _table_context_snapshot(self) -> dict[str, Any]:
         """Read headers, row cells, and loading state in one browser evaluation."""
+        return self._browser_context_snapshot()
+
+    def _filter_context_snapshot(self, controls) -> dict[str, Any]:
+        handles = {}
+        try:
+            # Release the previous observation before, never after, the atomic
+            # read. Keep at most three handles alive until the next read/close.
+            for handle in getattr(self, '_filter_observation_handles', {}).values():
+                if handle is not None:
+                    try:
+                        handle.dispose()
+                    except Exception:
+                        pass
+            self._filter_observation_handles = handles
+            for name, control in controls.items():
+                handles[name] = control.element_handle(timeout=1000) if control is not None else None
+            return self._browser_context_snapshot(handles)
+        except Exception:
+            return {'headers': [], 'rows': [], 'loading': True}
+
+    def _browser_context_snapshot(self, controls=None) -> dict[str, Any]:
         try:
             assert self.page
             snapshot = self.page.evaluate(
-                r"""() => {
+                r"""(controls) => {
                   const visible = (node) => {
                     if (!node) return false;
                     const rect = node.getBoundingClientRect();
@@ -5055,13 +5400,16 @@ class CuracelPilesRunner:
                     return rect.width > 0 && rect.height > 0
                       && style.display !== 'none' && style.visibility !== 'hidden';
                   };
+                  const filter_controls = Object.fromEntries(
+                    Object.entries(controls || {}).map(([name, node]) => [name,
+                      node && node.isConnected && visible(node) ? (node.innerText || '').trim() : null]));
                   const table = Array.from(document.querySelectorAll('table')).find(
                     (candidate) => visible(candidate) && candidate.querySelector('tbody')
                   );
                   const loading = Array.from(document.querySelectorAll(
                     "[aria-busy='true'], [role='progressbar'], .p-datatable-loading-overlay, .p-progressspinner"
                   )).some(visible);
-                  if (!table) return { headers: [], rows: [], loading };
+                  if (!table) return { headers: [], rows: [], loading, table_visible: false, explicit_empty: false, filter_controls };
                   const headers = Array.from(table.querySelectorAll('thead tr th'))
                     .map((cell) => (cell.innerText || '').trim());
                   const rows = Array.from(table.querySelectorAll('tbody tr'))
@@ -5082,8 +5430,10 @@ class CuracelPilesRunner:
                         || attribute.name === 'id' || attribute.name === 'name'
                         || attribute.name.startsWith('data-'))
                       .map((attribute) => attribute.value));
-                  return { headers, rows, row_attributes: rowAttributes, loading };
-                }"""
+                  const explicit_empty = Array.from(table.querySelectorAll('tbody td'))
+                    .some((cell) => visible(cell) && /^No Data Found$/i.test((cell.innerText || '').trim()));
+                  return { headers, rows, row_attributes: rowAttributes, loading, table_visible: true, explicit_empty, filter_controls };
+                }""", controls
             )
             return snapshot if isinstance(snapshot, dict) else {"headers": [], "rows": [], "loading": True}
         except Exception:
@@ -5209,6 +5559,7 @@ class CuracelPilesRunner:
                     f"The Piles paginator could not return to page 1 before filtering: {error}"
                 ) from error
 
+    @timed_operation('scan', 'pagination')
     def goto_next_page(
         self,
         month_label: str = "",
@@ -5385,6 +5736,14 @@ class CuracelPilesRunner:
             available_years,
             supports_multiple=supports_multiple,
         )
+        # Per-run snapshots become eligible only after ledger persistence succeeds.
+        self.initial_scan_results = {
+            (month, year, status): replace(
+                ScanAccumulator().finish(explicit_empty=True),
+                status=ContextStatus.PENDING, context=FilterContext(month, year, status),
+            )
+            for year in scan_years for month in month_labels for status in TARGET_STATUSES
+        }
         ledger = getattr(self, "execution_ledger", None)
         insurer_run_id = norm(getattr(self, "insurer_run_id", ""))
         context_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -5417,6 +5776,7 @@ class CuracelPilesRunner:
                 for status_label in TARGET_STATUSES:
                     print(f"\nScanning status: {status_label}")
                     context = context_by_key.get((month_label, scan_year, status_label))
+                    context_key = (month_label, scan_year, status_label)
                     if context:
                         ledger.heartbeat(insurer_run_id, phase="scan")
                         ledger.start_scan_context(context["id"])
@@ -5431,18 +5791,24 @@ class CuracelPilesRunner:
                             accumulator = ScanAccumulator()
                             accumulator.observe_page(1, rows)
                             scan_result = accumulator.finish(explicit_empty=not rows)
+                        scan_result = replace(scan_result, context=FilterContext(*context_key))
                         if context:
                             ledger.finish_scan_context(
                                 context["id"],
                                 scan_result,
                                 self._last_filter_evidence,
                             )
+                            self.initial_scan_results[context_key] = scan_result
                     except Exception as error:
+                        self.initial_scan_results[context_key] = replace(
+                            self.initial_scan_results[context_key], status=ContextStatus.FAILED,
+                        )
                         if context:
+                            safe_diagnostics = bool(getattr(self, "safe_diagnostics", False))
                             ledger.fail_scan_context(
                                 context["id"],
-                                error_code=type(error).__name__.lower(),
-                                error_message=str(error)[:2000],
+                                error_code=classify_runner_error(error) if safe_diagnostics else type(error).__name__.lower(),
+                                error_message=safe_worker_error(error)[1] if safe_diagnostics else str(error)[:2000],
                             )
                         raise
                     unassigned = [row for row in rows if not norm(row.assigned)]
@@ -5455,6 +5821,7 @@ class CuracelPilesRunner:
                         all_rows.append(row)
         return all_rows
 
+    @timed_operation('final_rescan', 'final_rescan')
     def scan_selected_statuses(
         self,
         filter_contexts: list[tuple[str, str, str]],
@@ -5465,6 +5832,7 @@ class CuracelPilesRunner:
         all_rows: list[PileRow] = []
         seen: set[str] = set()
         for month_label, filter_year, status_label in filter_contexts:
+            self._heartbeat("scan")
             active_year = norm(filter_year) or year_label
             print(f"\nScanning follow-up context: {active_year} / {month_label} / {status_label}")
             rows = self._scan_status_with_transient_retry(
@@ -5476,7 +5844,10 @@ class CuracelPilesRunner:
                 unassigned = [row for row in rows if not norm(row.assigned)]
                 print(f"  Found {len(rows)} rows, {len(unassigned)} unassigned")
             for row in rows:
-                if row.key in seen:
+                # V2 needs every observation to detect contradictory assignment
+                # evidence across contexts before canonical late-row deduplication.
+                preserve_evidence = bool(getattr(self, "safe_diagnostics", False)) and not only_unassigned
+                if row.key in seen and not preserve_evidence:
                     continue
                 seen.add(row.key)
                 all_rows.append(row)
@@ -5561,18 +5932,31 @@ class CuracelPilesRunner:
         selected_keys = [plan.pile_key for plan in selected_group]
         self._heartbeat("apply")
         self._open_assign_modal()
-        selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
+        submission_recorded = False
+        def before_submit():
+            nonlocal submission_recorded
+            self._transition_assignment_attempts(
+                selected_group, AttemptStatus.SUBMITTED, {AttemptStatus.SELECTED},
+                {"code": "portal_submission_starting", "details": {}},
+            )
+            submission_recorded = True
+        self._before_assignment_submit = before_submit if execute and getattr(self, "work_heartbeat", None) else None
+        try:
+            selected_assignee = self._apply_assignment_modal(assignment_type, assignee_name, execute)
+        finally:
+            self._before_assignment_submit = None
         verified_on_table = False
         observed_assigned_values: list[str] = []
         if execute:
-            self._transition_assignment_attempts(
-                selected_group,
-                AttemptStatus.SUBMITTED,
-                {AttemptStatus.SELECTED},
-                {"code": "portal_submit_returned", "details": {
-                    "selected_assignee": selected_assignee,
-                }},
-            )
+            if not submission_recorded:
+                self._transition_assignment_attempts(
+                    selected_group,
+                    AttemptStatus.SUBMITTED,
+                    {AttemptStatus.SELECTED},
+                    {"code": "portal_submit_returned", "details": {
+                        "selected_assignee": selected_assignee,
+                    }},
+                )
             self._heartbeat("apply")
             source_pages: list[int] = []
             for plan in selected_group:
@@ -5652,6 +6036,7 @@ class CuracelPilesRunner:
             return False
         return expected_label == observed_label
 
+    @timed_operation('apply', 'row_selection')
     def _select_rows(self, pile_keys: list[str], current_rows: list[PileRow]) -> RowSelectionResult:
         assert self.page
         rows = self.page.locator("table tbody tr")
@@ -5715,6 +6100,7 @@ class CuracelPilesRunner:
                     continue
         return RowSelectionResult(count=selected, selected_keys=selected_keys)
 
+    @timed_operation('verify', 'verification')
     def verify_assigned_rows(
         self,
         month_label: str,
@@ -6145,6 +6531,7 @@ class CuracelPilesRunner:
             pass
         return False
 
+    @timed_operation('apply', 'modal')
     def _apply_assignment_modal(self, assignment_type: str, assignee_name: str, execute: bool) -> str:
         assert self.page
         # Per current workflow, keep the assign modal on its default Vetting path.
@@ -6154,7 +6541,8 @@ class CuracelPilesRunner:
         control = None
         opened = False
         for attempt in range(1, 4):
-            time.sleep(0.8 if attempt == 1 else 1.2)
+            if attempt > 1:
+                time.sleep(1.2)
             control = self._wait_for_assign_user_control(timeout_ms=9000)
             if control is not None:
                 opened = self._open_select_control(control)
@@ -6188,10 +6576,29 @@ class CuracelPilesRunner:
                     try:
                         button = root.locator(selector).first
                         if button.count() and button.is_visible():
+                            work_heartbeat = getattr(self, "work_heartbeat", None)
+                            if work_heartbeat:
+                                work_heartbeat("apply")
+                                before_submit = getattr(self, "_before_assignment_submit", None)
+                                if before_submit:
+                                    before_submit()
+                                # Ledger recording can block too. Recheck at the
+                                # final boundary, not just before modal work.
+                                work_heartbeat("apply")
+                                try:
+                                    button.click(force=True)
+                                except Exception as error:
+                                    raise AssignmentSubmissionUncertain() from error
+                                clicked = True
+                                break
                             button.click(force=True)
                             clicked = True
                             break
+                    except (WorkOwnershipLost, AssignmentSubmissionUncertain):
+                        raise
                     except Exception:
+                        if getattr(self, "work_heartbeat", None):
+                            raise
                         continue
                 if clicked:
                     break
@@ -6221,6 +6628,8 @@ class CuracelPilesRunner:
                         pass
                     time.sleep(0.3)
             if not verified:
+                if getattr(self, "work_heartbeat", None):
+                    raise AssignmentSubmissionUncertain()
                 raise RuntimeError(f"Assign action for '{selected_assignee}' did not show a clear portal success state.")
             self._dismiss_popup()
         else:
@@ -6265,7 +6674,6 @@ class CuracelPilesRunner:
         if not selected:
             raise RuntimeError("Could not select a sample pile row to inspect the portal assignee dropdown.")
         self._open_assign_modal()
-        time.sleep(2)
         control = self._wait_for_assign_user_control()
         if control is None:
             raise RuntimeError("Could not find the Select User control while discovering portal assignees.")
@@ -7541,10 +7949,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visible", action="store_true", help="Run with a visible browser")
     parser.add_argument("--execute", action="store_true", help="Actually click Assign Claims. Default is dry-run.")
     parser.add_argument("--read-only", action="store_true", help="Use an in-memory execution ledger instead of writing new reliability state.")
+    parser.add_argument("--adopt-preview-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--run-id", default="", help="Adopt a runner run record pre-created by an asynchronous launcher.")
     parser.add_argument("--slow-mo", type=int, default=350, help="Playwright slow_mo in ms for visual debugging")
     parser.add_argument("--out", default="tmp/piles_auto_assignment_plan.json", help="Where to write the dry-run plan/output JSON")
-    parser.add_argument("--run-source", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUN_SOURCE")) or "manual", help="How this run was triggered, e.g. manual or schedule.")
+    parser.add_argument("--run-source", choices=[source.value for source in WorkSource], default="manual", help="Trusted invocation source supplied by the launcher.")
     parser.add_argument("--invocation-backend", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND")) or "local", help="Which compute backend launched this run, e.g. local or remote.")
     parser.add_argument("--effective-date", default=norm(os.getenv("PILES_AUTO_ASSIGNMENT_EFFECTIVE_DATE")), help="Override the local date used for weekend roster selection, e.g. 2026-05-23.")
     return parser.parse_args()
@@ -7580,6 +7989,7 @@ def is_retryable_scan_error(exc: Exception) -> bool:
     """Recognize bounded, read-safe portal failures that a page reload can recover."""
     phrases = (
         "no completed piles data request confirmed",
+        "piles filters were not confirmed: filter_settlement_timeout",
         "piles filters were not confirmed: filter_dom_response_mismatch",
         "piles table did not settle into a readable row state",
         "piles table did not match the selected page size response",
@@ -7788,6 +8198,8 @@ def _run_for_insurer_once(
     slack_replies_sent = 0
     reconciliation_manual_count = 0
     reconciliation_manual_keys: set[str] = set()
+    prior_attempt_keys: set[str] = set()
+    scan_context_summary: dict[str, int] | None = None
 
     print("=" * 72)
     print("Piles Auto-Assignment Runner")
@@ -7828,10 +8240,13 @@ def _run_for_insurer_once(
         )
 
     with CuracelPilesRunner(visible=visible, slow_mo=args.slow_mo) as runner:
+        runner.safe_diagnostics = bool(getattr(args, "worker_safe_diagnostics", False))
         runner.allow_test_any_assignee = False
         runner.execution_ledger = execution_ledger
         runner.insurer_run_id = insurer_run_id
         runner.insurer_name = insurer_name
+        runner.work_heartbeat = getattr(args, "work_heartbeat", None)
+        runner.phase_timer = getattr(args, 'phase_timer', None) or PhaseTimer()
 
         def ensure_portal_mapping(sample_pile: PileRow) -> None:
             nonlocal fallback_pool_used, portal_assignees, portal_option_names, resolved_name_map, resolved_bots, portal_mapping_warnings
@@ -7898,8 +8313,12 @@ def _run_for_insurer_once(
                     )]
 
             pending_attempts = execution_ledger.pending_attempts(insurer_name)
+            prior_attempt_keys.update(expanded_tracking_key_set(
+                key for attempt in pending_attempts
+                for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
+            ))
             if pending_attempts:
-                reconcile_pending_for_insurer(
+                runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer,
                     ScannedRowsPortal(),
                     execution_ledger,
                     pending_attempts,
@@ -7985,7 +8404,7 @@ def _run_for_insurer_once(
                 for candidate in stale_candidates
             }
             ensure_portal_mapping(stale_candidates[0].observed_row)
-            reassignment_plans, reassignment_summary = build_stale_reassignment_plans(
+            reassignment_plans, reassignment_summary = runner.phase_timer.call('plan', 'planning', build_stale_reassignment_plans,
                 insurer_name,
                 stale_candidates,
                 resolved_bots,
@@ -8053,6 +8472,9 @@ def _run_for_insurer_once(
             if canonical_pile_tracking_key(row.tracking_key) not in reconciliation_manual_keys
         ]
         initial_unassigned_keys = {row.key for row in unassigned}
+        initial_observed_keys = expanded_tracking_key_set(
+            key for row in scanned_rows for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+        )
         follow_up_context_pairs = {
             (row.filter_month, effective_filter_year(row, year_label), row.status_bucket)
             for row in unassigned
@@ -8067,7 +8489,7 @@ def _run_for_insurer_once(
             if not manual_mode:
                 ensure_portal_mapping(unassigned[0])
             if manual_mode:
-                plans, summary = build_assignment_plan(
+                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name,
                     unassigned,
                     resolved_bots,
@@ -8080,9 +8502,9 @@ def _run_for_insurer_once(
                     "no automatic assignment will be attempted."
                 )
             elif not bots:
-                plans, summary = build_assignment_plan_from_portal_options(insurer_name, unassigned, portal_assignees)
+                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, unassigned, portal_assignees)
             else:
-                plans, summary = build_assignment_plan(
+                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name,
                     unassigned,
                     resolved_bots,
@@ -8222,6 +8644,37 @@ def _run_for_insurer_once(
                 TARGET_STATUSES.index(item[2]) if item[2] in TARGET_STATUSES else 99,
             ),
         )
+        v2 = bool(getattr(args, "worker_safe_diagnostics", False))
+        if v2:
+            snapshots = tuple(getattr(runner, "initial_scan_results", {}).values())
+            scan_context_summary = {
+                "total": len(snapshots),
+                "complete": sum(result.status in {ContextStatus.COMPLETE, ContextStatus.EMPTY} for result in snapshots),
+                "empty": sum(result.status == ContextStatus.EMPTY for result in snapshots),
+                "failed": sum(result.status == ContextStatus.FAILED for result in snapshots),
+                "pending": sum(result.status not in {ContextStatus.COMPLETE, ContextStatus.EMPTY, ContextStatus.FAILED}
+                               for result in snapshots),
+            }
+            initial_observed_keys.update(expanded_tracking_key_set(
+                key for result in snapshots for row in result.rows
+                for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+            ))
+            follow_up_contexts = [
+                (context.filter_month, context.requested_year, context.status_bucket)
+                for context in late_arrival_contexts(snapshots)
+            ]
+            excluded = [
+                {"month": result.context.filter_month, "year": result.context.requested_year,
+                 "status": result.context.status_bucket, "code": "initial_context_" + result.status.value}
+                for result in snapshots if result.context is not None
+                and result.status not in {ContextStatus.COMPLETE, ContextStatus.EMPTY}
+            ]
+            late_arrival_detection["excluded_contexts"] = excluded
+            if excluded:
+                store.log_runner_event(
+                    insurer_name=insurer_name, event_type="late_arrival_contexts_excluded",
+                    status="completed_with_issues", details={"contexts": excluded},
+                )
         late_arrival_detection["contexts"] = [
             {"month": month_label, "year": filter_year, "status": status_label}
             for month_label, filter_year, status_label in follow_up_contexts
@@ -8229,14 +8682,59 @@ def _run_for_insurer_once(
 
         if follow_up_contexts:
             print("\nFinal late-arrival targeted rescan...")
-            follow_up_rows = runner.scan_selected_statuses(follow_up_contexts, year_label, only_unassigned=True)
+            if v2:
+                runner._heartbeat("scan")
+            follow_up_rows = runner.scan_selected_statuses(follow_up_contexts, year_label, only_unassigned=not v2)
         else:
             follow_up_rows = []
-        follow_up_unassigned = [
-            row for row in unique_unassigned_rows(follow_up_rows)
-            if row.key not in initial_unassigned_keys
-        ]
+        if v2:
+            if execution_ledger and insurer_run_id:
+                runner._heartbeat("reconcile")
+                final_pending = execution_ledger.pending_attempts(insurer_name)
+                prior_attempt_keys.update(expanded_tracking_key_set(
+                    key for attempt in final_pending
+                    for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
+                ))
+                observations_by_key: dict[str, list[Observation]] = {}
+                for row in follow_up_rows:
+                    for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]):
+                        observations_by_key.setdefault(key, []).append(Observation(
+                            assignable=not norm(row.assigned), assignee=norm(row.assigned),
+                            source="complete_final_scan",
+                        ))
+
+                class FinalScanPortal:
+                    def observe_attempt(self, attempt):
+                        runner._heartbeat("reconcile")
+                        return [observation
+                                for key in expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
+                                for observation in observations_by_key.get(key, [])]
+
+                for attempt in final_pending:
+                    runner._heartbeat("reconcile")
+                    decisions = runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer, FinalScanPortal(), execution_ledger, [attempt])
+                    for decision in decisions:
+                        counts = late_arrival_detection.setdefault("reconciliation", {})
+                        status = decision.status.value
+                        counts[status] = counts.get(status, 0) + 1
+            seen_late = initial_observed_keys | prior_attempt_keys | expanded_tracking_key_set(
+                key for row in follow_up_rows if norm(row.assigned)
+                for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+            )
+            follow_up_unassigned = []
+            for row in follow_up_rows:
+                identities = expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key])
+                if not norm(row.assigned) and not identities.intersection(seen_late):
+                    follow_up_unassigned.append(row)
+                seen_late.update(identities)
+        else:
+            follow_up_unassigned = [
+                row for row in unique_unassigned_rows(follow_up_rows)
+                if row.key not in initial_unassigned_keys
+            ]
         if follow_up_unassigned:
+            if v2:
+                runner._heartbeat("plan")
             late_arrival_detection["count"] = len(follow_up_unassigned)
             late_arrival_detection["claims"] = sum(row.claims for row in follow_up_unassigned)
             late_arrival_detection["piles"] = [row.__dict__ for row in follow_up_unassigned]
@@ -8244,13 +8742,23 @@ def _run_for_insurer_once(
                 f"Late-arrival unassigned piles detected after the first scan: "
                 f"{late_arrival_detection['count']} pile(s), {late_arrival_detection['claims']} claim(s)"
             )
-            ensure_portal_mapping(follow_up_unassigned[0])
+            late_manual = bool(rule and rule.distribution_mode == "manual_override")
+            if not late_manual:
+                ensure_portal_mapping(follow_up_unassigned[0])
             late_plans: list[PlannedAssignment]
             late_summary: dict[str, dict[str, Any]]
-            if not bots:
-                late_plans, late_summary = build_assignment_plan_from_portal_options(insurer_name, follow_up_unassigned, portal_assignees)
+            if v2:
+                runner._heartbeat("plan")
+            if late_manual:
+                manual_action_count += len(follow_up_unassigned)
+                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
+                    insurer_name, follow_up_unassigned, resolved_bots, metrics,
+                    rule=rule, effective_at=datetime.now(RUNNER_TIMEZONE),
+                )
+            elif not bots:
+                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, follow_up_unassigned, portal_assignees)
             else:
-                late_plans, late_summary = build_assignment_plan(
+                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
                     insurer_name,
                     follow_up_unassigned,
                     resolved_bots,
@@ -8264,7 +8772,7 @@ def _run_for_insurer_once(
             store.log_runner_event(
                 insurer_name=insurer_name,
                 event_type="late_arrival_detected",
-                status="follow_up_execute" if args.execute else "follow_up_preview",
+                status="manual_action_required" if late_manual else "follow_up_execute" if args.execute else "follow_up_preview",
                 pile_count=late_arrival_detection["count"],
                 claim_count=late_arrival_detection["claims"],
                 details={
@@ -8290,6 +8798,8 @@ def _run_for_insurer_once(
                         f"projected_finish={item['projected_finish_minutes']} mins"
                     )
             if late_plans:
+                if v2:
+                    runner._heartbeat("apply")
                 late_month_labels = list(dict.fromkeys(plan.filter_month for plan in late_plans if norm(plan.filter_month))) or month_labels
                 late_results, late_applied = runner.execute_assignment_plan(
                     late_month_labels,
@@ -8351,6 +8861,8 @@ def _run_for_insurer_once(
     notification_items: list[NotificationItem] = []
     if args.execute:
         for item in applied:
+            if getattr(args, "worker_safe_diagnostics", False) and not (item.verified_on_table and item.matched_planned_assignee):
+                continue
             planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
             owner_name = planned_assignee.owner_name if planned_assignee else item.actual_assignee_name
             owner_info = team_slack_map.get(owner_name.lower(), {})
@@ -8363,6 +8875,8 @@ def _run_for_insurer_once(
                 bot_name=planned_assignee.portal_name if planned_assignee else item.actual_assignee_name,
             ))
         for item in reassignment_applied:
+            if getattr(args, "worker_safe_diagnostics", False) and not (item.verified_on_table and item.matched_planned_assignee):
+                continue
             planned_assignee = next((bot for bot in resolved_bots if bot.id == item.plan.assignee_id), None)
             owner_name = planned_assignee.owner_name if planned_assignee else item.actual_assignee_name
             owner_info = team_slack_map.get(owner_name.lower(), {})
@@ -8468,7 +8982,7 @@ def _run_for_insurer_once(
     )
 
     print("\nDone.")
-    return {
+    result = {
         "insurer_name": insurer_name,
         "captured_at": captured_at,
         "tracked_reconcile": tracked_reconcile,
@@ -8489,6 +9003,19 @@ def _run_for_insurer_once(
         "external_notification_items": external_detection["notifications"],
         "late_arrival_detection": late_arrival_detection,
     }
+    if getattr(args, "worker_safe_diagnostics", False):
+        # A manual workflow can have no assignment attempts at all. Carry its
+        # explicit result across the worker boundary, not only ledger counts.
+        result["workflow_status"] = "manual_action_required" if manual_action_count else "completed"
+        if late_arrival_detection.get("excluded_contexts") or any(
+            count for status, count in late_arrival_detection.get("reconciliation", {}).items()
+            if status != AttemptStatus.CONFIRMED_RECONCILED.value
+        ):
+            result["workflow_status"] = "completed_with_issues"
+        result["manual_action_required_count"] = manual_action_count
+        if scan_context_summary is not None:
+            result["scan_context_summary"] = scan_context_summary
+    return result
 
 
 def run_for_insurer(
@@ -8516,6 +9043,8 @@ def run_for_insurer(
             )
         except Exception as exc:
             last_error = exc
+            if isinstance(exc, (WorkOwnershipLost, AssignmentSubmissionUncertain)):
+                raise
             if attempt >= 2 or not is_retryable_runner_browser_error(exc):
                 raise
             print(
@@ -8535,36 +9064,447 @@ def run_insurer_recorded(
     visible: bool,
     execution_ledger: Any,
     runner_run_id: str,
+    *,
+    safe_diagnostics: bool = False,
+    ownership: Any = None,
 ) -> dict[str, Any]:
     """Run one insurer and keep ledger-finalization failures from masking portal errors."""
     insurer_run_id = ""
+    args = argparse.Namespace(**vars(args))
+    args.phase_timer = PhaseTimer()
     try:
         if execution_ledger:
             master = store.get_master_account(insurer_name)
-            insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
+            if ownership:
+                insurer_run_id = ownership.started(master)
+            else:
+                insurer_run_id = execution_ledger.create_insurer_run(runner_run_id, master)
             execution_ledger.heartbeat(insurer_run_id, phase="login")
         result = run_for_insurer(
             store, args, insurer_name, month_labels, year_label, visible,
             execution_ledger, insurer_run_id,
         )
         if insurer_run_id:
-            execution_ledger.finalize_insurer_run(insurer_run_id, status="completed")
+            status = "completed"
+            error_code = ""
+            if ownership:
+                ownership.check()
+                summary = execution_ledger.summarize_insurer_run(insurer_run_id)
+                status, error_code = classify_workflow_outcome(result, summary)
+                ownership.status = InsurerRunStatus(status)
+                ownership.error_code = error_code
+                ownership.check()
+            args.phase_timer.finish()
+            fields = {"status": status, "performance": args.phase_timer.serialize()}
+            if error_code:
+                fields["error_code"] = error_code
+            execution_ledger.finalize_insurer_run(insurer_run_id, **fields)
         return result
     except Exception as exc:
+        if ownership:
+            # Lost owners cannot finalize even their old insurer run.
+            ownership.check()
         if insurer_run_id:
             try:
+                args.phase_timer.finish('failed')
                 execution_ledger.finalize_insurer_run(
                     insurer_run_id,
                     status="failed",
-                    error_code=classify_runner_error(exc),
-                    error_message=str(exc)[:500],
+                    error_code=safe_worker_error(exc)[0] if safe_diagnostics else classify_runner_error(exc),
+                    error_message=safe_worker_error(exc)[1] if safe_diagnostics else str(exc)[:500],
+                    performance=args.phase_timer.serialize(),
                 )
             except Exception as ledger_error:
-                print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
+                if safe_diagnostics:
+                    print("WARNING: could not finalize insurer ledger state.")
+                else:
+                    print(f"\nWARNING: could not finalize ledger state for {insurer_name}: {ledger_error}")
         raise
 
 
+def run_claimed_insurer_once(work, context: WorkerContext, args: argparse.Namespace,
+                             month_labels: list[str], year_label: str, visible: bool) -> dict[str, Any]:
+    """V2 portal boundary: one recorded execution, no coalescing or follow-up.
+
+    Shared invocation settings are copied before portal execution. Returned
+    notification payloads belong to the caller, never a shared parent list.
+    """
+    worker_args = deepcopy(args)
+    worker_args.worker_safe_diagnostics = True
+    if context.ownership:
+        worker_args.work_heartbeat = context.ownership.check
+    if context.output_path:
+        worker_args.out = context.output_path
+    elif getattr(worker_args, "out", None):
+        path = Path(worker_args.out)
+        identifier = hashlib.sha256(f"{work.id}:{work.claim_token}".encode()).hexdigest()[:16]
+        worker_args.out = str(path.with_name(f"{path.stem}-{identifier}{path.suffix}"))
+    return run_insurer_recorded(
+        context.store, worker_args, work.insurer_name, list(month_labels),
+        year_label, visible, context.ledger, work.parent_runner_run_id or "",
+        safe_diagnostics=True, ownership=context.ownership,
+    )
+
+
+def notify_dispatch_result(args: argparse.Namespace, result: DispatchResult) -> None:
+    """Send only parent-aggregated payloads after every worker has joined."""
+    external = list(result.external_notification_items)
+    if should_send_external_assignment_alert(args, external):
+        try:
+            send_external_assignment_alert(external, portal_environment=PORTAL_ENVIRONMENT,
+                                           run_source=norm(args.run_source) or "manual", safe_diagnostics=True)
+        except Exception:
+            print("WARNING: external assignment notification failed.")
+    items = list(result.notification_items)
+    if not args.execute or not items:
+        return
+    assigned = [item for item in items if item.kind == "assignment"]
+    reassigned = [item for item in items if item.kind == "reassignment"]
+    try:
+        thread = create_assignment_thread(
+            scope_label=args.insurer or "All active insurers", portal_environment=PORTAL_ENVIRONMENT,
+            assigned_piles=len(assigned), assigned_claims=sum(max(item.plan.remaining_claims, 0) for item in assigned),
+            reassigned_piles=len(reassigned), reassigned_claims=sum(max(item.plan.remaining_claims, 0) for item in reassigned),
+            insurer_names=[item.plan.insurer_name for item in items],
+            safe_diagnostics=True,
+        ) or ""
+        if thread:
+            for owner_items in group_notification_items_by_owner(items):
+                send_assignment_owner_reply(owner_items, thread, safe_diagnostics=True)
+    except Exception:
+        print("WARNING: assignment summary notification failed.")
+
+
+def classify_workflow_outcome(
+    result: Any, summary: Any = None,
+) -> tuple[str, str]:
+    """Require explicit workflow evidence before declaring an insurer complete."""
+    result = result if isinstance(result, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    workflow_status = norm(result.get("workflow_status"))
+    manual_count = safe_int(result.get("manual_action_required_count"), 0)
+    if workflow_status == "manual_action_required" or manual_count or summary.get("manual_action_required", 0):
+        return "manual_action_required", "manual_action_required"
+    if workflow_status not in {"completed", "completed_with_issues"}:
+        return "completed_with_issues", "workflow_outcome_unconfirmed"
+    has_follow_up = (
+        workflow_status == "completed_with_issues"
+        or bool(result.get("portal_mapping_warnings"))
+        or any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed"))
+    )
+    if has_follow_up:
+        return "completed_with_issues", "assignment_follow_up_required"
+    return "completed", ""
+
+
+def normalize_standalone_probe_outcome(outcome: Any) -> Any:
+    """Apply workflow evidence semantics after a read-only probe transport succeeds."""
+    if getattr(outcome, "status", None) != InsurerRunStatus.COMPLETED:
+        return outcome
+    value = getattr(outcome, "value", None)
+    result = getattr(value, "result", None) if value is not None else None
+    status, error_code = classify_workflow_outcome(result)
+    return replace(outcome, status=InsurerRunStatus(status), error_code=error_code)
+
+
+class StandaloneProbeIncomplete(WorkerUnavailable):
+    """Bounded CLI failure that retains normalized outcomes for trusted callers."""
+
+    def __init__(self, result: DispatchResult) -> None:
+        self.result = result
+        first_issue = next(
+            (outcome.error_code for outcome in result.outcomes
+             if outcome.status != InsurerRunStatus.COMPLETED and outcome.error_code),
+            "readiness_probe_incomplete",
+        )
+        super().__init__(first_issue)
+
+
+def finalize_standalone_probe(outcomes: Iterable[Any]) -> DispatchResult:
+    """Derive probe truth and fail unless every requested insurer is confirmed complete."""
+    normalized = tuple(normalize_standalone_probe_outcome(outcome) for outcome in outcomes)
+    result = DispatchResult(
+        derive_parent_status((), (outcome.status for outcome in normalized)),
+        normalized,
+    )
+    if any(outcome.status != InsurerRunStatus.COMPLETED for outcome in normalized):
+        raise StandaloneProbeIncomplete(result)
+    return result
+
+
+def preview_context_diagnostics(result: dict[str, Any]) -> dict[str, int | None]:
+    """Accept only internally consistent measured scan-context aggregates."""
+    keys = ("total", "complete", "empty", "failed", "pending")
+    raw = result.get("scan_context_summary")
+    unknown = {f"contexts_{key}": None for key in keys}
+    if not isinstance(raw, dict):
+        return unknown
+    values = {key: raw.get(key) for key in keys}
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 100000
+           for value in values.values()):
+        return unknown
+    if (values["empty"] > values["complete"]
+            or values["complete"] + values["failed"] + values["pending"] != values["total"]):
+        return unknown
+    return {f"contexts_{key}": value for key, value in values.items()}
+
+
+def preview_diagnostic_outcome(outcome: Any) -> dict[str, Any]:
+    """Project a probe result into bounded, non-identifying parent diagnostics."""
+    value = getattr(outcome, "value", None)
+    result = getattr(value, "result", None) if value is not None else None
+    result = result if isinstance(result, dict) else {}
+    status = getattr(getattr(outcome, "status", None), "value", "failed")
+    error_code = norm(getattr(outcome, "error_code", ""))[:100]
+    if status == "completed":
+        status, error_code = classify_workflow_outcome(result)
+    unassigned = list(result.get("unassigned") or [])
+    plans = [*list(result.get("reassignment_plans") or []), *list(result.get("plans") or [])]
+    return {
+        "insurer_name": norm(getattr(outcome, "insurer_name", ""))[:160],
+        "status": status if status in {"completed", "completed_with_issues", "manual_action_required", "failed"} else "failed",
+        "phase": "complete",
+        "error_code": error_code,
+        "discovered_piles": len(unassigned),
+        "discovered_claims": sum(max(safe_int(getattr(item, "remaining_claims", 0), 0), 0) for item in unassigned),
+        "planned_piles": len(plans),
+        "planned_claims": sum(max(safe_int(getattr(item, "remaining_claims", 0), 0), 0) for item in plans),
+        **preview_context_diagnostics(result),
+    }
+
+
+def preview_parent_status(
+    diagnostics: list[dict[str, Any]], *, interrupted: bool = False,
+) -> str:
+    """Aggregate preview truth, treating unfinished requested work as a failure signal."""
+    statuses = [InsurerRunStatus(item["status"]) for item in diagnostics]
+    if interrupted:
+        statuses.append(InsurerRunStatus.FAILED)
+    return derive_parent_status((), statuses).value
+
+
+def run_durable_preview(
+    args: argparse.Namespace,
+    store: DataStore,
+    months: list[str],
+    year: str,
+    visible: bool,
+    router: ContextOutputRouter,
+    stopped: threading.Event,
+) -> DispatchResult:
+    """Run an API preview with read-only workers and one fenced parent writer."""
+    scope = "all-active" if args.all_active else "single"
+    if not store.try_acquire_preview_parent_lock(args.run_id):
+        raise WorkerUnavailable("preview_parent_unavailable")
+    try:
+        token = store.claim_preview_runner_run(
+            run_id=args.run_id, insurer_name=args.insurer or "", run_scope=scope,
+            portal_environment=PORTAL_ENVIRONMENT, backend=norm(args.invocation_backend) or "local",
+            run_source=norm(args.run_source), months=months, year=year, mode="dry-run",
+        )
+        finalized = False
+        outcomes = []
+        diagnostics: list[dict[str, Any]] = []
+        parent_error = ""
+        try:
+            insurers = [args.insurer] if args.insurer else [
+                account.insurer_name for account in store.get_active_master_accounts()
+            ]
+            if not insurers:
+                raise RuntimeError("No active insurer master accounts were found to preview.")
+            probe_args = deepcopy(args)
+            probe_args.read_only = True
+            probe_args.worker_safe_diagnostics = True
+            def preview_heartbeat(phase="scan"):
+                if stopped.is_set():
+                    raise WorkerUnavailable("dispatch_stopped")
+                if not store.heartbeat_preview_runner_run(args.run_id, token, phase):
+                    raise WorkerUnavailable("preview_parent_ownership_lost")
+            probe_args.work_heartbeat = preview_heartbeat
+            factory = worker_context_factory(probe_args, router, max_concurrency=1, durable_claims=False)
+            @contextmanager
+            def probe_context(work):
+                with factory(work) as context:
+                    yield replace(context, dispatch_store=None, ownership=None)
+            def run_one(work, context):
+                return run_claimed_insurer_once(work, context, probe_args, months, year, visible)
+            for insurer in insurers:
+                if stopped.is_set():
+                    parent_error = "dispatch_stopped"
+                    break
+                if not store.heartbeat_preview_runner_run(args.run_id, token, "scan"):
+                    raise WorkerUnavailable("preview_parent_ownership_lost")
+                work = ProbeWork(insurer, canonical_insurer_key(insurer))
+                outcome = execute_claimed_insurer(work, probe_context, run_one, stop_event=stopped)
+                if outcome.error_code == "insurer_lock_unavailable":
+                    outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
+                elif outcome.error_code == "worker_capacity_unavailable":
+                    outcome = replace(outcome, error_code="probe_blocked_by_capacity")
+                outcomes.append(outcome)
+                diagnostic = preview_diagnostic_outcome(outcome)
+                diagnostics.append(diagnostic)
+                if diagnostic["status"] == "failed" and not parent_error:
+                    parent_error = diagnostic["error_code"] or "unexpected_error"
+                if stopped.is_set() and len(outcomes) < len(insurers):
+                    parent_error = "dispatch_stopped"
+                    break
+            if parent_error == "dispatch_stopped":
+                status = preview_parent_status(diagnostics, interrupted=True)
+            else:
+                status = preview_parent_status(diagnostics)
+            error_code = parent_error or next((item["error_code"] for item in diagnostics if item["error_code"]), "")
+            if not store.finalize_preview_runner_run(
+                args.run_id, token, status=status, outcomes=diagnostics, error_code=error_code,
+            ):
+                raise WorkerUnavailable("preview_parent_ownership_lost")
+            finalized = True
+            result = DispatchResult(ParentRunStatus(status), tuple(outcomes))
+            if status != "completed":
+                raise WorkerUnavailable(error_code or "preview_completed_with_issues")
+            return result
+        except Exception as error:
+            if not finalized:
+                code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
+                try:
+                    store.finalize_preview_runner_run(
+                        args.run_id, token, status=preview_parent_status(diagnostics, interrupted=True),
+                        outcomes=diagnostics, error_code=code,
+                    )
+                except Exception:
+                    pass
+            raise
+    finally:
+        store.release_preview_parent_lock(args.run_id)
+
+
+def main_v2() -> DispatchResult:
+    """Default-disabled composition root; no legacy follow-up or parent writer."""
+    args = parse_args()
+    if args.read_only and args.execute:
+        raise RuntimeError("--read-only cannot be combined with --execute.")
+    if args.adopt_preview_run and (args.execute or args.read_only or not norm(args.run_id)
+                                   or norm(args.run_source) != "manual"):
+        raise ParentScopeMismatch("Durable preview adoption requires an API-created manual preview parent.")
+    configure_portal_environment(args.portal_environment)
+    months, year = parse_month_labels(args.month), parse_year_label(args.year)
+    visible = args.visible or not env_bool("HEADLESS", True)
+    maximum = configured_max_concurrency()
+    if args.execute and not is_test_portal(CURACEL_BASE_URL) and not env_bool("ALLOW_PRODUCTION_ASSIGNMENTS", False):
+        raise RuntimeError("Execute mode is blocked outside the test portal without explicit production approval.")
+    durable_preview = bool(not args.execute and args.adopt_preview_run)
+    # Standalone non-execute invocations are probes: no parent/queue/assignment writes.
+    if not args.execute and not durable_preview:
+        args = deepcopy(args)
+        args.read_only = True
+    run_id, coordinator = "", None
+    with ExitStack() as resources:
+        stopped = threading.Event()
+        def request_stop(_signal, _frame):
+            stopped.set()
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            original = signal.signal(shutdown_signal, request_stop)
+            resources.callback(signal.signal, shutdown_signal, original)
+        store = DataStore(read_only=bool(args.read_only))
+        resources.callback(store.close)
+        with ContextOutputRouter.installed() as router:
+            if durable_preview:
+                try:
+                    return run_durable_preview(args, store, months, year, visible, router, stopped)
+                except ParentAlreadyTerminal:
+                    return DispatchResult(ParentRunStatus.COMPLETED, ())
+                except ParentScopeMismatch:
+                    raise WorkerUnavailable("parent_scope_mismatch") from None
+            insurers = [args.insurer] if args.insurer else [account.insurer_name for account in store.get_active_master_accounts()]
+            if not insurers:
+                raise RuntimeError("No active insurer master accounts were found to run.")
+            factory = worker_context_factory(args, router, max_concurrency=maximum, durable_claims=bool(args.execute))
+            def run_one(work, context):
+                return run_claimed_insurer_once(work, context, args, months, year, visible)
+            if not args.execute:
+                @contextmanager
+                def probe_context(work):
+                    with factory(work) as context:
+                        yield replace(context, dispatch_store=None)
+                outcomes = []
+                for insurer in insurers:
+                    work = ProbeWork(insurer, canonical_insurer_key(insurer))
+                    outcome = execute_claimed_insurer(
+                        work, probe_context, run_one, stop_event=stopped,
+                    )
+                    if outcome.error_code == "insurer_lock_unavailable":
+                        outcome = replace(outcome, error_code="probe_blocked_by_active_insurer")
+                    elif outcome.error_code == "worker_capacity_unavailable":
+                        outcome = replace(outcome, error_code="probe_blocked_by_capacity")
+                    outcomes.append(outcome)
+                return finalize_standalone_probe(outcomes)
+            try:
+                coordinator = build_dispatch_store(store)
+                resources.callback(coordinator.close)
+                run_id = store.create_runner_run(
+                    run_id=args.run_id, insurer_name=args.insurer or "",
+                    run_scope="all-active" if args.all_active else "single",
+                    portal_environment=PORTAL_ENVIRONMENT, backend=norm(args.invocation_backend) or "local",
+                    run_source=WorkSource(norm(args.run_source) or "manual").value,
+                    months=months, year=year, mode="execute",
+                    details={"dispatcher_v2": True, "insurers": insurers},
+                    preserve_existing=True,
+                )
+                requested_at = coordinator.parent_requested_at(run_id)
+                requests = [WorkRequest(insurer, WorkSource(norm(args.run_source) or "manual"), requested_at,
+                                        RequestScope.ALL_ACTIVE if args.all_active else RequestScope.SINGLE_INSURER,
+                                        PORTAL_ENVIRONMENT, tuple(months), year)
+                            for insurer in insurers]
+                work_items = coordinator.enqueue_parent_work(run_id, requests)
+                restored = []
+                if store.try_acquire_insurer_lock("__weekend_state__"):
+                    try:
+                        restored = store.restore_due_weekend_bot_states(runner_effective_date(args))
+                    finally:
+                        store.release_insurer_lock("__weekend_state__")
+                result = dispatch_parent(run_id, work_items, maximum, factory, run_one,
+                                         store=coordinator, stop_event=stopped)
+                if result.status == ParentRunStatus.RUNNING:
+                    raise WorkerUnavailable("dispatch_work_pending")
+                try:
+                    collection_complete = coordinator.notification_collection_complete(
+                        run_id, result.finalized_work_ids, result.notification_fingerprints)
+                except Exception:
+                    collection_complete = False
+                if collection_complete:
+                    notify_dispatch_result(args, result)
+                else:
+                    print("WARNING: parent_notification_incomplete; notification requires operational review.")
+                if restored and collection_complete:
+                    try:
+                        send_weekend_restore_update(restored, safe_diagnostics=True)
+                    except Exception:
+                        print("WARNING: weekend roster notification failed.")
+                if any(outcome.status == InsurerRunStatus.FAILED for outcome in result.outcomes):
+                    raise RuntimeError("One or more insurers failed; inspect the normalized insurer outcomes.")
+                return result
+            except ParentAlreadyTerminal:
+                return DispatchResult(coordinator.finalize_parent(run_id), ())
+            except Exception as error:
+                if coordinator and run_id:
+                    try:
+                        coordinator.fail_parent_setup(run_id)
+                    except Exception:
+                        pass  # Keep durable state recoverable when the DB is unavailable.
+                code = "parent_scope_mismatch" if isinstance(error, ParentScopeMismatch) else safe_worker_error(error)[0]
+                raise WorkerUnavailable(code) from None
+
+
 def main() -> None:
+    if dispatcher_v2_enabled():
+        try:
+            return main_v2()
+        except StandaloneProbeIncomplete:
+            # The exception string is already a bounded code; retain normalized
+            # outcomes for trusted in-process readiness callers.
+            raise
+        except Exception as error:
+            code, _ = safe_worker_error(error)
+            raise RuntimeError(f"Dispatcher could not complete ({code}).") from None
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     stdout_capture = TeeCapture(original_stdout)

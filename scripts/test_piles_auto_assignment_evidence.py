@@ -1,4 +1,6 @@
 import unittest
+from dataclasses import replace
+from scripts.piles_auto_assignment import evidence as evidence_module
 
 from scripts.piles_auto_assignment.domain import FilterEvidence
 from scripts.piles_auto_assignment.domain import AttemptStatus
@@ -9,6 +11,49 @@ from scripts.piles_auto_assignment.evidence import (
 
 
 class FilterEvidenceTests(unittest.TestCase):
+    def wait(self, evidence, elapsed):
+        self.assertTrue(hasattr(evidence_module, 'decide_filter_wait'), 'pure wait decision missing')
+        return evidence_module.decide_filter_wait(evidence, elapsed).decision
+
+    def test_positive_dom_evidence_requires_grace_and_stability(self):
+        for state in ('empty', 'stable'):
+            evidence = FilterEvidence(True, True, True, state, 'not_observed',
+                                      {'selection_changed': True, 'positive_dom': True, 'generation_fresh': True})
+            self.assertEqual(self.wait(evidence, 1499), 'continue')
+            self.assertEqual(self.wait(evidence, 1500), 'accept')
+            self.assertEqual(self.wait(replace(evidence, year_matches=False), 1500), 'continue')
+            self.assertEqual(self.wait(replace(evidence, details={'selection_changed': True}), 1500), 'continue')
+            self.assertEqual(self.wait(replace(evidence, details={'selection_changed': True, 'positive_dom': True}), 1500), 'continue')
+            self.assertEqual(self.wait(replace(evidence, details={'positive_dom': True}), 1500), 'continue')
+
+    def test_unknown_evidence_waits_until_cap_then_retries(self):
+        for state in ('unreadable', 'loading', 'structurally_empty'):
+            evidence = FilterEvidence(True, True, True, state, 'not_observed')
+            self.assertEqual(self.wait(evidence, 1500), 'continue')
+            self.assertEqual(self.wait(evidence, 29999), 'continue')
+            self.assertEqual(self.wait(evidence, 30000), 'retry')
+        unknown = FilterEvidence(True, True, True, 'empty', 'succeeded',
+                                 {'selection_changed': True, 'positive_dom': True,
+                                  'network': {'authoritative': False}})
+        self.assertEqual(self.wait(unknown, 1500), 'continue')
+        self.assertEqual(self.wait(replace(unknown, network_state='unknown'), 1500), 'continue')
+        self.assertEqual(self.wait(replace(unknown, network_state='unknown', details={'positive_dom': True}), 1500), 'continue')
+        self.assertEqual(self.wait(FilterEvidence(True, True, True, 'stable', 'succeeded'), 1500), 'continue')
+
+    def test_observed_contradictions_fail_without_grace(self):
+        for evidence in (
+            FilterEvidence(True, True, True, 'empty', 'failed'),
+            FilterEvidence(True, True, True, 'empty', 'succeeded', {
+                'selection_changed': True, 'positive_dom': True,
+                'network': {'authoritative': True, 'authoritative_empty': False},
+                'dom_matches_response': False}),
+            FilterEvidence(True, True, True, 'stable', 'succeeded', {
+                'selection_changed': True, 'network': {'authoritative': True},
+                'dom_matches_response': False}),
+        ):
+            self.assertEqual(self.wait(evidence, 0), 'fail')
+            self.assertEqual(self.wait(replace(evidence, year_matches=False), 0), 'fail')
+
     def test_noop_selection_with_matching_controls_and_stable_table_passes(self):
         decision = evaluate_filter_evidence(
             FilterEvidence(

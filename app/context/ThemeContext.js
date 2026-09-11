@@ -7,6 +7,7 @@ export const DARK = {
   border: '#1E2D3D', text: '#F0F4F8', sub: '#8899AA', muted: '#556677',
   danger: '#FF5C5C', warn: '#FFB84D', success: '#34D399',
   blue: '#5B8DEF', purple: '#A78BFA', orange: '#FB923C',
+  historyBadgeText: { success: '#34D399', warning: '#FFB84D', danger: '#FF5C5C', info: '#5B8DEF', neutral: '#8899AA' },
   sidebarBg: '#111827', inputBg: '#1A2332',
 };
 
@@ -16,6 +17,7 @@ export const LIGHT = {
   border: '#E2E8F0', text: '#0D1117', sub: '#4A5568', muted: '#A0AEC0',
   danger: '#E53E3E', warn: '#D97706', success: '#059669',
   blue: '#3B72D9', purple: '#7C3AED', orange: '#EA580C',
+  historyBadgeText: { success: '#047857', warning: '#92400E', danger: '#B91C1C', info: '#1D4ED8', neutral: '#4A5568' },
   sidebarBg: '#FFFFFF', inputBg: '#EDF2F7',
 };
 

@@ -76,6 +76,7 @@ async function queueRemote(request, runId) {
       portal_environment: request.portalEnvironment, months: request.months, year: request.year,
       effective_date: request.effectiveDate, visible_browser: request.visible,
       finalize_assignments: request.finalizeAssignments, run_source: 'manual', invocation_backend: 'remote',
+      adopt_preview_run: !request.finalizeAssignments,
     }),
   });
   if (!response.ok) throw new Error(`Remote runner queue failed with HTTP ${response.status}.`);
@@ -109,6 +110,9 @@ export async function POST(httpRequest) {
       queued_at: now,
       finalize_assignments: request.finalizeAssignments,
       insurers: request.runAll ? [] : [request.insurerName],
+      ...(request.finalizeAssignments ? {} : {
+        preview_protocol: 'durable_preview_v1', preview_phase: 'configuration', preview_outcomes: [],
+      }),
     };
     const { error: insertError } = await supabase.from('piles_auto_assignment_runner_runs').insert({
       id: runId, insurer_name: request.runAll ? '' : request.insurerName,
@@ -122,7 +126,7 @@ export async function POST(httpRequest) {
     if (backend === 'remote') {
       await queueRemote(request, runId);
     } else {
-      const args = buildRunnerArgs(request, { runId, backend });
+      const args = buildRunnerArgs(request, { runId, backend, source: 'manual' });
       startDetachedRunner({
         pythonBin: resolvePythonBin(), scriptPath: 'scripts/piles_auto_assignment_runner.py', args,
         cwd: process.cwd(), env: process.env,

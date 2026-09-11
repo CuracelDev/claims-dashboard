@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../../context/ThemeContext';
 import { getMemberId, getMemberName } from '../../lib/auth';
+import { formatDuration, formatCount, isRunnerActive, statusPresentation, heartbeatPresentation, summarizeInsurerOutcomes } from '../../../lib/piles-auto-assignment-history.mjs';
 
 const ROLE_OPTIONS = [
   { value: 'primary', label: 'Primary' },
@@ -147,36 +148,6 @@ function formatTrackedState(row) {
   return 'active';
 }
 
-function formatRunnerRunResult(run) {
-  if (!run) return 'No run output yet.';
-  const details = run.details || {};
-  const isRunning = ['queued', 'started', 'running'].includes(run.status) && !run.finished_at;
-  const lines = [
-    `Run scope: ${run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}`,
-    `Portal: ${run.portal_environment || 'production'}`,
-    `Mode: ${run.mode === 'execute' ? 'Execute' : 'Preview'}`,
-    `Status: ${isRunning ? 'in progress' : (run.status || 'completed')}`,
-  ];
-  if (Array.isArray(run.months) && run.months.length) {
-    lines.push(`Month(s): ${run.months.sort(compareMonthLabels).join(', ')}`);
-  }
-  if (run.year) {
-    lines.push(`Year: ${run.year}`);
-  }
-  if (run.started_at) {
-    lines.push(`Started: ${new Date(run.started_at).toLocaleString('en-GB')}`);
-  }
-  if (run.finished_at) {
-    lines.push(`Finished: ${new Date(run.finished_at).toLocaleString('en-GB')}`);
-  }
-  if (details?.error) {
-    lines.push(`Error: ${details.error}`);
-  }
-  if (run.stdout) return run.stdout;
-  if (run.stderr) return run.stderr;
-  return lines.join('\n');
-}
-
 function buildRunnerOutputFallback(logs) {
   const latest = (logs || []).find((log) => log.event_type === 'runner_complete');
   if (!latest) return '';
@@ -201,26 +172,6 @@ function buildRunnerOutputFallback(logs) {
     lines.push(`Result: ${totalPiles} pile(s), ${totalClaims} claim(s) in the latest plan.`);
   }
   return lines.join('\n');
-}
-
-function formatRunnerStatus(run) {
-  const isRunning = ['queued', 'started', 'running'].includes(run?.status) && !run?.finished_at;
-  if (isRunning) return 'in progress';
-  return run?.status || 'completed';
-}
-
-function formatRunnerDuration(run, nowTs = Date.now()) {
-  if (!run) return '—';
-  if (run.finished_at && Number(run.duration_ms) > 0) {
-    return `${Math.max(1, Math.round(Number(run.duration_ms) / 1000))}s`;
-  }
-  if (['queued', 'started', 'running'].includes(run.status) && run.started_at) {
-    const elapsedMs = Math.max(0, nowTs - new Date(run.started_at).getTime());
-    const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
-    return `${elapsedSec}s live`;
-  }
-  if (Number(run.duration_ms) === 0) return '0s';
-  return '—';
 }
 
 function formatBackendLabel(backend) {
@@ -385,7 +336,6 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
     if (!runId) return undefined;
     let active = true;
     let timer;
-    const terminal = new Set(['completed', 'partial', 'failed', 'manual_action_required', 'skipped_overlap']);
 
     async function refreshRun() {
       try {
@@ -396,22 +346,23 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
         if (!run || !active) return;
         const counts = run.counts || {};
         const insurerLines = (run.insurers || []).map((item) => (
-          `${item.insurer_name}: ${item.status} (${item.phase})`
+          `${item.insurer_name}: ${statusPresentation(item.status).label} (${item.phase})`
           + (item.error_code ? ` — ${item.error_code}` : '')
         ));
         setRunnerState({
-          activeRunId: terminal.has(run.status) ? '' : runId,
+          activeRunId: isRunnerActive(run) ? runId : '',
           runMeta: run,
           runOutput: [
             `Run ${run.id}`,
             `Phase: ${run.phase}`,
-            `Contexts: ${counts.contexts_complete || 0}/${counts.contexts_total || 0}`,
-            `Discovered: ${counts.discovered_piles || 0} piles / ${counts.discovered_claims || 0} claims`,
-            `Planned: ${counts.planned_piles || 0}; confirmed: ${counts.confirmed_piles || 0}; pending reconciliation: ${counts.reconciliation_pending || 0}; conflicts: ${counts.conflicts || 0}; failed: ${counts.failed || 0}`,
+            historyRunPresentation(run).explanation,
+            `Contexts: ${formatCount(counts.contexts_complete)}/${formatCount(counts.contexts_total)}`,
+            `Discovered: ${formatCount(counts.discovered_piles)} piles / ${formatCount(counts.discovered_claims)} claims`,
+            `Planned: ${formatCount(counts.planned_piles)}; confirmed: ${formatCount(counts.confirmed_piles)}; pending reconciliation: ${formatCount(counts.reconciliation_pending)}; conflicts: ${formatCount(counts.conflicts)}; failed: ${formatCount(counts.failed)}; manual action: ${formatCount(counts.manual_action_required)}`,
             ...insurerLines,
           ].join('\n'),
         });
-        if (terminal.has(run.status)) {
+        if (!isRunnerActive(run)) {
           onRefresh();
           onRunnerFinished?.();
           return;
@@ -628,20 +579,174 @@ function RunnerControlSection({ C, masterAccounts, onRefresh, onRunnerFinished, 
       </div>
       {runnerState.runMeta && (
         <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 12, color: C.sub, fontSize: 12 }}>
-          <div>Duration: <span style={{ color: C.text }}>{formatRunnerDuration(runnerState.runMeta)}</span></div>
-          <div>Status: <span style={{ color: runnerState.runMeta.status === 'failed' ? C.danger : C.accent }}>{formatRunnerStatus(runnerState.runMeta)}</span></div>
+          <div>Duration: <span style={{ color: C.text }}>{formatDuration(runnerState.runMeta.duration_ms)}</span></div>
+          <div>Status: <HistoryBadge C={C} presentation={historyRunPresentation(runnerState.runMeta)} /></div>
           <div>Backend: <span style={{ color: C.text }}>{formatBackendLabel(runnerState.runMeta.backend)}</span></div>
           <div>Phase: <span style={{ color: C.text }}>{runnerState.runMeta.phase || 'configuration'}</span></div>
           <div>Heartbeat: <span style={{ color: C.text }}>{runnerState.runMeta.heartbeat_at ? new Date(runnerState.runMeta.heartbeat_at).toLocaleString('en-GB') : 'waiting'}</span></div>
         </div>
       )}
       <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: '14px 16px' }}>
-        <div style={{ color: C.sub, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Runner Output</div>
+        <div style={{ color: C.sub, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Runner Progress</div>
         <pre style={{ margin: 0, color: C.text, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 320, overflowY: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
           {runnerState.runOutput || runnerOutputFallback || 'No run output yet.'}
         </pre>
       </div>
     </div>
+  );
+}
+
+function HistoryBadge({ C, presentation }) {
+  const color = C.historyBadgeText?.[presentation.tone]
+    || { success: C.success, warning: C.warn, danger: C.danger, info: C.blue, neutral: C.sub }[presentation.tone]
+    || C.sub;
+  return <span data-tone={presentation.tone} style={{ color, fontWeight: 700, fontSize: 12 }}>{presentation.label}</span>;
+}
+
+function HistoryFields({ C, fields }) {
+  return (
+    <dl style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 160px), 1fr))', gap: 12, margin: 0, fontSize: 12 }}>
+      {fields.map(([label, value]) => (
+        <div key={label} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+          <dt style={{ color: C.sub }}>{label}</dt>
+          <dd style={{ color: C.text, margin: '4px 0 0', fontWeight: 600 }}>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function HistoryCounts({ C, counts = {} }) {
+  return <HistoryFields C={C} fields={[
+    ['Contexts expected', counts.contexts_total], ['Contexts settled (including empty)', counts.contexts_complete],
+    ['Contexts empty', counts.contexts_empty], ['Contexts failed', counts.contexts_failed], ['Contexts pending', counts.contexts_pending],
+    ['Discovered piles', counts.discovered_piles], ['Discovered claims', counts.discovered_claims], ['Unassigned piles', counts.unassigned_piles],
+    ['Planned piles', counts.planned_piles], ['Selected piles', counts.selected_piles], ['Submitted piles', counts.submitted_piles],
+    ['Confirmed piles', counts.confirmed_piles], ['Awaiting reconciliation', counts.reconciliation_pending],
+    ['Conflicted piles', counts.conflicts], ['Failed piles', counts.failed], ['Manual action piles', counts.manual_action_required],
+  ].map(([label, value]) => [label, formatCount(value)])} />;
+}
+
+function HistoryHeartbeat({ C, item, parent = false }) {
+  const presentation = heartbeatPresentation(item.heartbeat_state, item.duration_ms);
+  return (
+    <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, padding: 12, fontSize: 12, lineHeight: 1.6 }}>
+      <HistoryBadge C={C} presentation={presentation} />
+      <div style={{ color: C.sub }}>{presentation.explanation}</div>
+      <div style={{ color: C.sub }}>{parent ? 'Latest recorded insurer heartbeat' : 'Last heartbeat'}: {formatDateTime(item.heartbeat_at)}</div>
+      {parent && <div style={{ color: C.sub }}>Freshness reflects the least healthy active insurer, not just the latest heartbeat.</div>}
+    </div>
+  );
+}
+
+function HistoryDisposition({ C, disposition }) {
+  const special = {
+    legacy: 'Legacy record — work disposition was not recorded.',
+    mixed: 'Mixed dispositions — review each insurer below.',
+    diagnostic_preview: 'Diagnostic preview — no executable work items or assignment attempts were created.',
+  };
+  const presentation = statusPresentation(disposition === 'claimed' ? 'running' : disposition === 'inactive' ? 'skipped_inactive' : disposition);
+  return (
+    <div style={{ color: C.sub, fontSize: 12, lineHeight: 1.6 }}>
+      <span style={{ color: C.text, fontWeight: 700 }}>Work disposition: </span>
+      {Object.hasOwn(special, disposition) ? special[disposition] : <>{disposition === 'claimed' ? 'Claimed' : presentation.label}. {presentation.explanation}</>}
+    </div>
+  );
+}
+
+function historyRunPresentation(run) {
+  const displayStatus = run.request_state?.state === 'waiting' ? 'waiting'
+    : run.request_state?.state === 'acknowledged' && !run.insurers?.length && run.status === 'completed' ? 'covered_by_active_cycle' : run.status;
+  const presentation = statusPresentation(displayStatus);
+  return { ...presentation, explanation: displayStatus !== run.status ? presentation.explanation : run.summary_text || presentation.explanation };
+}
+
+function RunnerHistoryRun({ C, run }) {
+  const insurers = run.insurers || [];
+  const request = run.request_state || {};
+  const presentation = historyRunPresentation(run);
+  const title = ['all-active', 'all_active'].includes(run.run_scope) ? 'All active insurers' : (run.insurer_name || 'One insurer');
+  return (
+    <details style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, minWidth: 0, overflowWrap: 'anywhere' }}>
+      <summary style={{ cursor: 'pointer', color: C.text, lineHeight: 1.8 }}>
+        <span style={{ fontWeight: 700 }}>{title}</span>{' · '}
+        <HistoryBadge C={C} presentation={presentation} />
+        <span style={{ display: 'block', color: C.sub, fontSize: 12 }}>
+          {run.source_label || 'Unknown source'} · {run.mode === 'execute' ? 'Execute' : run.mode === 'dry-run' ? 'Preview' : 'Unknown mode'} · {formatDuration(run.duration_ms)} · {formatDateTime(run.finished_at || run.started_at)}
+        </span>
+        <span style={{ display: 'block', color: C.sub, fontSize: 12 }}>{summarizeInsurerOutcomes(insurers)}</span>
+        {isRunnerActive(run) && <HistoryBadge C={C} presentation={heartbeatPresentation(run.heartbeat_state, run.duration_ms)} />}
+      </summary>
+      <div style={{ display: 'grid', gap: 14, marginTop: 14 }}>
+        <div style={{ color: C.sub, fontSize: 13, lineHeight: 1.6 }}>{presentation.explanation}</div>
+        <HistoryDisposition C={C} disposition={run.work_disposition} />
+        {request.state && request.state !== 'none' && (
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, padding: 12 }}>
+            <p style={{ color: C.sub, fontSize: 12, margin: '0 0 10px' }}>
+              {request.state === 'waiting' ? 'Waiting for another parent’s generation; no duplicate execution is owned here.'
+                : request.state === 'acknowledged' ? 'Scheduling request acknowledged. Another parent owns this generation; its assignment outcomes are not included here.'
+                  : 'Request acknowledgement is unknown; completion is not confirmed.'}
+            </p>
+            <HistoryFields C={C} fields={[
+              ['Referenced requests', formatCount(request.count)], ['Queued requests', formatCount(request.queued)],
+              ['Follow-up requests', formatCount(request.follow_up_queued)],
+            ]} />
+          </div>
+        )}
+        <HistoryFields C={C} fields={[
+          ['Source', run.source_label || 'Unknown source'], ['Phase', run.phase || 'Unknown'], ['Duration', formatDuration(run.duration_ms)],
+          ['Portal', run.portal_environment || 'Unknown'], ['Backend', run.backend || 'Unknown'],
+          ['Months', run.months?.length ? [...run.months].sort(compareMonthLabels).join(', ') : '—'], ['Year', run.year || '—'],
+          ['Started', formatDateTime(run.started_at)], ['Finished', formatDateTime(run.finished_at)],
+        ]} />
+        <HistoryHeartbeat C={C} item={run} parent />
+        <div style={{ color: C.text, fontWeight: 700, fontSize: 13 }}>Owned insurer totals</div>
+        <HistoryCounts C={C} counts={run.counts} />
+        <div style={{ color: C.sub, fontSize: 12 }}>Unknown means a count has not been recorded. Context and assignment counts are separate evidence, not additive totals.</div>
+        {!insurers.length && <div style={{ color: C.sub, fontSize: 12 }}>No owned insurer execution details were recorded. This does not confirm any assignments.</div>}
+        {insurers.map((insurer, index) => {
+          const status = statusPresentation(insurer.status);
+          return (
+            <details key={insurer.id || `${insurer.insurer_name}-${index}`} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, minWidth: 0 }}>
+              <summary style={{ cursor: 'pointer', color: C.text, lineHeight: 1.8 }}>
+                <span style={{ fontWeight: 700 }}>{insurer.insurer_name || 'Unknown insurer'}</span>{' · '}
+                <HistoryBadge C={C} presentation={status} />
+                <span style={{ display: 'block', color: C.sub, fontSize: 12 }}>{insurer.source_label || 'Unknown source'} · Phase: {insurer.phase || 'Unknown'} · {formatDuration(insurer.duration_ms)}</span>
+                {isRunnerActive(insurer) && <HistoryBadge C={C} presentation={heartbeatPresentation(insurer.heartbeat_state, insurer.duration_ms)} />}
+              </summary>
+              <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
+                <div style={{ color: C.sub, fontSize: 12, lineHeight: 1.6 }}>{status.explanation}</div>
+                <HistoryDisposition C={C} disposition={insurer.work_disposition} />
+                <HistoryFields C={C} fields={[
+                  ['Started', formatDateTime(insurer.started_at)], ['Finished', formatDateTime(insurer.finished_at)],
+                ]} />
+                <HistoryHeartbeat C={C} item={insurer} />
+                {insurer.error_code && (
+                  <div style={{ borderLeft: `3px solid ${C.warn}`, paddingLeft: 10, fontSize: 12, lineHeight: 1.6 }}>
+                    <div style={{ color: C.text, fontWeight: 700 }}>Error code: {insurer.error_code}</div>
+                    <div style={{ color: C.sub }}>{insurer.error_message}</div>
+                  </div>
+                )}
+                <HistoryCounts C={C} counts={insurer.counts} />
+                {!!insurer.performance?.length && (
+                  <div style={{ fontSize: 12 }}>
+                    <div style={{ color: C.text, fontWeight: 700 }}>Performance evidence</div>
+                    <p style={{ color: C.sub }}>Phase lifetimes and nested operation timings overlap; do not sum them as wall-clock duration.</p>
+                    <ul style={{ color: C.sub, paddingLeft: 20, margin: 0 }}>
+                      {insurer.performance.map((timing, timingIndex) => (
+                        <li key={timingIndex} style={{ marginBottom: 8 }}>
+                          {timing.phase} / {timing.operation}: {formatCount(timing.count)} observations · total {formatDuration(timing.total_ms)} · min {formatDuration(timing.min_ms)} · max {formatDuration(timing.max_ms)}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </details>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 
@@ -651,44 +756,40 @@ function RunnerHistorySection({ C, refreshToken }) {
   const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
   const [runs, setRuns] = useState([]);
   const [error, setError] = useState('');
-  const [nowTs, setNowTs] = useState(Date.now());
+  const [reloadToken, setReloadToken] = useState(0);
+  const [loadedAt, setLoadedAt] = useState(null);
 
   useEffect(() => {
     let active = true;
-    async function loadRuns() {
-      setLoading(true);
-      setError('');
+    let timer;
+    async function loadRuns(initial = false) {
+      if (initial) setLoading(true);
+      let refreshDelay = 10000;
       try {
         const res = await fetch('/api/tools/piles-auto-assignment/runner-runs?limit=150', { cache: 'no-store' });
         const json = await res.json();
-        if (!json.success) throw new Error(json.error || 'Failed to load runner history.');
+        if (!res.ok || !json.success) throw new Error('Failed to load runner history.');
         if (!active) return;
         setRuns(json.runs || []);
-      } catch (loadError) {
+        setLoadedAt(new Date().toISOString());
+        setError('');
+        refreshDelay = (json.runs || []).some(isRunnerActive) ? 5000 : 30000;
+      } catch {
         if (!active) return;
-        setError(loadError.message);
+        setError('Failed to load runner history. Refresh to retry; current activity cannot be confirmed.');
       } finally {
-        if (active) setLoading(false);
+        if (active) {
+          setLoading(false);
+          timer = window.setTimeout(() => loadRuns(), refreshDelay);
+        }
       }
     }
-    loadRuns();
+    loadRuns(true);
     return () => {
       active = false;
+      if (timer) window.clearTimeout(timer);
     };
-  }, [refreshToken]);
-
-  const hasActiveRun = useMemo(
-    () => runs.some((run) => run.status === 'started' && !run.finished_at),
-    [runs],
-  );
-
-  useEffect(() => {
-    if (!hasActiveRun) return undefined;
-    const interval = window.setInterval(() => {
-      setNowTs(Date.now());
-    }, 5000);
-    return () => window.clearInterval(interval);
-  }, [hasActiveRun]);
+  }, [refreshToken, reloadToken]);
 
   const filteredRuns = useMemo(() => {
     const sorted = [...runs].sort((a, b) => new Date(b.finished_at || b.started_at || 0).getTime() - new Date(a.finished_at || a.started_at || 0).getTime());
@@ -707,87 +808,35 @@ function RunnerHistorySection({ C, refreshToken }) {
         C={C}
         icon="📜"
         title="Runner History"
-        text="Full runner history for manual and scheduled executions. Use this to inspect the exact output, timing, and outcome of previous runs."
+        text="The latest 150 recorded requests, with safe insurer outcomes, timing and assignment evidence. Expand a request, then an insurer, for diagnostics."
       />
-      <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 1fr', gap: 12, marginBottom: 16 }}>
-        <select value={scope} onChange={(e) => setScope(e.target.value)} style={inputStyle(C)}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 180px), 1fr))', gap: 12, marginBottom: 16 }}>
+        <select aria-label="Runner history date range" value={scope} onChange={(e) => setScope(e.target.value)} style={{ ...inputStyle(C), outline: 'revert' }}>
           <option value="today">Today</option>
           <option value="yesterday">Yesterday</option>
           <option value="custom">Pick a day</option>
-          <option value="all">All time</option>
+          <option value="all">Latest 150 (all dates)</option>
         </select>
         {scope === 'custom' ? (
-          <input type="date" value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)} style={inputStyle(C)} />
+          <input aria-label="Runner history day" type="date" value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)} style={{ ...inputStyle(C), outline: 'revert' }} />
         ) : (
           <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
-            {scope === 'all' ? 'Showing all recorded runner executions.' : 'Showing the latest runner executions for the selected day.'}
+            {scope === 'all' ? 'Showing the latest 150 requests across all dates.' : 'Filtering the latest 150 requests by the selected day.'}
           </div>
         )}
+        <button type="button" disabled={loading} onClick={() => setReloadToken((value) => value + 1)} style={{ ...inputStyle(C), outline: 'revert', cursor: 'pointer' }}>Refresh history</button>
       </div>
+      {loadedAt && <div style={{ color: C.sub, fontSize: 12, marginBottom: 12 }}>Evidence as of {formatDateTime(loadedAt)}. Refreshes every 5 seconds while work is active, otherwise every 30 seconds.</div>}
       {loading ? (
-        <div style={{ color: C.sub, fontSize: 13 }}>Loading runner history…</div>
+        <div role="status" style={{ color: C.sub, fontSize: 13 }}>Loading runner history…</div>
       ) : error ? (
-        <div style={{ color: C.danger, fontSize: 13 }}>{error}</div>
+        <div role="alert" style={{ color: C.danger, fontSize: 13 }}>{error}</div>
       ) : !filteredRuns.length ? (
-        <EmptyState C={C} title="No runner executions for this filter" text="Once manual or scheduled runs happen, their full output will be available here for the selected day." />
+        <EmptyState C={C} title="No runner requests for this filter" text="No requests from the latest 150 matched this day. Try another date or refresh for new requests." />
       ) : (
         <div style={{ maxHeight: 540, overflowY: 'auto', display: 'grid', gap: 12 }}>
           {filteredRuns.map((run) => {
-            const eventTime = run.finished_at || run.started_at;
-            const months = Array.isArray(run.months) ? [...run.months].sort(compareMonthLabels).join(', ') : (run.months || '—');
-            const stdout = String(run.stdout || '').trim();
-            const stderr = String(run.stderr || '').trim();
-            const fallbackText = formatRunnerRunResult(run);
-            const isRunning = run.status === 'started' && !run.finished_at;
-            const statusText = formatRunnerStatus(run);
-            const durationText = formatRunnerDuration(run, nowTs);
-            return (
-              <details key={run.id} open={isRunning} style={{ background: C.elevated, border: `1px solid ${isRunning ? C.accent : C.border}`, boxShadow: isRunning ? `0 0 0 1px ${C.accent}33 inset` : 'none', borderRadius: 12, padding: '14px 16px' }}>
-                <summary style={{ cursor: 'pointer', listStyle: 'none' }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 0.9fr 0.9fr 0.8fr 1fr', gap: 12, alignItems: 'center' }}>
-                    <div>
-                      <div style={{ color: C.text, fontSize: 14, fontWeight: 700 }}>
-                        {run.run_scope === 'all-active' ? 'All active insurers' : (run.insurer_name || 'One insurer')}
-                      </div>
-                      <div style={{ color: C.sub, fontSize: 12 }}>
-                        {run.portal_environment || 'production'} portal · {run.run_source || 'manual'} · {formatBackendLabel(run.backend)}
-                      </div>
-                    </div>
-                    <div style={{ color: C.text, fontSize: 13 }}>{run.mode === 'execute' ? 'Execute' : 'Preview'}</div>
-                    <div style={{ color: run.status === 'failed' ? C.danger : C.accent, fontSize: 13, fontWeight: 700 }}>{statusText}</div>
-                    <div style={{ color: C.text, fontSize: 13 }}>{durationText}</div>
-                    <div style={{ color: C.muted, fontSize: 12 }}>{eventTime ? new Date(eventTime).toLocaleString('en-GB') : '—'}</div>
-                  </div>
-                </summary>
-                <div style={{ marginTop: 14, display: 'grid', gap: 12 }}>
-                  {isRunning && (
-                    <div style={{ background: '#14B8A61A', border: '1px solid #14B8A644', borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 12 }}>
-                      This run is still active. Duration and output will update after it finalizes.
-                    </div>
-                  )}
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 12 }}>
-                    <div style={{ color: C.sub, fontSize: 12 }}>Month(s): <span style={{ color: C.text, fontWeight: 700 }}>{months}</span></div>
-                    <div style={{ color: C.sub, fontSize: 12 }}>Year: <span style={{ color: C.text, fontWeight: 700 }}>{run.year || '—'}</span></div>
-                    <div style={{ color: C.sub, fontSize: 12 }}>Started: <span style={{ color: C.text, fontWeight: 700 }}>{run.started_at ? new Date(run.started_at).toLocaleString('en-GB') : '—'}</span></div>
-                    <div style={{ color: C.sub, fontSize: 12 }}>{isRunning ? 'Elapsed' : 'Finished'}: <span style={{ color: C.text, fontWeight: 700 }}>{isRunning ? durationText : (run.finished_at ? new Date(run.finished_at).toLocaleString('en-GB') : '—')}</span></div>
-                  </div>
-                  <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px' }}>
-                    <div style={{ color: C.sub, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Run Output</div>
-                    <pre style={{ margin: 0, color: C.text, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 280, overflowY: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
-                      {stdout || stderr || fallbackText}
-                    </pre>
-                  </div>
-                  {stderr && stdout && (
-                    <div style={{ background: '#EF444412', border: '1px solid #EF444444', borderRadius: 10, padding: '12px 14px' }}>
-                      <div style={{ color: C.danger, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>stderr</div>
-                      <pre style={{ margin: 0, color: C.text, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 180, overflowY: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
-                        {stderr}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              </details>
-            );
+            return <RunnerHistoryRun key={run.id} C={C} run={run} />;
           })}
         </div>
       )}
