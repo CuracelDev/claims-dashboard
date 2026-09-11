@@ -72,6 +72,12 @@ jobs:
             fi
 
             if [ "$probe_status" -ne 0 ]; then
+              echo "Portal readiness probe failed with status $probe_status." >&2
               exit "$probe_status"
             fi
-            exit "$readiness_status"
+            echo "Portal readiness probe completed successfully."
+            if [ "$readiness_status" -ne 0 ]; then
+              echo "Runtime readiness audit failed with status $readiness_status." >&2
+              exit "$readiness_status"
+            fi
+            echo "Runtime readiness audit completed successfully."
