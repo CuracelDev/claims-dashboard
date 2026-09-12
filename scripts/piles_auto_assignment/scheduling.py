@@ -39,7 +39,6 @@ def decide_dispatch(
     elif request.request_scope == RequestScope.ALL_ACTIVE and compatible_coverage:
         active_all_cycle = coverage.active_request_scope == RequestScope.ALL_ACTIVE
         covered_by_active_cycle = active_all_cycle and coverage.state in {
-            "queued",
             "claimed",
             "running",
         }
@@ -60,7 +59,9 @@ def decide_dispatch(
         create_work_item = False
     elif compatible_coverage and coverage.state == "queued":
         disposition = WorkDisposition.QUEUED
-        create_work_item = False
+        # Re-run the unique queued-generation insert so the store can atomically
+        # adopt work whose owning parent no longer holds its session lock.
+        create_work_item = True
 
     return DispatchDecision(
         insurer_name=request.insurer_name,

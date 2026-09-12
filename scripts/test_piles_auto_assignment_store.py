@@ -109,7 +109,12 @@ class EnqueueSqlConnection:
 
     def __init__(self):
         self.database = sqlite3.connect(":memory:")
+        self.locked_parent_namespaces = set()
         self.database.create_function("now", 0, lambda: NOW.isoformat())
+        self.database.create_function("clock_timestamp", 0, lambda: NOW.isoformat())
+        self.database.create_function("duration_ms", 2, lambda end, start: max(
+            0, int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() * 1000)
+        ))
         self.database.create_function("btrim", 1, str.strip)
         self.database.create_function("regexp_replace", 4, lambda value, pattern, replacement, flags: re.sub(pattern, replacement, value))
         self.database.create_function("json_contains", 2, lambda covering, requested: int(
@@ -117,13 +122,19 @@ class EnqueueSqlConnection:
         ))
         self.database.create_function("hashtextextended", 2, lambda value, seed: value)
         self.database.create_function("pg_advisory_xact_lock", 1, lambda value: 1)
+        self.database.create_function(
+            "pg_try_advisory_xact_lock", 1,
+            lambda value: int(value not in self.locked_parent_namespaces),
+        )
         self.database.executescript("""
             CREATE TABLE piles_auto_assignment_master_accounts(insurer_name TEXT, is_active BOOLEAN);
             CREATE TABLE piles_auto_assignment_runner_runs(
                 id TEXT PRIMARY KEY, status TEXT DEFAULT 'started', mode TEXT DEFAULT 'execute',
                 run_scope TEXT DEFAULT 'all-active', portal_environment TEXT DEFAULT 'production',
+                run_source TEXT DEFAULT 'schedule',
                 months TEXT DEFAULT '["All"]', year TEXT DEFAULT 'All',
-                details TEXT DEFAULT '{}', updated_at TEXT);
+                details TEXT DEFAULT '{}', started_at TEXT DEFAULT (now()),
+                finished_at TEXT, duration_ms INTEGER DEFAULT 0, updated_at TEXT);
             CREATE TABLE piles_auto_assignment_insurer_runs(
                 id TEXT PRIMARY KEY, runner_run_id TEXT, insurer_name TEXT, status TEXT,
                 started_at TEXT, finished_at TEXT, created_at TEXT DEFAULT (now()),
@@ -134,7 +145,9 @@ class EnqueueSqlConnection:
                 portal_environment TEXT DEFAULT 'production', months TEXT DEFAULT '["All"]', year TEXT DEFAULT 'All',
                 disposition TEXT, generation_requested_at TEXT,
                 covered_by_insurer_run_id TEXT, requested_at TEXT,
-                started_at TEXT, finished_at TEXT, updated_at TEXT);
+                worker_id TEXT, claim_token TEXT, lease_expires_at TEXT,
+                heartbeat_at TEXT, claimed_at TEXT, attempt_number INTEGER DEFAULT 0,
+                reason_code TEXT, started_at TEXT, finished_at TEXT, updated_at TEXT);
             CREATE UNIQUE INDEX queued_generation ON piles_auto_assignment_work_items
                 (canonical_insurer_name, source, request_scope, portal_environment, months, year)
                 WHERE disposition = 'queued';
@@ -162,6 +175,11 @@ class EnqueueSqlConnection:
                 sql = sql.replace(
                     "jsonb_set(coalesce(details, '{}'), '{dispatch_requests}', ?)",
                     "json_set(coalesce(details, '{}'), '$.dispatch_requests', json(?))",
+                )
+                sql = re.sub(
+                    r"least\(2147483647,\s*greatest\(0,\s*extract\(epoch FROM \(now\(\) - started_at\)\) \* 1000\)\)::integer",
+                    "min(2147483647, duration_ms(now(), started_at))",
+                    sql,
                 )
                 self.raw.execute(sql, tuple(value.isoformat() if isinstance(value, datetime) else value for value in params))
                 self.description = self.raw.description
@@ -209,6 +227,11 @@ class LegacyCoverageSqlTests(unittest.TestCase):
         self.connection.commit()
 
     def enqueue(self, parent_id, source=WorkSource.SCHEDULE):
+        self.connection.database.execute(
+            "UPDATE piles_auto_assignment_runner_runs SET run_source=?, run_scope=? WHERE id=?",
+            (source.value, "all-active" if source == WorkSource.SCHEDULE else "single", parent_id),
+        )
+        self.connection.commit()
         portal, months, year = self.connection.database.execute(
             "SELECT portal_environment,months,year FROM piles_auto_assignment_runner_runs WHERE id=?", (parent_id,)
         ).fetchone()
@@ -324,7 +347,9 @@ class LegacyCoverageSqlTests(unittest.TestCase):
         self.assertEqual(decision.disposition, WorkDisposition.QUEUED)
         self.assertTrue(decision.create_work_item)
 
-    def test_v2_queued_and_claimed_generations_still_cover_execute_overlap(self):
+    def test_new_cycle_adopts_queued_generation_but_live_claim_still_covers(self):
+        # Break caught: queued work remains attached to a dead parent, so every
+        # later schedule says "covered" while no worker can claim the work.
         self.connection.database.execute(
             "UPDATE piles_auto_assignment_runner_runs SET mode = 'dry-run' WHERE id = 'legacy'"
         )
@@ -336,7 +361,12 @@ class LegacyCoverageSqlTests(unittest.TestCase):
                     'schedule', 'all_active', 'queued', now())
         """)
         self.connection.commit()
-        self.assertEqual(self.enqueue("request-2").disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
+        adopted = self.enqueue("request-2")
+        self.assertEqual(adopted.disposition, WorkDisposition.QUEUED)
+        self.assertFalse(adopted.create_work_item)
+        self.assertEqual(self.connection.database.execute(
+            "SELECT parent_runner_run_id FROM piles_auto_assignment_work_items WHERE id = 'v2-work'"
+        ).fetchone(), ("request-2",))
         self.connection.database.execute(
             "UPDATE piles_auto_assignment_work_items SET disposition = 'claimed' WHERE id = 'v2-work'"
         )
@@ -609,24 +639,27 @@ class DispatchStoreTests(unittest.TestCase):
         self.assertEqual(self.connection.rollback_count, 0)
         self.assertIn("pg_advisory_xact_lock", self.connection.statements[1][0])
 
-    def test_queued_all_active_is_covered_and_never_followed_up(self):
+    def test_queued_all_active_is_reenqueued_for_atomic_parent_adoption(self):
         decision = self.enqueue_store([work_row(disposition="queued")]).enqueue_parent_work("parent-2", [self.request()])[0]
-        self.assertEqual(decision.disposition, WorkDisposition.COVERED_BY_ACTIVE_CYCLE)
-        self.assertEqual(self.connection.statements[-2][1][9], "covered_by_active_cycle")
+        self.assertEqual(decision.disposition, WorkDisposition.QUEUED)
+        self.assertEqual(self.connection.statements[-2][1][9], "queued")
+        self.assertIn("parent_runner_run_id = EXCLUDED.parent_runner_run_id", self.connection.statements[-2][0])
         self.assertIn("canonical_insurer_name = %s", self.connection.statements[3][0])
         self.assertEqual(self.connection.statements[3][1], (
             "OLD MUTUAL", "OLD MUTUAL", NOW, "production", "All", '["All"]', "OLD MUTUAL",
         ))
 
-    def test_manual_request_reuses_queued_generation_without_reparenting(self):
-        decision = self.enqueue_store([work_row(disposition="queued", source="manual", request_scope="single_insurer")], inserted=False).enqueue_parent_work("parent-2", [self.request(WorkSource.MANUAL)])[0]
+    def test_manual_request_adopts_an_abandoned_queued_generation(self):
+        # Break caught: a manual queued generation remains owned by a dead
+        # parent and no later manual invocation can claim it.
+        decision = self.enqueue_store([work_row(disposition="queued", source="manual", request_scope="single_insurer")]).enqueue_parent_work("parent-2", [self.request(WorkSource.MANUAL)])[0]
         self.assertEqual(decision.disposition, WorkDisposition.QUEUED)
-        self.assertFalse(decision.create_work_item)
-        self.assertFalse(any("INSERT INTO piles_auto_assignment_work_items" in sql for sql, _ in self.connection.statements))
-        sql, params = self.connection.statements[-1]
-        self.assertIn("details", sql)
+        self.assertTrue(decision.create_work_item)
+        sql, _params = self.connection.statements[-2]
+        self.assertIn("parent_runner_run_id = EXCLUDED.parent_runner_run_id", sql)
+        _sql, params = self.connection.statements[-1]
         references = json.loads(params[0])
-        self.assertEqual(references[0]["work_item_id"], "work-1")
+        self.assertRegex(references[0]["work_item_id"], r"^[0-9a-f-]{36}$")
         self.assertEqual(params[-1], "parent-2")
 
     def test_manual_follow_up_is_created_once_and_reused(self):
@@ -637,6 +670,23 @@ class DispatchStoreTests(unittest.TestCase):
         decision = self.enqueue_store([active, follow_up], inserted=False).enqueue_parent_work("parent-3", [self.request(WorkSource.MANUAL)])[0]
         self.assertFalse(decision.create_work_item)
         self.assertEqual(json.loads(self.connection.statements[-1][1][0])[0]["work_item_id"], "follow-up")
+
+    def test_manual_request_adopts_follow_up_owned_by_a_dead_parent(self):
+        # Break caught: an orphaned follow-up remains permanently unclaimable
+        # after the parent process exits before starting it.
+        orphan = work_row(
+            id="orphan-follow-up", disposition="follow_up_queued",
+            source="manual", request_scope="single_insurer",
+            queued_parent_reclaimable=True,
+        )
+
+        decision = self.enqueue_store([orphan]).enqueue_parent_work(
+            "parent-2", [self.request(WorkSource.MANUAL)],
+        )[0]
+
+        self.assertEqual(decision.disposition, WorkDisposition.FOLLOW_UP_QUEUED)
+        self.assertTrue(decision.create_work_item)
+        self.assertIn("parent_runner_run_id = EXCLUDED.parent_runner_run_id", self.connection.statements[-2][0])
 
     def test_explicit_inactive_configuration_is_terminal(self):
         decision = self.enqueue_store(master=[{"is_active": False}]).enqueue_parent_work("parent-1", [self.request()])[0]

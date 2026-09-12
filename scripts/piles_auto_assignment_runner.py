@@ -1623,6 +1623,22 @@ class DataStore:
                 (f"piles-insurer:{canonical_insurer_key(insurer_name)}",),
             )
 
+    def try_acquire_dispatch_parent_lock(self, run_id: str) -> bool:
+        if self.mode != "postgres" or not norm(run_id):
+            raise RuntimeError("Durable parent ownership requires DATABASE_URL and a run id.")
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+            (f"piles-parent:{run_id}",),
+        )
+        return bool(rows and rows[0].get("acquired"))
+
+    def release_dispatch_parent_lock(self, run_id: str) -> None:
+        if self.mode == "postgres" and norm(run_id):
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-parent:{run_id}",),
+            )
+
     def try_acquire_runner_slot(self, max_concurrency: int) -> int:
         if self.mode != "postgres":
             raise RuntimeError("Runner capacity protection requires DATABASE_URL.")
@@ -9493,6 +9509,9 @@ def main_v2() -> DispatchResult:
                     details={"dispatcher_v2": True, "insurers": insurers},
                     preserve_existing=True,
                 )
+                if not store.try_acquire_dispatch_parent_lock(run_id):
+                    raise WorkerUnavailable("parent_dispatch_active")
+                resources.callback(store.release_dispatch_parent_lock, run_id)
                 requested_at = coordinator.parent_requested_at(run_id)
                 requests = [WorkRequest(insurer, WorkSource(norm(args.run_source) or "manual"), requested_at,
                                         RequestScope.ALL_ACTIVE if args.all_active else RequestScope.SINGLE_INSURER,

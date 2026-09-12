@@ -316,7 +316,9 @@ class BoundedDispatcherTests(unittest.TestCase):
         connection.commit()
         store = DispatchStore(connection)
         requests = [WorkRequest("UAPOM", "schedule", NOW)]
-        decisions = [store.enqueue_parent_work(parent, requests)[0] for parent in ("parent", "overlap-1", "overlap-2")]
+        decisions = [store.enqueue_parent_work("parent", requests)[0]]
+        connection.locked_parent_namespaces.add("piles-parent:parent")
+        decisions.extend(store.enqueue_parent_work(parent, requests)[0] for parent in ("overlap-1", "overlap-2"))
         self.assertEqual([decision.disposition.value for decision in decisions],
                          ["queued", "covered_by_active_cycle", "covered_by_active_cycle"])
         rows = connection.database.execute("SELECT id,parent_runner_run_id,disposition FROM piles_auto_assignment_work_items").fetchall()

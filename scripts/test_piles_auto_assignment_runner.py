@@ -3298,6 +3298,23 @@ class RunnerRunAdoptionTests(unittest.TestCase):
         self.assertIn("pg_advisory_unlock", calls[1][0])
         self.assertFalse(store.try_acquire_preview_parent_lock("invalid/id"))
 
+    def test_dispatch_parent_advisory_lock_uses_a_domain_separated_exact_id(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "postgres"
+        calls = []
+        responses = iter([[{"acquired": True}], [{"released": True}]])
+        store._fetchall_postgres = lambda sql, params=(): calls.append((" ".join(sql.split()), params)) or next(responses)
+
+        self.assertTrue(store.try_acquire_dispatch_parent_lock("dispatch-parent"))
+        store.release_dispatch_parent_lock("dispatch-parent")
+
+        self.assertEqual([params for _sql, params in calls], [
+            ("piles-parent:dispatch-parent",),
+            ("piles-parent:dispatch-parent",),
+        ])
+        self.assertIn("pg_try_advisory_lock", calls[0][0])
+        self.assertIn("pg_advisory_unlock", calls[1][0])
+
 
 class AssignmentRuleLoadingTests(unittest.TestCase):
     def test_inactive_rule_is_not_applied(self):
@@ -3922,6 +3939,11 @@ class DispatcherMainTests(unittest.TestCase):
                 return preview_lock
             def release_preview_parent_lock(self, run_id):
                 owner.events.append(("preview_unlock", run_id))
+            def try_acquire_dispatch_parent_lock(self, run_id):
+                owner.events.append(("dispatch_parent_lock", run_id))
+                return True
+            def release_dispatch_parent_lock(self, run_id):
+                owner.events.append(("dispatch_parent_unlock", run_id))
             def heartbeat_preview_runner_run(self, run_id, token, phase):
                 nonlocal preview_heartbeat_count
                 preview_heartbeat_count += 1
