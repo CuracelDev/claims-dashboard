@@ -1,0 +1,75 @@
+name: Piles Runtime Incident Probe
+
+on:
+  push:
+    branches:
+      - AM-253-piles-stale-cycle-weekend-fix
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect bounded production runtime evidence
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+
+            echo "Bot eligibility counts at current Lagos time"
+            psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -At <<'SQL'
+            BEGIN READ ONLY;
+            WITH bot AS (
+              SELECT insurer_name, is_active, is_available, availability_status,
+                CASE WHEN btrim(coalesce(active_from_time, '')) ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+                  THEN active_from_time::time ELSE NULL END AS starts,
+                CASE WHEN btrim(coalesce(active_to_time, '')) ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+                  THEN active_to_time::time ELSE NULL END AS ends,
+                (clock_timestamp() AT TIME ZONE 'Africa/Lagos')::time AS local_time
+              FROM piles_auto_assignment_bot_accounts
+            )
+            SELECT insurer_name,
+              count(*) AS configured,
+              count(*) FILTER (WHERE is_active) AS active,
+              count(*) FILTER (WHERE is_active AND is_available
+                AND coalesce(availability_status, '') IN ('', 'available', 'weekend_added')) AS available,
+              count(*) FILTER (WHERE is_active AND is_available
+                AND coalesce(availability_status, '') IN ('', 'available', 'weekend_added')
+                AND CASE
+                  WHEN starts IS NULL AND ends IS NULL THEN true
+                  WHEN coalesce(starts, time '00:00') <= coalesce(ends, time '23:59:59')
+                    THEN local_time BETWEEN coalesce(starts, time '00:00') AND coalesce(ends, time '23:59:59')
+                  ELSE local_time >= coalesce(starts, time '00:00') OR local_time <= coalesce(ends, time '23:59:59')
+                END) AS eligible_now
+            FROM bot GROUP BY insurer_name ORDER BY insurer_name;
+
+            SELECT 'current_rosters', count(*) FROM piles_auto_assignment_weekend_rosters
+            WHERE weekend_start <= (clock_timestamp() AT TIME ZONE 'Africa/Lagos')::date
+              AND weekend_end >= (clock_timestamp() AT TIME ZONE 'Africa/Lagos')::date;
+            SELECT 'current_on_shift_members', count(*)
+            FROM piles_auto_assignment_weekend_roster_members member
+            JOIN piles_auto_assignment_weekend_rosters roster ON roster.id = member.roster_id
+            WHERE roster.weekend_start <= (clock_timestamp() AT TIME ZONE 'Africa/Lagos')::date
+              AND roster.weekend_end >= (clock_timestamp() AT TIME ZONE 'Africa/Lagos')::date
+              AND lower(btrim(member.duty_status)) = 'on_shift';
+            ROLLBACK;
+            SQL
+
+            echo "Host termination evidence counts"
+            kernel_log="$(journalctl -k --since '12 hours ago' --no-pager 2>/dev/null || true)"
+            printf 'oom_events|%s\n' "$(printf '%s\n' "$kernel_log" | awk 'tolower($0) ~ /out of memory|oom-kill|killed process/ {n++} END {print n+0}')"
+            printf 'runner_processes|%s\n' "$(ps -eo comm=,args= | awk '$1 ~ /^python([0-9.]*)?$/ && /piles_auto_assignment_runner[.]py/ {n++} END {print n+0}')"
