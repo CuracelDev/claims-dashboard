@@ -50,16 +50,15 @@ class DispatchCoverageTests(unittest.TestCase):
         self.assertEqual(decision.generation_requested_at, T2)
         self.assertTrue(decision.create_work_item)
 
-    def test_queued_scheduled_insurer_is_covered_without_follow_up(self):
+    def test_queued_scheduled_insurer_is_adopted_by_the_new_cycle(self):
+        # Break caught: an abandoned queued generation is reported as covered,
+        # even though the new parent cannot claim work owned by the old parent.
         decision = decide_dispatch(
             WorkRequest("Jubilee Uganda", WorkSource.SCHEDULE, requested_at=T2),
             InsurerCoverage(state="queued", active_started_at=T1),
         )
 
-        self.assertEqual(
-            decision.disposition,
-            WorkDisposition.COVERED_BY_ACTIVE_CYCLE,
-        )
+        self.assertEqual(decision.disposition, WorkDisposition.QUEUED)
         self.assertNotEqual(decision.disposition, WorkDisposition.FOLLOW_UP_QUEUED)
         self.assertTrue(decision.create_work_item)
 

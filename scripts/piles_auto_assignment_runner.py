@@ -54,6 +54,7 @@ try:
     from piles_auto_assignment.timing import PhaseTimer, timed_operation
     from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from piles_auto_assignment.planning import (
+        NoEligibleAssignees,
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
     )
@@ -72,6 +73,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
     from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from scripts.piles_auto_assignment.planning import (
+        NoEligibleAssignees,
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
     )
@@ -1619,6 +1621,22 @@ class DataStore:
             self._fetchall_postgres(
                 "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
                 (f"piles-insurer:{canonical_insurer_key(insurer_name)}",),
+            )
+
+    def try_acquire_dispatch_parent_lock(self, run_id: str) -> bool:
+        if self.mode != "postgres" or not norm(run_id):
+            raise RuntimeError("Durable parent ownership requires DATABASE_URL and a run id.")
+        rows = self._fetchall_postgres(
+            "select pg_try_advisory_lock(hashtextextended(%s, 0)) as acquired",
+            (f"piles-parent:{run_id}",),
+        )
+        return bool(rows and rows[0].get("acquired"))
+
+    def release_dispatch_parent_lock(self, run_id: str) -> None:
+        if self.mode == "postgres" and norm(run_id):
+            self._fetchall_postgres(
+                "select pg_advisory_unlock(hashtextextended(%s, 0)) as released",
+                (f"piles-parent:{run_id}",),
             )
 
     def try_acquire_runner_slot(self, max_concurrency: int) -> int:
@@ -7650,7 +7668,7 @@ def build_assignment_plan(
                 reason += f": {norm(bot.active_from_time) or 'start'}-{norm(bot.active_to_time) or 'end'}"
             exclusions.append(f"{owner} ({reason})")
         detail = ", ".join(exclusions) or "no bot accounts were configured"
-        raise RuntimeError(
+        raise NoEligibleAssignees(
             "No eligible bot accounts are available for assignment. "
             f"Safe exclusions: {detail}."
         )
@@ -8212,6 +8230,7 @@ def _run_for_insurer_once(
     slack_replies_sent = 0
     reconciliation_manual_count = 0
     reconciliation_manual_keys: set[str] = set()
+    workflow_error_code = ""
     prior_attempt_keys: set[str] = set()
     scan_context_summary: dict[str, int] | None = None
 
@@ -8502,29 +8521,42 @@ def _run_for_insurer_once(
             manual_mode = bool(rule and rule.distribution_mode == "manual_override")
             if not manual_mode:
                 ensure_portal_mapping(unassigned[0])
-            if manual_mode:
-                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
-                    insurer_name,
-                    unassigned,
-                    resolved_bots,
-                    metrics,
-                    rule=rule,
-                    effective_at=datetime.now(RUNNER_TIMEZONE),
-                )
-                print(
-                    f"\nManual override is active: {len(unassigned)} pile(s) require manual action; "
-                    "no automatic assignment will be attempted."
-                )
-            elif not bots:
-                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, unassigned, portal_assignees)
-            else:
-                plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
-                    insurer_name,
-                    unassigned,
-                    resolved_bots,
-                    metrics,
-                    rule=rule,
-                    effective_at=datetime.now(RUNNER_TIMEZONE),
+            try:
+                if manual_mode:
+                    plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
+                        insurer_name,
+                        unassigned,
+                        resolved_bots,
+                        metrics,
+                        rule=rule,
+                        effective_at=datetime.now(RUNNER_TIMEZONE),
+                    )
+                    print(
+                        f"\nManual override is active: {len(unassigned)} pile(s) require manual action; "
+                        "no automatic assignment will be attempted."
+                    )
+                elif not bots:
+                    plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, unassigned, portal_assignees)
+                else:
+                    plans, summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
+                        insurer_name,
+                        unassigned,
+                        resolved_bots,
+                        metrics,
+                        rule=rule,
+                        effective_at=datetime.now(RUNNER_TIMEZONE),
+                    )
+            except NoEligibleAssignees:
+                workflow_error_code = "no_eligible_assignees"
+                plans, summary = [], {}
+                print("\nAssignment deferred: no configured assignee is eligible in the current time window.")
+                store.log_runner_event(
+                    insurer_name=insurer_name,
+                    event_type="runner_assignment_deferred",
+                    status="completed_with_issues",
+                    pile_count=len(unassigned),
+                    claim_count=sum(max(row.remaining_claims, 0) for row in unassigned),
+                    details={"reason_code": workflow_error_code},
                 )
 
         if summary:
@@ -8589,6 +8621,7 @@ def _run_for_insurer_once(
             status=(
                 "manual_action_required"
                 if manual_action_count
+                else "completed_with_issues" if workflow_error_code
                 else "planned" if not args.execute else "ready"
             ),
             pile_count=planned_scan_count,
@@ -8763,23 +8796,27 @@ def _run_for_insurer_once(
             late_summary: dict[str, dict[str, Any]]
             if v2:
                 runner._heartbeat("plan")
-            if late_manual:
-                manual_action_count += len(follow_up_unassigned)
-                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
-                    insurer_name, follow_up_unassigned, resolved_bots, metrics,
-                    rule=rule, effective_at=datetime.now(RUNNER_TIMEZONE),
-                )
-            elif not bots:
-                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, follow_up_unassigned, portal_assignees)
-            else:
-                late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
-                    insurer_name,
-                    follow_up_unassigned,
-                    resolved_bots,
-                    metrics,
-                    rule=rule,
-                    effective_at=datetime.now(RUNNER_TIMEZONE),
-                )
+            try:
+                if late_manual:
+                    manual_action_count += len(follow_up_unassigned)
+                    late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
+                        insurer_name, follow_up_unassigned, resolved_bots, metrics,
+                        rule=rule, effective_at=datetime.now(RUNNER_TIMEZONE),
+                    )
+                elif not bots:
+                    late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan_from_portal_options, insurer_name, follow_up_unassigned, portal_assignees)
+                else:
+                    late_plans, late_summary = runner.phase_timer.call('plan', 'planning', build_assignment_plan,
+                        insurer_name,
+                        follow_up_unassigned,
+                        resolved_bots,
+                        metrics,
+                        rule=rule,
+                        effective_at=datetime.now(RUNNER_TIMEZONE),
+                    )
+            except NoEligibleAssignees:
+                workflow_error_code = "no_eligible_assignees"
+                late_plans, late_summary = [], {}
             late_arrival_detection["summary"] = late_summary
             summary = merge_assignment_summaries(summary, late_summary)
             plans.extend(late_plans)
@@ -8923,6 +8960,7 @@ def _run_for_insurer_once(
         status=(
             "manual_action_required"
             if manual_action_count
+            else "completed_with_issues" if workflow_error_code
             else "assigned"
             if args.execute and total_completed
             else "dry_run_complete"
@@ -8946,6 +8984,8 @@ def _run_for_insurer_once(
             "message": (
                 f"{manual_action_count} pile(s) require manual action."
                 if manual_action_count
+                else "Assignment deferred until an assignee enters an eligible time window."
+                if workflow_error_code
                 else "No unassigned piles found. Nothing to assign." if total_planned == 0 else ""
             ),
                 "tracked_reconcile": {
@@ -9021,6 +9061,9 @@ def _run_for_insurer_once(
         # A manual workflow can have no assignment attempts at all. Carry its
         # explicit result across the worker boundary, not only ledger counts.
         result["workflow_status"] = "manual_action_required" if manual_action_count else "completed"
+        if workflow_error_code:
+            result["workflow_status"] = "completed_with_issues"
+            result["workflow_error_code"] = workflow_error_code
         if late_arrival_detection.get("excluded_contexts") or any(
             count for status, count in late_arrival_detection.get("reconciliation", {}).items()
             if status != AttemptStatus.CONFIRMED_RECONCILED.value
@@ -9196,11 +9239,14 @@ def classify_workflow_outcome(
     result = result if isinstance(result, dict) else {}
     summary = summary if isinstance(summary, dict) else {}
     workflow_status = norm(result.get("workflow_status"))
+    workflow_error_code = norm(result.get("workflow_error_code"))
     manual_count = safe_int(result.get("manual_action_required_count"), 0)
     if workflow_status == "manual_action_required" or manual_count or summary.get("manual_action_required", 0):
         return "manual_action_required", "manual_action_required"
     if workflow_status not in {"completed", "completed_with_issues"}:
         return "completed_with_issues", "workflow_outcome_unconfirmed"
+    if workflow_status == "completed_with_issues" and workflow_error_code == "no_eligible_assignees":
+        return "completed_with_issues", workflow_error_code
     has_follow_up = (
         workflow_status == "completed_with_issues"
         or bool(result.get("portal_mapping_warnings"))
@@ -9463,6 +9509,9 @@ def main_v2() -> DispatchResult:
                     details={"dispatcher_v2": True, "insurers": insurers},
                     preserve_existing=True,
                 )
+                if not store.try_acquire_dispatch_parent_lock(run_id):
+                    raise WorkerUnavailable("parent_dispatch_active")
+                resources.callback(store.release_dispatch_parent_lock, run_id)
                 requested_at = coordinator.parent_requested_at(run_id)
                 requests = [WorkRequest(insurer, WorkSource(norm(args.run_source) or "manual"), requested_at,
                                         RequestScope.ALL_ACTIVE if args.all_active else RequestScope.SINGLE_INSURER,

@@ -10,6 +10,7 @@ from .domain import (
     WorkDisposition,
 )
 from .scanning import IncompleteScan
+from .planning import NoEligibleAssignees
 
 
 class IncompleteWorkflow(RuntimeError):
@@ -38,6 +39,8 @@ def classify_runner_error(error: BaseException) -> str:
     if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower():
         return "portal_timeout"
     message = str(error).lower()
+    if isinstance(error, NoEligibleAssignees):
+        return "no_eligible_assignees"
     if "filter" in message and any(word in message for word in ("response", "settle", "control")):
         return "filter_not_confirmed"
     if "login" in message or "credential" in message:

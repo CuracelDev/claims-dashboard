@@ -15,9 +15,16 @@ from scripts.piles_auto_assignment.orchestrator import (
     run_insurer_workflows,
 )
 from scripts.piles_auto_assignment.scanning import IncompleteScan
+from scripts.piles_auto_assignment.planning import NoEligibleAssignees
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_empty_assignment_window_has_a_stable_error_code(self):
+        self.assertEqual(
+            classify_runner_error(NoEligibleAssignees("private owner details")),
+            "no_eligible_assignees",
+        )
+
     def test_one_insurer_failure_does_not_stop_following_insurers(self):
         calls = []
 

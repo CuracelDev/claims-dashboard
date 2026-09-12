@@ -1207,12 +1207,33 @@ class AssignmentPlanningTests(unittest.TestCase):
         bot.owner_name = "Daniel"
 
         with self.assertRaisesRegex(
-            RuntimeError,
+            runner.NoEligibleAssignees,
             r"No eligible bot accounts.*Daniel \(unavailable\)",
         ):
             runner.build_assignment_plan(
                 "OLD MUTUAL", [make_pile(1)], [bot], {},
             )
+
+    def test_temporarily_empty_assignment_window_is_deferred_not_failed(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        bot = runner.replace(make_bot("Daniel", "primary"), active_from_time="09:00")
+
+        class BeforeShift(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 9, 12, 8, 0, tzinfo=runner.RUNNER_TIMEZONE)
+                return value if tz is None else value.astimezone(tz)
+
+        with patch.object(runner, "datetime", BeforeShift):
+            state = LateArrivalWorkflowTests().workflow(
+                {context: [make_pile(1)]}, {}, configured_bots=(bot,), execute=True,
+            )
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(state.applied, [])
+        self.assertEqual(state.result["plans"], [])
+        self.assertEqual(state.result["workflow_status"], "completed_with_issues")
+        self.assertEqual(state.result["workflow_error_code"], "no_eligible_assignees")
 
     def test_existing_load_is_respected_after_primary_floor(self):
         bots = [
@@ -3277,6 +3298,23 @@ class RunnerRunAdoptionTests(unittest.TestCase):
         self.assertIn("pg_advisory_unlock", calls[1][0])
         self.assertFalse(store.try_acquire_preview_parent_lock("invalid/id"))
 
+    def test_dispatch_parent_advisory_lock_uses_a_domain_separated_exact_id(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "postgres"
+        calls = []
+        responses = iter([[{"acquired": True}], [{"released": True}]])
+        store._fetchall_postgres = lambda sql, params=(): calls.append((" ".join(sql.split()), params)) or next(responses)
+
+        self.assertTrue(store.try_acquire_dispatch_parent_lock("dispatch-parent"))
+        store.release_dispatch_parent_lock("dispatch-parent")
+
+        self.assertEqual([params for _sql, params in calls], [
+            ("piles-parent:dispatch-parent",),
+            ("piles-parent:dispatch-parent",),
+        ])
+        self.assertIn("pg_try_advisory_lock", calls[0][0])
+        self.assertIn("pg_advisory_unlock", calls[1][0])
+
 
 class AssignmentRuleLoadingTests(unittest.TestCase):
     def test_inactive_rule_is_not_applied(self):
@@ -3901,6 +3939,11 @@ class DispatcherMainTests(unittest.TestCase):
                 return preview_lock
             def release_preview_parent_lock(self, run_id):
                 owner.events.append(("preview_unlock", run_id))
+            def try_acquire_dispatch_parent_lock(self, run_id):
+                owner.events.append(("dispatch_parent_lock", run_id))
+                return True
+            def release_dispatch_parent_lock(self, run_id):
+                owner.events.append(("dispatch_parent_unlock", run_id))
             def heartbeat_preview_runner_run(self, run_id, token, phase):
                 nonlocal preview_heartbeat_count
                 preview_heartbeat_count += 1

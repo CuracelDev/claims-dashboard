@@ -309,6 +309,10 @@ class AcceptanceHarness:
                 return self.conn.acquire("piles-insurer:" + runner.canonical_insurer_key(name))
             def release_insurer_lock(self, name):
                 self.conn.release("piles-insurer:" + runner.canonical_insurer_key(name))
+            def try_acquire_dispatch_parent_lock(self, run_id):
+                return self.conn.acquire("piles-parent:" + run_id)
+            def release_dispatch_parent_lock(self, run_id):
+                self.conn.release("piles-parent:" + run_id)
             def try_acquire_runner_slot(self, maximum):
                 return next((slot for slot in range(maximum) if self.conn.acquire(f"piles-capacity:{slot}")), -1)
             def release_runner_slot(self, slot):
@@ -524,6 +528,20 @@ class DispatcherAcceptanceTests(unittest.TestCase):
                 self.assertEqual(harness.portals, [])
                 self.assertEqual(harness.clicks, [])
 
+    def test_parent_replay_rejects_changed_source_before_portal_work(self):
+        # Break caught: replaying a scheduled parent as manual creates a second
+        # generation under the same parent and can assign the same pile twice.
+        harness = self.harness
+        harness.parent("parent", "DEFMIS", "schedule")
+
+        result, error = harness.invoke(parent="parent", insurer="DEFMIS")
+
+        self.assertIsNone(result)
+        self.assertIsNotNone(error)
+        self.assertIn("scope", str(error).lower())
+        self.assertEqual(harness.portals, [])
+        self.assertEqual(harness.clicks, [])
+
     def complete_lifecycle(self, harness, maximum):
         harness.failures = {"DEFMIS"}
         harness.initial["Jubilee Kenya"] = [harness.pile("kenya-initial")]
@@ -679,6 +697,56 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         self.assertEqual(harness.results, [("parent", "recovered-once")])
         self.assertEqual(len(harness.deliveries), 1)
 
+    def test_new_cycle_recovers_an_expired_claim_owned_by_a_dead_parent(self):
+        # Break caught: claim_next can only recover work for its own parent, so
+        # an expired claim from a dead hourly process covers every future cycle
+        # forever even after its insurer session lock has disappeared.
+        harness = self.harness
+        harness.parent("dead-parent", "DEFMIS", "schedule")
+        coordinator = runner.DispatchStore(harness.db.connect())
+        self.addCleanup(coordinator.close)
+        expired = coordinator.claim_next("dead-parent", "dead-worker")
+        worker = harness.store_type()()
+        self.assertEqual(worker.try_acquire_runner_slot(1), 0)
+        self.assertTrue(worker.try_acquire_insurer_lock("DEFMIS"))
+        ownership_class = runner.execute_claimed_insurer.__globals__["ClaimOwnership"]
+        old_owner = ownership_class(expired, coordinator, worker.conn.pid, 0, 120)
+        old_child = old_owner.started(worker.get_master_account("DEFMIS"))
+
+        worker.close()
+        harness.db.now += timedelta(seconds=121)
+        harness.initial["DEFMIS"] = [harness.pile("recovered-by-next-cycle")]
+        parent_store = harness.store_type()()
+        try:
+            parent_store.create_runner_run(
+                run_id="new-parent", insurer_name="DEFMIS", run_source="manual",
+                run_scope="single", portal_environment="test", months=["Jul"],
+                year="2026", details={}, mode="execute",
+            )
+        finally:
+            parent_store.close()
+
+        result, error = harness.invoke(parent="new-parent", insurer="DEFMIS")
+        self.assertIsNone(error, str(error))
+        self.assertEqual(result.status, runner.ParentRunStatus.COMPLETED)
+        retired = harness.db.work("dead-parent")
+        self.assertEqual(len(retired), 1)
+        self.assertEqual((retired[0]["id"], retired[0]["disposition"], retired[0]["reason_code"]),
+                         (expired.id, "failed", "expired_lease_superseded"))
+        replacement = harness.db.work("new-parent")
+        self.assertEqual(len(replacement), 1)
+        self.assertNotEqual(replacement[0]["id"], expired.id)
+        self.assertEqual(
+            harness.clicks,
+            [(replacement[0]["id"], "recovered-by-next-cycle")],
+            harness.db.rows("SELECT id,parent_runner_run_id,disposition,attempt_number,reason_code FROM piles_auto_assignment_work_items ORDER BY requested_at,id"),
+        )
+        self.assertEqual(harness.db.rows(
+            "SELECT status,error_code FROM piles_auto_assignment_insurer_runs WHERE id=?",
+            (old_child,),
+        ), [{"status": "failed", "error_code": "worker_attempt_reclaimed"}])
+        self.assertEqual(harness.db.parent("dead-parent")["status"], "failed")
+
     def test_crash_after_child_attachment_closes_old_attempt_before_reclaim(self):
         """A SIGKILL-style loss must not leave a v2 child looking actively covered."""
         harness = self.harness
@@ -726,7 +794,7 @@ class DispatcherAcceptanceTests(unittest.TestCase):
 
         # The old v2 child cannot masquerade as legacy active coverage. A later
         # request owns and executes a fresh generation normally.
-        decisions = harness.parent("next", "DEFMIS", "schedule")
+        decisions = harness.parent("next", "DEFMIS", "manual")
         self.assertEqual(decisions[0].disposition.value, "queued")
         harness.initial["DEFMIS"] = [harness.pile("next-generation")]
         next_result, error = harness.invoke(parent="next", insurer="DEFMIS")

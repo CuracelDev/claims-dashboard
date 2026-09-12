@@ -156,7 +156,8 @@ class DispatchStore:
     @staticmethod
     def _lock_parent(cursor: Any, parent_id: str) -> dict[str, Any]:
         cursor.execute(
-            "SELECT status, details, portal_environment, months, year FROM piles_auto_assignment_runner_runs WHERE id = %s FOR UPDATE",
+            "SELECT status, details, portal_environment, months, year, run_source, run_scope "
+            "FROM piles_auto_assignment_runner_runs WHERE id = %s FOR UPDATE",
             (parent_id,),
         )
         rows = _rows(cursor)
@@ -212,10 +213,23 @@ class DispatchStore:
         if any(request.source == WorkSource.READINESS for request in requests):
             raise ValueError("Read-only probes cannot enqueue execute work")
         decisions = []
+        superseded_parent_ids: set[str] = set()
         with self._transaction() as cursor:
             parent = self._lock_parent(cursor, parent_id)
             if parent["status"] not in {"queued", "started", "running"}:
                 raise ParentAlreadyTerminal("Cannot enqueue work for a terminal parent")
+            persisted_source = str(parent.get("run_source") or "").strip()
+            persisted_scope = str(parent.get("run_scope") or "").strip().replace("-", "_")
+            if persisted_source and any(request.source.value != persisted_source for request in requests):
+                raise ParentScopeMismatch("Invocation source does not match persisted parent scope")
+            if persisted_scope:
+                expected_scope = (
+                    RequestScope.ALL_ACTIVE if persisted_scope == "all_active"
+                    else RequestScope.SINGLE_INSURER if persisted_scope == "single"
+                    else None
+                )
+                if expected_scope is None or any(request.request_scope != expected_scope for request in requests):
+                    raise ParentScopeMismatch("Invocation request scope does not match persisted parent scope")
             references = self._references(parent)
             # Take all locks in canonical order before reading coverage, avoiding
             # cross-parent deadlocks and stale statement snapshots after waits.
@@ -272,7 +286,17 @@ class DispatchStore:
                     SELECT * FROM (
                       SELECT id, disposition, request_scope, covered_by_insurer_run_id,
                              started_at, finished_at, requested_at,
-                             portal_environment, months, year
+                             portal_environment, months, year,
+                             parent_runner_run_id, claim_token, lease_expires_at,
+                             CASE WHEN disposition = 'claimed'
+                                       AND lease_expires_at <= clock_timestamp()
+                                  THEN pg_try_advisory_xact_lock(hashtextextended(
+                                    'piles-insurer:' || canonical_insurer_name, 0))
+                                  ELSE false END AS reclaimable,
+                             CASE WHEN disposition IN ('queued','follow_up_queued')
+                                  THEN pg_try_advisory_xact_lock(hashtextextended(
+                                    'piles-parent:' || parent_runner_run_id, 0))
+                                  ELSE NULL END AS queued_parent_reclaimable
                       FROM piles_auto_assignment_work_items
                       WHERE canonical_insurer_name = %s
                         AND (disposition IN ('queued','claimed','follow_up_queued')
@@ -291,7 +315,8 @@ class DispatchStore:
                       SELECT run.id, 'running',
                              CASE WHEN parent.run_scope = 'all-active' THEN 'all_active' ELSE 'single_insurer' END,
                              run.id, run.started_at, run.finished_at, run.created_at,
-                             parent.portal_environment, parent.months, parent.year
+                             parent.portal_environment, parent.months, parent.year,
+                             run.runner_run_id, NULL, NULL, false, NULL
                       FROM piles_auto_assignment_insurer_runs run
                       JOIN piles_auto_assignment_runner_runs parent ON parent.id = run.runner_run_id
                       WHERE run.status IN ('queued','running')
@@ -313,6 +338,45 @@ class DispatchStore:
                     ),
                 )
                 existing = _rows(cursor)
+                expired_claims = [row for row in existing if row.get("reclaimable")]
+                for expired in expired_claims:
+                    if expired.get("covered_by_insurer_run_id"):
+                        cursor.execute(
+                            """
+                            UPDATE piles_auto_assignment_insurer_runs
+                            SET status = 'failed', phase = 'complete',
+                                error_code = 'worker_attempt_reclaimed',
+                                error_message = 'The expired worker attempt was superseded by a fenced reclaim.',
+                                heartbeat_at = clock_timestamp(), finished_at = clock_timestamp(),
+                                updated_at = clock_timestamp()
+                            WHERE id = %s AND runner_run_id = %s
+                              AND status IN ('queued','running')
+                            """,
+                            (expired["covered_by_insurer_run_id"], expired["parent_runner_run_id"]),
+                        )
+                    cursor.execute(
+                        """
+                        UPDATE piles_auto_assignment_work_items
+                        SET disposition = 'failed',
+                            reason_code = 'expired_lease_superseded',
+                            finished_at = clock_timestamp(),
+                            heartbeat_at = clock_timestamp(),
+                            lease_expires_at = NULL,
+                            updated_at = clock_timestamp()
+                        WHERE id = %s AND disposition = 'claimed'
+                          AND claim_token IS NOT DISTINCT FROM %s
+                          AND lease_expires_at <= clock_timestamp()
+                        RETURNING id
+                        """,
+                        (expired["id"], expired.get("claim_token")),
+                    )
+                    if cursor.fetchone() is None:
+                        raise ConcurrentStateChange("Expired claim ownership changed")
+                    if expired.get("parent_runner_run_id") != parent_id:
+                        superseded_parent_ids.add(expired["parent_runner_run_id"])
+                if expired_claims:
+                    expired_ids = {row["id"] for row in expired_claims}
+                    existing = [row for row in existing if row["id"] not in expired_ids]
                 compatible = []
                 for row in existing:
                     candidate = InsurerCoverage(
@@ -325,8 +389,13 @@ class DispatchStore:
                         compatible.append(row)
                 active = compatible[0] if compatible else {}
                 follow_up = next((row for row in compatible if row["disposition"] == "follow_up_queued"), None)
+                coverage_state = active.get("disposition", "idle")
+                queued_parent_reclaimable = active.get("queued_parent_reclaimable")
+                if (coverage_state == "queued" and queued_parent_reclaimable is not None
+                        and not bool(queued_parent_reclaimable)):
+                    coverage_state = "running"
                 coverage = InsurerCoverage(
-                    state=active.get("disposition", "idle") if any(row["is_active"] for row in masters) else "inactive",
+                    state=coverage_state if any(row["is_active"] for row in masters) else "inactive",
                     active_started_at=active.get("started_at"),
                     active_finished_at=active.get("finished_at"),
                     active_run_id=active.get("covered_by_insurer_run_id") or "",
@@ -337,13 +406,25 @@ class DispatchStore:
                     year=active.get("year") or request.year,
                 )
                 decision = decide_dispatch(request, coverage)
+                if (decision.disposition == WorkDisposition.FOLLOW_UP_QUEUED
+                        and active.get("disposition") == "follow_up_queued"
+                        and bool(active.get("queued_parent_reclaimable"))):
+                    decision = replace(decision, create_work_item=True)
                 if decision.create_work_item:
                     work_id = str(uuid.uuid4())
                     conflict = ""
                     if decision.disposition == WorkDisposition.QUEUED:
-                        conflict = "ON CONFLICT (canonical_insurer_name, source, request_scope, portal_environment, months, year) WHERE disposition = 'queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
+                        conflict = """ON CONFLICT (canonical_insurer_name, source, request_scope, portal_environment, months, year)
+                            WHERE disposition = 'queued' DO UPDATE SET
+                              parent_runner_run_id = EXCLUDED.parent_runner_run_id,
+                              insurer_name = EXCLUDED.insurer_name,
+                              updated_at = now()"""
                     elif decision.disposition == WorkDisposition.FOLLOW_UP_QUEUED:
-                        conflict = "ON CONFLICT (canonical_insurer_name, portal_environment, months, year) WHERE disposition = 'follow_up_queued' DO UPDATE SET updated_at = piles_auto_assignment_work_items.updated_at"
+                        conflict = """ON CONFLICT (canonical_insurer_name, portal_environment, months, year)
+                            WHERE disposition = 'follow_up_queued' DO UPDATE SET
+                              parent_runner_run_id = EXCLUDED.parent_runner_run_id,
+                              insurer_name = EXCLUDED.insurer_name,
+                              updated_at = now()"""
                     cursor.execute(
                         """
                         INSERT INTO piles_auto_assignment_work_items
@@ -364,6 +445,10 @@ class DispatchStore:
                     returned_id = str(cursor.fetchone()[0])
                     if returned_id != work_id and conflict:
                         decision = replace(decision, create_work_item=False)
+                        prior_parent_id = active.get("parent_runner_run_id")
+                        if (prior_parent_id and prior_parent_id != parent_id
+                                and bool(active.get("queued_parent_reclaimable"))):
+                            superseded_parent_ids.add(prior_parent_id)
                     work_id = returned_id
                 else:
                     reused = follow_up if decision.disposition == WorkDisposition.FOLLOW_UP_QUEUED else active
@@ -380,6 +465,24 @@ class DispatchStore:
                     updated_at = now() WHERE id = %s
                 """, (json.dumps(references, sort_keys=True), parent_id),
             )
+            for superseded_parent_id in sorted(superseded_parent_ids):
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_runner_runs
+                    SET status = 'failed', finished_at = now(),
+                        updated_at = now(),
+                        duration_ms = least(2147483647, greatest(0,
+                          extract(epoch FROM (now() - started_at)) * 1000))::integer
+                    WHERE id = %s AND status IN ('queued','started','running')
+                      AND pg_try_advisory_xact_lock(hashtextextended(
+                        'piles-parent:' || id, 0))
+                      AND NOT EXISTS (
+                        SELECT 1 FROM piles_auto_assignment_work_items work
+                        WHERE work.parent_runner_run_id = piles_auto_assignment_runner_runs.id
+                          AND work.disposition IN ('queued','claimed','follow_up_queued'))
+                    """,
+                    (superseded_parent_id,),
+                )
         return decisions
 
     def claim_next(self, parent_id: str, worker_id: str, lease_seconds: int = 120) -> Optional[ClaimedWork]:
