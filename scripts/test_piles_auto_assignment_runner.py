@@ -1207,12 +1207,33 @@ class AssignmentPlanningTests(unittest.TestCase):
         bot.owner_name = "Daniel"
 
         with self.assertRaisesRegex(
-            RuntimeError,
+            runner.NoEligibleAssignees,
             r"No eligible bot accounts.*Daniel \(unavailable\)",
         ):
             runner.build_assignment_plan(
                 "OLD MUTUAL", [make_pile(1)], [bot], {},
             )
+
+    def test_temporarily_empty_assignment_window_is_deferred_not_failed(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        bot = runner.replace(make_bot("Daniel", "primary"), active_from_time="09:00")
+
+        class BeforeShift(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 9, 12, 8, 0, tzinfo=runner.RUNNER_TIMEZONE)
+                return value if tz is None else value.astimezone(tz)
+
+        with patch.object(runner, "datetime", BeforeShift):
+            state = LateArrivalWorkflowTests().workflow(
+                {context: [make_pile(1)]}, {}, configured_bots=(bot,), execute=True,
+            )
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(state.applied, [])
+        self.assertEqual(state.result["plans"], [])
+        self.assertEqual(state.result["workflow_status"], "completed_with_issues")
+        self.assertEqual(state.result["workflow_error_code"], "no_eligible_assignees")
 
     def test_existing_load_is_respected_after_primary_floor(self):
         bots = [

@@ -18,6 +18,10 @@ class InvalidAssignmentConfiguration(RuntimeError):
     pass
 
 
+class NoEligibleAssignees(InvalidAssignmentConfiguration):
+    """No configured assignee can safely receive work at the effective time."""
+
+
 def _value(item: Any, name: str, default: Any = None) -> Any:
     if isinstance(item, Mapping):
         return item.get(name, default)
@@ -175,7 +179,7 @@ def plan_assignments(
 
     eligibility = eligible_bots(bots, effective_at=effective_at)
     if not eligibility.eligible:
-        raise InvalidAssignmentConfiguration("No eligible bot accounts are available for assignment.")
+        raise NoEligibleAssignees("No eligible bot accounts are available for assignment.")
 
     if mode == "single_owner":
         primaries = [
