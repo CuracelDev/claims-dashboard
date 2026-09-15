@@ -9002,6 +9002,9 @@ def _run_for_insurer_once(
                     late_plans,
                     execute=args.execute,
                     minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+                    # This is already the final complete-context scan. There is
+                    # no later relocation pass to consume deferred plans.
+                    defer_unresolved=False,
                 )
                 late_arrival_detection["results"] = late_results
                 if late_results:

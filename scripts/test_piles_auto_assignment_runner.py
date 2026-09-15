@@ -1045,6 +1045,7 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(state.scans), 10)
                 self.assertEqual(state.scans.count(context), 2)
                 self.assertEqual([[plan.pile_key for plan in batch] for batch in state.applied], [["pile-2"]])
+                self.assertFalse(state.execute_options[-1]["defer_unresolved"])
                 self.assertEqual(state.result["late_arrival_detection"]["count"], 1)
                 self.assertEqual(state.result["scan_context_summary"], {
                     "total": 5, "complete": 5, "empty": 5 - int(bool(rows)),
