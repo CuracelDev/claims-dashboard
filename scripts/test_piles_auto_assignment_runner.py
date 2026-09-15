@@ -504,6 +504,45 @@ process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(controls)));
         self.assertGreaterEqual(clock.ns, 2_000_000_000)
         self.assertLessEqual(clock.ns, 2_400_000_000)
 
+    def test_unrelated_pending_request_does_not_block_matching_finished_context(self):
+        browser = runner.CuracelPilesRunner()
+        target = types.SimpleNamespace(
+            method="GET",
+            url=("https://api.health.curacel.co/api/piles?year=2026&page=1"
+                 "&status%5Bcode%5D=VETTING_PENDING"),
+        )
+        unrelated = types.SimpleNamespace(
+            method="GET",
+            url=("https://api.health.curacel.co/api/piles?year=2026&page=1"
+                 "&status%5Bcode%5D=AUDIT_ONGOING"),
+        )
+        browser._capture_piles_request(target)
+        browser._finish_piles_request(target)
+        browser._capture_piles_request(unrelated)
+
+        self.assertEqual(
+            browser._filter_request_state(0, "All", "2026", "Vetting Pending"),
+            "finished",
+        )
+
+    def test_matching_request_started_before_generation_does_not_block_current_context(self):
+        browser = runner.CuracelPilesRunner()
+        old_request = types.SimpleNamespace(
+            method="GET",
+            url=("https://api.health.curacel.co/api/piles?year=2026&page=1"
+                 "&status%5Bcode%5D=VETTING_PENDING"),
+        )
+        current_request = types.SimpleNamespace(method="GET", url=old_request.url)
+        browser._capture_piles_request(old_request)
+        marker = browser._piles_request_sequence
+        browser._capture_piles_request(current_request)
+        browser._finish_piles_request(current_request)
+
+        self.assertEqual(
+            browser._filter_request_state(marker, "All", "2026", "Vetting Pending"),
+            "finished",
+        )
+
     def test_request_completion_alone_cannot_relabel_unchanged_empty_dom(self):
         browser, clock = self.fixture()
         snapshot = browser._table_context_snapshot()

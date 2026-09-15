@@ -3794,13 +3794,25 @@ class CuracelPilesRunner:
         self._piles_request_events = self._piles_request_events[-100:]
 
     def _filter_request_state(self, marker, month, year, status):
-        matching = [(state, started) for sequence, state, url, started in self._piles_request_events
-                    if sequence > marker and piles_response_matches_context(url, month, year, status, page_number=1)]
+        matching = [
+            (state, started)
+            for sequence, state, url, started in self._piles_request_events
+            if sequence > marker
+            and started > marker
+            and piles_response_matches_context(url, month, year, status, page_number=1)
+        ]
         if any(state == 'failed' for state, _ in matching):
             return 'failed'
-        if self._piles_pending_requests or self._piles_request_overflow:
+        matching_pending = any(
+            started > marker
+            and piles_response_matches_context(
+                norm(request.url), month, year, status, page_number=1,
+            )
+            for started, request in self._piles_pending_requests.values()
+        )
+        if matching_pending or self._piles_request_overflow:
             return 'pending'
-        if any(state == 'finished' and started > marker for state, started in matching):
+        if any(state == 'finished' for state, _ in matching):
             return 'finished'
         return 'not_observed'
 
