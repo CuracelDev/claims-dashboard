@@ -945,7 +945,7 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                  supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
                  after_initial=None, configured_bots=(), execute=True, defer_first_assignment=False):
         state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[],
-                                      execute_modes=[])
+                                      execute_modes=[], execute_options=[])
         pending = [dict(item) for item in attempts]
 
         class Ledger(runner.ReadOnlyExecutionLedger):
@@ -1001,9 +1001,15 @@ class LateArrivalWorkflowTests(unittest.TestCase):
             def execute_assignment_plan(self, months, year, plans, **options):
                 state.applied.append(list(plans))
                 state.execute_modes.append(bool(options.get("execute")))
+                state.execute_options.append(dict(options))
                 if defer_first_assignment and len(state.applied) == 1:
                     self.deferred_assignment_plans = list(plans)
                 return {}, []
+            def _transition_assignment_attempts(self, plans, target, expected, evidence=None):
+                state.transitions.extend(
+                    (plan.tracking_key, target.value, evidence and evidence.get("code"))
+                    for plan in plans
+                )
 
         store = types.SimpleNamespace(
             get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
@@ -1061,6 +1067,8 @@ class LateArrivalWorkflowTests(unittest.TestCase):
         self.assertEqual(len(state.applied), 2)
         self.assertEqual(state.applied[1][0].status_bucket, "Audit Pending")
         self.assertEqual(state.applied[1][0].pile_key, "moved-pile")
+        self.assertFalse(state.execute_options[1]["persist_attempts"])
+        self.assertFalse(state.execute_options[1]["defer_unresolved"])
 
     def test_read_only_probe_does_not_repeat_assignment_only_late_arrival_scan(self):
         state = self.workflow({}, {}, execute=False)
@@ -1068,6 +1076,24 @@ class LateArrivalWorkflowTests(unittest.TestCase):
         self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
         self.assertEqual(len(state.scans), 5)
         self.assertEqual(state.result["late_arrival_detection"]["contexts"], [])
+
+    def test_deferred_plan_that_is_no_longer_assignable_is_terminalized(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = make_pile(1)
+        externally_assigned = runner.replace(original, assigned="Daniel")
+
+        state = self.workflow(
+            {context: [original]},
+            {context: [externally_assigned]},
+            defer_first_assignment=True,
+        )
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.applied), 1)
+        self.assertIn(
+            (original.tracking_key, "failed", "planned_row_not_assignable_at_final_scan"),
+            state.transitions,
+        )
 
     def test_actual_flow_preserves_concrete_and_all_year_contexts(self):
         for multiple, expected in ((False, {"2026", "2025"}), (True, {"All"})):
@@ -1184,6 +1210,61 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     self.assertEqual(len(state.scans), 5)
                 if phase in ("scan", "reconcile", "plan"):
                     self.assertEqual(state.mapping, [])
+
+
+class AssignmentPlanCompletionTests(unittest.TestCase):
+    def fixture(self):
+        plans, _summary = runner.build_assignment_plan(
+            "OLD MUTUAL",
+            [make_pile(1)],
+            [make_bot("primary", "primary", priority=1)],
+            {},
+        )
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.deferred_assignment_plans = []
+        portal._heartbeat = lambda *_: None
+        portal.persist_assignment_plans = lambda *_: None
+        portal.open_piles = lambda: None
+        portal.apply_filters = lambda *_: None
+        portal.try_set_page_size = lambda *_: None
+        portal.rows_on_current_page = lambda *_: []
+        portal.goto_next_page = lambda *_args, **_kwargs: False
+        portal._page_candidates_for_plan = lambda _plan: [1]
+        portal.reset_to_filtered_page = lambda *_: []
+        portal.scan_status = lambda *_args, **_kwargs: []
+        portal._transition_assignment_attempts = lambda *args, **kwargs: None
+        return portal, plans
+
+    def test_first_unsubmitted_selection_is_deferred_to_same_run_rescan(self):
+        portal, plans = self.fixture()
+        with patch.object(runner.time, "sleep", lambda *_: None):
+            results, applied = portal.execute_assignment_plan(
+                ["Jul"], "2026", plans, execute=True,
+            )
+
+        self.assertEqual(results, {})
+        self.assertEqual(applied, [])
+        self.assertEqual(portal.deferred_assignment_plans, plans)
+
+    def test_final_unsubmitted_selection_is_terminalized_and_fails(self):
+        portal, plans = self.fixture()
+        transitions = []
+        portal._transition_assignment_attempts = lambda *args, **kwargs: transitions.append((args, kwargs))
+
+        with patch.object(runner.time, "sleep", lambda *_: None), self.assertRaisesRegex(
+            RuntimeError, "Could not submit 1 persisted planned pile",
+        ):
+            portal.execute_assignment_plan(
+                ["Jul"], "2026", plans, execute=True,
+                persist_attempts=False, defer_unresolved=False,
+            )
+
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0][0][1], runner.AttemptStatus.FAILED)
+        self.assertEqual(
+            transitions[0][1]["evidence"]["code"],
+            "planned_selection_retry_exhausted",
+        )
 
 
 class AssignmentPlanningTests(unittest.TestCase):
@@ -4272,7 +4353,7 @@ class DispatcherMainTests(unittest.TestCase):
         empty_state = workflow({}, {}, v2=True, execute=False)
         empty = empty_state.result
         manual = workflow(
-            {}, {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, manual=True, v2=True, execute=False,
+            {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, {}, manual=True, v2=True, execute=False,
         )
         warning_state = workflow(
             {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, {}, v2=True,
