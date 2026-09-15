@@ -3794,13 +3794,25 @@ class CuracelPilesRunner:
         self._piles_request_events = self._piles_request_events[-100:]
 
     def _filter_request_state(self, marker, month, year, status):
-        matching = [(state, started) for sequence, state, url, started in self._piles_request_events
-                    if sequence > marker and piles_response_matches_context(url, month, year, status, page_number=1)]
+        matching = [
+            (state, started)
+            for sequence, state, url, started in self._piles_request_events
+            if sequence > marker
+            and started > marker
+            and piles_response_matches_context(url, month, year, status, page_number=1)
+        ]
         if any(state == 'failed' for state, _ in matching):
             return 'failed'
-        if self._piles_pending_requests or self._piles_request_overflow:
+        matching_pending = any(
+            started > marker
+            and piles_response_matches_context(
+                norm(request.url), month, year, status, page_number=1,
+            )
+            for started, request in self._piles_pending_requests.values()
+        )
+        if matching_pending or self._piles_request_overflow:
             return 'pending'
-        if any(state == 'finished' and started > marker for state, started in matching):
+        if any(state == 'finished' for state, _ in matching):
             return 'finished'
         return 'not_observed'
 
@@ -6826,6 +6838,25 @@ class CuracelPilesRunner:
                 evidence=evidence,
             )
 
+    def _persist_relocated_plans(self, plans: list[PlannedAssignment]) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        if not ledger:
+            return
+        for plan in plans:
+            attempt_id = self.assignment_attempt_ids.get(plan.tracking_key)
+            if not attempt_id:
+                raise RuntimeError("Persisted assignment attempt could not be resolved for relocation.")
+            ledger.relocate_planned_attempt(
+                attempt_id,
+                last_pile_key=plan.pile_key,
+                filter_context={
+                    "month": plan.filter_month,
+                    "year": norm(plan.filter_year),
+                    "status": plan.status_bucket,
+                    "source_page": plan.source_page_number,
+                },
+            )
+
     def execute_assignment_plan(
         self,
         month_labels: list[str],
@@ -6833,8 +6864,11 @@ class CuracelPilesRunner:
         plans: list[PlannedAssignment],
         execute: bool,
         minimum_claim_chunk: int = 25,
+        *,
+        persist_attempts: bool = True,
+        defer_unresolved: bool = True,
     ) -> tuple[dict[str, int], list[AppliedAssignment]]:
-        if execute:
+        if execute and persist_attempts:
             self.persist_assignment_plans(plans, minimum_claim_chunk)
         results: dict[str, int] = {}
         applied: list[AppliedAssignment] = []
@@ -7074,18 +7108,38 @@ class CuracelPilesRunner:
                             still_visible.append(plan)
                         else:
                             no_longer_unassigned.append(plan)
-                    if no_longer_unassigned:
-                        print(
-                            f"  Warning: {len(no_longer_unassigned)} planned pile(s) were no longer visible as "
-                            f"unassigned in {filter_month} / {status_label}; leaving them for the next scan."
+                    if execute and defer_unresolved:
+                        deferred = list(getattr(self, "deferred_assignment_plans", []))
+                        known = {plan.tracking_key for plan in deferred}
+                        deferred.extend(
+                            plan for plan in pending_status_plans
+                            if plan.tracking_key not in known
                         )
-                    if still_visible:
-                        unresolved = ", ".join(plan.pile_key for plan in still_visible[:3])
-                        if len(still_visible) > 3:
-                            unresolved += f", +{len(still_visible) - 3} more"
+                        self.deferred_assignment_plans = deferred
+                        print(
+                            f"  Deferring {len(pending_status_plans)} unsubmitted planned pile(s) to the "
+                            "same-run complete-context rescan."
+                        )
+                        continue
+                    if execute:
+                        self._transition_assignment_attempts(
+                            pending_status_plans,
+                            AttemptStatus.FAILED,
+                            {AttemptStatus.PLANNED},
+                            evidence={
+                                "code": "planned_selection_retry_exhausted",
+                                "details": {
+                                    "still_visible_count": len(still_visible),
+                                    "not_visible_count": len(no_longer_unassigned),
+                                },
+                            },
+                        )
+                    if pending_status_plans:
                         raise RuntimeError(
-                            f"Could not reliably relocate {len(still_visible)} planned pile(s) for "
-                            f"status '{status_label}' after a follow-up pass. Remaining: {unresolved}"
+                            f"Could not submit {len(pending_status_plans)} persisted planned pile(s) for "
+                            f"status '{status_label}' after the final same-run retry "
+                            f"({len(still_visible)} still visible; "
+                            f"{len(no_longer_unassigned)} no longer visible as unassigned)."
                         )
         return results, applied
 
@@ -8706,10 +8760,14 @@ def _run_for_insurer_once(
                 key for result in snapshots for row in result.rows
                 for key in (row.tracking_key, row.legacy_tracking_key, row.key)
             ))
-            follow_up_contexts = [
-                (context.filter_month, context.requested_year, context.status_bucket)
-                for context in late_arrival_contexts(snapshots)
-            ]
+            follow_up_contexts = (
+                [
+                    (context.filter_month, context.requested_year, context.status_bucket)
+                    for context in late_arrival_contexts(snapshots)
+                ]
+                if args.execute
+                else []
+            )
             excluded = [
                 {"month": result.context.filter_month, "year": result.context.requested_year,
                  "status": result.context.status_bucket, "code": "initial_context_" + result.status.value}
@@ -8761,9 +8819,120 @@ def _run_for_insurer_once(
                     runner._heartbeat("reconcile")
                     decisions = runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer, FinalScanPortal(), execution_ledger, [attempt])
                     for decision in decisions:
-                        counts = late_arrival_detection.setdefault("reconciliation", {})
+                        scope = (
+                            "reconciliation"
+                            if norm(attempt.get("insurer_run_id")) == insurer_run_id
+                            else "historical_reconciliation"
+                        )
+                        counts = late_arrival_detection.setdefault(scope, {})
                         status = decision.status.value
                         counts[status] = counts.get(status, 0) + 1
+            deferred_plans = list(getattr(runner, "deferred_assignment_plans", []))
+            runner.deferred_assignment_plans = []
+            if deferred_plans:
+                rows_by_identity: dict[str, PileRow] = {}
+                for row in follow_up_rows:
+                    for key in expanded_tracking_key_set([
+                        row.tracking_key, row.legacy_tracking_key, row.key,
+                    ]):
+                        rows_by_identity[key] = row
+                relocated_plans: list[PlannedAssignment] = []
+                unresolved_plans: list[PlannedAssignment] = []
+                for plan in deferred_plans:
+                    matched_row = next(
+                        (
+                            rows_by_identity.get(key)
+                            for key in expanded_tracking_key_set([
+                                plan.tracking_key, plan.pile_key,
+                            ])
+                            if rows_by_identity.get(key) is not None
+                        ),
+                        None,
+                    )
+                    if matched_row is None or norm(matched_row.assigned):
+                        unresolved_plans.append(plan)
+                        continue
+                    plan.pile_key = matched_row.key
+                    plan.filter_month = matched_row.filter_month
+                    plan.filter_year = effective_filter_year(matched_row, year_label)
+                    plan.status_bucket = matched_row.status_bucket
+                    plan.source_page_number = matched_row.page_number
+                    relocated_plans.append(plan)
+                if unresolved_plans:
+                    runner._transition_assignment_attempts(
+                        unresolved_plans,
+                        AttemptStatus.FAILED,
+                        {AttemptStatus.PLANNED},
+                        evidence={
+                            "code": "planned_row_not_assignable_at_final_scan",
+                            "details": {"count": len(unresolved_plans)},
+                        },
+                    )
+                if relocated_plans:
+                    runner._persist_relocated_plans(relocated_plans)
+                    print(
+                        f"Retrying {len(relocated_plans)} relocated planned pile(s) "
+                        "during the same insurer run..."
+                    )
+                    relocated_reassignments = [
+                        plan for plan in relocated_plans
+                        if plan.tracking_key in reassignment_source_by_tracking
+                    ]
+                    relocated_new_assignments = [
+                        plan for plan in relocated_plans
+                        if plan.tracking_key not in reassignment_source_by_tracking
+                    ]
+                    for retry_plans, target_results, target_applied in (
+                        (relocated_reassignments, reassignment_results, reassignment_applied),
+                        (relocated_new_assignments, results, applied),
+                    ):
+                        if not retry_plans:
+                            continue
+                        relocated_months = list(dict.fromkeys(
+                            plan.filter_month for plan in retry_plans if norm(plan.filter_month)
+                        )) or month_labels
+                        retry_results, retry_applied = runner.execute_assignment_plan(
+                            relocated_months,
+                            year_label,
+                            retry_plans,
+                            execute=args.execute,
+                            minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+                            persist_attempts=False,
+                            defer_unresolved=False,
+                        )
+                        for assignee_name, count in retry_results.items():
+                            target_results[assignee_name] = target_results.get(assignee_name, 0) + count
+                        target_applied.extend(retry_applied)
+                        if retry_plans is relocated_reassignments and args.execute:
+                            for item in retry_applied:
+                                planned_assignee = next(
+                                    (bot for bot in resolved_bots if bot.id == item.plan.assignee_id),
+                                    None,
+                                )
+                                store.log_assignment(
+                                    item.plan,
+                                    execute=True,
+                                    actual_assignee_name=item.actual_assignee_name,
+                                    planned_assignee=planned_assignee,
+                                    verified_on_table=item.verified_on_table,
+                                    observed_assigned_values=item.observed_assigned_values,
+                                    event_type_override="reassignment",
+                                )
+                                candidate = reassignment_source_by_tracking.get(item.plan.tracking_key)
+                                if planned_assignee and item.matched_planned_assignee and item.verified_on_table:
+                                    store.save_tracked_assignment(
+                                        master.id,
+                                        item.plan,
+                                        item.actual_assignee_name,
+                                        planned_assignee.id,
+                                        reassigned=True,
+                                    )
+                                    if candidate and candidate.source_kind == "external":
+                                        store.clear_external_assignment(candidate.source_id)
+                            if resolved_bots:
+                                metrics = store.refresh_bot_metrics_from_tracking(
+                                    insurer_name, resolved_bots, metrics,
+                                )
             seen_late = initial_observed_keys | prior_attempt_keys | expanded_tracking_key_set(
                 key for row in follow_up_rows if norm(row.assigned)
                 for key in (row.tracking_key, row.legacy_tracking_key, row.key)
@@ -8858,6 +9027,9 @@ def _run_for_insurer_once(
                     late_plans,
                     execute=args.execute,
                     minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+                    # This is already the final complete-context scan. There is
+                    # no later relocation pass to consume deferred plans.
+                    defer_unresolved=False,
                 )
                 late_arrival_detection["results"] = late_results
                 if late_results:
@@ -9250,7 +9422,10 @@ def classify_workflow_outcome(
     has_follow_up = (
         workflow_status == "completed_with_issues"
         or bool(result.get("portal_mapping_warnings"))
-        or any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed"))
+        or any(summary.get(key, 0) for key in (
+            "planned", "selected", "still_unassigned", "submitted",
+            "reconciliation_pending", "conflict", "failed",
+        ))
     )
     if has_follow_up:
         return "completed_with_issues", "assignment_follow_up_required"

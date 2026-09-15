@@ -504,6 +504,45 @@ process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(controls)));
         self.assertGreaterEqual(clock.ns, 2_000_000_000)
         self.assertLessEqual(clock.ns, 2_400_000_000)
 
+    def test_unrelated_pending_request_does_not_block_matching_finished_context(self):
+        browser = runner.CuracelPilesRunner()
+        target = types.SimpleNamespace(
+            method="GET",
+            url=("https://api.health.curacel.co/api/piles?year=2026&page=1"
+                 "&status%5Bcode%5D=VETTING_PENDING"),
+        )
+        unrelated = types.SimpleNamespace(
+            method="GET",
+            url=("https://api.health.curacel.co/api/piles?year=2026&page=1"
+                 "&status%5Bcode%5D=AUDIT_ONGOING"),
+        )
+        browser._capture_piles_request(target)
+        browser._finish_piles_request(target)
+        browser._capture_piles_request(unrelated)
+
+        self.assertEqual(
+            browser._filter_request_state(0, "All", "2026", "Vetting Pending"),
+            "finished",
+        )
+
+    def test_matching_request_started_before_generation_does_not_block_current_context(self):
+        browser = runner.CuracelPilesRunner()
+        old_request = types.SimpleNamespace(
+            method="GET",
+            url=("https://api.health.curacel.co/api/piles?year=2026&page=1"
+                 "&status%5Bcode%5D=VETTING_PENDING"),
+        )
+        current_request = types.SimpleNamespace(method="GET", url=old_request.url)
+        browser._capture_piles_request(old_request)
+        marker = browser._piles_request_sequence
+        browser._capture_piles_request(current_request)
+        browser._finish_piles_request(current_request)
+
+        self.assertEqual(
+            browser._filter_request_state(marker, "All", "2026", "Vetting Pending"),
+            "finished",
+        )
+
     def test_request_completion_alone_cannot_relabel_unchanged_empty_dom(self):
         browser, clock = self.fixture()
         snapshot = browser._table_context_snapshot()
@@ -904,10 +943,10 @@ class LateArrivalWorkflowTests(unittest.TestCase):
 
     def workflow(self, initial, late, *, attempts=(), v2=True, years=("2026",),
                  supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
-                 after_initial=None, configured_bots=(), execute=True):
-        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[],
-                                      execute_modes=[])
-        pending = [dict(item) for item in attempts]
+                 after_initial=None, configured_bots=(), execute=True, defer_first_assignment=False):
+        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], relocations=[], mapping=[],
+                                      execute_modes=[], execute_options=[])
+        pending = [{"insurer_run_id": "run", **dict(item)} for item in attempts]
 
         class Ledger(runner.ReadOnlyExecutionLedger):
             def finish_scan_context(self, context_id, result, evidence=None):
@@ -923,6 +962,9 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 assert item["status"] in expected
                 item["status"] = target.value
                 state.transitions.append((attempt_id, target.value))
+
+            def relocate_planned_attempt(self, attempt_id, *, last_pile_key, filter_context):
+                state.relocations.append((attempt_id, last_pile_key, filter_context))
 
         class Portal(runner.CuracelPilesRunner):
             def __init__(self, **_):
@@ -962,7 +1004,18 @@ class LateArrivalWorkflowTests(unittest.TestCase):
             def execute_assignment_plan(self, months, year, plans, **options):
                 state.applied.append(list(plans))
                 state.execute_modes.append(bool(options.get("execute")))
+                state.execute_options.append(dict(options))
+                if defer_first_assignment and len(state.applied) == 1:
+                    self.assignment_attempt_ids = {
+                        plan.tracking_key: plan.tracking_key for plan in plans
+                    }
+                    self.deferred_assignment_plans = list(plans)
                 return {}, []
+            def _transition_assignment_attempts(self, plans, target, expected, evidence=None):
+                state.transitions.extend(
+                    (plan.tracking_key, target.value, evidence and evidence.get("code"))
+                    for plan in plans
+                )
 
         store = types.SimpleNamespace(
             get_master_account=lambda name: runner.MasterAccount("master", name, "fixture", "fixture", True),
@@ -998,11 +1051,61 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(state.scans), 10)
                 self.assertEqual(state.scans.count(context), 2)
                 self.assertEqual([[plan.pile_key for plan in batch] for batch in state.applied], [["pile-2"]])
+                self.assertFalse(state.execute_options[-1]["defer_unresolved"])
                 self.assertEqual(state.result["late_arrival_detection"]["count"], 1)
                 self.assertEqual(state.result["scan_context_summary"], {
                     "total": 5, "complete": 5, "empty": 5 - int(bool(rows)),
                     "failed": 0, "pending": 0,
                 })
+
+    def test_planned_row_that_moves_status_is_retried_in_the_same_run(self):
+        initial_context = ("Jul", "2026", "Vetting Pending")
+        moved_context = ("Jul", "2026", "Audit Pending")
+        original = make_pile(1)
+        moved = runner.replace(original, status_bucket="Audit Pending", key="moved-pile")
+
+        state = self.workflow(
+            {initial_context: [original]},
+            {moved_context: [moved]},
+            defer_first_assignment=True,
+        )
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.applied), 2)
+        self.assertEqual(state.applied[1][0].status_bucket, "Audit Pending")
+        self.assertEqual(state.applied[1][0].pile_key, "moved-pile")
+        self.assertEqual(state.relocations, [(
+            original.tracking_key,
+            "moved-pile",
+            {"month": "Jul", "year": "2026", "status": "Audit Pending", "source_page": 1},
+        )])
+        self.assertFalse(state.execute_options[1]["persist_attempts"])
+        self.assertFalse(state.execute_options[1]["defer_unresolved"])
+
+    def test_read_only_probe_does_not_repeat_assignment_only_late_arrival_scan(self):
+        state = self.workflow({}, {}, execute=False)
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.scans), 5)
+        self.assertEqual(state.result["late_arrival_detection"]["contexts"], [])
+
+    def test_deferred_plan_that_is_no_longer_assignable_is_terminalized(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = make_pile(1)
+        externally_assigned = runner.replace(original, assigned="Daniel")
+
+        state = self.workflow(
+            {context: [original]},
+            {context: [externally_assigned]},
+            defer_first_assignment=True,
+        )
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.applied), 1)
+        self.assertIn(
+            (original.tracking_key, "failed", "planned_row_not_assignable_at_final_scan"),
+            state.transitions,
+        )
 
     def test_actual_flow_preserves_concrete_and_all_year_contexts(self):
         for multiple, expected in ((False, {"2026", "2025"}), (True, {"All"})):
@@ -1049,6 +1152,22 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     self.assertEqual(state.mapping, [])
                     self.assertEqual(state.result["workflow_status"],
                                      "completed" if expected == "confirmed_reconciled" else "completed_with_issues")
+
+    def test_unresolved_historical_reconciliation_does_not_taint_owned_run(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        attempt = dict(
+            id="historical-attempt", insurer_run_id="older-run",
+            tracking_key="missing", status="reconciliation_pending",
+            intended_portal_assignee="Daniel", attempt_number=1,
+        )
+        state = self.workflow({}, {context: []}, attempts=[attempt])
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(state.result["workflow_status"], "completed")
+        self.assertEqual(
+            state.result["late_arrival_detection"]["historical_reconciliation"],
+            {"reconciliation_pending": 1},
+        )
 
     def test_persistence_failure_cannot_make_context_eligible(self):
         state = self.workflow({}, {}, persist_error=True)
@@ -1119,6 +1238,63 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     self.assertEqual(len(state.scans), 5)
                 if phase in ("scan", "reconcile", "plan"):
                     self.assertEqual(state.mapping, [])
+
+
+class AssignmentPlanCompletionTests(unittest.TestCase):
+    def fixture(self):
+        plans, _summary = runner.build_assignment_plan(
+            "OLD MUTUAL",
+            [make_pile(1)],
+            [make_bot("primary", "primary", priority=1)],
+            {},
+        )
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.deferred_assignment_plans = []
+        portal._heartbeat = lambda *_: None
+        portal.persist_assignment_plans = lambda *_: None
+        portal.open_piles = lambda: None
+        portal.apply_filters = lambda *_: None
+        portal.try_set_page_size = lambda *_: None
+        portal.rows_on_current_page = lambda *_: []
+        portal.goto_next_page = lambda *_args, **_kwargs: False
+        portal._page_candidates_for_plan = lambda _plan: [1]
+        portal.reset_to_filtered_page = lambda *_: []
+        portal.scan_status = lambda *_args, **_kwargs: []
+        portal._transition_assignment_attempts = lambda *args, **kwargs: None
+        return portal, plans
+
+    def test_first_unsubmitted_selection_is_deferred_to_same_run_rescan(self):
+        portal, plans = self.fixture()
+        with patch.object(runner.time, "sleep", lambda *_: None):
+            results, applied = portal.execute_assignment_plan(
+                ["Jul"], "2026", plans, execute=True,
+            )
+
+        self.assertEqual(results, {})
+        self.assertEqual(applied, [])
+        self.assertEqual(portal.deferred_assignment_plans, plans)
+
+    def test_final_unsubmitted_selection_is_terminalized_and_fails(self):
+        portal, plans = self.fixture()
+        transitions = []
+        portal._transition_assignment_attempts = lambda *args, **kwargs: transitions.append((args, kwargs))
+
+        with patch.object(runner.time, "sleep", lambda *_: None), self.assertRaisesRegex(
+            RuntimeError, "Could not submit 1 persisted planned pile",
+        ) as raised:
+            portal.execute_assignment_plan(
+                ["Jul"], "2026", plans, execute=True,
+                persist_attempts=False, defer_unresolved=False,
+            )
+
+        self.assertNotIn(plans[0].pile_key, str(raised.exception))
+        self.assertNotIn(plans[0].tracking_key, str(raised.exception))
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0][0][1], runner.AttemptStatus.FAILED)
+        self.assertEqual(
+            transitions[0][1]["evidence"]["code"],
+            "planned_selection_retry_exhausted",
+        )
 
 
 class AssignmentPlanningTests(unittest.TestCase):
@@ -3622,6 +3798,16 @@ class ManualWorkflowOutcomeTests(unittest.TestCase):
         self.assertEqual(finals[-1]["status"], "completed_with_issues")
         self.assertEqual(finals[-1].get("error_code"), "workflow_outcome_unconfirmed")
 
+    def test_nonterminal_attempts_cannot_be_classified_as_completed(self):
+        for attempt_status in ("planned", "selected", "still_unassigned", "submitted", "reconciliation_pending"):
+            with self.subTest(attempt_status=attempt_status):
+                status, error_code = runner.classify_workflow_outcome(
+                    {"workflow_status": "completed"},
+                    {attempt_status: 1},
+                )
+                self.assertEqual(status, "completed_with_issues")
+                self.assertEqual(error_code, "assignment_follow_up_required")
+
     def test_legacy_manual_workflow_keeps_original_return_and_finalization_behavior(self):
         result, finals, _ = self.manual_workflow(recorded=True, v2=False)
         self.assertNotIn("workflow_status", result)
@@ -4197,7 +4383,7 @@ class DispatcherMainTests(unittest.TestCase):
         empty_state = workflow({}, {}, v2=True, execute=False)
         empty = empty_state.result
         manual = workflow(
-            {}, {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, manual=True, v2=True, execute=False,
+            {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, {}, manual=True, v2=True, execute=False,
         )
         warning_state = workflow(
             {("Jul", "2026", "Vetting Pending"): [make_pile(1)]}, {}, v2=True,

@@ -582,9 +582,13 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.connection.database.executescript("""
             CREATE TABLE piles_auto_assignment_attempts(insurer_run_id TEXT, status TEXT);
             INSERT INTO piles_auto_assignment_attempts VALUES
-                ('run','submitted'),('run','manual_action_required'),('run','confirmed_visible');
+                ('run','planned'),('run','selected'),('run','still_unassigned'),('run','submitted'),
+                ('run','manual_action_required'),('run','confirmed_visible');
         """)
         summary = ExecutionLedger(self.connection).summarize_insurer_run("run")
+        self.assertEqual(summary.get("planned"), 1)
+        self.assertEqual(summary.get("selected"), 1)
+        self.assertEqual(summary.get("still_unassigned"), 1)
         self.assertEqual(summary.get("submitted"), 1)
         self.assertEqual(summary.get("manual_action_required"), 1)
 
@@ -978,6 +982,30 @@ class ExecutionLedgerTests(unittest.TestCase):
             )
         self.assertEqual(self.connection.rollback_count, 1)
 
+    def test_relocated_planned_attempt_updates_only_current_location(self):
+        self.ledger.relocate_planned_attempt(
+            "attempt-1",
+            last_pile_key="current-pile-key",
+            filter_context={"month": "Jul", "year": "2026", "status": "Audit Pending", "source_page": 2},
+        )
+
+        sql, params = self.connection.statements[-1]
+        self.assertIn("WHERE id = %s AND status = 'planned'", sql)
+        self.assertEqual(params[0], "current-pile-key")
+        self.assertEqual(json.loads(params[1])["status"], "Audit Pending")
+        self.assertEqual(params[-1], "attempt-1")
+        self.assertEqual(self.connection.commit_count, 1)
+
+    def test_relocated_planned_attempt_rejects_concurrent_state_change(self):
+        self.connection.cursor_instance._row = None
+        with self.assertRaises(ConcurrentStateChange):
+            self.ledger.relocate_planned_attempt(
+                "attempt-1",
+                last_pile_key="current-pile-key",
+                filter_context={},
+            )
+        self.assertEqual(self.connection.rollback_count, 1)
+
     def test_batch_and_attempt_creation_is_one_transaction(self):
         batch_id = self.ledger.create_batch_with_attempts(
             {
@@ -1015,6 +1043,11 @@ class ExecutionLedgerTests(unittest.TestCase):
             AttemptStatus.SUBMITTED,
             expected={AttemptStatus.SELECTED},
         )
+        ledger.relocate_planned_attempt(
+            "attempt-1",
+            last_pile_key="current-pile-key",
+            filter_context={},
+        )
         ledger.heartbeat(run_id, phase="scan")
         self.assertTrue(run_id)
         self.assertEqual(ledger.write_count, 0)
@@ -1035,6 +1068,22 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertIn("distinct_pile_count", sql)
         self.assertEqual(params[-1], "context-1")
         self.assertEqual(self.connection.commit_count, 2)
+
+    def test_attempt_aggregates_use_action_timestamps_not_terminal_status_guessing(self):
+        self.ledger.transition_attempt(
+            "attempt-1",
+            AttemptStatus.FAILED,
+            expected={AttemptStatus.PLANNED},
+            evidence={"code": "selection_failed", "details": {}},
+        )
+
+        batch_sql = self.connection.statements[-1][0].lower()
+        self.assertIn("selected_at is not null", batch_sql)
+        self.assertIn("submitted_at is not null", batch_sql)
+
+        self.ledger.finalize_insurer_run("run-1", status="completed_with_issues")
+        finalizer_sql = self.connection.statements[-2][0].lower()
+        self.assertIn("submitted_at is not null", finalizer_sql)
 
     def test_scan_context_failure_is_recorded_without_raw_exception_details(self):
         self.ledger.fail_scan_context(

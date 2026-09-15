@@ -621,8 +621,9 @@ function HistoryCounts({ C, counts = {} }) {
     ['Contexts expected', counts.contexts_total], ['Contexts settled (including empty)', counts.contexts_complete],
     ['Contexts empty', counts.contexts_empty], ['Contexts failed', counts.contexts_failed], ['Contexts pending', counts.contexts_pending],
     ['Discovered piles', counts.discovered_piles], ['Discovered claims', counts.discovered_claims], ['Unassigned piles', counts.unassigned_piles],
-    ['Planned piles', counts.planned_piles], ['Selected piles', counts.selected_piles], ['Submitted piles', counts.submitted_piles],
-    ['Confirmed piles', counts.confirmed_piles], ['Awaiting reconciliation', counts.reconciliation_pending],
+    ['Planned piles', counts.planned_piles], ['Unsubmitted plans', counts.unsubmitted_plans],
+    ['Selected piles', counts.selected_piles], ['Submitted piles', counts.submitted_piles],
+    ['Confirmed piles', counts.confirmed_piles], ['Awaiting reconciliation/retry', counts.reconciliation_pending],
     ['Conflicted piles', counts.conflicts], ['Failed piles', counts.failed], ['Manual action piles', counts.manual_action_required],
   ].map(([label, value]) => [label, formatCount(value)])} />;
 }

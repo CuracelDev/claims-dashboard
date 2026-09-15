@@ -174,6 +174,24 @@ class OrchestratorTests(unittest.TestCase):
     def test_errors_have_stable_sanitized_codes(self):
         self.assertEqual(classify_runner_error(IncompleteScan("private detail")), "scan_incomplete")
         self.assertEqual(classify_runner_error(TimeoutError("slow")), "portal_timeout")
+        self.assertEqual(
+            classify_runner_error(RuntimeError(
+                "Could not submit 2 persisted planned pile(s) after the final same-run retry."
+            )),
+            "assignment_plan_incomplete",
+        )
+        self.assertEqual(
+            classify_runner_error(RuntimeError(
+                "Piles filters were not confirmed: filter_settlement_timeout."
+            )),
+            "filter_settlement_timeout",
+        )
+        self.assertEqual(
+            classify_runner_error(RuntimeError(
+                "Piles filters were not confirmed: filter_dom_response_mismatch."
+            )),
+            "filter_dom_response_mismatch",
+        )
 
     def test_only_known_shutdown_noise_is_suppressible(self):
         from scripts.piles_auto_assignment.orchestrator import is_harmless_shutdown_warning

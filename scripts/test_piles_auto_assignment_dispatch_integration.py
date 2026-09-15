@@ -641,7 +641,10 @@ class DispatcherAcceptanceTests(unittest.TestCase):
                             harness.late["DEFMIS"] = [runner.replace(harness.pile("historical-pile"), assigned=observed)]
                         result, error = harness.invoke(insurer="DEFMIS")
                         self.assertIsNone(error, str(error))
-                        self.assertEqual(result.status.value, "completed" if observed else "completed_with_issues")
+                        # Reconciliation remains attached to the historical
+                        # attempt. It must not make this parent claim ownership
+                        # of work created by an older run.
+                        self.assertEqual(result.status.value, "completed")
                         self.assertEqual(harness.db.rows("SELECT id,status,attempt_number FROM piles_auto_assignment_attempts"),
                                          [{"id": "historical-attempt", "status": expected, "attempt_number": 1}])
                         self.assertEqual(harness.clicks, [])

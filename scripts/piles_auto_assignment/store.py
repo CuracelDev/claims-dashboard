@@ -1264,8 +1264,8 @@ class ExecutionLedger:
                       updated_at = now()
                     FROM (
                       SELECT batch_id, count(*) total_count,
-                        count(*) FILTER (WHERE status <> 'planned') selected_count,
-                        count(*) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')) submitted_count,
+                        count(*) FILTER (WHERE selected_at IS NOT NULL) selected_count,
+                        count(*) FILTER (WHERE submitted_at IS NOT NULL) submitted_count,
                         count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_count,
                         count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_count,
                         count(*) FILTER (WHERE status = 'conflict') conflict_count,
@@ -1277,6 +1277,34 @@ class ExecutionLedger:
                     """,
                     (row[0],),
                 )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def relocate_planned_attempt(
+        self,
+        attempt_id: str,
+        *,
+        last_pile_key: str,
+        filter_context: Mapping[str, Any],
+    ) -> None:
+        """Persist the current portal location before retrying a planned attempt."""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_attempts
+                    SET last_pile_key = %s,
+                        filter_context = %s::jsonb,
+                        updated_at = now()
+                    WHERE id = %s AND status = 'planned'
+                    RETURNING id
+                    """,
+                    (last_pile_key, _json(filter_context), attempt_id),
+                )
+                if not cursor.fetchone():
+                    raise ConcurrentStateChange(attempt_id)
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -1375,12 +1403,12 @@ class ExecutionLedger:
                   FROM piles_auto_assignment_scan_contexts WHERE insurer_run_id = %s
                 ), attempt_summary AS (
                   SELECT count(*) planned_piles, coalesce(sum(claim_count), 0) planned_claims,
-                    count(*) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')) submitted_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')), 0) submitted_claims,
+                    count(*) FILTER (WHERE submitted_at IS NOT NULL) submitted_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE submitted_at IS NOT NULL), 0) submitted_claims,
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
                     coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')), 0) confirmed_claims,
-                    count(*) FILTER (WHERE status = 'reconciliation_pending') pending_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE status = 'reconciliation_pending'), 0) pending_claims,
+                    count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')), 0) pending_claims,
                     count(*) FILTER (WHERE status = 'conflict') conflicts,
                     count(*) FILTER (WHERE status = 'failed') failures
                   FROM piles_auto_assignment_attempts WHERE insurer_run_id = %s
@@ -1420,6 +1448,9 @@ class ExecutionLedger:
             cursor.execute(
                 """
                 SELECT
+                    count(*) FILTER (WHERE status = 'planned') AS planned,
+                    count(*) FILTER (WHERE status = 'selected') AS selected,
+                    count(*) FILTER (WHERE status = 'still_unassigned') AS still_unassigned,
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) AS confirmed,
                     count(*) FILTER (WHERE status = 'reconciliation_pending') AS reconciliation_pending,
                     count(*) FILTER (WHERE status = 'conflict') AS conflict,
@@ -1431,14 +1462,17 @@ class ExecutionLedger:
                 """,
                 (insurer_run_id,),
             )
-            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0, 0)
         return {
-            "confirmed": int(row[0] or 0),
-            "reconciliation_pending": int(row[1] or 0),
-            "conflict": int(row[2] or 0),
-            "failed": int(row[3] or 0),
-            "submitted": int(row[4] or 0),
-            "manual_action_required": int(row[5] or 0),
+            "planned": int(row[0] or 0),
+            "selected": int(row[1] or 0),
+            "still_unassigned": int(row[2] or 0),
+            "confirmed": int(row[3] or 0),
+            "reconciliation_pending": int(row[4] or 0),
+            "conflict": int(row[5] or 0),
+            "failed": int(row[6] or 0),
+            "submitted": int(row[7] or 0),
+            "manual_action_required": int(row[8] or 0),
         }
 
 
@@ -1480,6 +1514,15 @@ class ReadOnlyExecutionLedger:
     def transition_attempt(self, _attempt_id: str, _target: AttemptStatus, *, expected: Iterable[AttemptStatus], evidence: Optional[Any] = None) -> None:
         del expected, evidence
 
+    def relocate_planned_attempt(
+        self,
+        _attempt_id: str,
+        *,
+        last_pile_key: str,
+        filter_context: Mapping[str, Any],
+    ) -> None:
+        del last_pile_key, filter_context
+
     def pending_attempts(self, _insurer_name: str) -> list[dict[str, Any]]:
         return []
 
@@ -1501,7 +1544,11 @@ class ReadOnlyExecutionLedger:
         del status, error_code, error_message, performance
 
     def summarize_insurer_run(self, _insurer_run_id: str) -> dict[str, int]:
-        return {"confirmed": 0, "reconciliation_pending": 0, "conflict": 0, "failed": 0}
+        return {
+            "planned": 0, "selected": 0, "still_unassigned": 0,
+            "confirmed": 0, "reconciliation_pending": 0, "conflict": 0,
+            "failed": 0, "submitted": 0, "manual_action_required": 0,
+        }
 
     def close(self) -> None:
         return None

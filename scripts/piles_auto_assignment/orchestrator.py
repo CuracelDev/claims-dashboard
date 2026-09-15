@@ -41,6 +41,24 @@ def classify_runner_error(error: BaseException) -> str:
     message = str(error).lower()
     if isinstance(error, NoEligibleAssignees):
         return "no_eligible_assignees"
+    if "persisted planned pile" in message and "could not submit" in message:
+        return "assignment_plan_incomplete"
+    filter_prefix = "piles filters were not confirmed: "
+    if filter_prefix in message:
+        filter_code = message.split(filter_prefix, 1)[1].split(".", 1)[0].strip()
+        if filter_code in {
+            "controls_not_confirmed",
+            "empty_ui_conflicts_with_response",
+            "filter_dom_response_mismatch",
+            "filter_request_pending",
+            "filter_response_failed",
+            "filter_response_not_confirmed",
+            "filter_response_payload_unreadable",
+            "filter_settlement_timeout",
+            "structural_empty_without_authoritative_response",
+            "table_not_settled",
+        }:
+            return filter_code
     if "filter" in message and any(word in message for word in ("response", "settle", "control")):
         return "filter_not_confirmed"
     if "login" in message or "credential" in message:
