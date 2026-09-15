@@ -946,7 +946,7 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                  after_initial=None, configured_bots=(), execute=True, defer_first_assignment=False):
         state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], relocations=[], mapping=[],
                                       execute_modes=[], execute_options=[])
-        pending = [dict(item) for item in attempts]
+        pending = [{"insurer_run_id": "run", **dict(item)} for item in attempts]
 
         class Ledger(runner.ReadOnlyExecutionLedger):
             def finish_scan_context(self, context_id, result, evidence=None):
@@ -1152,6 +1152,22 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     self.assertEqual(state.mapping, [])
                     self.assertEqual(state.result["workflow_status"],
                                      "completed" if expected == "confirmed_reconciled" else "completed_with_issues")
+
+    def test_unresolved_historical_reconciliation_does_not_taint_owned_run(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        attempt = dict(
+            id="historical-attempt", insurer_run_id="older-run",
+            tracking_key="missing", status="reconciliation_pending",
+            intended_portal_assignee="Daniel", attempt_number=1,
+        )
+        state = self.workflow({}, {context: []}, attempts=[attempt])
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(state.result["workflow_status"], "completed")
+        self.assertEqual(
+            state.result["late_arrival_detection"]["historical_reconciliation"],
+            {"reconciliation_pending": 1},
+        )
 
     def test_persistence_failure_cannot_make_context_eligible(self):
         state = self.workflow({}, {}, persist_error=True)
@@ -3783,7 +3799,7 @@ class ManualWorkflowOutcomeTests(unittest.TestCase):
         self.assertEqual(finals[-1].get("error_code"), "workflow_outcome_unconfirmed")
 
     def test_nonterminal_attempts_cannot_be_classified_as_completed(self):
-        for attempt_status in ("planned", "selected", "submitted", "reconciliation_pending"):
+        for attempt_status in ("planned", "selected", "still_unassigned", "submitted", "reconciliation_pending"):
             with self.subTest(attempt_status=attempt_status):
                 status, error_code = runner.classify_workflow_outcome(
                     {"workflow_status": "completed"},

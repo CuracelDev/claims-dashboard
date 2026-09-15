@@ -8819,7 +8819,12 @@ def _run_for_insurer_once(
                     runner._heartbeat("reconcile")
                     decisions = runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer, FinalScanPortal(), execution_ledger, [attempt])
                     for decision in decisions:
-                        counts = late_arrival_detection.setdefault("reconciliation", {})
+                        scope = (
+                            "reconciliation"
+                            if norm(attempt.get("insurer_run_id")) == insurer_run_id
+                            else "historical_reconciliation"
+                        )
+                        counts = late_arrival_detection.setdefault(scope, {})
                         status = decision.status.value
                         counts[status] = counts.get(status, 0) + 1
             deferred_plans = list(getattr(runner, "deferred_assignment_plans", []))
@@ -9418,7 +9423,8 @@ def classify_workflow_outcome(
         workflow_status == "completed_with_issues"
         or bool(result.get("portal_mapping_warnings"))
         or any(summary.get(key, 0) for key in (
-            "planned", "selected", "submitted", "reconciliation_pending", "conflict", "failed",
+            "planned", "selected", "still_unassigned", "submitted",
+            "reconciliation_pending", "conflict", "failed",
         ))
     )
     if has_follow_up:

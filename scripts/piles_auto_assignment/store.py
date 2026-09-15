@@ -1407,8 +1407,8 @@ class ExecutionLedger:
                     coalesce(sum(claim_count) FILTER (WHERE submitted_at IS NOT NULL), 0) submitted_claims,
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
                     coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')), 0) confirmed_claims,
-                    count(*) FILTER (WHERE status = 'reconciliation_pending') pending_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE status = 'reconciliation_pending'), 0) pending_claims,
+                    count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')), 0) pending_claims,
                     count(*) FILTER (WHERE status = 'conflict') conflicts,
                     count(*) FILTER (WHERE status = 'failed') failures
                   FROM piles_auto_assignment_attempts WHERE insurer_run_id = %s
@@ -1450,6 +1450,7 @@ class ExecutionLedger:
                 SELECT
                     count(*) FILTER (WHERE status = 'planned') AS planned,
                     count(*) FILTER (WHERE status = 'selected') AS selected,
+                    count(*) FILTER (WHERE status = 'still_unassigned') AS still_unassigned,
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) AS confirmed,
                     count(*) FILTER (WHERE status = 'reconciliation_pending') AS reconciliation_pending,
                     count(*) FILTER (WHERE status = 'conflict') AS conflict,
@@ -1461,16 +1462,17 @@ class ExecutionLedger:
                 """,
                 (insurer_run_id,),
             )
-            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0, 0)
         return {
             "planned": int(row[0] or 0),
             "selected": int(row[1] or 0),
-            "confirmed": int(row[2] or 0),
-            "reconciliation_pending": int(row[3] or 0),
-            "conflict": int(row[4] or 0),
-            "failed": int(row[5] or 0),
-            "submitted": int(row[6] or 0),
-            "manual_action_required": int(row[7] or 0),
+            "still_unassigned": int(row[2] or 0),
+            "confirmed": int(row[3] or 0),
+            "reconciliation_pending": int(row[4] or 0),
+            "conflict": int(row[5] or 0),
+            "failed": int(row[6] or 0),
+            "submitted": int(row[7] or 0),
+            "manual_action_required": int(row[8] or 0),
         }
 
 
@@ -1542,7 +1544,11 @@ class ReadOnlyExecutionLedger:
         del status, error_code, error_message, performance
 
     def summarize_insurer_run(self, _insurer_run_id: str) -> dict[str, int]:
-        return {"confirmed": 0, "reconciliation_pending": 0, "conflict": 0, "failed": 0}
+        return {
+            "planned": 0, "selected": 0, "still_unassigned": 0,
+            "confirmed": 0, "reconciliation_pending": 0, "conflict": 0,
+            "failed": 0, "submitted": 0, "manual_action_required": 0,
+        }
 
     def close(self) -> None:
         return None

@@ -582,12 +582,13 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.connection.database.executescript("""
             CREATE TABLE piles_auto_assignment_attempts(insurer_run_id TEXT, status TEXT);
             INSERT INTO piles_auto_assignment_attempts VALUES
-                ('run','planned'),('run','selected'),('run','submitted'),
+                ('run','planned'),('run','selected'),('run','still_unassigned'),('run','submitted'),
                 ('run','manual_action_required'),('run','confirmed_visible');
         """)
         summary = ExecutionLedger(self.connection).summarize_insurer_run("run")
         self.assertEqual(summary.get("planned"), 1)
         self.assertEqual(summary.get("selected"), 1)
+        self.assertEqual(summary.get("still_unassigned"), 1)
         self.assertEqual(summary.get("submitted"), 1)
         self.assertEqual(summary.get("manual_action_required"), 1)
 
