@@ -7116,12 +7116,11 @@ class CuracelPilesRunner:
                             },
                         )
                     if pending_status_plans:
-                        unresolved = ", ".join(plan.pile_key for plan in still_visible[:3])
-                        if not unresolved:
-                            unresolved = "not visible in the original status"
                         raise RuntimeError(
                             f"Could not submit {len(pending_status_plans)} persisted planned pile(s) for "
-                            f"status '{status_label}' after the final same-run retry. Remaining: {unresolved}"
+                            f"status '{status_label}' after the final same-run retry "
+                            f"({len(still_visible)} still visible; "
+                            f"{len(no_longer_unassigned)} no longer visible as unassigned)."
                         )
         return results, applied
 

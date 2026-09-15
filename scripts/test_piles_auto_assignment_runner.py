@@ -1253,12 +1253,14 @@ class AssignmentPlanCompletionTests(unittest.TestCase):
 
         with patch.object(runner.time, "sleep", lambda *_: None), self.assertRaisesRegex(
             RuntimeError, "Could not submit 1 persisted planned pile",
-        ):
+        ) as raised:
             portal.execute_assignment_plan(
                 ["Jul"], "2026", plans, execute=True,
                 persist_attempts=False, defer_unresolved=False,
             )
 
+        self.assertNotIn(plans[0].pile_key, str(raised.exception))
+        self.assertNotIn(plans[0].tracking_key, str(raised.exception))
         self.assertEqual(len(transitions), 1)
         self.assertEqual(transitions[0][0][1], runner.AttemptStatus.FAILED)
         self.assertEqual(
