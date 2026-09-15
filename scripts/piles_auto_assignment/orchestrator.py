@@ -41,6 +41,8 @@ def classify_runner_error(error: BaseException) -> str:
     message = str(error).lower()
     if isinstance(error, NoEligibleAssignees):
         return "no_eligible_assignees"
+    if "persisted planned pile" in message and "could not submit" in message:
+        return "assignment_plan_incomplete"
     filter_prefix = "piles filters were not confirmed: "
     if filter_prefix in message:
         filter_code = message.split(filter_prefix, 1)[1].split(".", 1)[0].strip()

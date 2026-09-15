@@ -18,7 +18,7 @@ Make every production insurer run truthfully account for every discovered assign
 - [x] Keep unresolved planned attempts in the same run, relocate them across the final complete scan, and require a terminal outcome.
 - [x] Make insurer outcome classification fail closed for every non-terminal assignment state.
 - [x] Avoid the assignment-only late-arrival pass in read-only readiness/preview runs.
-- [ ] Extend incident/readiness evidence for non-terminal plans and phase timings.
+- [x] Extend incident/readiness evidence for non-terminal plans and phase timings.
 - [ ] Run focused tests after every commit, then the full Python, Node, build, and static validation suites.
 - [ ] Perform isolated production read-only probes; do not submit assignments during validation.
 

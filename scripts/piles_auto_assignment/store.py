@@ -1264,8 +1264,8 @@ class ExecutionLedger:
                       updated_at = now()
                     FROM (
                       SELECT batch_id, count(*) total_count,
-                        count(*) FILTER (WHERE status <> 'planned') selected_count,
-                        count(*) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')) submitted_count,
+                        count(*) FILTER (WHERE selected_at IS NOT NULL) selected_count,
+                        count(*) FILTER (WHERE submitted_at IS NOT NULL) submitted_count,
                         count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_count,
                         count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_count,
                         count(*) FILTER (WHERE status = 'conflict') conflict_count,
@@ -1375,8 +1375,8 @@ class ExecutionLedger:
                   FROM piles_auto_assignment_scan_contexts WHERE insurer_run_id = %s
                 ), attempt_summary AS (
                   SELECT count(*) planned_piles, coalesce(sum(claim_count), 0) planned_claims,
-                    count(*) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')) submitted_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE status IN ('submitted','confirmed_visible','confirmed_reconciled','reconciliation_pending','still_unassigned','manual_action_required','conflict','failed')), 0) submitted_claims,
+                    count(*) FILTER (WHERE submitted_at IS NOT NULL) submitted_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE submitted_at IS NOT NULL), 0) submitted_claims,
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
                     coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')), 0) confirmed_claims,
                     count(*) FILTER (WHERE status = 'reconciliation_pending') pending_piles,

@@ -1039,6 +1039,22 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertEqual(params[-1], "context-1")
         self.assertEqual(self.connection.commit_count, 2)
 
+    def test_attempt_aggregates_use_action_timestamps_not_terminal_status_guessing(self):
+        self.ledger.transition_attempt(
+            "attempt-1",
+            AttemptStatus.FAILED,
+            expected={AttemptStatus.PLANNED},
+            evidence={"code": "selection_failed", "details": {}},
+        )
+
+        batch_sql = self.connection.statements[-1][0].lower()
+        self.assertIn("selected_at is not null", batch_sql)
+        self.assertIn("submitted_at is not null", batch_sql)
+
+        self.ledger.finalize_insurer_run("run-1", status="completed_with_issues")
+        finalizer_sql = self.connection.statements[-2][0].lower()
+        self.assertIn("submitted_at is not null", finalizer_sql)
+
     def test_scan_context_failure_is_recorded_without_raw_exception_details(self):
         self.ledger.fail_scan_context(
             "context-1",

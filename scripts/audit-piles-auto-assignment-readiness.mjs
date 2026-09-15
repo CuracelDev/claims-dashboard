@@ -52,6 +52,22 @@ export function evaluateQueueHealth(findings, { deploymentMode = false } = {}) {
   });
 }
 
+export function evaluateAttemptHealth(findings, { deploymentMode = false } = {}) {
+  return [
+    ['pending reconciliation age', findings.pendingReconciliation],
+    ['stale unsubmitted assignment attempts', findings.staleUnsubmitted],
+  ].map(([name, rawCount]) => {
+    const count = Number(rawCount || 0);
+    const isError = count > 0 && !deploymentMode;
+    return {
+      name,
+      ok: !isError,
+      detail: `${count} attempt(s) older than 30 minutes${deploymentMode && count ? ' (runtime warning; repair deployment allowed)' : ''}`,
+      severity: isError ? 'error' : count > 0 ? 'warning' : 'pass',
+    };
+  });
+}
+
 export async function inspectQueueHealth(pool) {
   const queued = await pool.query(`
     select count(*)::int as queued_without_live_worker
@@ -144,11 +160,12 @@ export async function databaseChecks({ pool: suppliedPool, deploymentMode: suppl
       await pool.query('ROLLBACK');
       return checks;
     }
-    const [linkage, owners, stale, pending, unsupported, queueHealth] = await Promise.all([
+    const [linkage, owners, stale, pending, unsubmitted, unsupported, queueHealth] = await Promise.all([
       pool.query(`select count(*)::int count from piles_auto_assignment_master_accounts m left join piles_auto_assignment_rules r on lower(r.insurer_name)=lower(m.insurer_name) and r.is_active=true where m.is_active=true and r.id is null`),
       pool.query(`select count(*)::int count from piles_auto_assignment_master_accounts m where m.is_active=true and not exists (select 1 from piles_auto_assignment_bot_accounts b where lower(b.insurer_name)=lower(m.insurer_name) and b.is_active=true and b.is_available=true)`),
       pool.query(`select count(*)::int count from piles_auto_assignment_insurer_runs where status='running' and coalesce(heartbeat_at, started_at, created_at) < now() - interval '15 minutes'`),
       pool.query(`select count(*)::int count from piles_auto_assignment_attempts where status='reconciliation_pending' and updated_at < now() - interval '30 minutes'`),
+      pool.query(`select count(*)::int count from piles_auto_assignment_attempts where status in ('planned','selected') and updated_at < now() - interval '30 minutes'`),
       pool.query(`select count(*)::int count from piles_auto_assignment_rules where distribution_mode not in ('balanced_finish','single_owner','manual_override') or minimum_claim_chunk < 1`),
       inspectQueueHealth(pool),
     ]);
@@ -161,12 +178,10 @@ export async function databaseChecks({ pool: suppliedPool, deploymentMode: suppl
         `${stale.rows[0].count} running insurer records stale over 15 minutes${deploymentMode && stale.rows[0].count ? ' (runtime warning; repair deployment allowed)' : ''}`,
         deploymentMode && stale.rows[0].count ? 'warning' : undefined,
       ),
-      report(
-        'pending reconciliation age',
-        deploymentMode || pending.rows[0].count === 0,
-        `${pending.rows[0].count} attempts pending over 30 minutes${deploymentMode && pending.rows[0].count ? ' (runtime warning; repair deployment allowed)' : ''}`,
-        deploymentMode && pending.rows[0].count ? 'warning' : undefined,
-      ),
+      ...evaluateAttemptHealth({
+        pendingReconciliation: pending.rows[0].count,
+        staleUnsubmitted: unsubmitted.rows[0].count,
+      }, { deploymentMode }).map((item) => report(item.name, item.ok, item.detail, item.severity)),
       report('supported rule values', unsupported.rows[0].count === 0, `${unsupported.rows[0].count} unsupported rule rows`),
       ...evaluateQueueHealth(queueHealth, { deploymentMode }).map((item) => (
         report(item.name, item.ok, item.detail, item.severity)

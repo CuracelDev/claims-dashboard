@@ -176,6 +176,12 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(classify_runner_error(TimeoutError("slow")), "portal_timeout")
         self.assertEqual(
             classify_runner_error(RuntimeError(
+                "Could not submit 2 persisted planned pile(s) after the final same-run retry."
+            )),
+            "assignment_plan_incomplete",
+        )
+        self.assertEqual(
+            classify_runner_error(RuntimeError(
                 "Piles filters were not confirmed: filter_settlement_timeout."
             )),
             "filter_settlement_timeout",
