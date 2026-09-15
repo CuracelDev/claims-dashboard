@@ -1420,6 +1420,8 @@ class ExecutionLedger:
             cursor.execute(
                 """
                 SELECT
+                    count(*) FILTER (WHERE status = 'planned') AS planned,
+                    count(*) FILTER (WHERE status = 'selected') AS selected,
                     count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) AS confirmed,
                     count(*) FILTER (WHERE status = 'reconciliation_pending') AS reconciliation_pending,
                     count(*) FILTER (WHERE status = 'conflict') AS conflict,
@@ -1431,14 +1433,16 @@ class ExecutionLedger:
                 """,
                 (insurer_run_id,),
             )
-            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0)
         return {
-            "confirmed": int(row[0] or 0),
-            "reconciliation_pending": int(row[1] or 0),
-            "conflict": int(row[2] or 0),
-            "failed": int(row[3] or 0),
-            "submitted": int(row[4] or 0),
-            "manual_action_required": int(row[5] or 0),
+            "planned": int(row[0] or 0),
+            "selected": int(row[1] or 0),
+            "confirmed": int(row[2] or 0),
+            "reconciliation_pending": int(row[3] or 0),
+            "conflict": int(row[4] or 0),
+            "failed": int(row[5] or 0),
+            "submitted": int(row[6] or 0),
+            "manual_action_required": int(row[7] or 0),
         }
 
 

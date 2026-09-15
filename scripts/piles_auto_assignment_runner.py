@@ -9262,7 +9262,9 @@ def classify_workflow_outcome(
     has_follow_up = (
         workflow_status == "completed_with_issues"
         or bool(result.get("portal_mapping_warnings"))
-        or any(summary.get(key, 0) for key in ("reconciliation_pending", "submitted", "conflict", "failed"))
+        or any(summary.get(key, 0) for key in (
+            "planned", "selected", "submitted", "reconciliation_pending", "conflict", "failed",
+        ))
     )
     if has_follow_up:
         return "completed_with_issues", "assignment_follow_up_required"

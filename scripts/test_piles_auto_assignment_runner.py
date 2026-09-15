@@ -943,7 +943,7 @@ class LateArrivalWorkflowTests(unittest.TestCase):
 
     def workflow(self, initial, late, *, attempts=(), v2=True, years=("2026",),
                  supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
-                 after_initial=None, configured_bots=(), execute=True):
+                 after_initial=None, configured_bots=(), execute=True, defer_first_assignment=False):
         state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[],
                                       execute_modes=[])
         pending = [dict(item) for item in attempts]
@@ -1001,6 +1001,8 @@ class LateArrivalWorkflowTests(unittest.TestCase):
             def execute_assignment_plan(self, months, year, plans, **options):
                 state.applied.append(list(plans))
                 state.execute_modes.append(bool(options.get("execute")))
+                if defer_first_assignment and len(state.applied) == 1:
+                    self.deferred_assignment_plans = list(plans)
                 return {}, []
 
         store = types.SimpleNamespace(
@@ -1042,6 +1044,30 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     "total": 5, "complete": 5, "empty": 5 - int(bool(rows)),
                     "failed": 0, "pending": 0,
                 })
+
+    def test_planned_row_that_moves_status_is_retried_in_the_same_run(self):
+        initial_context = ("Jul", "2026", "Vetting Pending")
+        moved_context = ("Jul", "2026", "Audit Pending")
+        original = make_pile(1)
+        moved = runner.replace(original, status_bucket="Audit Pending", key="moved-pile")
+
+        state = self.workflow(
+            {initial_context: [original]},
+            {moved_context: [moved]},
+            defer_first_assignment=True,
+        )
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.applied), 2)
+        self.assertEqual(state.applied[1][0].status_bucket, "Audit Pending")
+        self.assertEqual(state.applied[1][0].pile_key, "moved-pile")
+
+    def test_read_only_probe_does_not_repeat_assignment_only_late_arrival_scan(self):
+        state = self.workflow({}, {}, execute=False)
+
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.scans), 5)
+        self.assertEqual(state.result["late_arrival_detection"]["contexts"], [])
 
     def test_actual_flow_preserves_concrete_and_all_year_contexts(self):
         for multiple, expected in ((False, {"2026", "2025"}), (True, {"All"})):
@@ -3660,6 +3686,16 @@ class ManualWorkflowOutcomeTests(unittest.TestCase):
                                        Ledger(), "parent", ownership=guard)
         self.assertEqual(finals[-1]["status"], "completed_with_issues")
         self.assertEqual(finals[-1].get("error_code"), "workflow_outcome_unconfirmed")
+
+    def test_nonterminal_attempts_cannot_be_classified_as_completed(self):
+        for attempt_status in ("planned", "selected", "submitted", "reconciliation_pending"):
+            with self.subTest(attempt_status=attempt_status):
+                status, error_code = runner.classify_workflow_outcome(
+                    {"workflow_status": "completed"},
+                    {attempt_status: 1},
+                )
+                self.assertEqual(status, "completed_with_issues")
+                self.assertEqual(error_code, "assignment_follow_up_required")
 
     def test_legacy_manual_workflow_keeps_original_return_and_finalization_behavior(self):
         result, finals, _ = self.manual_workflow(recorded=True, v2=False)
