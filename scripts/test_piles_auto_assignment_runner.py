@@ -944,7 +944,7 @@ class LateArrivalWorkflowTests(unittest.TestCase):
     def workflow(self, initial, late, *, attempts=(), v2=True, years=("2026",),
                  supports_multiple=False, guard=None, persist_error=False, statuses=None, manual=False,
                  after_initial=None, configured_bots=(), execute=True, defer_first_assignment=False):
-        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], mapping=[],
+        state = types.SimpleNamespace(scans=[], applied=[], events=[], persisted={}, transitions=[], relocations=[], mapping=[],
                                       execute_modes=[], execute_options=[])
         pending = [dict(item) for item in attempts]
 
@@ -962,6 +962,9 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 assert item["status"] in expected
                 item["status"] = target.value
                 state.transitions.append((attempt_id, target.value))
+
+            def relocate_planned_attempt(self, attempt_id, *, last_pile_key, filter_context):
+                state.relocations.append((attempt_id, last_pile_key, filter_context))
 
         class Portal(runner.CuracelPilesRunner):
             def __init__(self, **_):
@@ -1003,6 +1006,9 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 state.execute_modes.append(bool(options.get("execute")))
                 state.execute_options.append(dict(options))
                 if defer_first_assignment and len(state.applied) == 1:
+                    self.assignment_attempt_ids = {
+                        plan.tracking_key: plan.tracking_key for plan in plans
+                    }
                     self.deferred_assignment_plans = list(plans)
                 return {}, []
             def _transition_assignment_attempts(self, plans, target, expected, evidence=None):
@@ -1068,6 +1074,11 @@ class LateArrivalWorkflowTests(unittest.TestCase):
         self.assertEqual(len(state.applied), 2)
         self.assertEqual(state.applied[1][0].status_bucket, "Audit Pending")
         self.assertEqual(state.applied[1][0].pile_key, "moved-pile")
+        self.assertEqual(state.relocations, [(
+            original.tracking_key,
+            "moved-pile",
+            {"month": "Jul", "year": "2026", "status": "Audit Pending", "source_page": 1},
+        )])
         self.assertFalse(state.execute_options[1]["persist_attempts"])
         self.assertFalse(state.execute_options[1]["defer_unresolved"])
 

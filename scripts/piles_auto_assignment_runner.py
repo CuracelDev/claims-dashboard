@@ -6838,6 +6838,25 @@ class CuracelPilesRunner:
                 evidence=evidence,
             )
 
+    def _persist_relocated_plans(self, plans: list[PlannedAssignment]) -> None:
+        ledger = getattr(self, "execution_ledger", None)
+        if not ledger:
+            return
+        for plan in plans:
+            attempt_id = self.assignment_attempt_ids.get(plan.tracking_key)
+            if not attempt_id:
+                raise RuntimeError("Persisted assignment attempt could not be resolved for relocation.")
+            ledger.relocate_planned_attempt(
+                attempt_id,
+                last_pile_key=plan.pile_key,
+                filter_context={
+                    "month": plan.filter_month,
+                    "year": norm(plan.filter_year),
+                    "status": plan.status_bucket,
+                    "source_page": plan.source_page_number,
+                },
+            )
+
     def execute_assignment_plan(
         self,
         month_labels: list[str],
@@ -8845,6 +8864,7 @@ def _run_for_insurer_once(
                         },
                     )
                 if relocated_plans:
+                    runner._persist_relocated_plans(relocated_plans)
                     print(
                         f"Retrying {len(relocated_plans)} relocated planned pile(s) "
                         "during the same insurer run..."

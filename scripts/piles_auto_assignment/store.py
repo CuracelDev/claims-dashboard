@@ -1282,6 +1282,34 @@ class ExecutionLedger:
             self.connection.rollback()
             raise
 
+    def relocate_planned_attempt(
+        self,
+        attempt_id: str,
+        *,
+        last_pile_key: str,
+        filter_context: Mapping[str, Any],
+    ) -> None:
+        """Persist the current portal location before retrying a planned attempt."""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_attempts
+                    SET last_pile_key = %s,
+                        filter_context = %s::jsonb,
+                        updated_at = now()
+                    WHERE id = %s AND status = 'planned'
+                    RETURNING id
+                    """,
+                    (last_pile_key, _json(filter_context), attempt_id),
+                )
+                if not cursor.fetchone():
+                    raise ConcurrentStateChange(attempt_id)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def pending_attempts(self, insurer_name: str) -> list[dict[str, Any]]:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -1483,6 +1511,15 @@ class ReadOnlyExecutionLedger:
 
     def transition_attempt(self, _attempt_id: str, _target: AttemptStatus, *, expected: Iterable[AttemptStatus], evidence: Optional[Any] = None) -> None:
         del expected, evidence
+
+    def relocate_planned_attempt(
+        self,
+        _attempt_id: str,
+        *,
+        last_pile_key: str,
+        filter_context: Mapping[str, Any],
+    ) -> None:
+        del last_pile_key, filter_context
 
     def pending_attempts(self, _insurer_name: str) -> list[dict[str, Any]]:
         return []

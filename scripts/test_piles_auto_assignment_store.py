@@ -981,6 +981,30 @@ class ExecutionLedgerTests(unittest.TestCase):
             )
         self.assertEqual(self.connection.rollback_count, 1)
 
+    def test_relocated_planned_attempt_updates_only_current_location(self):
+        self.ledger.relocate_planned_attempt(
+            "attempt-1",
+            last_pile_key="current-pile-key",
+            filter_context={"month": "Jul", "year": "2026", "status": "Audit Pending", "source_page": 2},
+        )
+
+        sql, params = self.connection.statements[-1]
+        self.assertIn("WHERE id = %s AND status = 'planned'", sql)
+        self.assertEqual(params[0], "current-pile-key")
+        self.assertEqual(json.loads(params[1])["status"], "Audit Pending")
+        self.assertEqual(params[-1], "attempt-1")
+        self.assertEqual(self.connection.commit_count, 1)
+
+    def test_relocated_planned_attempt_rejects_concurrent_state_change(self):
+        self.connection.cursor_instance._row = None
+        with self.assertRaises(ConcurrentStateChange):
+            self.ledger.relocate_planned_attempt(
+                "attempt-1",
+                last_pile_key="current-pile-key",
+                filter_context={},
+            )
+        self.assertEqual(self.connection.rollback_count, 1)
+
     def test_batch_and_attempt_creation_is_one_transaction(self):
         batch_id = self.ledger.create_batch_with_attempts(
             {
@@ -1017,6 +1041,11 @@ class ExecutionLedgerTests(unittest.TestCase):
             "attempt-1",
             AttemptStatus.SUBMITTED,
             expected={AttemptStatus.SELECTED},
+        )
+        ledger.relocate_planned_attempt(
+            "attempt-1",
+            last_pile_key="current-pile-key",
+            filter_context={},
         )
         ledger.heartbeat(run_id, phase="scan")
         self.assertTrue(run_id)
