@@ -983,22 +983,26 @@ class ExecutionLedger:
 
     def create_insurer_run(self, runner_run_id: str, master: Any) -> str:
         insurer_run_id = str(uuid.uuid4())
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO piles_auto_assignment_insurer_runs
-                    (id, runner_run_id, master_account_id, insurer_name,
-                     status, phase, heartbeat_at, started_at)
-                VALUES (%s, %s, %s, %s, 'running', 'configuration', now(), now())
-                """,
-                (
-                    insurer_run_id,
-                    runner_run_id or None,
-                    _value(master, "id"),
-                    _value(master, "insurer_name", ""),
-                ),
-            )
-        self.connection.commit()
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO piles_auto_assignment_insurer_runs
+                        (id, runner_run_id, master_account_id, insurer_name,
+                         status, phase, heartbeat_at, started_at)
+                    VALUES (%s, %s, %s, %s, 'running', 'configuration', now(), now())
+                    """,
+                    (
+                        insurer_run_id,
+                        runner_run_id or None,
+                        _value(master, "id"),
+                        _value(master, "insurer_name", ""),
+                    ),
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
         return insurer_run_id
 
     def create_scan_contexts(
@@ -1374,16 +1378,20 @@ class ExecutionLedger:
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
     def heartbeat(self, insurer_run_id: str, *, phase: str) -> None:
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE piles_auto_assignment_insurer_runs
-                SET phase = %s, heartbeat_at = now(), updated_at = now()
-                WHERE id = %s AND status = 'running'
-                """,
-                (phase, insurer_run_id),
-            )
-        self.connection.commit()
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_insurer_runs
+                    SET phase = %s, heartbeat_at = now(), updated_at = now()
+                    WHERE id = %s AND status = 'running'
+                    """,
+                    (phase, insurer_run_id),
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def finalize_insurer_run(
         self,
@@ -1394,54 +1402,61 @@ class ExecutionLedger:
         error_message: Optional[str] = None,
         performance: Optional[list] = None,
     ) -> None:
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                WITH context_summary AS (
-                  SELECT coalesce(sum(distinct_pile_count), 0) discovered_piles,
-                         coalesce(sum(claim_count), 0) discovered_claims
-                  FROM piles_auto_assignment_scan_contexts WHERE insurer_run_id = %s
-                ), attempt_summary AS (
-                  SELECT count(*) planned_piles, coalesce(sum(claim_count), 0) planned_claims,
-                    count(*) FILTER (WHERE submitted_at IS NOT NULL) submitted_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE submitted_at IS NOT NULL), 0) submitted_claims,
-                    count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')), 0) confirmed_claims,
-                    count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_piles,
-                    coalesce(sum(claim_count) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')), 0) pending_claims,
-                    count(*) FILTER (WHERE status = 'conflict') conflicts,
-                    count(*) FILTER (WHERE status = 'failed') failures
-                  FROM piles_auto_assignment_attempts WHERE insurer_run_id = %s
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH context_summary AS (
+                      SELECT coalesce(sum(distinct_pile_count), 0) discovered_piles,
+                             coalesce(sum(claim_count), 0) discovered_claims
+                      FROM piles_auto_assignment_scan_contexts WHERE insurer_run_id = %s
+                    ), attempt_summary AS (
+                      SELECT count(*) planned_piles, coalesce(sum(claim_count), 0) planned_claims,
+                        count(*) FILTER (WHERE submitted_at IS NOT NULL) submitted_piles,
+                        coalesce(sum(claim_count) FILTER (WHERE submitted_at IS NOT NULL), 0) submitted_claims,
+                        count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
+                        coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')), 0) confirmed_claims,
+                        count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_piles,
+                        coalesce(sum(claim_count) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')), 0) pending_claims,
+                        count(*) FILTER (WHERE status = 'conflict') conflicts,
+                        count(*) FILTER (WHERE status = 'failed') failures
+                      FROM piles_auto_assignment_attempts WHERE insurer_run_id = %s
+                    )
+                    UPDATE piles_auto_assignment_insurer_runs run SET
+                      discovered_pile_count = context_summary.discovered_piles,
+                      discovered_claim_count = context_summary.discovered_claims,
+                      planned_pile_count = attempt_summary.planned_piles,
+                      planned_claim_count = attempt_summary.planned_claims,
+                      submitted_pile_count = attempt_summary.submitted_piles,
+                      submitted_claim_count = attempt_summary.submitted_claims,
+                      confirmed_pile_count = attempt_summary.confirmed_piles,
+                      confirmed_claim_count = attempt_summary.confirmed_claims,
+                      reconciliation_pending_pile_count = attempt_summary.pending_piles,
+                      reconciliation_pending_claim_count = attempt_summary.pending_claims,
+                      conflict_pile_count = attempt_summary.conflicts,
+                      failed_pile_count = attempt_summary.failures
+                    FROM context_summary, attempt_summary WHERE run.id = %s
+                    """,
+                    (insurer_run_id, insurer_run_id, insurer_run_id),
                 )
-                UPDATE piles_auto_assignment_insurer_runs run SET
-                  discovered_pile_count = context_summary.discovered_piles,
-                  discovered_claim_count = context_summary.discovered_claims,
-                  planned_pile_count = attempt_summary.planned_piles,
-                  planned_claim_count = attempt_summary.planned_claims,
-                  submitted_pile_count = attempt_summary.submitted_piles,
-                  submitted_claim_count = attempt_summary.submitted_claims,
-                  confirmed_pile_count = attempt_summary.confirmed_piles,
-                  confirmed_claim_count = attempt_summary.confirmed_claims,
-                  reconciliation_pending_pile_count = attempt_summary.pending_piles,
-                  reconciliation_pending_claim_count = attempt_summary.pending_claims,
-                  conflict_pile_count = attempt_summary.conflicts,
-                  failed_pile_count = attempt_summary.failures
-                FROM context_summary, attempt_summary WHERE run.id = %s
-                """,
-                (insurer_run_id, insurer_run_id, insurer_run_id),
-            )
-            cursor.execute(
-                """
-                UPDATE piles_auto_assignment_insurer_runs
-                SET status = %s, phase = 'complete', error_code = %s,
-                    error_message = %s, heartbeat_at = now(), finished_at = now(),
-                    details = jsonb_set(coalesce(details, '{}'::jsonb), '{performance}', %s::jsonb),
-                    updated_at = now()
-                WHERE id = %s
-                """,
-                (status, error_code, error_message, json.dumps(sanitize_performance(performance)), insurer_run_id),
-            )
-        self.connection.commit()
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_insurer_runs
+                    SET status = %s, phase = 'complete', error_code = %s,
+                        error_message = %s, heartbeat_at = now(), finished_at = now(),
+                        details = jsonb_set(coalesce(details, '{}'::jsonb), '{performance}', %s::jsonb),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (status, error_code, error_message, json.dumps(sanitize_performance(performance)), insurer_run_id),
+                )
+            self.connection.commit()
+        except Exception:
+            # psycopg2 leaves a transaction aborted after any statement error.
+            # Roll back here so the caller's guarded failed-finalization attempt
+            # can use this same session instead of stranding a running insurer.
+            self.connection.rollback()
+            raise
 
     def summarize_insurer_run(self, insurer_run_id: str) -> dict[str, int]:
         with self.connection.cursor() as cursor:

@@ -951,6 +951,44 @@ class ExecutionLedgerTests(unittest.TestCase):
         _sql, params = self.connection.statements[-1]
         self.assertEqual(params, ("piles-insurer:OLD MUTUAL",))
 
+    def test_finalization_failure_rolls_back_and_allows_guarded_retry(self):
+        original_execute = self.connection.cursor_instance.execute
+        failed_once = False
+
+        def fail_first_summary(sql, params=()):
+            nonlocal failed_once
+            if "WITH context_summary" in sql and not failed_once:
+                failed_once = True
+                raise RuntimeError("transient finalization failure")
+            return original_execute(sql, params)
+
+        self.connection.cursor_instance.execute = fail_first_summary
+        with self.assertRaisesRegex(RuntimeError, "transient finalization failure"):
+            self.ledger.finalize_insurer_run("run-1", status="completed")
+
+        self.assertEqual((self.connection.commit_count, self.connection.rollback_count), (0, 1))
+        self.ledger.finalize_insurer_run(
+            "run-1", status="failed", error_code="unexpected_error",
+        )
+        self.assertEqual((self.connection.commit_count, self.connection.rollback_count), (1, 1))
+
+    def test_run_creation_and_heartbeat_failures_roll_back(self):
+        for operation in (
+            lambda: self.ledger.create_insurer_run(
+                "parent-1", {"id": "master-1", "insurer_name": "Jubilee Uganda"},
+            ),
+            lambda: self.ledger.heartbeat("run-1", phase="scan"),
+        ):
+            with self.subTest(operation=operation):
+                self.connection.cursor_instance.execute = lambda *_args, **_kwargs: (
+                    _ for _ in ()
+                ).throw(RuntimeError("database failure"))
+                with self.assertRaisesRegex(RuntimeError, "database failure"):
+                    operation()
+                self.assertEqual(self.connection.rollback_count, 1)
+                self.connection = RecordingConnection()
+                self.ledger = ExecutionLedger(self.connection)
+
     def test_transition_uses_compare_and_set(self):
         self.ledger.transition_attempt(
             "attempt-1",
