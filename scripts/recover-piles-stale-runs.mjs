@@ -76,6 +76,22 @@ function unsafeSubmissionSql(canonical, runId) {
       OR (batch.insurer_run_id = ${runId} AND batch.submitted_at IS NOT NULL))`;
 }
 
+// Finalizing one exact stale insurer ledger row does not replay work. Only
+// evidence owned by that row can make the finalization unsafe; unrelated
+// unresolved evidence for the same insurer must continue to block work replay,
+// but must not leave an otherwise empty crashed ledger row running forever.
+function unsafeRunSubmissionSql(runId) {
+  return `EXISTS (SELECT 1 FROM piles_auto_assignment_attempts attempt
+    WHERE attempt.insurer_run_id = ${runId}
+      AND (attempt.status IN ('submitted', 'reconciliation_pending', 'conflict', 'manual_action_required')
+        OR attempt.submitted_at IS NOT NULL))
+    OR EXISTS (SELECT 1 FROM piles_auto_assignment_batches batch
+    WHERE batch.insurer_run_id = ${runId}
+      AND (batch.status IN ('submitted', 'partially_confirmed', 'reconciliation_pending', 'conflict')
+        OR batch.pending_pile_count > 0 OR batch.conflict_pile_count > 0
+        OR batch.submitted_at IS NOT NULL))`;
+}
+
 async function inspectRecovery(client, options) {
   const rows = await recoveryQuery(client, 'recovery-inspect', `
     SELECT insurer_name, sum(stale_insurer_runs)::integer AS stale_insurer_runs,
@@ -201,7 +217,7 @@ async function recoverInsurer(client, options, report) {
       AND NOT EXISTS (SELECT 1 FROM piles_auto_assignment_work_items work
         WHERE (work.covered_by_insurer_run_id = run.id OR work.canonical_insurer_name = $2)
           AND work.disposition IN ('queued', 'claimed', 'follow_up_queued'))
-      AND NOT (${unsafeSubmissionSql('$2', 'run.id')})
+      AND NOT (${unsafeRunSubmissionSql('run.id')})
     ) AS eligible FROM piles_auto_assignment_insurer_runs run WHERE run.id = $1
   `, [options.id, canonicalInsurerLockKey(run.insurer_name)]);
   if (evidence[0]?.eligible !== true) return false;
