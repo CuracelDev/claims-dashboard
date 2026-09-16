@@ -3389,8 +3389,14 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
         self.assertIn("statement_timeout=45000", calls[0][1]["options"])
         self.assertIn("lock_timeout=5000", calls[0][1]["options"])
 
-    def test_tracked_reconciliation_renews_ownership_for_each_database_unit(self):
-        tracked = runner.TrackedPile(
+    def test_read_only_postgres_connection_is_guarded_by_the_server(self):
+        with patch.object(runner.psycopg2, "connect", return_value=types.SimpleNamespace(), create=True) as connect:
+            runner.open_postgres_connection("postgresql://fixture", autocommit=True, read_only=True)
+        self.assertIn("default_transaction_read_only=on", connect.call_args.kwargs["options"])
+
+    @staticmethod
+    def make_tracked_fixture():
+        return runner.TrackedPile(
             id="tracked", master_account_id="master", bot_account_id="", insurer_name="Kenya",
             tracking_key="pile", last_pile_key="pile", provider="Provider", claim_month="Jul",
             submitted_date="2026-07-01", claims_total=10, synced_claims=0, remaining_claims=10,
@@ -3400,6 +3406,9 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
             last_progress_at="", last_reassigned_at="", completed_at="", is_active=True,
             is_stale=False, stale_reason="", details={},
         )
+
+    def test_tracked_reconciliation_renews_ownership_for_each_database_unit(self):
+        tracked = self.make_tracked_fixture()
         heartbeats = []
         portal = types.SimpleNamespace(_heartbeat=lambda phase: heartbeats.append(phase))
 
@@ -3419,6 +3428,38 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result["tracked_count"], 5)
         self.assertEqual(heartbeats, ["reconcile"] * 12)
+
+    def test_read_only_tracked_observation_never_calls_a_database_adapter(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.read_only = True
+        store.mode = "postgres"
+        def forbidden(*_args, **_kwargs):
+            self.fail("read-only observation called a database adapter")
+        store._fetchall_postgres = forbidden
+        store._execute_postgres = forbidden
+        store.get_tracked_pile_by_id = forbidden
+
+        updated = store.update_tracked_pile_observation(
+            self.make_tracked_fixture(), None, "", "", "completed", "Vetting Pending", True, 10,
+        )
+        self.assertFalse(updated.is_active)
+        self.assertEqual(updated.remaining_claims, 0)
+
+    def test_worker_database_heartbeat_is_throttled_but_renews_during_long_work(self):
+        calls = []
+        ownership = types.SimpleNamespace(check=lambda *_: calls.append("renewed"))
+        store = types.SimpleNamespace()
+        context = types.SimpleNamespace(ownership=ownership, store=store, output_path="", ledger=None)
+        work = types.SimpleNamespace(id="work", claim_token="token", insurer_name="Kenya", parent_runner_run_id="parent")
+        args = types.SimpleNamespace(worker_safe_diagnostics=False, out="")
+
+        with patch.object(runner.time, "monotonic", side_effect=[1, 10, 22]), \
+                patch.object(runner, "run_insurer_recorded", side_effect=lambda *_a, **_kw: (
+                    store.operation_heartbeat(), store.operation_heartbeat(), store.operation_heartbeat(), {}
+                )[-1]):
+            runner.run_claimed_insurer_once(work, context, args, ["All"], "All", False)
+
+        self.assertEqual(calls, ["renewed"])
 
     def test_runner_heartbeat_phases_match_database_constraint(self):
         source = Path(runner.__file__).read_text()

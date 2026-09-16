@@ -15,11 +15,13 @@
 3. [x] Keep reconciliation ownership live, remove redundant reads, and bound database operations rather than entire runs.
 4. [x] Preserve isolated insurer workers and supervise stallable database/browser operations so one blocked operation cannot trap unrelated queued work.
 5. [x] Audit queue drainage, recovery fencing, parent finalization, and enforce complete per-pile planning.
-6. [ ] Run exhaustive local regressions, build/static checks, and document rollout/rollback and remaining production verification.
+6. [x] Run exhaustive local regressions, build/static checks, and document rollout/rollback and remaining production verification.
 
 ## Validation log
 
 - Baseline: 219 focused Python tests passed on current `origin/main` (`715462ab`).
 - Red test: pre-09:00 actual workflow produced zero applied plans; corrected assertion failed before implementation.
 - First regression run: 436 Python and 115 Node tests passed after eligibility repair. Additional boundary tests are required before committing this slice.
+- Final committed-tree validation: 445 Python tests, 116 Node tests, Python bytecode compilation, Git integrity/diff checks, and the Next.js production build passed.
+- A final safety re-review added server-enforced read-only PostgreSQL probe sessions and a no-write tracked-observation regression after catching an optimization-path guard bypass locally. Focused read-only and dispatcher acceptance tests passed; the full suite is rerun after this final guard commit.
 - Production remains unchanged. Local passing tests do not claim that live assignment has been verified.

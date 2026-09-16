@@ -298,7 +298,7 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
     return min(max(safe_int(os.getenv(name), default), minimum), maximum)
 
 
-def open_postgres_connection(database_url: str, *, autocommit: bool):
+def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: bool = False):
     """Bound individual database operations without bounding the whole run."""
     statement_ms = _bounded_env_int("PILES_DB_STATEMENT_TIMEOUT_MS", 45_000, 5_000, 90_000)
     lock_ms = _bounded_env_int("PILES_DB_LOCK_TIMEOUT_MS", 5_000, 1_000, 30_000)
@@ -309,6 +309,7 @@ def open_postgres_connection(database_url: str, *, autocommit: bool):
             f"-c statement_timeout={statement_ms} "
             f"-c lock_timeout={lock_ms} "
             "-c idle_in_transaction_session_timeout=60000"
+            + (" -c default_transaction_read_only=on" if read_only else "")
         ),
     )
     connection.autocommit = autocommit
@@ -1611,13 +1612,18 @@ class DataStore:
         self.conn = None
 
         if self.mode == "postgres":
-            self.conn = open_postgres_connection(self.database_url, autocommit=True)
+            self.conn = open_postgres_connection(self.database_url, autocommit=True, read_only=read_only)
         elif not (self.supabase_url and self.supabase_key):
             raise RuntimeError("Missing DATABASE_URL or Supabase URL/service role key.")
 
     def close(self) -> None:
         if self.conn:
             self.conn.close()
+
+    def _pulse_operation_heartbeat(self) -> None:
+        heartbeat = getattr(self, "operation_heartbeat", None)
+        if heartbeat:
+            heartbeat()
 
     def try_acquire_runner_lock(self) -> bool:
         if self.mode != "postgres":
@@ -1718,6 +1724,7 @@ class DataStore:
         return bool(rows)
 
     def _fetchall_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        self._pulse_operation_heartbeat()
         assert self.conn
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
@@ -1727,11 +1734,13 @@ class DataStore:
     def _execute_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         if getattr(self, "read_only", False):
             return
+        self._pulse_operation_heartbeat()
         assert self.conn
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
 
     def _fetchall_supabase(self, table: str, filters: list[tuple[str, str, str]] | None = None, order: str | None = None) -> list[dict[str, Any]]:
+        self._pulse_operation_heartbeat()
         params = ["select=*"]
         if order:
             params.append(f"order={quote(order, safe=',.')}")
@@ -1749,6 +1758,7 @@ class DataStore:
     def _insert_supabase(self, table: str, payload: dict[str, Any]) -> None:
         if getattr(self, "read_only", False):
             return
+        self._pulse_operation_heartbeat()
         url = f"{self.supabase_url}/rest/v1/{table}"
         res = requests.post(url, headers={
             "apikey": self.supabase_key,
@@ -1761,6 +1771,7 @@ class DataStore:
     def _update_supabase(self, table: str, field: str, value: str, payload: dict[str, Any]) -> None:
         if getattr(self, "read_only", False):
             return
+        self._pulse_operation_heartbeat()
         url = f"{self.supabase_url}/rest/v1/{table}?{quote(field)}=eq.{quote(value)}"
         res = requests.patch(url, headers={
             "apikey": self.supabase_key,
@@ -2648,6 +2659,10 @@ class DataStore:
             "stale_reason": stale_reason,
             "updated_at": now_iso,
         }
+        if getattr(self, "read_only", False):
+            # Simulate the observed state locally. UPDATE ... RETURNING must
+            # never bypass the low-level write guards used by live probes.
+            return replace(tracked, **{key: value for key, value in payload.items() if key != "updated_at"})
         if self.mode == "postgres":
             rows = self._fetchall_postgres(
                 """
@@ -9420,6 +9435,13 @@ def run_claimed_insurer_once(work, context: WorkerContext, args: argparse.Namesp
     worker_args.worker_safe_diagnostics = True
     if context.ownership:
         worker_args.work_heartbeat = context.ownership.check
+        last_operation_heartbeat = [0.0]
+        def pulse_operation_heartbeat() -> None:
+            now = time.monotonic()
+            if now - last_operation_heartbeat[0] >= 20:
+                context.ownership.check()
+                last_operation_heartbeat[0] = now
+        context.store.operation_heartbeat = pulse_operation_heartbeat
     if context.output_path:
         worker_args.out = context.output_path
     elif getattr(worker_args, "out", None):
