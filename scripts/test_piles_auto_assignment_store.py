@@ -399,6 +399,7 @@ class LeaseSqlConnection:
     def __init__(self):
         self.database = sqlite3.connect(":memory:")
         self.wall_time = 1000
+        self.after_execute = None
         self.database.create_function("now", 0, lambda: 1000)
         self.database.create_function("clock_timestamp", 0, lambda: self.wall_time)
         self.database.create_function("current_database", 0, lambda: "fixture")
@@ -418,6 +419,8 @@ class LeaseSqlConnection:
                 VALUES ('work','parent','OLD MUTUAL','claimed','current',1120);
             CREATE TABLE piles_auto_assignment_insurer_runs(
                 id TEXT, runner_run_id TEXT, insurer_name TEXT, status TEXT,
+                phase TEXT, error_code TEXT, error_message TEXT,
+                heartbeat_at INTEGER, finished_at INTEGER,
                 details TEXT DEFAULT '{}', updated_at INTEGER);
             INSERT INTO piles_auto_assignment_insurer_runs(id,runner_run_id,insurer_name,status)
                 VALUES ('run','parent','OLD MUTUAL','running'),('foreign','other','OLD MUTUAL','running');
@@ -444,6 +447,8 @@ class LeaseSqlConnection:
                 sql = sql.replace("* interval '1 second'", "").replace(" FOR UPDATE", "")
                 self.raw.execute(sql, params)
                 self.description = self.raw.description
+                if connection.after_execute:
+                    connection.after_execute(sql)
             def fetchone(self):
                 return self.raw.fetchone()
         return Cursor()
@@ -563,6 +568,56 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.assertEqual(self.connection.database.execute(
             "SELECT disposition,finished_at FROM piles_auto_assignment_work_items"
         ).fetchone(), ("claimed", None))
+
+    def test_failed_work_atomically_terminalizes_its_exact_running_insurer(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+        self.assertTrue(self.store.finish_claim(
+            "work", "current", WorkDisposition.FAILED,
+            insurer_run_id="run", reason_code="unexpected_error",
+        ))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,covered_by_insurer_run_id,reason_code "
+            "FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("failed", "run", "unexpected_error"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status,phase,error_code,finished_at IS NOT NULL "
+            "FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone(), ("failed", "complete", "unexpected_error", 1))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status FROM piles_auto_assignment_insurer_runs WHERE id='foreign'"
+        ).fetchone(), ("running",))
+
+    def test_finish_rejects_a_different_insurer_run_attachment(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+        self.assertFalse(self.store.finish_claim(
+            "work", "current", WorkDisposition.FAILED,
+            insurer_run_id="foreign", reason_code="unexpected_error",
+        ))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", "run"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone(), ("running",))
+
+    def test_expiry_between_child_and_work_finalization_rolls_back_both(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+
+        def expire_after_child_update(sql):
+            if "UPDATE piles_auto_assignment_insurer_runs AS run" in sql:
+                self.connection.wall_time = 1061
+
+        self.connection.after_execute = expire_after_child_update
+        self.assertFalse(self.store.finish_claim(
+            "work", "current", WorkDisposition.FAILED,
+            insurer_run_id="run", reason_code="unexpected_error",
+        ))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,covered_by_insurer_run_id,finished_at FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", "run", None))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status,phase,error_code,finished_at FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone(), ("running", None, None, None))
 
     def test_renew_does_not_resurrect_a_lease_live_only_at_transaction_start(self):
         self.connection.wall_time = 1121
@@ -951,6 +1006,44 @@ class ExecutionLedgerTests(unittest.TestCase):
         _sql, params = self.connection.statements[-1]
         self.assertEqual(params, ("piles-insurer:OLD MUTUAL",))
 
+    def test_finalization_failure_rolls_back_and_allows_guarded_retry(self):
+        original_execute = self.connection.cursor_instance.execute
+        failed_once = False
+
+        def fail_first_summary(sql, params=()):
+            nonlocal failed_once
+            if "WITH context_summary" in sql and not failed_once:
+                failed_once = True
+                raise RuntimeError("transient finalization failure")
+            return original_execute(sql, params)
+
+        self.connection.cursor_instance.execute = fail_first_summary
+        with self.assertRaisesRegex(RuntimeError, "transient finalization failure"):
+            self.ledger.finalize_insurer_run("run-1", status="completed")
+
+        self.assertEqual((self.connection.commit_count, self.connection.rollback_count), (0, 1))
+        self.ledger.finalize_insurer_run(
+            "run-1", status="failed", error_code="unexpected_error",
+        )
+        self.assertEqual((self.connection.commit_count, self.connection.rollback_count), (1, 1))
+
+    def test_run_creation_and_heartbeat_failures_roll_back(self):
+        for operation in (
+            lambda: self.ledger.create_insurer_run(
+                "parent-1", {"id": "master-1", "insurer_name": "Jubilee Uganda"},
+            ),
+            lambda: self.ledger.heartbeat("run-1", phase="scan"),
+        ):
+            with self.subTest(operation=operation):
+                self.connection.cursor_instance.execute = lambda *_args, **_kwargs: (
+                    _ for _ in ()
+                ).throw(RuntimeError("database failure"))
+                with self.assertRaisesRegex(RuntimeError, "database failure"):
+                    operation()
+                self.assertEqual(self.connection.rollback_count, 1)
+                self.connection = RecordingConnection()
+                self.ledger = ExecutionLedger(self.connection)
+
     def test_transition_uses_compare_and_set(self):
         self.ledger.transition_attempt(
             "attempt-1",
@@ -1080,6 +1173,8 @@ class ExecutionLedgerTests(unittest.TestCase):
         batch_sql = self.connection.statements[-1][0].lower()
         self.assertIn("selected_at is not null", batch_sql)
         self.assertIn("submitted_at is not null", batch_sql)
+        self.assertIn("status = 'manual_action_required'", batch_sql)
+        self.assertIn("summary.manual_count > 0", batch_sql)
 
         self.ledger.finalize_insurer_run("run-1", status="completed_with_issues")
         finalizer_sql = self.connection.statements[-2][0].lower()
@@ -1099,6 +1194,9 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.ledger.pending_attempts("Jubilee Uganda")
         sql, params = self.connection.statements[-1]
         self.assertIn("'selected','submitted','reconciliation_pending'", sql)
+        self.assertIn("submitted_at", sql)
+        self.assertIn("updated_at", sql)
+        self.assertIn("clock_timestamp() AS observed_at", sql)
         self.assertEqual(params, ("Jubilee Uganda",))
 
     def test_retryable_attempts_are_bounded_by_attempt_number(self):

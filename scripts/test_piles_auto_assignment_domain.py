@@ -90,7 +90,7 @@ class BatchStatusTests(unittest.TestCase):
         self.assertEqual(derive_batch_status([]), BatchStatus.PLANNED)
 
     def test_failed_or_conflicted_item_marks_batch_failed(self):
-        for status in (AttemptStatus.FAILED, AttemptStatus.CONFLICT):
+        for status in (AttemptStatus.FAILED, AttemptStatus.CONFLICT, AttemptStatus.MANUAL_ACTION_REQUIRED):
             with self.subTest(status=status):
                 self.assertEqual(
                     derive_batch_status([AttemptStatus.CONFIRMED_VISIBLE, status]),

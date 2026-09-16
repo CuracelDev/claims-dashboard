@@ -632,11 +632,12 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         # Break caught: final-rescan planning fails to exclude a historical
         # submitted identity after reconciliation, causing a second portal click.
         for prior_status in ("submitted", "reconciliation_pending"):
-            for observed, expected in (("Acceptance owner", "confirmed_reconciled"), ("", "still_unassigned"), (None, "reconciliation_pending")):
+            for observed, expected in (("Acceptance owner", "confirmed_reconciled"), ("", "still_unassigned"), (None, "manual_action_required")):
                 with self.subTest(prior=prior_status, observed=observed), TemporaryDirectory(prefix="piles-reconcile-") as directory:
                     harness = AcceptanceHarness(directory)
                     try:
                         harness.seed_pending(prior_status)
+                        harness.db.now += timedelta(minutes=31)
                         if observed is not None:
                             harness.late["DEFMIS"] = [runner.replace(harness.pile("historical-pile"), assigned=observed)]
                         result, error = harness.invoke(insurer="DEFMIS")
