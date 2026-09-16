@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import Counter
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -57,6 +58,7 @@ try:
         NoEligibleAssignees,
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
+        reassignment_eligible_bots as evaluate_reassignment_eligible_bots,
     )
     from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
     from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
@@ -76,6 +78,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         NoEligibleAssignees,
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
+        reassignment_eligible_bots as evaluate_reassignment_eligible_bots,
     )
     from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
     from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
@@ -289,6 +292,28 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(float(str(value).replace(",", "").strip()))
     except Exception:
         return default
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    return min(max(safe_int(os.getenv(name), default), minimum), maximum)
+
+
+def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: bool = False):
+    """Bound individual database operations without bounding the whole run."""
+    statement_ms = _bounded_env_int("PILES_DB_STATEMENT_TIMEOUT_MS", 45_000, 5_000, 90_000)
+    lock_ms = _bounded_env_int("PILES_DB_LOCK_TIMEOUT_MS", 5_000, 1_000, 30_000)
+    connection = psycopg2.connect(
+        database_url,
+        connect_timeout=_bounded_env_int("PILES_DB_CONNECT_TIMEOUT_SECONDS", 10, 2, 30),
+        options=(
+            f"-c statement_timeout={statement_ms} "
+            f"-c lock_timeout={lock_ms} "
+            "-c idle_in_transaction_session_timeout=60000"
+            + (" -c default_transaction_read_only=on" if read_only else "")
+        ),
+    )
+    connection.autocommit = autocommit
+    return connection
 
 
 def parse_synced_claims(value: Any) -> int:
@@ -1587,14 +1612,18 @@ class DataStore:
         self.conn = None
 
         if self.mode == "postgres":
-            self.conn = psycopg2.connect(self.database_url)
-            self.conn.autocommit = True
+            self.conn = open_postgres_connection(self.database_url, autocommit=True, read_only=read_only)
         elif not (self.supabase_url and self.supabase_key):
             raise RuntimeError("Missing DATABASE_URL or Supabase URL/service role key.")
 
     def close(self) -> None:
         if self.conn:
             self.conn.close()
+
+    def _pulse_operation_heartbeat(self) -> None:
+        heartbeat = getattr(self, "operation_heartbeat", None)
+        if heartbeat:
+            heartbeat()
 
     def try_acquire_runner_lock(self) -> bool:
         if self.mode != "postgres":
@@ -1695,6 +1724,7 @@ class DataStore:
         return bool(rows)
 
     def _fetchall_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        self._pulse_operation_heartbeat()
         assert self.conn
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
@@ -1704,11 +1734,13 @@ class DataStore:
     def _execute_postgres(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         if getattr(self, "read_only", False):
             return
+        self._pulse_operation_heartbeat()
         assert self.conn
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
 
     def _fetchall_supabase(self, table: str, filters: list[tuple[str, str, str]] | None = None, order: str | None = None) -> list[dict[str, Any]]:
+        self._pulse_operation_heartbeat()
         params = ["select=*"]
         if order:
             params.append(f"order={quote(order, safe=',.')}")
@@ -1726,6 +1758,7 @@ class DataStore:
     def _insert_supabase(self, table: str, payload: dict[str, Any]) -> None:
         if getattr(self, "read_only", False):
             return
+        self._pulse_operation_heartbeat()
         url = f"{self.supabase_url}/rest/v1/{table}"
         res = requests.post(url, headers={
             "apikey": self.supabase_key,
@@ -1738,6 +1771,7 @@ class DataStore:
     def _update_supabase(self, table: str, field: str, value: str, payload: dict[str, Any]) -> None:
         if getattr(self, "read_only", False):
             return
+        self._pulse_operation_heartbeat()
         url = f"{self.supabase_url}/rest/v1/{table}?{quote(field)}=eq.{quote(value)}"
         res = requests.patch(url, headers={
             "apikey": self.supabase_key,
@@ -2625,8 +2659,12 @@ class DataStore:
             "stale_reason": stale_reason,
             "updated_at": now_iso,
         }
+        if getattr(self, "read_only", False):
+            # Simulate the observed state locally. UPDATE ... RETURNING must
+            # never bypass the low-level write guards used by live probes.
+            return replace(tracked, **{key: value for key, value in payload.items() if key != "updated_at"})
         if self.mode == "postgres":
-            self._execute_postgres(
+            rows = self._fetchall_postgres(
                 """
                 update piles_auto_assignment_tracked_piles
                 set bot_account_id = %s,
@@ -2645,6 +2683,7 @@ class DataStore:
                     stale_reason = %s,
                     updated_at = now()
                 where id = %s
+                returning *
                 """,
                 (
                     payload["bot_account_id"],
@@ -2664,6 +2703,9 @@ class DataStore:
                     tracked.id,
                 ),
             )
+            if not rows:
+                raise RuntimeError("Tracked pile observation could not be updated.")
+            return self._rows_to_tracked_piles(rows)[0]
         else:
             self._update_supabase("piles_auto_assignment_tracked_piles", "id", tracked.id, payload)
         return self.get_tracked_pile_by_id(tracked.id)
@@ -3031,8 +3073,11 @@ class DataStore:
         if not bot_ids:
             return {}
         aliases = insurer_aliases(insurer_name)
+        pulse = getattr(self, "progress_heartbeat", None)
 
         if self.mode == "postgres":
+            if pulse:
+                pulse()
             snapshot_rows = self._fetchall_postgres(
                 """
                 select bot_account_id, progress_claims, observed_at, insurer_name
@@ -3044,6 +3089,8 @@ class DataStore:
                 (bot_ids, str(window_hours)),
             )
             snapshot_rows = [row for row in snapshot_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
+            if pulse:
+                pulse()
             active_rows = self._fetchall_postgres(
                 """
                 select bot_account_id, remaining_claims, insurer_name
@@ -3055,6 +3102,8 @@ class DataStore:
             )
             active_rows = [row for row in active_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
+            if pulse:
+                pulse()
             snapshot_rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_pile_snapshots")
                 if canonical_insurer_key(row.get("insurer_name")) in aliases and str(row.get("bot_account_id") or "") in bot_ids
@@ -3118,6 +3167,8 @@ class DataStore:
             }
 
             if self.mode == "postgres":
+                if pulse:
+                    pulse()
                 self._execute_postgres(
                     """
                     insert into piles_auto_assignment_bot_metrics
@@ -3590,16 +3641,14 @@ def build_execution_ledger(store: DataStore, args: argparse.Namespace, *, requir
         raise RuntimeError(
             "PILES_EXECUTION_LEDGER_ENABLED requires DATABASE_URL for transactional writes."
         )
-    connection = psycopg2.connect(store.database_url)
-    connection.autocommit = False
+    connection = open_postgres_connection(store.database_url, autocommit=False)
     return ExecutionLedger(connection)
 
 
 def build_dispatch_store(store: DataStore) -> DispatchStore:
     if store.mode != "postgres" or not store.database_url:
         raise RuntimeError("Dispatcher v2 requires DATABASE_URL")
-    connection = psycopg2.connect(store.database_url)
-    connection.autocommit = False
+    connection = open_postgres_connection(store.database_url, autocommit=False)
     return DispatchStore(connection)
 
 
@@ -7157,26 +7206,26 @@ def match_bot_to_portal_name(bots: list[BotAccount], portal_name: str) -> BotAcc
 
 
 def shift_reassignment_hold(bot: BotAccount, now_utc: datetime) -> tuple[bool, str]:
-    grace_ends_local = shift_grace_end_local(bot, now_utc)
-    if grace_ends_local is None:
+    eligibility = evaluate_reassignment_eligible_bots(
+        [bot], effective_at=now_utc, local_timezone=RUNNER_TIMEZONE,
+    )
+    if eligibility.eligible:
         return False, ""
-    local_now = now_utc.astimezone(RUNNER_TIMEZONE)
-    grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
-    if local_now < grace_ends_local:
+    if any(item.reason_code == "outside_active_window" for item in eligibility.exclusions):
+        start = format_clock_label(bot.active_from_time) if norm(bot.active_from_time) else "start of day"
+        end = format_clock_label(bot.active_to_time) if norm(bot.active_to_time) else "end of day"
         return True, (
-            f"{bot.owner_name or bot.portal_name} is within shift grace until "
-            f"{grace_ends_local.strftime('%H:%M')} {RUNNER_TIMEZONE.key} "
-            f"(starts {format_clock_label(bot.active_from_time)}, grace {grace_minutes} mins)."
+            f"{bot.owner_name or bot.portal_name} is outside the reassignment window "
+            f"({start}-{end} {RUNNER_TIMEZONE.key})."
         )
     return False, ""
 
 
-def shift_grace_end_local(bot: BotAccount, now_utc: datetime) -> datetime | None:
+def reassignment_window_start_local(bot: BotAccount, now_utc: datetime) -> datetime | None:
     start_minutes = parse_clock_minutes(bot.active_from_time)
     if start_minutes is None:
         return None
 
-    grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
     local_now = now_utc.astimezone(RUNNER_TIMEZONE)
     now_minutes = (local_now.hour * 60) + local_now.minute
     end_minutes = parse_clock_minutes(bot.active_to_time)
@@ -7197,7 +7246,11 @@ def shift_grace_end_local(bot: BotAccount, now_utc: datetime) -> datetime | None
             microsecond=0,
         )
 
-    return shift_start_local + timedelta(minutes=grace_minutes)
+    # ``active_from_time`` is the point at which reassignment may begin. The
+    # historical shift_grace_minutes value is retained in storage for backward
+    # compatibility, but must not silently move a 09:00 reassignment window to
+    # 11:00.
+    return shift_start_local
 
 
 def is_shift_ready_for_reassignment(bot: BotAccount, now_utc: datetime) -> bool:
@@ -7223,13 +7276,13 @@ def stale_reason_for_reassignment(
             return None
 
     if not has_meaningful_progress:
-        cutoff = shift_grace_end_local(bot, now_utc) if bot is not None else None
+        cutoff = reassignment_window_start_local(bot, now_utc) if bot is not None else None
         if cutoff is not None:
             local_now = now_utc.astimezone(RUNNER_TIMEZONE)
             if local_now < cutoff:
                 return None
             return (
-                f"No progress recorded by the shift grace cutoff "
+                f"No progress recorded by the reassignment window start "
                 f"({cutoff.strftime('%H:%M')} {RUNNER_TIMEZONE.key}) with {remaining_claims} claims still open."
             )
         return f"No progress recorded with {remaining_claims} claims still open."
@@ -7292,6 +7345,7 @@ def reconcile_tracked_assignments(
     requested_month_labels: list[str],
     scanned_rows: list[PileRow] | None = None,
 ) -> dict[str, Any]:
+    runner._heartbeat("reconcile")
     tracked = store.get_active_tracked_piles(insurer_name)
     if not tracked:
         return {
@@ -7333,6 +7387,7 @@ def reconcile_tracked_assignments(
     completed_count = 0
     refreshed_tracked: list[TrackedPile] = []
     for tracked_pile in tracked:
+        runner._heartbeat("reconcile")
         observed = row_map.get(tracked_pile.tracking_key) or row_map.get(canonical_pile_tracking_key(tracked_pile.tracking_key))
         previous_completed = max(tracked_pile.synced_claims, tracked_pile.claims_total - tracked_pile.remaining_claims)
         matched_bot = match_bot_to_portal_name(bots, observed.assigned if observed else tracked_pile.current_assigned) if (observed or tracked_pile.current_assigned) else None
@@ -7371,6 +7426,7 @@ def reconcile_tracked_assignments(
             progress_claims,
             stale_reason=stale_reason,
         )
+        runner._heartbeat("reconcile")
         store.record_tracked_snapshot(updated, observed, active_bot_id, progress_claims, completed)
         refreshed_tracked.append(updated)
         if completed:
@@ -7385,7 +7441,13 @@ def reconcile_tracked_assignments(
                 source_tracking_key=updated.tracking_key,
             ))
 
-    refreshed_metrics = store.refresh_bot_metrics_from_tracking(insurer_name, bots, previous_metrics)
+    runner._heartbeat("reconcile")
+    prior_progress_heartbeat = getattr(store, "progress_heartbeat", None)
+    store.progress_heartbeat = lambda: runner._heartbeat("reconcile")
+    try:
+        refreshed_metrics = store.refresh_bot_metrics_from_tracking(insurer_name, bots, previous_metrics)
+    finally:
+        store.progress_heartbeat = prior_progress_heartbeat
     active_count = len([item for item in refreshed_tracked if item.is_active])
     stale_count = len([item for item in refreshed_tracked if item.is_stale])
     return {
@@ -7616,15 +7678,6 @@ def build_stale_reassignment_plans(
             now_utc=now_utc,
         )
         if target is None:
-            target = choose_best_bot_for_pile(
-                max(observed_row.remaining_claims, 1),
-                bots,
-                metrics,
-                exclude_bot_ids={current_bot.id},
-                require_shift_ready=False,
-                now_utc=now_utc,
-            )
-        if target is None:
             continue
 
         current_metric = metrics.get(current_bot.id)
@@ -7718,8 +7771,6 @@ def build_assignment_plan(
             bot = bots_by_id.get(exclusion.subject_id)
             owner = norm(bot.owner_name if bot else "") or norm(bot.portal_name if bot else "") or exclusion.subject_id
             reason = exclusion.reason_code
-            if bot and reason == "outside_active_window":
-                reason += f": {norm(bot.active_from_time) or 'start'}-{norm(bot.active_to_time) or 'end'}"
             exclusions.append(f"{owner} ({reason})")
         detail = ", ".join(exclusions) or "no bot accounts were configured"
         raise NoEligibleAssignees(
@@ -7785,6 +7836,24 @@ def build_assignment_plan(
             "projected_finish_minutes": projected_finish_minutes(projected_hours),
         }
     return plans, summary
+
+
+def require_complete_fresh_plan(
+    piles: list[PileRow], plans: list[PlannedAssignment], *, context: str,
+) -> None:
+    """Fail closed if an eligible fresh pile is omitted or planned twice."""
+    expected = [pile.key for pile in piles]
+    actual = [plan.pile_key for plan in plans]
+    expected_counts = Counter(expected)
+    actual_counts = Counter(actual)
+    missing_count = sum(max(count - actual_counts.get(key, 0), 0) for key, count in expected_counts.items())
+    duplicate_count = sum(max(count - expected_counts.get(key, 0), 0) for key, count in actual_counts.items())
+    if missing_count or duplicate_count or len(actual) != len(expected):
+        raise RuntimeError(
+            "Fresh assignment planning was incomplete; "
+            f"context={context}, expected={len(expected)}, planned={len(actual)}, "
+            f"missing={missing_count}, duplicate_or_unexpected={duplicate_count}."
+        )
 
 
 def build_assignment_plan_from_portal_options(
@@ -8603,7 +8672,7 @@ def _run_for_insurer_once(
             except NoEligibleAssignees:
                 workflow_error_code = "no_eligible_assignees"
                 plans, summary = [], {}
-                print("\nAssignment deferred: no configured assignee is eligible in the current time window.")
+                print("\nAssignment deferred: no active, available assignee has valid capacity configuration.")
                 store.log_runner_event(
                     insurer_name=insurer_name,
                     event_type="runner_assignment_deferred",
@@ -8612,6 +8681,8 @@ def _run_for_insurer_once(
                     claim_count=sum(max(row.remaining_claims, 0) for row in unassigned),
                     details={"reason_code": workflow_error_code},
                 )
+            if not manual_mode and not workflow_error_code:
+                require_complete_fresh_plan(unassigned, plans, context="initial")
 
         if summary:
             print("\nAssignment summary:")
@@ -8986,6 +9057,8 @@ def _run_for_insurer_once(
             except NoEligibleAssignees:
                 workflow_error_code = "no_eligible_assignees"
                 late_plans, late_summary = [], {}
+            if not late_manual and not workflow_error_code:
+                require_complete_fresh_plan(follow_up_unassigned, late_plans, context="follow_up")
             late_arrival_detection["summary"] = late_summary
             summary = merge_assignment_summaries(summary, late_summary)
             plans.extend(late_plans)
@@ -9156,7 +9229,7 @@ def _run_for_insurer_once(
             "message": (
                 f"{manual_action_count} pile(s) require manual action."
                 if manual_action_count
-                else "Assignment deferred until an assignee enters an eligible time window."
+                else "Assignment deferred until an active, available assignee has valid capacity configuration."
                 if workflow_error_code
                 else "No unassigned piles found. Nothing to assign." if total_planned == 0 else ""
             ),
@@ -9362,6 +9435,13 @@ def run_claimed_insurer_once(work, context: WorkerContext, args: argparse.Namesp
     worker_args.worker_safe_diagnostics = True
     if context.ownership:
         worker_args.work_heartbeat = context.ownership.check
+        last_operation_heartbeat = [0.0]
+        def pulse_operation_heartbeat() -> None:
+            now = time.monotonic()
+            if now - last_operation_heartbeat[0] >= 20:
+                context.ownership.check()
+                last_operation_heartbeat[0] = now
+        context.store.operation_heartbeat = pulse_operation_heartbeat
     if context.output_path:
         worker_args.out = context.output_path
     elif getattr(worker_args, "out", None):

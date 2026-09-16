@@ -1298,6 +1298,23 @@ class AssignmentPlanCompletionTests(unittest.TestCase):
 
 
 class AssignmentPlanningTests(unittest.TestCase):
+    def test_complete_fresh_plan_rejects_missing_duplicate_and_unexpected_piles(self):
+        piles = [make_pile(1), make_pile(2)]
+        plans, _ = runner.build_assignment_plan(
+            "OLD MUTUAL", piles, [make_bot("Daniel", "primary")], {},
+        )
+        runner.require_complete_fresh_plan(piles, plans, context="initial")
+
+        for label, changed in (
+            ("missing", plans[:1]),
+            ("duplicate", [plans[0], plans[0]]),
+            ("unexpected", [plans[0], runner.replace(plans[1], pile_key="foreign")]),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                RuntimeError, r"planning was incomplete.*expected=2, planned=2|planning was incomplete.*expected=2, planned=1",
+            ):
+                runner.require_complete_fresh_plan(piles, changed, context="initial")
+
     def test_all_years_expand_for_single_select_portal(self):
         self.assertEqual(
             runner.year_scan_labels("All", ["2026", "2025", "2024"], supports_multiple=False),
@@ -1390,7 +1407,7 @@ class AssignmentPlanningTests(unittest.TestCase):
                 "OLD MUTUAL", [make_pile(1)], [bot], {},
             )
 
-    def test_temporarily_empty_assignment_window_is_deferred_not_failed(self):
+    def test_fresh_assignment_is_not_deferred_before_reassignment_window(self):
         context = ("Jul", "2026", "Vetting Pending")
         bot = runner.replace(make_bot("Daniel", "primary"), active_from_time="09:00")
 
@@ -1406,10 +1423,39 @@ class AssignmentPlanningTests(unittest.TestCase):
             )
 
         self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
-        self.assertEqual(state.applied, [])
-        self.assertEqual(state.result["plans"], [])
-        self.assertEqual(state.result["workflow_status"], "completed_with_issues")
-        self.assertEqual(state.result["workflow_error_code"], "no_eligible_assignees")
+        self.assertEqual(len(state.applied), 1)
+        self.assertEqual(len(state.result["plans"]), 1)
+        self.assertEqual(state.result["workflow_status"], "completed")
+
+    def test_reassignment_window_opens_at_active_from_without_legacy_grace(self):
+        bot = runner.replace(
+            make_bot("Daniel", "primary"),
+            active_from_time="09:00",
+            active_to_time="17:00",
+            shift_grace_minutes=120,
+        )
+
+        self.assertFalse(runner.is_shift_ready_for_reassignment(
+            bot, datetime(2026, 9, 12, 7, 59, tzinfo=timezone.utc),
+        ))
+        self.assertTrue(runner.is_shift_ready_for_reassignment(
+            bot, datetime(2026, 9, 12, 8, 0, tzinfo=timezone.utc),
+        ))
+        self.assertFalse(runner.is_shift_ready_for_reassignment(
+            bot, datetime(2026, 9, 12, 16, 1, tzinfo=timezone.utc),
+        ))
+
+    def test_reassignment_does_not_fall_back_to_a_not_ready_target(self):
+        current = make_bot("Daniel", "primary")
+        candidate = types.SimpleNamespace(observed_row=make_pile(1), current_bot=current)
+        rule = runner.AssignmentRule("OLD MUTUAL", "balanced_finish", 25, 120, 40, 30)
+        with patch.object(runner, "choose_best_bot_for_pile", return_value=None) as choose:
+            plans, summary = runner.build_stale_reassignment_plans(
+                "OLD MUTUAL", [candidate], [current], {}, rule,
+            )
+        self.assertEqual((plans, summary), ([], {}))
+        self.assertEqual(choose.call_count, 1)
+        self.assertTrue(choose.call_args.kwargs["require_shift_ready"])
 
     def test_existing_load_is_respected_after_primary_floor(self):
         bots = [
@@ -3326,6 +3372,95 @@ class YearFilterScanningTests(unittest.TestCase):
 
 
 class ExecutionLedgerIntegrationTests(unittest.TestCase):
+    def test_postgres_connections_bound_individual_operations_below_work_lease(self):
+        calls = []
+        connection = types.SimpleNamespace(autocommit=None)
+
+        def connect(url, **options):
+            calls.append((url, options))
+            return connection
+
+        with patch.object(runner.psycopg2, "connect", connect, create=True):
+            result = runner.open_postgres_connection("postgresql://fixture", autocommit=False)
+
+        self.assertIs(result, connection)
+        self.assertFalse(result.autocommit)
+        self.assertEqual(calls[0][1]["connect_timeout"], 10)
+        self.assertIn("statement_timeout=45000", calls[0][1]["options"])
+        self.assertIn("lock_timeout=5000", calls[0][1]["options"])
+
+    def test_read_only_postgres_connection_is_guarded_by_the_server(self):
+        with patch.object(runner.psycopg2, "connect", return_value=types.SimpleNamespace(), create=True) as connect:
+            runner.open_postgres_connection("postgresql://fixture", autocommit=True, read_only=True)
+        self.assertIn("default_transaction_read_only=on", connect.call_args.kwargs["options"])
+
+    @staticmethod
+    def make_tracked_fixture():
+        return runner.TrackedPile(
+            id="tracked", master_account_id="master", bot_account_id="", insurer_name="Kenya",
+            tracking_key="pile", last_pile_key="pile", provider="Provider", claim_month="Jul",
+            submitted_date="2026-07-01", claims_total=10, synced_claims=0, remaining_claims=10,
+            assignment_type="Vetting", current_status="Vetting Pending",
+            current_status_bucket="Vetting Pending", current_assigned="", filter_month="Jul",
+            first_assigned_at="", assigned_at="", first_seen_at="", last_seen_at="",
+            last_progress_at="", last_reassigned_at="", completed_at="", is_active=True,
+            is_stale=False, stale_reason="", details={},
+        )
+
+    def test_tracked_reconciliation_renews_ownership_for_each_database_unit(self):
+        tracked = self.make_tracked_fixture()
+        heartbeats = []
+        portal = types.SimpleNamespace(_heartbeat=lambda phase: heartbeats.append(phase))
+
+        class Store:
+            def get_active_tracked_piles(self, _):
+                return [runner.replace(tracked, id=f"tracked-{index}", tracking_key=f"pile-{index}") for index in range(5)]
+            def update_tracked_pile_observation(self, item, *_args, **_kwargs):
+                return runner.replace(item, is_active=False)
+            def record_tracked_snapshot(self, *_args):
+                pass
+            def refresh_bot_metrics_from_tracking(self, _name, _bots, metrics):
+                return metrics
+
+        result = runner.reconcile_tracked_assignments(
+            Store(), portal, "Kenya", "All", [], {}, None, ["All"], scanned_rows=[],
+        )
+
+        self.assertEqual(result["tracked_count"], 5)
+        self.assertEqual(heartbeats, ["reconcile"] * 12)
+
+    def test_read_only_tracked_observation_never_calls_a_database_adapter(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.read_only = True
+        store.mode = "postgres"
+        def forbidden(*_args, **_kwargs):
+            self.fail("read-only observation called a database adapter")
+        store._fetchall_postgres = forbidden
+        store._execute_postgres = forbidden
+        store.get_tracked_pile_by_id = forbidden
+
+        updated = store.update_tracked_pile_observation(
+            self.make_tracked_fixture(), None, "", "", "completed", "Vetting Pending", True, 10,
+        )
+        self.assertFalse(updated.is_active)
+        self.assertEqual(updated.remaining_claims, 0)
+
+    def test_worker_database_heartbeat_is_throttled_but_renews_during_long_work(self):
+        calls = []
+        ownership = types.SimpleNamespace(check=lambda *_: calls.append("renewed"))
+        store = types.SimpleNamespace()
+        context = types.SimpleNamespace(ownership=ownership, store=store, output_path="", ledger=None)
+        work = types.SimpleNamespace(id="work", claim_token="token", insurer_name="Kenya", parent_runner_run_id="parent")
+        args = types.SimpleNamespace(worker_safe_diagnostics=False, out="")
+
+        with patch.object(runner.time, "monotonic", side_effect=[1, 10, 22]), \
+                patch.object(runner, "run_insurer_recorded", side_effect=lambda *_a, **_kw: (
+                    store.operation_heartbeat(), store.operation_heartbeat(), store.operation_heartbeat(), {}
+                )[-1]):
+            runner.run_claimed_insurer_once(work, context, args, ["All"], "All", False)
+
+        self.assertEqual(calls, ["renewed"])
+
     def test_runner_heartbeat_phases_match_database_constraint(self):
         source = Path(runner.__file__).read_text()
         phases = set(__import__("re").findall(r'_heartbeat\("([^\"]+)"', source))
@@ -3603,7 +3738,7 @@ class WorkerAdapterIntegrationTests(unittest.TestCase):
             closed = False
             def close(self):
                 self.closed = True
-        def connect(_url):
+        def connect(_url, **_options):
             connection = Connection()
             connections.append(connection)
             return connection
@@ -3997,7 +4132,7 @@ class DispatcherRunnerFencingTests(unittest.TestCase):
             closed = False
             def close(self):
                 self.closed = True
-        def connect(_url):
+        def connect(_url, **_options):
             result = Connection()
             connections.append(result)
             return result

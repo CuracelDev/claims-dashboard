@@ -1181,7 +1181,6 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
     availability_note: '',
     active_from_time: '09:00',
     active_to_time: '',
-    shift_grace_minutes: 120,
     priority_order: 100,
     current_claim_load: 0,
     notes: '',
@@ -1201,7 +1200,6 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       availability_note: '',
       active_from_time: '09:00',
       active_to_time: '',
-      shift_grace_minutes: 120,
       priority_order: 100,
       current_claim_load: 0,
       notes: '',
@@ -1229,7 +1227,6 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
       availability_note: account.availability_note || '',
       active_from_time: account.active_from_time || '09:00',
       active_to_time: account.active_to_time || '',
-      shift_grace_minutes: account.shift_grace_minutes ?? 120,
       priority_order: account.priority_order ?? 100,
       current_claim_load: account.current_claim_load ?? 0,
       notes: account.notes || '',
@@ -1317,10 +1314,9 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
         <input value={draft.availability_note} onChange={(e) => setDraft((prev) => ({ ...prev, availability_note: e.target.value }))} placeholder="Availability note or reassignment note" style={inputStyle(C)} />
         <button onClick={submit} disabled={saving} style={{ background: saving ? C.muted : C.accent, color: saving ? C.sub : '#0B0F1A', border: 'none', borderRadius: 8, fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>{saving ? 'Saving...' : editingId ? 'Save Changes' : 'Add Bot'}</button>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 0.8fr 0.8fr', gap: 12, marginBottom: 16 }}>
-        <input value={draft.active_from_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_from_time: e.target.value }))} placeholder="Active from (HH:MM)" style={inputStyle(C)} />
-        <input value={draft.active_to_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_to_time: e.target.value }))} placeholder="Active to (HH:MM)" style={inputStyle(C)} />
-        <input type="number" value={draft.shift_grace_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, shift_grace_minutes: e.target.value }))} placeholder="Grace mins before reassign" style={inputStyle(C)} />
+      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 0.8fr', gap: 12, marginBottom: 16 }}>
+        <input value={draft.active_from_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_from_time: e.target.value }))} placeholder="Reassign from (HH:MM)" aria-label="Reassignment starts at" style={inputStyle(C)} />
+        <input value={draft.active_to_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_to_time: e.target.value }))} placeholder="Reassign until (HH:MM)" aria-label="Reassignment ends at" style={inputStyle(C)} />
       </div>
       <textarea value={draft.notes} onChange={(e) => setDraft((prev) => ({ ...prev, notes: e.target.value }))} placeholder="Notes for shift ownership, fallback usage, or password caveats" style={{ ...inputStyle(C), minHeight: 72, marginBottom: 18, resize: 'vertical' }} />
       {editingId && (
@@ -1334,7 +1330,7 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
         </div>
       )}
       <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px', color: C.sub, fontSize: 12, marginBottom: 18, lineHeight: 1.6 }}>
-        `Primary` rows are the main owners for an insurer. `Support` rows are helpers and should receive less work; use `Role weight` to limit that share. If someone is unavailable, set their availability away from `Available` and move the primary responsibility to another row before the runner starts. If you set `Active from` and `Active to`, stale reassignments will wait until that shift has started and the grace window has passed.
+        `Primary` rows are the main owners for an insurer. `Support` rows are helpers and should receive less work; use `Role weight` to limit that share. If someone is unavailable, set their availability away from `Available` and move the primary responsibility to another row before the runner starts. The reassignment window affects only stale work: fresh unassigned piles can be assigned on every scheduled run. Reassignment can begin exactly at `Reassign from`; there is no additional hidden grace period.
       </div>
       {!accounts.length ? (
         <EmptyState C={C} title="No bot accounts yet" text="Add the sub-bots under each insurer so the runner has explicit assignee targets." />
@@ -1356,7 +1352,7 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
-                    <tr>{['Owner', 'Role', 'Weight', 'Bot Name', 'Shift', 'Claims/Hr', 'Current Load', 'Availability', 'Last Modified', 'Action'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
+                    <tr>{['Owner', 'Role', 'Weight', 'Bot Name', 'Reassignment Window', 'Claims/Hr', 'Current Load', 'Availability', 'Last Modified', 'Action'].map((label) => <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>{label}</th>)}</tr>
                   </thead>
                   <tbody>
                     {insurerAccounts.map((account) => {
@@ -1369,9 +1365,6 @@ function BotAccountsSection({ C, accounts, masterAccounts, metricsByBotId, onRef
                           <td style={{ color: C.sub, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{account.bot_name || '—'}</td>
                           <td style={{ color: C.text, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>
                             {account.active_from_time ? `${account.active_from_time}${account.active_to_time ? ` - ${account.active_to_time}` : ''}` : 'Always'}
-                            {account.shift_grace_minutes ? (
-                              <div style={{ color: C.muted, fontSize: 11, marginTop: 3 }}>Grace {account.shift_grace_minutes} min</div>
-                            ) : null}
                           </td>
                           <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric?.claims_per_hour ?? '—'}</td>
                           <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{metric?.active_claim_load ?? account.current_claim_load ?? 0}</td>
@@ -1415,7 +1408,6 @@ function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
     availability_note: '',
     active_from_time: '09:00',
     active_to_time: '',
-    shift_grace_minutes: 120,
     current_claim_load: 0,
     notes: '',
   });
@@ -1429,7 +1421,6 @@ function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
       availability_note: selected.availability_note || '',
       active_from_time: selected.active_from_time || '09:00',
       active_to_time: selected.active_to_time || '',
-      shift_grace_minutes: selected.shift_grace_minutes ?? 120,
       current_claim_load: selected.current_claim_load ?? 0,
       notes: selected.notes || '',
     });
@@ -1492,10 +1483,9 @@ function BotRoleEditorSection({ C, accounts, onRefresh, setNotice }) {
           {saving ? 'Saving...' : 'Update Role'}
         </button>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 0.8fr 0.8fr', gap: 12, marginBottom: 14 }}>
-        <input value={draft.active_from_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_from_time: e.target.value }))} placeholder="Active from (HH:MM)" style={inputStyle(C)} disabled={!selected} />
-        <input value={draft.active_to_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_to_time: e.target.value }))} placeholder="Active to (HH:MM)" style={inputStyle(C)} disabled={!selected} />
-        <input type="number" value={draft.shift_grace_minutes} onChange={(e) => setDraft((prev) => ({ ...prev, shift_grace_minutes: e.target.value }))} placeholder="Grace mins before reassign" style={inputStyle(C)} disabled={!selected} />
+      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 0.8fr', gap: 12, marginBottom: 14 }}>
+        <input value={draft.active_from_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_from_time: e.target.value }))} placeholder="Reassign from (HH:MM)" aria-label="Reassignment starts at" style={inputStyle(C)} disabled={!selected} />
+        <input value={draft.active_to_time} onChange={(e) => setDraft((prev) => ({ ...prev, active_to_time: e.target.value }))} placeholder="Reassign until (HH:MM)" aria-label="Reassignment ends at" style={inputStyle(C)} disabled={!selected} />
       </div>
       <textarea value={draft.notes} onChange={(e) => setDraft((prev) => ({ ...prev, notes: e.target.value }))} placeholder="Operational notes for this insurer/person row" style={{ ...inputStyle(C), minHeight: 72, resize: 'vertical' }} disabled={!selected} />
     </div>

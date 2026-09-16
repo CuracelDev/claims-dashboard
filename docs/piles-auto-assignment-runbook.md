@@ -60,9 +60,10 @@ Parent notification limitation: SIGTERM drains active work at a safe evidence bo
 - `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false`: default-disabled dispatcher rollout/rollback switch.
 - `HEADLESS=true`: normal server operation.
 - `ALLOW_PRODUCTION_ASSIGNMENTS=true`: required only for intentionally authorized live execution.
+- `PILES_DB_CONNECT_TIMEOUT_SECONDS=10`, `PILES_DB_LOCK_TIMEOUT_MS=5000`, and `PILES_DB_STATEMENT_TIMEOUT_MS=45000`: optional per-operation bounds. Defaults are safe below the 120-second durable work lease; these are not full-run deadlines. Do not raise the statement timeout above the work lease without changing the lease/heartbeat design together.
 - Portal and Slack credentials remain in the secret manager/environment and must never be copied into logs or history.
 
-An insurer with `is_active=false` in Master Insurer Credentials is excluded from all-active runs and the Runner Control insurer dropdown. Bot eligibility separately requires an active, available bot whose time window and assignment rule permit work.
+An insurer with `is_active=false` in Master Insurer Credentials is excluded from all-active runs and the Runner Control insurer dropdown. Fresh pile eligibility separately requires an active, available bot with positive capacity; it is not gated by the reassignment window. `active_from_time`/`active_to_time` apply only to stale-pile reassignment, which may begin exactly at `active_from_time` in the configured runner timezone.
 
 ## Expected states
 
