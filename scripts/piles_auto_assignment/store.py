@@ -1351,7 +1351,8 @@ class ExecutionLedger:
             cursor.execute(
                 """
                 SELECT id, insurer_run_id, batch_id, tracking_key, last_pile_key,
-                       intended_portal_assignee, status, attempt_number, filter_context
+                       intended_portal_assignee, status, attempt_number, filter_context,
+                       submitted_at, updated_at, clock_timestamp() AS observed_at
                 FROM piles_auto_assignment_attempts
                 WHERE insurer_name = %s
                   AND status IN ('selected','submitted','reconciliation_pending')

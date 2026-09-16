@@ -72,6 +72,7 @@ An insurer with `is_active=false` in Master Insurer Credentials is excluded from
 - Context: `pending` → `scanning` → `complete`, `empty`, or `failed`.
 - Attempt: `planned` → `selected` → `submitted` → `confirmed_visible` or `reconciliation_pending`.
 - Reconciliation: `confirmed_reconciled`, positively observed `still_unassigned`, `conflict`, or `manual_action_required` after the retry limit.
+- Historical uncertainty is never guessed. A submitted/reconciliation-pending attempt remains protected from replay while it is recent or its original filter context was not fully rescanned. After 30 minutes, if two complete scans of that exact month/year/status context still cannot find it, the attempt becomes `manual_action_required` with `historical_submission_missing_after_complete_scan`; it is not reported as assigned and is not automatically retried. Positive assigned/unassigned evidence always takes precedence.
 
 A no-work result is trustworthy only when every expected context is `complete` or `empty`. A missing row after submission is not success.
 

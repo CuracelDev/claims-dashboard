@@ -121,6 +121,7 @@ PRIMARY_ASSIGNMENT_FLOOR_RATIO = min(
     max(float(os.getenv("PILES_PRIMARY_MIN_SHARE") or "0.6"), 0.4),
     0.9,
 )
+HISTORICAL_RECONCILIATION_GRACE_MINUTES = 30
 PLANNING_SPEED_FLOOR_RATIO = min(
     max(float(os.getenv("PILES_PLANNING_SPEED_FLOOR_RATIO") or "0.5"), 0.1),
     1.0,
@@ -8866,7 +8867,30 @@ def _run_for_insurer_once(
         if v2:
             if execution_ledger and insurer_run_id:
                 runner._heartbeat("reconcile")
+                complete_final_reconciliation_scan = bool(snapshots) and all(
+                    result.status in {ContextStatus.COMPLETE, ContextStatus.EMPTY}
+                    for result in snapshots
+                ) and len(follow_up_contexts) == len(snapshots)
                 final_pending = execution_ledger.pending_attempts(insurer_name)
+                complete_context_keys = {
+                    (
+                        result.context.filter_month,
+                        result.context.requested_year,
+                        result.context.status_bucket,
+                    )
+                    for result in snapshots
+                    if result.context is not None
+                    and result.status in {ContextStatus.COMPLETE, ContextStatus.EMPTY}
+                }
+                missing_attempt_ids = {
+                    norm(attempt.get("id"))
+                    for attempt in final_pending
+                    if (
+                        norm((attempt.get("filter_context") or {}).get("month")),
+                        norm((attempt.get("filter_context") or {}).get("year")),
+                        norm((attempt.get("filter_context") or {}).get("status")),
+                    ) in complete_context_keys
+                }
                 prior_attempt_keys.update(expanded_tracking_key_set(
                     key for attempt in final_pending
                     for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
@@ -8888,7 +8912,20 @@ def _run_for_insurer_once(
 
                 for attempt in final_pending:
                     runner._heartbeat("reconcile")
-                    decisions = runner.phase_timer.call('reconcile', 'reconciliation', reconcile_pending_for_insurer, FinalScanPortal(), execution_ledger, [attempt])
+                    decisions = runner.phase_timer.call(
+                        'reconcile',
+                        'reconciliation',
+                        reconcile_pending_for_insurer,
+                        FinalScanPortal(),
+                        execution_ledger,
+                        [attempt],
+                        minimum_missing_age=(
+                            timedelta(minutes=HISTORICAL_RECONCILIATION_GRACE_MINUTES)
+                            if args.execute and complete_final_reconciliation_scan
+                            else None
+                        ),
+                        missing_attempt_ids=missing_attempt_ids,
+                    )
                     for decision in decisions:
                         scope = (
                             "reconciliation"

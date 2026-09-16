@@ -1170,6 +1170,9 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.ledger.pending_attempts("Jubilee Uganda")
         sql, params = self.connection.statements[-1]
         self.assertIn("'selected','submitted','reconciliation_pending'", sql)
+        self.assertIn("submitted_at", sql)
+        self.assertIn("updated_at", sql)
+        self.assertIn("clock_timestamp() AS observed_at", sql)
         self.assertEqual(params, ("Jubilee Uganda",))
 
     def test_retryable_attempts_are_bounded_by_attempt_number(self):
