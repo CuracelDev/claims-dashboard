@@ -758,6 +758,15 @@ class DispatchStore:
 
     def finish_claim(self, work_id: str, claim_token: str, disposition: WorkDisposition,
                      insurer_run_id: Optional[str] = None, reason_code: str = "") -> bool:
+        try:
+            return self._finish_claim_transaction(
+                work_id, claim_token, disposition, insurer_run_id, reason_code,
+            )
+        except ConcurrentStateChange:
+            return False
+
+    def _finish_claim_transaction(self, work_id: str, claim_token: str, disposition: WorkDisposition,
+                                  insurer_run_id: Optional[str], reason_code: str) -> bool:
         disposition = WorkDisposition(disposition)
         if disposition not in {WorkDisposition.COMPLETED, WorkDisposition.FAILED, WorkDisposition.CANCELLED}:
             raise ValueError("Claims must finish with a terminal execution disposition")
@@ -809,6 +818,10 @@ class DispatchStore:
                 ),
             )
             finished = cursor.fetchone() is not None
+            if not finished:
+                # Expiry can occur between the child update and this CAS.
+                # Roll back the whole transaction, not only the work update.
+                raise ConcurrentStateChange("Claim finalization ownership changed")
         return finished
 
     def recoverable_expired_work(self) -> list[ClaimedWork]:

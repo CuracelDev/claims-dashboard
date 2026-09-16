@@ -399,6 +399,7 @@ class LeaseSqlConnection:
     def __init__(self):
         self.database = sqlite3.connect(":memory:")
         self.wall_time = 1000
+        self.after_execute = None
         self.database.create_function("now", 0, lambda: 1000)
         self.database.create_function("clock_timestamp", 0, lambda: self.wall_time)
         self.database.create_function("current_database", 0, lambda: "fixture")
@@ -446,6 +447,8 @@ class LeaseSqlConnection:
                 sql = sql.replace("* interval '1 second'", "").replace(" FOR UPDATE", "")
                 self.raw.execute(sql, params)
                 self.description = self.raw.description
+                if connection.after_execute:
+                    connection.after_execute(sql)
             def fetchone(self):
                 return self.raw.fetchone()
         return Cursor()
@@ -596,6 +599,25 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.assertEqual(self.connection.database.execute(
             "SELECT status FROM piles_auto_assignment_insurer_runs WHERE id='run'"
         ).fetchone(), ("running",))
+
+    def test_expiry_between_child_and_work_finalization_rolls_back_both(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+
+        def expire_after_child_update(sql):
+            if "UPDATE piles_auto_assignment_insurer_runs AS run" in sql:
+                self.connection.wall_time = 1061
+
+        self.connection.after_execute = expire_after_child_update
+        self.assertFalse(self.store.finish_claim(
+            "work", "current", WorkDisposition.FAILED,
+            insurer_run_id="run", reason_code="unexpected_error",
+        ))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,covered_by_insurer_run_id,finished_at FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", "run", None))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status,phase,error_code,finished_at FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone(), ("running", None, None, None))
 
     def test_renew_does_not_resurrect_a_lease_live_only_at_transaction_start(self):
         self.connection.wall_time = 1121
