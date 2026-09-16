@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import Counter
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -7822,6 +7823,24 @@ def build_assignment_plan(
     return plans, summary
 
 
+def require_complete_fresh_plan(
+    piles: list[PileRow], plans: list[PlannedAssignment], *, context: str,
+) -> None:
+    """Fail closed if an eligible fresh pile is omitted or planned twice."""
+    expected = [pile.key for pile in piles]
+    actual = [plan.pile_key for plan in plans]
+    expected_counts = Counter(expected)
+    actual_counts = Counter(actual)
+    missing_count = sum(max(count - actual_counts.get(key, 0), 0) for key, count in expected_counts.items())
+    duplicate_count = sum(max(count - expected_counts.get(key, 0), 0) for key, count in actual_counts.items())
+    if missing_count or duplicate_count or len(actual) != len(expected):
+        raise RuntimeError(
+            "Fresh assignment planning was incomplete; "
+            f"context={context}, expected={len(expected)}, planned={len(actual)}, "
+            f"missing={missing_count}, duplicate_or_unexpected={duplicate_count}."
+        )
+
+
 def build_assignment_plan_from_portal_options(
     insurer_name: str,
     piles: list[PileRow],
@@ -8647,6 +8666,8 @@ def _run_for_insurer_once(
                     claim_count=sum(max(row.remaining_claims, 0) for row in unassigned),
                     details={"reason_code": workflow_error_code},
                 )
+            if not manual_mode and not workflow_error_code:
+                require_complete_fresh_plan(unassigned, plans, context="initial")
 
         if summary:
             print("\nAssignment summary:")
@@ -9021,6 +9042,8 @@ def _run_for_insurer_once(
             except NoEligibleAssignees:
                 workflow_error_code = "no_eligible_assignees"
                 late_plans, late_summary = [], {}
+            if not late_manual and not workflow_error_code:
+                require_complete_fresh_plan(follow_up_unassigned, late_plans, context="follow_up")
             late_arrival_detection["summary"] = late_summary
             summary = merge_assignment_summaries(summary, late_summary)
             plans.extend(late_plans)

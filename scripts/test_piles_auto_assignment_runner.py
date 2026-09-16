@@ -1298,6 +1298,23 @@ class AssignmentPlanCompletionTests(unittest.TestCase):
 
 
 class AssignmentPlanningTests(unittest.TestCase):
+    def test_complete_fresh_plan_rejects_missing_duplicate_and_unexpected_piles(self):
+        piles = [make_pile(1), make_pile(2)]
+        plans, _ = runner.build_assignment_plan(
+            "OLD MUTUAL", piles, [make_bot("Daniel", "primary")], {},
+        )
+        runner.require_complete_fresh_plan(piles, plans, context="initial")
+
+        for label, changed in (
+            ("missing", plans[:1]),
+            ("duplicate", [plans[0], plans[0]]),
+            ("unexpected", [plans[0], runner.replace(plans[1], pile_key="foreign")]),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                RuntimeError, r"planning was incomplete.*expected=2, planned=2|planning was incomplete.*expected=2, planned=1",
+            ):
+                runner.require_complete_fresh_plan(piles, changed, context="initial")
+
     def test_all_years_expand_for_single_select_portal(self):
         self.assertEqual(
             runner.year_scan_labels("All", ["2026", "2025", "2024"], supports_multiple=False),
