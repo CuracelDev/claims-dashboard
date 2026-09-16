@@ -8,6 +8,7 @@ from scripts.piles_auto_assignment.planning import (
     batch_plans,
     eligible_bots,
     plan_assignments,
+    reassignment_eligible_bots,
     validate_rule,
 )
 
@@ -49,19 +50,48 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(sum(plan.work_claims for plan in result.plans), 4)
         self.assertEqual(result.exclusions[0].reason_code, "no_remaining_claims")
 
-    def test_bot_outside_active_window_is_excluded_with_reason(self):
+    def test_fresh_assignment_ignores_reassignment_window(self):
         result = eligible_bots(
             [bot("Daniel", start="09:00", end="17:00")],
             effective_at=datetime(2026, 9, 8, 20, 0, tzinfo=LAGOS),
         )
+
+        self.assertEqual([item.id for item in result.eligible], ["daniel"])
+        self.assertEqual(result.exclusions, ())
+
+    def test_bot_outside_reassignment_window_is_excluded_with_reason(self):
+        result = reassignment_eligible_bots(
+            [bot("Daniel", start="09:00", end="17:00")],
+            effective_at=datetime(2026, 9, 8, 20, 0, tzinfo=LAGOS),
+        )
+
         self.assertEqual(result.exclusions[0].reason_code, "outside_active_window")
 
-    def test_overnight_active_window_is_supported(self):
-        result = eligible_bots(
+    def test_overnight_reassignment_window_is_supported(self):
+        result = reassignment_eligible_bots(
             [bot("Night", start="20:00", end="04:00")],
             effective_at=datetime(2026, 9, 8, 23, 0, tzinfo=LAGOS),
         )
         self.assertEqual([item.id for item in result.eligible], ["night"])
+
+    def test_every_hour_can_plan_fresh_work_without_bypassing_availability(self):
+        for hour in range(24):
+            with self.subTest(hour=hour):
+                result = plan_assignments(
+                    "balanced_finish", [pile(1), pile(2)],
+                    [bot("Daniel", end="17:00"), bot("Paused", active=False)],
+                    {}, rule(), effective_at=datetime(2026, 9, 16, hour, tzinfo=LAGOS),
+                )
+                self.assertEqual(len(result.plans), 2)
+                self.assertEqual({item.bot.id for item in result.plans}, {"daniel"})
+
+    def test_reassignment_uses_configured_timezone(self):
+        result = reassignment_eligible_bots(
+            [bot("Daniel", start="09:00", end="17:00")],
+            effective_at=datetime(2026, 9, 16, 6, tzinfo=ZoneInfo("UTC")),
+            local_timezone=ZoneInfo("Africa/Nairobi"),
+        )
+        self.assertEqual([item.id for item in result.eligible], ["daniel"])
 
     def test_single_owner_rejects_multiple_available_primaries(self):
         with self.assertRaises(InvalidAssignmentConfiguration):

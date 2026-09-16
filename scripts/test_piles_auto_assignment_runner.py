@@ -1390,7 +1390,7 @@ class AssignmentPlanningTests(unittest.TestCase):
                 "OLD MUTUAL", [make_pile(1)], [bot], {},
             )
 
-    def test_temporarily_empty_assignment_window_is_deferred_not_failed(self):
+    def test_fresh_assignment_is_not_deferred_before_reassignment_window(self):
         context = ("Jul", "2026", "Vetting Pending")
         bot = runner.replace(make_bot("Daniel", "primary"), active_from_time="09:00")
 
@@ -1406,10 +1406,39 @@ class AssignmentPlanningTests(unittest.TestCase):
             )
 
         self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
-        self.assertEqual(state.applied, [])
-        self.assertEqual(state.result["plans"], [])
-        self.assertEqual(state.result["workflow_status"], "completed_with_issues")
-        self.assertEqual(state.result["workflow_error_code"], "no_eligible_assignees")
+        self.assertEqual(len(state.applied), 1)
+        self.assertEqual(len(state.result["plans"]), 1)
+        self.assertEqual(state.result["workflow_status"], "completed")
+
+    def test_reassignment_window_opens_at_active_from_without_legacy_grace(self):
+        bot = runner.replace(
+            make_bot("Daniel", "primary"),
+            active_from_time="09:00",
+            active_to_time="17:00",
+            shift_grace_minutes=120,
+        )
+
+        self.assertFalse(runner.is_shift_ready_for_reassignment(
+            bot, datetime(2026, 9, 12, 7, 59, tzinfo=timezone.utc),
+        ))
+        self.assertTrue(runner.is_shift_ready_for_reassignment(
+            bot, datetime(2026, 9, 12, 8, 0, tzinfo=timezone.utc),
+        ))
+        self.assertFalse(runner.is_shift_ready_for_reassignment(
+            bot, datetime(2026, 9, 12, 16, 1, tzinfo=timezone.utc),
+        ))
+
+    def test_reassignment_does_not_fall_back_to_a_not_ready_target(self):
+        current = make_bot("Daniel", "primary")
+        candidate = types.SimpleNamespace(observed_row=make_pile(1), current_bot=current)
+        rule = runner.AssignmentRule("OLD MUTUAL", "balanced_finish", 25, 120, 40, 30)
+        with patch.object(runner, "choose_best_bot_for_pile", return_value=None) as choose:
+            plans, summary = runner.build_stale_reassignment_plans(
+                "OLD MUTUAL", [candidate], [current], {}, rule,
+            )
+        self.assertEqual((plans, summary), ([], {}))
+        self.assertEqual(choose.call_count, 1)
+        self.assertTrue(choose.call_args.kwargs["require_shift_ready"])
 
     def test_existing_load_is_respected_after_primary_floor(self):
         bots = [

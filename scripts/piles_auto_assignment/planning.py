@@ -19,7 +19,7 @@ class InvalidAssignmentConfiguration(RuntimeError):
 
 
 class NoEligibleAssignees(InvalidAssignmentConfiguration):
-    """No configured assignee can safely receive work at the effective time."""
+    """No configured assignee can safely receive new work."""
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -101,10 +101,17 @@ def eligible_bots(
     *,
     effective_at: Optional[datetime] = None,
 ) -> EligibilityResult:
-    when = effective_at or datetime.now(LAGOS)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=LAGOS)
-    local_time = when.astimezone(LAGOS).time().replace(tzinfo=None)
+    """Return bots that may receive fresh work.
+
+    ``active_from_time`` and ``active_to_time`` are reassignment controls. Fresh
+    piles must not wait for that window: the scheduled runner is expected to
+    distribute newly discovered work before the reassignment window opens.
+
+    ``effective_at`` remains accepted for call-site compatibility and to make
+    this distinction explicit to callers, but does not affect fresh-work
+    eligibility.
+    """
+    del effective_at
     eligible = []
     exclusions = []
     for bot in bots:
@@ -123,13 +130,32 @@ def eligible_bots(
         if ratio <= 0:
             exclusions.append(Exclusion(bot_id, "invalid_capacity"))
             continue
+        eligible.append(bot)
+    eligible.sort(key=lambda item: (int(_value(item, "priority_order", 100) or 100), str(_value(item, "id", ""))))
+    return EligibilityResult(tuple(eligible), tuple(exclusions))
+
+
+def reassignment_eligible_bots(
+    bots: Iterable[Any],
+    *,
+    effective_at: Optional[datetime] = None,
+    local_timezone: ZoneInfo = LAGOS,
+) -> EligibilityResult:
+    """Return available bots whose reassignment window is currently open."""
+    when = effective_at or datetime.now(local_timezone)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=local_timezone)
+    local_time = when.astimezone(local_timezone).time().replace(tzinfo=None)
+    base = eligible_bots(bots)
+    eligible = []
+    exclusions = list(base.exclusions)
+    for bot in base.eligible:
         start = _parse_time(_value(bot, "active_from_time", ""))
         end = _parse_time(_value(bot, "active_to_time", ""))
         if not _inside_window(local_time, start, end):
-            exclusions.append(Exclusion(bot_id, "outside_active_window"))
+            exclusions.append(Exclusion(str(_value(bot, "id", "")), "outside_active_window"))
             continue
         eligible.append(bot)
-    eligible.sort(key=lambda item: (int(_value(item, "priority_order", 100) or 100), str(_value(item, "id", ""))))
     return EligibilityResult(tuple(eligible), tuple(exclusions))
 
 

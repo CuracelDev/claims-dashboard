@@ -57,6 +57,7 @@ try:
         NoEligibleAssignees,
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
+        reassignment_eligible_bots as evaluate_reassignment_eligible_bots,
     )
     from piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
     from piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
@@ -76,6 +77,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         NoEligibleAssignees,
         eligible_bots as evaluate_eligible_bots,
         plan_assignments,
+        reassignment_eligible_bots as evaluate_reassignment_eligible_bots,
     )
     from scripts.piles_auto_assignment.reconciliation import Observation, reconcile_pending_for_insurer
     from scripts.piles_auto_assignment.orchestrator import classify_runner_error, derive_overall_run_status, derive_parent_status
@@ -7157,26 +7159,26 @@ def match_bot_to_portal_name(bots: list[BotAccount], portal_name: str) -> BotAcc
 
 
 def shift_reassignment_hold(bot: BotAccount, now_utc: datetime) -> tuple[bool, str]:
-    grace_ends_local = shift_grace_end_local(bot, now_utc)
-    if grace_ends_local is None:
+    eligibility = evaluate_reassignment_eligible_bots(
+        [bot], effective_at=now_utc, local_timezone=RUNNER_TIMEZONE,
+    )
+    if eligibility.eligible:
         return False, ""
-    local_now = now_utc.astimezone(RUNNER_TIMEZONE)
-    grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
-    if local_now < grace_ends_local:
+    if any(item.reason_code == "outside_active_window" for item in eligibility.exclusions):
+        start = format_clock_label(bot.active_from_time) if norm(bot.active_from_time) else "start of day"
+        end = format_clock_label(bot.active_to_time) if norm(bot.active_to_time) else "end of day"
         return True, (
-            f"{bot.owner_name or bot.portal_name} is within shift grace until "
-            f"{grace_ends_local.strftime('%H:%M')} {RUNNER_TIMEZONE.key} "
-            f"(starts {format_clock_label(bot.active_from_time)}, grace {grace_minutes} mins)."
+            f"{bot.owner_name or bot.portal_name} is outside the reassignment window "
+            f"({start}-{end} {RUNNER_TIMEZONE.key})."
         )
     return False, ""
 
 
-def shift_grace_end_local(bot: BotAccount, now_utc: datetime) -> datetime | None:
+def reassignment_window_start_local(bot: BotAccount, now_utc: datetime) -> datetime | None:
     start_minutes = parse_clock_minutes(bot.active_from_time)
     if start_minutes is None:
         return None
 
-    grace_minutes = max(0, safe_int(bot.shift_grace_minutes, 120))
     local_now = now_utc.astimezone(RUNNER_TIMEZONE)
     now_minutes = (local_now.hour * 60) + local_now.minute
     end_minutes = parse_clock_minutes(bot.active_to_time)
@@ -7197,7 +7199,11 @@ def shift_grace_end_local(bot: BotAccount, now_utc: datetime) -> datetime | None
             microsecond=0,
         )
 
-    return shift_start_local + timedelta(minutes=grace_minutes)
+    # ``active_from_time`` is the point at which reassignment may begin. The
+    # historical shift_grace_minutes value is retained in storage for backward
+    # compatibility, but must not silently move a 09:00 reassignment window to
+    # 11:00.
+    return shift_start_local
 
 
 def is_shift_ready_for_reassignment(bot: BotAccount, now_utc: datetime) -> bool:
@@ -7223,13 +7229,13 @@ def stale_reason_for_reassignment(
             return None
 
     if not has_meaningful_progress:
-        cutoff = shift_grace_end_local(bot, now_utc) if bot is not None else None
+        cutoff = reassignment_window_start_local(bot, now_utc) if bot is not None else None
         if cutoff is not None:
             local_now = now_utc.astimezone(RUNNER_TIMEZONE)
             if local_now < cutoff:
                 return None
             return (
-                f"No progress recorded by the shift grace cutoff "
+                f"No progress recorded by the reassignment window start "
                 f"({cutoff.strftime('%H:%M')} {RUNNER_TIMEZONE.key}) with {remaining_claims} claims still open."
             )
         return f"No progress recorded with {remaining_claims} claims still open."
@@ -7616,15 +7622,6 @@ def build_stale_reassignment_plans(
             now_utc=now_utc,
         )
         if target is None:
-            target = choose_best_bot_for_pile(
-                max(observed_row.remaining_claims, 1),
-                bots,
-                metrics,
-                exclude_bot_ids={current_bot.id},
-                require_shift_ready=False,
-                now_utc=now_utc,
-            )
-        if target is None:
             continue
 
         current_metric = metrics.get(current_bot.id)
@@ -7718,8 +7715,6 @@ def build_assignment_plan(
             bot = bots_by_id.get(exclusion.subject_id)
             owner = norm(bot.owner_name if bot else "") or norm(bot.portal_name if bot else "") or exclusion.subject_id
             reason = exclusion.reason_code
-            if bot and reason == "outside_active_window":
-                reason += f": {norm(bot.active_from_time) or 'start'}-{norm(bot.active_to_time) or 'end'}"
             exclusions.append(f"{owner} ({reason})")
         detail = ", ".join(exclusions) or "no bot accounts were configured"
         raise NoEligibleAssignees(
