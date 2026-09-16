@@ -418,6 +418,8 @@ class LeaseSqlConnection:
                 VALUES ('work','parent','OLD MUTUAL','claimed','current',1120);
             CREATE TABLE piles_auto_assignment_insurer_runs(
                 id TEXT, runner_run_id TEXT, insurer_name TEXT, status TEXT,
+                phase TEXT, error_code TEXT, error_message TEXT,
+                heartbeat_at INTEGER, finished_at INTEGER,
                 details TEXT DEFAULT '{}', updated_at INTEGER);
             INSERT INTO piles_auto_assignment_insurer_runs(id,runner_run_id,insurer_name,status)
                 VALUES ('run','parent','OLD MUTUAL','running'),('foreign','other','OLD MUTUAL','running');
@@ -563,6 +565,37 @@ class DispatchLeaseSqlTests(unittest.TestCase):
         self.assertEqual(self.connection.database.execute(
             "SELECT disposition,finished_at FROM piles_auto_assignment_work_items"
         ).fetchone(), ("claimed", None))
+
+    def test_failed_work_atomically_terminalizes_its_exact_running_insurer(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+        self.assertTrue(self.store.finish_claim(
+            "work", "current", WorkDisposition.FAILED,
+            insurer_run_id="run", reason_code="unexpected_error",
+        ))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,covered_by_insurer_run_id,reason_code "
+            "FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("failed", "run", "unexpected_error"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status,phase,error_code,finished_at IS NOT NULL "
+            "FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone(), ("failed", "complete", "unexpected_error", 1))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status FROM piles_auto_assignment_insurer_runs WHERE id='foreign'"
+        ).fetchone(), ("running",))
+
+    def test_finish_rejects_a_different_insurer_run_attachment(self):
+        self.assertTrue(self.heartbeat(run_id="run"))
+        self.assertFalse(self.store.finish_claim(
+            "work", "current", WorkDisposition.FAILED,
+            insurer_run_id="foreign", reason_code="unexpected_error",
+        ))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT disposition,covered_by_insurer_run_id FROM piles_auto_assignment_work_items"
+        ).fetchone(), ("claimed", "run"))
+        self.assertEqual(self.connection.database.execute(
+            "SELECT status FROM piles_auto_assignment_insurer_runs WHERE id='run'"
+        ).fetchone(), ("running",))
 
     def test_renew_does_not_resurrect_a_lease_live_only_at_transaction_start(self):
         self.connection.wall_time = 1121

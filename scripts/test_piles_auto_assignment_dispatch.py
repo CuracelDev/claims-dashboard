@@ -126,6 +126,12 @@ class DispatchState:
                         return False
                     state.rows[work_id] = replace(row, disposition=disposition,
                         covered_by_insurer_run_id=insurer_run_id or "", reason_code=reason_code)
+                    if insurer_run_id and insurer_run_id not in state.insurer_statuses:
+                        state.insurer_statuses[insurer_run_id] = (
+                            InsurerRunStatus.FAILED
+                            if disposition == WorkDisposition.FAILED
+                            else InsurerRunStatus.COMPLETED
+                        )
                     state.events.append(("finish", work_id, str(disposition)))
                     return True
 
@@ -246,6 +252,22 @@ class BoundedDispatcherTests(unittest.TestCase):
         result = self.run_dispatch(state, run_one, maximum=1)
         self.assertEqual(calls, ["0", "1"])
         self.assertEqual(result.status, ParentRunStatus.COMPLETED)
+
+    def test_worker_failure_after_child_start_terminalizes_parent(self):
+        state = DispatchState(("Uganda",))
+
+        def fail_after_child_start(work, context):
+            context.ownership.started({"insurer_name": work.insurer_name})
+            raise RuntimeError("transient insurer finalization failure")
+
+        result = self.run_dispatch(state, fail_after_child_start, maximum=1)
+
+        self.assertEqual(result.status, ParentRunStatus.FAILED)
+        self.assertEqual(result.outcomes[0].status, InsurerRunStatus.FAILED)
+        self.assertEqual(result.outcomes[0].error_code, "unexpected_error")
+        self.assertEqual(state.rows["0"].disposition, WorkDisposition.FAILED)
+        self.assertEqual(state.insurer_statuses["run-Uganda"], InsurerRunStatus.FAILED)
+        self.assertEqual(state.events[-1][0], "parent")
 
     def test_same_canonical_insurer_never_overlaps(self):
         state = DispatchState(("UAPOM", "OLD MUTUAL", "Kenya"))

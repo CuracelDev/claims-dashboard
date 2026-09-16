@@ -766,6 +766,34 @@ class DispatchStore:
         with self._transaction() as cursor:
             if not self._lock_claim(cursor, work_id, claim_token):
                 return False
+            if disposition == WorkDisposition.FAILED and insurer_run_id:
+                # The portal worker may fail after creating its insurer row but
+                # before its ledger connection can finalize that row. Converge
+                # the exact attached child in the same fenced transaction as
+                # the terminal work item so a parent can never poll forever on
+                # a stranded `running` insurer.
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_insurer_runs AS run
+                    SET status = 'failed', phase = 'complete',
+                        error_code = coalesce(nullif(error_code, ''), %s),
+                        error_message = coalesce(nullif(error_message, ''),
+                          'Insurer execution could not complete; inspect the normalized error code.'),
+                        heartbeat_at = clock_timestamp(),
+                        finished_at = coalesce(finished_at, clock_timestamp()),
+                        updated_at = clock_timestamp()
+                    WHERE run.id = %s AND run.status = 'running'
+                      AND EXISTS (
+                        SELECT 1 FROM piles_auto_assignment_work_items work
+                        WHERE work.id = %s AND work.claim_token = %s
+                          AND work.disposition = 'claimed'
+                          AND work.lease_expires_at > clock_timestamp()
+                          AND work.covered_by_insurer_run_id = run.id
+                          AND work.parent_runner_run_id = run.runner_run_id
+                      )
+                    """,
+                    (reason_code or "unexpected_error", insurer_run_id, work_id, claim_token),
+                )
             cursor.execute(
                 """
                 UPDATE piles_auto_assignment_work_items
@@ -773,8 +801,12 @@ class DispatchStore:
                     finished_at = clock_timestamp(), heartbeat_at = clock_timestamp(), lease_expires_at = NULL, updated_at = clock_timestamp()
                 WHERE id = %s AND claim_token = %s AND disposition = 'claimed'
                   AND lease_expires_at > clock_timestamp()
+                  AND covered_by_insurer_run_id IS NOT DISTINCT FROM %s
                 RETURNING id
-                """, (disposition.value, insurer_run_id, reason_code or None, work_id, claim_token),
+                """, (
+                    disposition.value, insurer_run_id, reason_code or None,
+                    work_id, claim_token, insurer_run_id,
+                ),
             )
             finished = cursor.fetchone() is not None
         return finished
