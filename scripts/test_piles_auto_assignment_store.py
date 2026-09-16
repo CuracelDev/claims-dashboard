@@ -1173,6 +1173,8 @@ class ExecutionLedgerTests(unittest.TestCase):
         batch_sql = self.connection.statements[-1][0].lower()
         self.assertIn("selected_at is not null", batch_sql)
         self.assertIn("submitted_at is not null", batch_sql)
+        self.assertIn("status = 'manual_action_required'", batch_sql)
+        self.assertIn("summary.manual_count > 0", batch_sql)
 
         self.ledger.finalize_insurer_run("run-1", status="completed_with_issues")
         finalizer_sql = self.connection.statements[-2][0].lower()

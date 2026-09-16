@@ -1300,7 +1300,7 @@ class ExecutionLedger:
                       conflict_pile_count = summary.conflict_count,
                       failed_pile_count = summary.failed_count,
                       status = CASE
-                        WHEN summary.conflict_count > 0 OR summary.failed_count > 0 THEN 'failed'
+                        WHEN summary.conflict_count > 0 OR summary.failed_count > 0 OR summary.manual_count > 0 THEN 'failed'
                         WHEN summary.confirmed_count = summary.total_count THEN 'confirmed'
                         WHEN summary.confirmed_count > 0 THEN 'partially_confirmed'
                         WHEN summary.pending_count > 0 THEN 'reconciliation_pending'
@@ -1319,6 +1319,7 @@ class ExecutionLedger:
                         count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_count,
                         count(*) FILTER (WHERE status = 'conflict') conflict_count,
                         count(*) FILTER (WHERE status = 'failed') failed_count,
+                        count(*) FILTER (WHERE status = 'manual_action_required') manual_count,
                         count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled','manual_action_required','conflict','failed')) terminal_count
                       FROM piles_auto_assignment_attempts WHERE batch_id = %s GROUP BY batch_id
                     ) summary

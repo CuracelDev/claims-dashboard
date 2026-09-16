@@ -318,7 +318,7 @@ def derive_batch_status(statuses: Iterable[AttemptStatus]) -> BatchStatus:
         return BatchStatus.CONFIRMED
     if AttemptStatus.CONFLICT in status_set:
         return BatchStatus.FAILED
-    if AttemptStatus.FAILED in status_set:
+    if status_set & {AttemptStatus.FAILED, AttemptStatus.MANUAL_ACTION_REQUIRED}:
         return BatchStatus.FAILED
     if status_set & confirmed:
         return BatchStatus.PARTIALLY_CONFIRMED

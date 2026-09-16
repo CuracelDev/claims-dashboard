@@ -87,7 +87,7 @@ export async function GET(request) {
           .select('id,insurer_run_id,status,distinct_pile_count,unassigned_pile_count,claim_count')
           .in('insurer_run_id', insurerRunIds)),
         loadRows(() => supabase.from('piles_auto_assignment_batches')
-          .select('id,insurer_run_id,status,planned_pile_count,selected_pile_count,confirmed_pile_count,pending_pile_count,conflict_pile_count,failed_pile_count')
+          .select('id,insurer_run_id,status,finished_at,planned_pile_count,selected_pile_count,confirmed_pile_count,pending_pile_count,conflict_pile_count,failed_pile_count')
           .in('insurer_run_id', insurerRunIds)),
       ]);
     }
