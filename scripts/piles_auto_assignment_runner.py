@@ -293,6 +293,27 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    return min(max(safe_int(os.getenv(name), default), minimum), maximum)
+
+
+def open_postgres_connection(database_url: str, *, autocommit: bool):
+    """Bound individual database operations without bounding the whole run."""
+    statement_ms = _bounded_env_int("PILES_DB_STATEMENT_TIMEOUT_MS", 45_000, 5_000, 90_000)
+    lock_ms = _bounded_env_int("PILES_DB_LOCK_TIMEOUT_MS", 5_000, 1_000, 30_000)
+    connection = psycopg2.connect(
+        database_url,
+        connect_timeout=_bounded_env_int("PILES_DB_CONNECT_TIMEOUT_SECONDS", 10, 2, 30),
+        options=(
+            f"-c statement_timeout={statement_ms} "
+            f"-c lock_timeout={lock_ms} "
+            "-c idle_in_transaction_session_timeout=60000"
+        ),
+    )
+    connection.autocommit = autocommit
+    return connection
+
+
 def parse_synced_claims(value: Any) -> int:
     text = norm(value)
     match = re.search(r"(\d+)\s+synced", text, re.IGNORECASE)
@@ -1589,8 +1610,7 @@ class DataStore:
         self.conn = None
 
         if self.mode == "postgres":
-            self.conn = psycopg2.connect(self.database_url)
-            self.conn.autocommit = True
+            self.conn = open_postgres_connection(self.database_url, autocommit=True)
         elif not (self.supabase_url and self.supabase_key):
             raise RuntimeError("Missing DATABASE_URL or Supabase URL/service role key.")
 
@@ -2628,7 +2648,7 @@ class DataStore:
             "updated_at": now_iso,
         }
         if self.mode == "postgres":
-            self._execute_postgres(
+            rows = self._fetchall_postgres(
                 """
                 update piles_auto_assignment_tracked_piles
                 set bot_account_id = %s,
@@ -2647,6 +2667,7 @@ class DataStore:
                     stale_reason = %s,
                     updated_at = now()
                 where id = %s
+                returning *
                 """,
                 (
                     payload["bot_account_id"],
@@ -2666,6 +2687,9 @@ class DataStore:
                     tracked.id,
                 ),
             )
+            if not rows:
+                raise RuntimeError("Tracked pile observation could not be updated.")
+            return self._rows_to_tracked_piles(rows)[0]
         else:
             self._update_supabase("piles_auto_assignment_tracked_piles", "id", tracked.id, payload)
         return self.get_tracked_pile_by_id(tracked.id)
@@ -3033,8 +3057,11 @@ class DataStore:
         if not bot_ids:
             return {}
         aliases = insurer_aliases(insurer_name)
+        pulse = getattr(self, "progress_heartbeat", None)
 
         if self.mode == "postgres":
+            if pulse:
+                pulse()
             snapshot_rows = self._fetchall_postgres(
                 """
                 select bot_account_id, progress_claims, observed_at, insurer_name
@@ -3046,6 +3073,8 @@ class DataStore:
                 (bot_ids, str(window_hours)),
             )
             snapshot_rows = [row for row in snapshot_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
+            if pulse:
+                pulse()
             active_rows = self._fetchall_postgres(
                 """
                 select bot_account_id, remaining_claims, insurer_name
@@ -3057,6 +3086,8 @@ class DataStore:
             )
             active_rows = [row for row in active_rows if canonical_insurer_key(row.get("insurer_name")) in aliases]
         else:
+            if pulse:
+                pulse()
             snapshot_rows = [
                 row for row in self._fetchall_supabase("piles_auto_assignment_pile_snapshots")
                 if canonical_insurer_key(row.get("insurer_name")) in aliases and str(row.get("bot_account_id") or "") in bot_ids
@@ -3120,6 +3151,8 @@ class DataStore:
             }
 
             if self.mode == "postgres":
+                if pulse:
+                    pulse()
                 self._execute_postgres(
                     """
                     insert into piles_auto_assignment_bot_metrics
@@ -3592,16 +3625,14 @@ def build_execution_ledger(store: DataStore, args: argparse.Namespace, *, requir
         raise RuntimeError(
             "PILES_EXECUTION_LEDGER_ENABLED requires DATABASE_URL for transactional writes."
         )
-    connection = psycopg2.connect(store.database_url)
-    connection.autocommit = False
+    connection = open_postgres_connection(store.database_url, autocommit=False)
     return ExecutionLedger(connection)
 
 
 def build_dispatch_store(store: DataStore) -> DispatchStore:
     if store.mode != "postgres" or not store.database_url:
         raise RuntimeError("Dispatcher v2 requires DATABASE_URL")
-    connection = psycopg2.connect(store.database_url)
-    connection.autocommit = False
+    connection = open_postgres_connection(store.database_url, autocommit=False)
     return DispatchStore(connection)
 
 
@@ -7298,6 +7329,7 @@ def reconcile_tracked_assignments(
     requested_month_labels: list[str],
     scanned_rows: list[PileRow] | None = None,
 ) -> dict[str, Any]:
+    runner._heartbeat("reconcile")
     tracked = store.get_active_tracked_piles(insurer_name)
     if not tracked:
         return {
@@ -7339,6 +7371,7 @@ def reconcile_tracked_assignments(
     completed_count = 0
     refreshed_tracked: list[TrackedPile] = []
     for tracked_pile in tracked:
+        runner._heartbeat("reconcile")
         observed = row_map.get(tracked_pile.tracking_key) or row_map.get(canonical_pile_tracking_key(tracked_pile.tracking_key))
         previous_completed = max(tracked_pile.synced_claims, tracked_pile.claims_total - tracked_pile.remaining_claims)
         matched_bot = match_bot_to_portal_name(bots, observed.assigned if observed else tracked_pile.current_assigned) if (observed or tracked_pile.current_assigned) else None
@@ -7377,6 +7410,7 @@ def reconcile_tracked_assignments(
             progress_claims,
             stale_reason=stale_reason,
         )
+        runner._heartbeat("reconcile")
         store.record_tracked_snapshot(updated, observed, active_bot_id, progress_claims, completed)
         refreshed_tracked.append(updated)
         if completed:
@@ -7391,7 +7425,13 @@ def reconcile_tracked_assignments(
                 source_tracking_key=updated.tracking_key,
             ))
 
-    refreshed_metrics = store.refresh_bot_metrics_from_tracking(insurer_name, bots, previous_metrics)
+    runner._heartbeat("reconcile")
+    prior_progress_heartbeat = getattr(store, "progress_heartbeat", None)
+    store.progress_heartbeat = lambda: runner._heartbeat("reconcile")
+    try:
+        refreshed_metrics = store.refresh_bot_metrics_from_tracking(insurer_name, bots, previous_metrics)
+    finally:
+        store.progress_heartbeat = prior_progress_heartbeat
     active_count = len([item for item in refreshed_tracked if item.is_active])
     stale_count = len([item for item in refreshed_tracked if item.is_stale])
     return {
@@ -8598,7 +8638,7 @@ def _run_for_insurer_once(
             except NoEligibleAssignees:
                 workflow_error_code = "no_eligible_assignees"
                 plans, summary = [], {}
-                print("\nAssignment deferred: no configured assignee is eligible in the current time window.")
+                print("\nAssignment deferred: no active, available assignee has valid capacity configuration.")
                 store.log_runner_event(
                     insurer_name=insurer_name,
                     event_type="runner_assignment_deferred",
@@ -9151,7 +9191,7 @@ def _run_for_insurer_once(
             "message": (
                 f"{manual_action_count} pile(s) require manual action."
                 if manual_action_count
-                else "Assignment deferred until an assignee enters an eligible time window."
+                else "Assignment deferred until an active, available assignee has valid capacity configuration."
                 if workflow_error_code
                 else "No unassigned piles found. Nothing to assign." if total_planned == 0 else ""
             ),

@@ -3355,6 +3355,54 @@ class YearFilterScanningTests(unittest.TestCase):
 
 
 class ExecutionLedgerIntegrationTests(unittest.TestCase):
+    def test_postgres_connections_bound_individual_operations_below_work_lease(self):
+        calls = []
+        connection = types.SimpleNamespace(autocommit=None)
+
+        def connect(url, **options):
+            calls.append((url, options))
+            return connection
+
+        with patch.object(runner.psycopg2, "connect", connect, create=True):
+            result = runner.open_postgres_connection("postgresql://fixture", autocommit=False)
+
+        self.assertIs(result, connection)
+        self.assertFalse(result.autocommit)
+        self.assertEqual(calls[0][1]["connect_timeout"], 10)
+        self.assertIn("statement_timeout=45000", calls[0][1]["options"])
+        self.assertIn("lock_timeout=5000", calls[0][1]["options"])
+
+    def test_tracked_reconciliation_renews_ownership_for_each_database_unit(self):
+        tracked = runner.TrackedPile(
+            id="tracked", master_account_id="master", bot_account_id="", insurer_name="Kenya",
+            tracking_key="pile", last_pile_key="pile", provider="Provider", claim_month="Jul",
+            submitted_date="2026-07-01", claims_total=10, synced_claims=0, remaining_claims=10,
+            assignment_type="Vetting", current_status="Vetting Pending",
+            current_status_bucket="Vetting Pending", current_assigned="", filter_month="Jul",
+            first_assigned_at="", assigned_at="", first_seen_at="", last_seen_at="",
+            last_progress_at="", last_reassigned_at="", completed_at="", is_active=True,
+            is_stale=False, stale_reason="", details={},
+        )
+        heartbeats = []
+        portal = types.SimpleNamespace(_heartbeat=lambda phase: heartbeats.append(phase))
+
+        class Store:
+            def get_active_tracked_piles(self, _):
+                return [runner.replace(tracked, id=f"tracked-{index}", tracking_key=f"pile-{index}") for index in range(5)]
+            def update_tracked_pile_observation(self, item, *_args, **_kwargs):
+                return runner.replace(item, is_active=False)
+            def record_tracked_snapshot(self, *_args):
+                pass
+            def refresh_bot_metrics_from_tracking(self, _name, _bots, metrics):
+                return metrics
+
+        result = runner.reconcile_tracked_assignments(
+            Store(), portal, "Kenya", "All", [], {}, None, ["All"], scanned_rows=[],
+        )
+
+        self.assertEqual(result["tracked_count"], 5)
+        self.assertEqual(heartbeats, ["reconcile"] * 12)
+
     def test_runner_heartbeat_phases_match_database_constraint(self):
         source = Path(runner.__file__).read_text()
         phases = set(__import__("re").findall(r'_heartbeat\("([^\"]+)"', source))
@@ -3632,7 +3680,7 @@ class WorkerAdapterIntegrationTests(unittest.TestCase):
             closed = False
             def close(self):
                 self.closed = True
-        def connect(_url):
+        def connect(_url, **_options):
             connection = Connection()
             connections.append(connection)
             return connection
@@ -4026,7 +4074,7 @@ class DispatcherRunnerFencingTests(unittest.TestCase):
             closed = False
             def close(self):
                 self.closed = True
-        def connect(_url):
+        def connect(_url, **_options):
             result = Connection()
             connections.append(result)
             return result

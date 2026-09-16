@@ -95,7 +95,7 @@ class SqlDatabase:
             self.admin.raw.execute("INSERT INTO piles_auto_assignment_master_accounts VALUES (?,?,true)", (name, name))
         self.admin.raw.commit()
 
-    def connect(self, dsn="offline-acceptance"):
+    def connect(self, dsn="offline-acceptance", **_options):
         if dsn != "offline-acceptance":
             raise AssertionError("Only the offline fixture database may be opened")
         with self.mutex:
