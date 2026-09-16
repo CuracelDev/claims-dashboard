@@ -11,7 +11,7 @@
 ## Small-commit sequence
 
 1. [x] Separate fresh eligibility from reassignment eligibility; pin morning, timezone, overnight, and no-bypass regressions.
-2. [ ] Clarify timing controls and remove obsolete grace editing without destructive schema changes.
+2. [x] Clarify timing controls and remove obsolete grace editing without destructive schema changes.
 3. [ ] Keep reconciliation ownership live, remove redundant reads, and bound database operations rather than entire runs.
 4. [ ] Isolate/supervise insurer execution so blocked work cannot trap the parent or unrelated queued work.
 5. [ ] Audit queue drainage, recovery fencing, parent finalization, and complete per-pile accounting.
