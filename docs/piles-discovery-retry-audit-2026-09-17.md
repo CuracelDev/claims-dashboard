@@ -20,6 +20,8 @@ pile; raw portal evidence is still needed for an end-to-end sign-off.
    persist relocated keys/pages before selection, and preserve the chosen owner.
    Reject ambiguous identities. Fresh assignment plans exclude already-owned
    rows; the existing stale-reassignment path explicitly permits assigned rows.
+   Recovery passes use the same matcher and persist relocation too. Reloaded
+   groups are matched again before selection, rather than using stale row keys.
 
 ## Existing retry boundaries
 
@@ -34,6 +36,8 @@ or uncertain submissions.
 Run `npm run test:piles` before committing. Regression coverage includes admission
 backoff, identity relocation, intended-owner preservation, ambiguous/owned rows,
 read-safe pagination retry classification, and propagating a failed retry.
+Assignment-path tests exercise first-pass and recovery selection. The Piles
+Regression Tests workflow runs the isolated suite on pull requests and main.
 
 No production assignments, scheduler changes, or recovery writes are authorized
 as part of this local validation. After deployment, observe a normal scheduled
