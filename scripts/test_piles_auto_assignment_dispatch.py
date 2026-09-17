@@ -384,6 +384,10 @@ class BoundedDispatcherTests(unittest.TestCase):
         self.assertEqual([event for event in state.events if event[0] == "release_claim"],
                          [("release_claim", "0", "worker_capacity_unavailable")])
 
+    def test_contention_backoff_is_bounded_without_a_retry_limit(self):
+        self.assertEqual([dispatch.contention_retry_delay(2, n) for n in (1, 2, 3, 4, 10000)],
+                         [4, 8, 16, 30, 30])
+
     def test_failed_future_does_not_cancel_peer_or_reexecute_it(self):
         state, calls = DispatchState(), []
         real_execute = dispatch.execute_claimed_insurer

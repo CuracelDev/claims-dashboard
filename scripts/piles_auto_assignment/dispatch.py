@@ -113,6 +113,11 @@ class AssignmentSubmissionUncertain(WorkerUnavailable):
         super().__init__("assignment_submission_uncertain")
 
 
+def contention_retry_delay(poll_interval: float, consecutive_contentions: int) -> float:
+    """Back off admission, not portal execution; never abandon waiting work."""
+    return min(30.0, poll_interval * (2 ** min(consecutive_contentions, 10)))
+
+
 class ClaimOwnership:
     """Worker-local fail-closed lease/lock guard; never shared across threads."""
 
@@ -266,6 +271,7 @@ def dispatch_parent(parent_id, work_items, max_workers, context_factory, run_one
 
     status = ParentRunStatus.RUNNING
     lost_ownership = False
+    consecutive_contentions = 0
     with ContextOutputRouter.installed():
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="piles-insurer") as pool:
             pending = {}
@@ -319,7 +325,10 @@ def dispatch_parent(parent_id, work_items, max_workers, context_factory, run_one
                     outcomes.append(outcome)
                     work_by_outcome[id(outcome)] = work.id
                 if contended:
-                    stopped.wait(poll_interval)
+                    consecutive_contentions += 1
+                    stopped.wait(contention_retry_delay(poll_interval, consecutive_contentions))
+                elif finished:
+                    consecutive_contentions = 0
     ordered = tuple(sorted(outcomes, key=lambda outcome: order.get(outcome.insurer_name, len(order))))
     notifications, external, fingerprints = [], [], []
     for outcome in ordered:
