@@ -3077,6 +3077,34 @@ class YearFilterScanningTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "next Piles page did not settle"):
             runner.CuracelPilesRunner.goto_next_page(portal_runner)
 
+    def test_enabled_next_click_failure_is_not_end_of_scan_or_reclicked(self):
+        clicks = []
+        class Button:
+            first = property(lambda self: self)
+            def count(self): return 1
+            def is_visible(self): return True
+            def get_attribute(self, name): return None
+            def click(self):
+                clicks.append(True)
+                raise TimeoutError("synthetic click timeout")
+        class Page:
+            def locator(self, selector): return Button()
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        portal._table_preview_fingerprint = lambda: ()
+        with self.assertRaises(runner.IncompleteScan) as raised:
+            portal.goto_next_page("All", "All", "Vetting Pending", next_page=2)
+        self.assertEqual(clicks, [True])
+        self.assertTrue(runner.is_retryable_scan_error(raised.exception))
+
+    def test_paginator_lookup_failure_is_not_end_of_scan(self):
+        class Page:
+            def locator(self, selector): raise TimeoutError("synthetic lookup timeout")
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        with self.assertRaises(runner.IncompleteScan):
+            portal.goto_next_page("All", "All", "Vetting Pending", next_page=2)
+
     def test_pagination_waits_for_the_exact_next_page_context(self):
         class NextButton:
             first = None

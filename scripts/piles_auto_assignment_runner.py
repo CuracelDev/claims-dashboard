@@ -5673,11 +5673,14 @@ class CuracelPilesRunner:
             ".p-paginator-next",
             "button:has-text('Next')",
         ]
+        lookup_error: Exception | None = None
         for selector in selectors:
+            control_visible = False
             try:
                 loc = self.page.locator(selector).first
                 if loc.count() == 0 or not loc.is_visible():
                     continue
+                control_visible = True
                 disabled = loc.get_attribute("disabled") is not None
                 classes = norm(loc.get_attribute("class")).lower()
                 if disabled or "disabled" in classes:
@@ -5730,8 +5733,14 @@ class CuracelPilesRunner:
                 return True
             except IncompleteScan:
                 raise
-            except Exception:
-                continue
+            except Exception as error:
+                if control_visible:
+                    # The click may already have navigated. Do not click a
+                    # second alias and accidentally advance two pages.
+                    raise IncompleteScan("The next Piles page navigation failed.") from error
+                lookup_error = error
+        if lookup_error is not None:
+            raise IncompleteScan("The next Piles page navigation failed during control lookup.") from lookup_error
         return False
 
     def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
@@ -8178,6 +8187,7 @@ def is_retryable_scan_error(exc: Exception) -> bool:
         "piles table did not settle into a readable row state",
         "piles table did not match the selected page size response",
         "the next piles page request was not confirmed",
+        "the next piles page navigation failed",
         "the next piles page response payload contained no readable rows",
         "the next piles page did not settle into a readable row state",
         "the next piles page response completed but the visible rows did not change",
