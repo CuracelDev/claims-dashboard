@@ -5326,8 +5326,8 @@ class CuracelPilesRunner:
 
     def _table_headers(self) -> list[str]:
         assert self.page
-        if self._table_headers_cache:
-            return list(self._table_headers_cache)
+        # A filter/status switch can change the rendered column layout. Read
+        # current headers rather than reusing a layout from another context.
         last_error: Exception | None = None
         for attempt in range(3):
             headers: list[str] = []

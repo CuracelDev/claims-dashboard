@@ -1241,6 +1241,20 @@ class LateArrivalWorkflowTests(unittest.TestCase):
 
 
 class SharedPileColumnsTests(unittest.TestCase):
+    def test_live_headers_do_not_reuse_another_contexts_cached_layout(self):
+        class Cell:
+            def __init__(self, text): self.text = text
+            def inner_text(self, **kwargs): return self.text
+        class Headers:
+            def count(self): return 2
+            def nth(self, index): return Cell(["Claims", "Provider"][index])
+        class Page:
+            def locator(self, selector): return Headers()
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        portal._table_headers_cache = ["Provider", "Claims"]
+        self.assertEqual(portal._table_headers(), ["Claims", "Provider"])
+
     def test_reconciliation_keeps_owned_alias_in_either_scan_order(self):
         from scripts.piles_auto_assignment.reconciliation import reconcile_attempt
         unassigned = make_pile(1)
