@@ -6908,7 +6908,7 @@ class CuracelPilesRunner:
             )
 
     def _match_page_plans(self, plans: list[PlannedAssignment], rows: list[PileRow], *, allow_assigned: bool = False) -> list[PlannedAssignment]:
-        """Relocate by stable identity before selecting; never take an owned row."""
+        """Relocate by stable identity; owned rows require reassignment intent."""
         matched = []
         relocated = []
         for plan in plans:
@@ -6981,14 +6981,16 @@ class CuracelPilesRunner:
                         ]
                         for group_index, ((assignee_name, assignment_type), group) in enumerate(grouped_items):
                             self._heartbeat("apply")
+                            if group_index > 0:
+                                current_rows = self.reset_to_filtered_page(filter_month, filter_year, status_label, page_number)
+                                group = self._match_page_plans(group, current_rows, allow_assigned=allow_assigned)
+                                if not group:
+                                    continue
                             requested_keys = [plan.pile_key for plan in group]
                             selected_keys: list[str] = []
                             missing_keys = requested_keys[:]
                             partial_selection_detected = False
                             deferred_missing_keys: list[str] = []
-
-                            if group_index > 0:
-                                current_rows = self.reset_to_filtered_page(filter_month, filter_year, status_label, page_number)
 
                             selection = self._select_rows(requested_keys, current_rows)
                             if selection.selected_keys:
@@ -7110,17 +7112,7 @@ class CuracelPilesRunner:
                             status_label,
                             recovery_page,
                         )
-                        selectable_rows = [row for row in current_rows if not norm(row.assigned)]
-                        rows_by_key = {row.key: row for row in selectable_rows}
-                        rows_by_tracking = {row.tracking_key: row for row in selectable_rows}
-                        page_plans: list[PlannedAssignment] = []
-                        for plan in pending_status_plans:
-                            matched_row = rows_by_key.get(plan.pile_key) or rows_by_tracking.get(plan.tracking_key)
-                            if matched_row is None:
-                                continue
-                            plan.pile_key = matched_row.key
-                            plan.source_page_number = matched_row.page_number
-                            page_plans.append(plan)
+                        page_plans = self._match_page_plans(pending_status_plans, current_rows, allow_assigned=allow_assigned)
                         if not page_plans:
                             continue
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
@@ -7139,6 +7131,9 @@ class CuracelPilesRunner:
                                     status_label,
                                     recovery_page,
                                 )
+                                group = self._match_page_plans(group, current_rows, allow_assigned=allow_assigned)
+                                if not group:
+                                    continue
                             requested_keys = [plan.pile_key for plan in group]
                             selection = self._select_rows(requested_keys, current_rows)
                             if not selection.selected_keys:
