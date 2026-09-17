@@ -1240,6 +1240,75 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     self.assertEqual(state.mapping, [])
 
 
+class SharedPileColumnsTests(unittest.TestCase):
+    def test_live_headers_do_not_reuse_another_contexts_cached_layout(self):
+        class Cell:
+            def __init__(self, text): self.text = text
+            def inner_text(self, **kwargs): return self.text
+        class Headers:
+            def count(self): return 2
+            def nth(self, index): return Cell(["Claims", "Provider"][index])
+        class Page:
+            def locator(self, selector): return Headers()
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        portal._table_headers_cache = ["Provider", "Claims"]
+        self.assertEqual(portal._table_headers(), ["Claims", "Provider"])
+
+    def test_reconciliation_keeps_owned_alias_in_either_scan_order(self):
+        from scripts.piles_auto_assignment.reconciliation import reconcile_attempt
+        unassigned = make_pile(1)
+        assigned = runner.replace(unassigned, key="assigned-alias", assigned="Daniel")
+        attempt = {"tracking_key": unassigned.tracking_key, "last_pile_key": unassigned.key}
+        for rows in ([assigned, unassigned], [unassigned, assigned]):
+            observations = runner.observations_for_scanned_attempt(rows, attempt)
+            indexed = runner.index_scanned_rows(rows)
+            indexed_observations = runner.observations_for_scanned_attempt([], attempt, indexed_rows=indexed)
+            self.assertEqual(len(indexed_observations), 2)
+            self.assertEqual(reconcile_attempt(indexed_observations, "Daniel").status, runner.AttemptStatus.CONFIRMED_RECONCILED)
+            self.assertEqual(reconcile_attempt(observations, "Daniel").status, runner.AttemptStatus.CONFIRMED_RECONCILED)
+            self.assertEqual(reconcile_attempt(observations, "Another owner").status, runner.AttemptStatus.CONFLICT)
+
+    def test_reordered_columns_are_discovered_and_selected_consistently(self):
+        checked = []
+        texts = ["", "reference", "Provider", "10", "Sep", "100", "", "2026-09-01", "Vetting Pending", "", ""]
+        class Cell:
+            def __init__(self, text): self.text = text
+            def inner_text(self): return self.text
+        class Items:
+            def __init__(self, values): self.values = values
+            def count(self): return len(self.values)
+            def nth(self, index): return self.values[index]
+        class Checkbox:
+            first = property(lambda self: self)
+            def check(self, **kwargs): checked.append(True)
+        class Row:
+            def locator(self, selector):
+                if selector == "td":
+                    return Items([Cell(t) for t in texts])
+                return Checkbox()
+        class Page:
+            def locator(self, selector): return Items([Row()])
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        portal._table_headers = lambda: ["", "Reference", "Provider", "Claims", "Month", "Amount", "Notes", "Submitted Date", "Status", "Assigned", "Actions"]
+        rows = portal.rows_on_current_page("Vetting Pending", 1, "All", "All")
+        selection = portal._select_rows([rows[0].key], rows)
+        self.assertEqual(selection.selected_keys, [rows[0].key])
+        self.assertEqual(checked, [True])
+        texts[9] = "Manual owner"
+        self.assertEqual(portal._select_rows([rows[0].key], rows).count, 0)
+        texts[9] = ""
+        texts[5] = "1000"
+        self.assertEqual(portal._select_rows([rows[0].key], rows).count, 0)
+        self.assertEqual(checked, [True])
+
+    def test_legacy_layout_and_short_rows_have_deterministic_fallbacks(self):
+        values = runner.pile_cell_values(["", "Provider", "10", "Sep", "100", "", "date", "status", "owner", ""], [])
+        self.assertEqual((values["provider"], values["assigned"]), ("Provider", "owner"))
+        self.assertEqual(runner.pile_cell_values([], ["Provider"])["provider"], "")
+
+
 class AssignmentPlanCompletionTests(unittest.TestCase):
     def fixture(self):
         plans, _summary = runner.build_assignment_plan(
@@ -3042,6 +3111,34 @@ class YearFilterScanningTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "next Piles page did not settle"):
             runner.CuracelPilesRunner.goto_next_page(portal_runner)
+
+    def test_enabled_next_click_failure_is_not_end_of_scan_or_reclicked(self):
+        clicks = []
+        class Button:
+            first = property(lambda self: self)
+            def count(self): return 1
+            def is_visible(self): return True
+            def get_attribute(self, name): return None
+            def click(self):
+                clicks.append(True)
+                raise TimeoutError("synthetic click timeout")
+        class Page:
+            def locator(self, selector): return Button()
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        portal._table_preview_fingerprint = lambda: ()
+        with self.assertRaises(runner.IncompleteScan) as raised:
+            portal.goto_next_page("All", "All", "Vetting Pending", next_page=2)
+        self.assertEqual(clicks, [True])
+        self.assertTrue(runner.is_retryable_scan_error(raised.exception))
+
+    def test_paginator_lookup_failure_is_not_end_of_scan(self):
+        class Page:
+            def locator(self, selector): raise TimeoutError("synthetic lookup timeout")
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        with self.assertRaises(runner.IncompleteScan):
+            portal.goto_next_page("All", "All", "Vetting Pending", next_page=2)
 
     def test_pagination_waits_for_the_exact_next_page_context(self):
         class NextButton:

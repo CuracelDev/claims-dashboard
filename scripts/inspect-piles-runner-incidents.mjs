@@ -22,7 +22,7 @@ const SAFE_FIELDS = Object.freeze({
     'reconciliation_pending_pile_count', 'reconciliation_pending_claim_count',
     'conflict_pile_count', 'failed_pile_count', 'error_code', 'error_message',
     'heartbeat_at', 'heartbeat_age_seconds', 'started_at', 'finished_at',
-    'duration_ms', 'created_at', 'updated_at',
+    'duration_ms', 'created_at', 'updated_at', 'failure',
   ],
   contexts: [
     'id', 'insurer_run_id', 'insurer_name', 'filter_month', 'requested_year',
@@ -93,6 +93,7 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
     `, hours, runId),
     insurers: query(`
       select id, runner_run_id, insurer_name, status, phase,
+             details -> 'failure' as failure,
              discovered_pile_count, discovered_claim_count,
              planned_pile_count, planned_claim_count,
              submitted_pile_count, submitted_claim_count,
@@ -205,10 +206,23 @@ function projectRows(section, rows) {
       if (row[field] !== undefined) projected[field] = row[field];
     }
     if ('error_code' in projected) projected.error_code = normalizeErrorCode(projected.error_code);
+    if ('failure' in projected) projected.failure = sanitizeFailure(projected.failure);
     if ('reason_code' in projected) projected.reason_code = normalizeErrorCode(projected.reason_code);
     if ('error_message' in projected) projected.error_message = sanitizeMessage(projected.error_message);
     return projected;
   });
+}
+
+function sanitizeFailure(value) {
+  const allowed = {
+    phase: ['login', 'navigation', 'scan', 'plan', 'apply', 'verify', 'reconcile', 'final_rescan', 'other'],
+    module: ['piles_auto_assignment_runner', 'dispatch', 'store', 'reconciliation', 'scanning', 'evidence', 'planning', 'orchestrator', 'timing'],
+    error_type: ['TypeError', 'ValueError', 'KeyError', 'AttributeError', 'RuntimeError', 'TimeoutError', 'IncompleteScan', 'ConcurrentStateChange', 'TrackingKeyCollision', 'NoEligibleAssignees', 'OperationalError', 'IntegrityError', 'ProgrammingError', 'WorkOwnershipLost'],
+  };
+  const result = {};
+  for (const [key, names] of Object.entries(allowed)) result[key] = names.includes(value?.[key]) ? value[key] : 'other';
+  result.line = Number.isInteger(value?.line) && value.line > 0 && value.line <= 1000000 ? value.line : 0;
+  return result;
 }
 
 export function buildIncidentReport({ hours, runId, workItemsAvailable, sections }) {

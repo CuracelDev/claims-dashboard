@@ -30,6 +30,10 @@ class PhaseTimer:
         self._aggregates = {}
         self._phase = None
 
+    @property
+    def current_phase(self):
+        return self._phase[0] if self._phase else 'other'
+
     def enter_phase(self, phase):
         now = time.monotonic_ns()
         phase = _name(phase, PHASES)

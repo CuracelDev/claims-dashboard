@@ -53,6 +53,7 @@ try:
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
     from piles_auto_assignment.timing import PhaseTimer, timed_operation
+    from piles_auto_assignment.diagnostics import failure_diagnostic
     from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from piles_auto_assignment.planning import (
         NoEligibleAssignees,
@@ -73,6 +74,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
     from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
+    from scripts.piles_auto_assignment.diagnostics import failure_diagnostic
     from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from scripts.piles_auto_assignment.planning import (
         NoEligibleAssignees,
@@ -1381,6 +1383,36 @@ def pile_row_matches_filter_year(pile: "PileRow", requested_year: str) -> bool:
         return True
     rendered_years = set(re.findall(r"\b20\d{2}\b", norm(pile.month)))
     return not rendered_years or rendered_years == {expected_year}
+
+
+def pile_cell_values(texts: list[str], headers: list[str]) -> dict[str, str]:
+    """Use the same column interpretation for discovery and live selection."""
+    header_map = {norm_key(h): i for i, h in enumerate(headers)}
+    positions = {"provider": 1, "claims": 2, "month": 3, "amount": 4,
+                 "submitted date": 6, "status": 7, "assigned": max(len(texts) - 2, 0)}
+    return {
+        label: texts[index] if index < len(texts) else ""
+        for label, fallback in positions.items()
+        for index in [header_map.get(norm_key(label), fallback)]
+    }
+
+
+def index_scanned_rows(rows: list["PileRow"]) -> dict[str, list["PileRow"]]:
+    indexed: dict[str, list[PileRow]] = {}
+    for row in rows:
+        for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]):
+            indexed.setdefault(key, []).append(row)
+    return indexed
+
+
+def observations_for_scanned_attempt(rows: list["PileRow"], attempt: dict[str, Any], *, indexed_rows=None) -> list[Observation]:
+    """Keep all matching context aliases; positive ownership outranks blanks."""
+    keys = expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
+    indexed = index_scanned_rows(rows) if indexed_rows is None else indexed_rows
+    matching = {id(row): row for key in keys for row in indexed.get(key, [])}
+    return [Observation(assignable=not norm(row.assigned), assignee=norm(row.assigned),
+                        source="complete_initial_scan")
+            for row in matching.values()]
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -5294,8 +5326,8 @@ class CuracelPilesRunner:
 
     def _table_headers(self) -> list[str]:
         assert self.page
-        if self._table_headers_cache:
-            return list(self._table_headers_cache)
+        # A filter/status switch can change the rendered column layout. Read
+        # current headers rather than reusing a layout from another context.
         last_error: Exception | None = None
         for attempt in range(3):
             headers: list[str] = []
@@ -5374,7 +5406,6 @@ class CuracelPilesRunner:
     ) -> list[PileRow]:
         assert self.page
         headers = self._table_headers()
-        header_map = {norm_key(h): i for i, h in enumerate(headers)}
         rows = self.page.locator("table tbody tr")
         piles: list[PileRow] = []
         for idx in range(rows.count()):
@@ -5385,24 +5416,17 @@ class CuracelPilesRunner:
             if "no data found" in joined:
                 continue
 
-            def value(label: str, fallback_index: int | None = None) -> str:
-                key = norm_key(label)
-                if key in header_map and header_map[key] < len(texts):
-                    return texts[header_map[key]]
-                if fallback_index is not None and fallback_index < len(texts):
-                    return texts[fallback_index]
-                return ""
-
-            provider = value("provider", 1)
-            claims_cell = value("claims", 2)
+            values = pile_cell_values(texts, headers)
+            provider = values["provider"]
+            claims_cell = values["claims"]
             claims = safe_int(claims_cell, 0)
             synced_claims = min(claims, parse_synced_claims(claims_cell))
             remaining_claims = max(claims - synced_claims, 0)
-            month = value("month", 3)
-            amount_text = value("amount", 4)
-            submitted_date = value("submitted date", 6)
-            row_status = value("status", 7) or status_bucket
-            assigned = value("assigned", len(texts) - 2 if len(texts) >= 2 else 0)
+            month = values["month"]
+            amount_text = values["amount"]
+            submitted_date = values["submitted date"]
+            row_status = values["status"] or status_bucket
+            assigned = values["assigned"]
             if claims <= 0 and not any([provider, amount_text, month, submitted_date, row_status, assigned]):
                 continue
             tracking_key = stable_pile_tracking_key(provider, claims, amount_text, month, submitted_date)
@@ -5669,11 +5693,14 @@ class CuracelPilesRunner:
             ".p-paginator-next",
             "button:has-text('Next')",
         ]
+        lookup_error: Exception | None = None
         for selector in selectors:
+            control_visible = False
             try:
                 loc = self.page.locator(selector).first
                 if loc.count() == 0 or not loc.is_visible():
                     continue
+                control_visible = True
                 disabled = loc.get_attribute("disabled") is not None
                 classes = norm(loc.get_attribute("class")).lower()
                 if disabled or "disabled" in classes:
@@ -5726,8 +5753,14 @@ class CuracelPilesRunner:
                 return True
             except IncompleteScan:
                 raise
-            except Exception:
-                continue
+            except Exception as error:
+                if control_visible:
+                    # The click may already have navigated. Do not click a
+                    # second alias and accidentally advance two pages.
+                    raise IncompleteScan("The next Piles page navigation failed.") from error
+                lookup_error = error
+        if lookup_error is not None:
+            raise IncompleteScan("The next Piles page navigation failed during control lookup.") from lookup_error
         return False
 
     def scan_status(self, month_label: str, year_label: str, status_label: str, *, only_unassigned: bool = False) -> list[PileRow]:
@@ -6132,6 +6165,7 @@ class CuracelPilesRunner:
     @timed_operation('apply', 'row_selection')
     def _select_rows(self, pile_keys: list[str], current_rows: list[PileRow]) -> RowSelectionResult:
         assert self.page
+        headers = self._table_headers()
         rows = self.page.locator("table tbody tr")
         selected = 0
         selected_keys: list[str] = []
@@ -6144,13 +6178,14 @@ class CuracelPilesRunner:
             texts = [norm(cells.nth(c).inner_text()) for c in range(cells.count())]
             if "no data found" in " ".join(texts).lower():
                 continue
-            provider = texts[1] if len(texts) > 1 else ""
-            claims_cell = texts[2] if len(texts) > 2 else "0"
+            values = pile_cell_values(texts, headers)
+            provider = values["provider"]
+            claims_cell = values["claims"]
             claims = safe_int(claims_cell, 0)
             synced_claims = min(claims, parse_synced_claims(claims_cell))
-            month = texts[3] if len(texts) > 3 else ""
-            amount_text = texts[4] if len(texts) > 4 else ""
-            submitted = texts[6] if len(texts) > 6 else ""
+            month = values["month"]
+            amount_text = values["amount"]
+            submitted = values["submitted date"]
             matched_keys: list[str] = []
             if idx < len(current_rows):
                 indexed_row = current_rows[idx]
@@ -6159,8 +6194,9 @@ class CuracelPilesRunner:
                     and indexed_row.claims == claims
                     and indexed_row.synced_claims == synced_claims
                     and indexed_row.month == month
-                    and norm(indexed_row.key).find(norm(amount_text)) >= 0
+                    and norm(indexed_row.amount_text) == norm(amount_text)
                     and indexed_row.submitted_date == submitted
+                    and norm(indexed_row.assigned) == norm(values["assigned"])
                 ):
                     matched_keys.append(indexed_row.key)
             if not matched_keys:
@@ -6172,8 +6208,11 @@ class CuracelPilesRunner:
                     and pile.synced_claims == synced_claims
                     and pile.month == month
                     and pile.submitted_date == submitted
-                    and norm(amount_text) in norm(pile.key)
+                    and norm(pile.amount_text) == norm(amount_text)
+                    and norm(pile.assigned) == norm(values["assigned"])
                 ]
+            if len(matched_keys) > 1:
+                raise IncompleteScan("Ambiguous pile identity during live row selection.")
             target_key = next((key for key in matched_keys if key in remaining_keys), None)
             if not target_key:
                 continue
@@ -8168,6 +8207,7 @@ def is_retryable_scan_error(exc: Exception) -> bool:
         "piles table did not settle into a readable row state",
         "piles table did not match the selected page size response",
         "the next piles page request was not confirmed",
+        "the next piles page navigation failed",
         "the next piles page response payload contained no readable rows",
         "the next piles page did not settle into a readable row state",
         "the next piles page response completed but the visible rows did not change",
@@ -8474,22 +8514,11 @@ def _run_for_insurer_once(
                     evidence={"code": "superseded_unsubmitted_plan", "details": {}},
                 )
 
-            rows_by_tracking: dict[str, PileRow] = {}
-            for row in scanned_rows:
-                for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key]):
-                    rows_by_tracking[key] = row
+            indexed_initial_rows = index_scanned_rows(scanned_rows)
 
             class ScannedRowsPortal:
                 def observe_attempt(self, attempt: dict[str, Any]) -> list[Observation]:
-                    key = canonical_pile_tracking_key(attempt.get("tracking_key"))
-                    observed = rows_by_tracking.get(key)
-                    if observed is None:
-                        return []
-                    return [Observation(
-                        assignable=not norm(observed.assigned),
-                        assignee=norm(observed.assigned),
-                        source="complete_initial_scan",
-                    )]
+                    return observations_for_scanned_attempt(scanned_rows, attempt, indexed_rows=indexed_initial_rows)
 
             pending_attempts = execution_ledger.pending_attempts(insurer_name)
             prior_attempt_keys.update(expanded_tracking_key_set(
@@ -9468,6 +9497,7 @@ def run_insurer_recorded(
             ownership.check()
         if insurer_run_id:
             try:
+                failure = failure_diagnostic(exc, args.phase_timer.current_phase)
                 args.phase_timer.finish('failed')
                 execution_ledger.finalize_insurer_run(
                     insurer_run_id,
@@ -9475,6 +9505,7 @@ def run_insurer_recorded(
                     error_code=safe_worker_error(exc)[0] if safe_diagnostics else classify_runner_error(exc),
                     error_message=safe_worker_error(exc)[1] if safe_diagnostics else str(exc)[:500],
                     performance=args.phase_timer.serialize(),
+                    failure=failure,
                 )
             except Exception as ledger_error:
                 if safe_diagnostics:
