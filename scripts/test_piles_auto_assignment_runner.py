@@ -1241,8 +1241,19 @@ class LateArrivalWorkflowTests(unittest.TestCase):
 
 
 class SharedPileColumnsTests(unittest.TestCase):
+    def test_reconciliation_keeps_owned_alias_in_either_scan_order(self):
+        from scripts.piles_auto_assignment.reconciliation import reconcile_attempt
+        unassigned = make_pile(1)
+        assigned = runner.replace(unassigned, key="assigned-alias", assigned="Daniel")
+        attempt = {"tracking_key": unassigned.tracking_key, "last_pile_key": unassigned.key}
+        for rows in ([assigned, unassigned], [unassigned, assigned]):
+            observations = runner.observations_for_scanned_attempt(rows, attempt)
+            self.assertEqual(reconcile_attempt(observations, "Daniel").status, runner.AttemptStatus.CONFIRMED_RECONCILED)
+            self.assertEqual(reconcile_attempt(observations, "Another owner").status, runner.AttemptStatus.CONFLICT)
+
     def test_reordered_columns_are_discovered_and_selected_consistently(self):
         checked = []
+        texts = ["", "reference", "Provider", "10", "Sep", "100", "", "2026-09-01", "Vetting Pending", "", ""]
         class Cell:
             def __init__(self, text): self.text = text
             def inner_text(self): return self.text
@@ -1256,7 +1267,7 @@ class SharedPileColumnsTests(unittest.TestCase):
         class Row:
             def locator(self, selector):
                 if selector == "td":
-                    return Items([Cell(t) for t in ["", "reference", "Provider", "10", "Sep", "100", "", "2026-09-01", "Vetting Pending", "", ""]])
+                    return Items([Cell(t) for t in texts])
                 return Checkbox()
         class Page:
             def locator(self, selector): return Items([Row()])
@@ -1266,6 +1277,12 @@ class SharedPileColumnsTests(unittest.TestCase):
         rows = portal.rows_on_current_page("Vetting Pending", 1, "All", "All")
         selection = portal._select_rows([rows[0].key], rows)
         self.assertEqual(selection.selected_keys, [rows[0].key])
+        self.assertEqual(checked, [True])
+        texts[9] = "Manual owner"
+        self.assertEqual(portal._select_rows([rows[0].key], rows).count, 0)
+        texts[9] = ""
+        texts[5] = "1000"
+        self.assertEqual(portal._select_rows([rows[0].key], rows).count, 0)
         self.assertEqual(checked, [True])
 
     def test_legacy_layout_and_short_rows_have_deterministic_fallbacks(self):

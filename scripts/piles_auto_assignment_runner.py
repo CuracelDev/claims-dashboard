@@ -53,6 +53,7 @@ try:
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
     from piles_auto_assignment.timing import PhaseTimer, timed_operation
+    from piles_auto_assignment.diagnostics import failure_diagnostic
     from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from piles_auto_assignment.planning import (
         NoEligibleAssignees,
@@ -73,6 +74,7 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
     from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
+    from scripts.piles_auto_assignment.diagnostics import failure_diagnostic
     from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
     from scripts.piles_auto_assignment.planning import (
         NoEligibleAssignees,
@@ -1393,6 +1395,15 @@ def pile_cell_values(texts: list[str], headers: list[str]) -> dict[str, str]:
         for label, fallback in positions.items()
         for index in [header_map.get(norm_key(label), fallback)]
     }
+
+
+def observations_for_scanned_attempt(rows: list["PileRow"], attempt: dict[str, Any]) -> list[Observation]:
+    """Keep all matching context aliases; positive ownership outranks blanks."""
+    keys = expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
+    return [Observation(assignable=not norm(row.assigned), assignee=norm(row.assigned),
+                        source="complete_initial_scan")
+            for row in rows
+            if keys.intersection(expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]))]
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -8494,22 +8505,9 @@ def _run_for_insurer_once(
                     evidence={"code": "superseded_unsubmitted_plan", "details": {}},
                 )
 
-            rows_by_tracking: dict[str, PileRow] = {}
-            for row in scanned_rows:
-                for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key]):
-                    rows_by_tracking[key] = row
-
             class ScannedRowsPortal:
                 def observe_attempt(self, attempt: dict[str, Any]) -> list[Observation]:
-                    key = canonical_pile_tracking_key(attempt.get("tracking_key"))
-                    observed = rows_by_tracking.get(key)
-                    if observed is None:
-                        return []
-                    return [Observation(
-                        assignable=not norm(observed.assigned),
-                        assignee=norm(observed.assigned),
-                        source="complete_initial_scan",
-                    )]
+                    return observations_for_scanned_attempt(scanned_rows, attempt)
 
             pending_attempts = execution_ledger.pending_attempts(insurer_name)
             prior_attempt_keys.update(expanded_tracking_key_set(
@@ -9488,6 +9486,7 @@ def run_insurer_recorded(
             ownership.check()
         if insurer_run_id:
             try:
+                failure = failure_diagnostic(exc, args.phase_timer.current_phase)
                 args.phase_timer.finish('failed')
                 execution_ledger.finalize_insurer_run(
                     insurer_run_id,
@@ -9495,6 +9494,7 @@ def run_insurer_recorded(
                     error_code=safe_worker_error(exc)[0] if safe_diagnostics else classify_runner_error(exc),
                     error_message=safe_worker_error(exc)[1] if safe_diagnostics else str(exc)[:500],
                     performance=args.phase_timer.serialize(),
+                    failure=failure,
                 )
             except Exception as ledger_error:
                 if safe_diagnostics:
