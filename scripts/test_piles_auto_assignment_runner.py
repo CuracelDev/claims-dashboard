@@ -1248,6 +1248,10 @@ class SharedPileColumnsTests(unittest.TestCase):
         attempt = {"tracking_key": unassigned.tracking_key, "last_pile_key": unassigned.key}
         for rows in ([assigned, unassigned], [unassigned, assigned]):
             observations = runner.observations_for_scanned_attempt(rows, attempt)
+            indexed = runner.index_scanned_rows(rows)
+            indexed_observations = runner.observations_for_scanned_attempt([], attempt, indexed_rows=indexed)
+            self.assertEqual(len(indexed_observations), 2)
+            self.assertEqual(reconcile_attempt(indexed_observations, "Daniel").status, runner.AttemptStatus.CONFIRMED_RECONCILED)
             self.assertEqual(reconcile_attempt(observations, "Daniel").status, runner.AttemptStatus.CONFIRMED_RECONCILED)
             self.assertEqual(reconcile_attempt(observations, "Another owner").status, runner.AttemptStatus.CONFLICT)
 

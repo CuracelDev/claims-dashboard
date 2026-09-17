@@ -1397,13 +1397,22 @@ def pile_cell_values(texts: list[str], headers: list[str]) -> dict[str, str]:
     }
 
 
-def observations_for_scanned_attempt(rows: list["PileRow"], attempt: dict[str, Any]) -> list[Observation]:
+def index_scanned_rows(rows: list["PileRow"]) -> dict[str, list["PileRow"]]:
+    indexed: dict[str, list[PileRow]] = {}
+    for row in rows:
+        for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]):
+            indexed.setdefault(key, []).append(row)
+    return indexed
+
+
+def observations_for_scanned_attempt(rows: list["PileRow"], attempt: dict[str, Any], *, indexed_rows=None) -> list[Observation]:
     """Keep all matching context aliases; positive ownership outranks blanks."""
     keys = expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
+    indexed = index_scanned_rows(rows) if indexed_rows is None else indexed_rows
+    matching = {id(row): row for key in keys for row in indexed.get(key, [])}
     return [Observation(assignable=not norm(row.assigned), assignee=norm(row.assigned),
                         source="complete_initial_scan")
-            for row in rows
-            if keys.intersection(expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]))]
+            for row in matching.values()]
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -8505,9 +8514,11 @@ def _run_for_insurer_once(
                     evidence={"code": "superseded_unsubmitted_plan", "details": {}},
                 )
 
+            indexed_initial_rows = index_scanned_rows(scanned_rows)
+
             class ScannedRowsPortal:
                 def observe_attempt(self, attempt: dict[str, Any]) -> list[Observation]:
-                    return observations_for_scanned_attempt(scanned_rows, attempt)
+                    return observations_for_scanned_attempt(scanned_rows, attempt, indexed_rows=indexed_initial_rows)
 
             pending_attempts = execution_ledger.pending_attempts(insurer_name)
             prior_attempt_keys.update(expanded_tracking_key_set(
