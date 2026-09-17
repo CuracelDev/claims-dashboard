@@ -1240,6 +1240,40 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                     self.assertEqual(state.mapping, [])
 
 
+class SharedPileColumnsTests(unittest.TestCase):
+    def test_reordered_columns_are_discovered_and_selected_consistently(self):
+        checked = []
+        class Cell:
+            def __init__(self, text): self.text = text
+            def inner_text(self): return self.text
+        class Items:
+            def __init__(self, values): self.values = values
+            def count(self): return len(self.values)
+            def nth(self, index): return self.values[index]
+        class Checkbox:
+            first = property(lambda self: self)
+            def check(self, **kwargs): checked.append(True)
+        class Row:
+            def locator(self, selector):
+                if selector == "td":
+                    return Items([Cell(t) for t in ["", "reference", "Provider", "10", "Sep", "100", "", "2026-09-01", "Vetting Pending", "", ""]])
+                return Checkbox()
+        class Page:
+            def locator(self, selector): return Items([Row()])
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal.page = Page()
+        portal._table_headers = lambda: ["", "Reference", "Provider", "Claims", "Month", "Amount", "Notes", "Submitted Date", "Status", "Assigned", "Actions"]
+        rows = portal.rows_on_current_page("Vetting Pending", 1, "All", "All")
+        selection = portal._select_rows([rows[0].key], rows)
+        self.assertEqual(selection.selected_keys, [rows[0].key])
+        self.assertEqual(checked, [True])
+
+    def test_legacy_layout_and_short_rows_have_deterministic_fallbacks(self):
+        values = runner.pile_cell_values(["", "Provider", "10", "Sep", "100", "", "date", "status", "owner", ""], [])
+        self.assertEqual((values["provider"], values["assigned"]), ("Provider", "owner"))
+        self.assertEqual(runner.pile_cell_values([], ["Provider"])["provider"], "")
+
+
 class AssignmentPlanCompletionTests(unittest.TestCase):
     def fixture(self):
         plans, _summary = runner.build_assignment_plan(

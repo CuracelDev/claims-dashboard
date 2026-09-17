@@ -1383,6 +1383,18 @@ def pile_row_matches_filter_year(pile: "PileRow", requested_year: str) -> bool:
     return not rendered_years or rendered_years == {expected_year}
 
 
+def pile_cell_values(texts: list[str], headers: list[str]) -> dict[str, str]:
+    """Use the same column interpretation for discovery and live selection."""
+    header_map = {norm_key(h): i for i, h in enumerate(headers)}
+    positions = {"provider": 1, "claims": 2, "month": 3, "amount": 4,
+                 "submitted date": 6, "status": 7, "assigned": max(len(texts) - 2, 0)}
+    return {
+        label: texts[index] if index < len(texts) else ""
+        for label, fallback in positions.items()
+        for index in [header_map.get(norm_key(label), fallback)]
+    }
+
+
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
     seen = set()
     unique_rows: list[PileRow] = []
@@ -5374,7 +5386,6 @@ class CuracelPilesRunner:
     ) -> list[PileRow]:
         assert self.page
         headers = self._table_headers()
-        header_map = {norm_key(h): i for i, h in enumerate(headers)}
         rows = self.page.locator("table tbody tr")
         piles: list[PileRow] = []
         for idx in range(rows.count()):
@@ -5385,24 +5396,17 @@ class CuracelPilesRunner:
             if "no data found" in joined:
                 continue
 
-            def value(label: str, fallback_index: int | None = None) -> str:
-                key = norm_key(label)
-                if key in header_map and header_map[key] < len(texts):
-                    return texts[header_map[key]]
-                if fallback_index is not None and fallback_index < len(texts):
-                    return texts[fallback_index]
-                return ""
-
-            provider = value("provider", 1)
-            claims_cell = value("claims", 2)
+            values = pile_cell_values(texts, headers)
+            provider = values["provider"]
+            claims_cell = values["claims"]
             claims = safe_int(claims_cell, 0)
             synced_claims = min(claims, parse_synced_claims(claims_cell))
             remaining_claims = max(claims - synced_claims, 0)
-            month = value("month", 3)
-            amount_text = value("amount", 4)
-            submitted_date = value("submitted date", 6)
-            row_status = value("status", 7) or status_bucket
-            assigned = value("assigned", len(texts) - 2 if len(texts) >= 2 else 0)
+            month = values["month"]
+            amount_text = values["amount"]
+            submitted_date = values["submitted date"]
+            row_status = values["status"] or status_bucket
+            assigned = values["assigned"]
             if claims <= 0 and not any([provider, amount_text, month, submitted_date, row_status, assigned]):
                 continue
             tracking_key = stable_pile_tracking_key(provider, claims, amount_text, month, submitted_date)
@@ -6132,6 +6136,7 @@ class CuracelPilesRunner:
     @timed_operation('apply', 'row_selection')
     def _select_rows(self, pile_keys: list[str], current_rows: list[PileRow]) -> RowSelectionResult:
         assert self.page
+        headers = self._table_headers()
         rows = self.page.locator("table tbody tr")
         selected = 0
         selected_keys: list[str] = []
@@ -6144,13 +6149,14 @@ class CuracelPilesRunner:
             texts = [norm(cells.nth(c).inner_text()) for c in range(cells.count())]
             if "no data found" in " ".join(texts).lower():
                 continue
-            provider = texts[1] if len(texts) > 1 else ""
-            claims_cell = texts[2] if len(texts) > 2 else "0"
+            values = pile_cell_values(texts, headers)
+            provider = values["provider"]
+            claims_cell = values["claims"]
             claims = safe_int(claims_cell, 0)
             synced_claims = min(claims, parse_synced_claims(claims_cell))
-            month = texts[3] if len(texts) > 3 else ""
-            amount_text = texts[4] if len(texts) > 4 else ""
-            submitted = texts[6] if len(texts) > 6 else ""
+            month = values["month"]
+            amount_text = values["amount"]
+            submitted = values["submitted date"]
             matched_keys: list[str] = []
             if idx < len(current_rows):
                 indexed_row = current_rows[idx]
@@ -6159,8 +6165,9 @@ class CuracelPilesRunner:
                     and indexed_row.claims == claims
                     and indexed_row.synced_claims == synced_claims
                     and indexed_row.month == month
-                    and norm(indexed_row.key).find(norm(amount_text)) >= 0
+                    and norm(indexed_row.amount_text) == norm(amount_text)
                     and indexed_row.submitted_date == submitted
+                    and norm(indexed_row.assigned) == norm(values["assigned"])
                 ):
                     matched_keys.append(indexed_row.key)
             if not matched_keys:
@@ -6172,8 +6179,11 @@ class CuracelPilesRunner:
                     and pile.synced_claims == synced_claims
                     and pile.month == month
                     and pile.submitted_date == submitted
-                    and norm(amount_text) in norm(pile.key)
+                    and norm(pile.amount_text) == norm(amount_text)
+                    and norm(pile.assigned) == norm(values["assigned"])
                 ]
+            if len(matched_keys) > 1:
+                raise IncompleteScan("Ambiguous pile identity during live row selection.")
             target_key = next((key for key in matched_keys if key in remaining_keys), None)
             if not target_key:
                 continue
