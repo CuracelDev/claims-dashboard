@@ -1583,6 +1583,58 @@ class ReadOnlyProbeTests(unittest.TestCase):
             "Configured bot names did not match the portal dropdown."
         )))
 
+    def test_page_plan_relocation_preserves_intended_owner_and_persists_before_selection(self):
+        portal = object.__new__(runner.CuracelPilesRunner)
+        saved = []
+        portal._persist_relocated_plans = lambda plans: saved.extend(plans)
+        row = make_pile(1)
+        plan = types.SimpleNamespace(pile_key="old-key", tracking_key=row.tracking_key,
+                                     source_page_number=99, assignee_name="Daniel")
+        self.assertEqual(portal._match_page_plans([plan], [row]), [plan])
+        self.assertEqual((plan.pile_key, plan.source_page_number, plan.assignee_name),
+                         (row.key, row.page_number, "Daniel"))
+        self.assertEqual(saved, [plan])
+
+    def test_page_plan_relocation_rejects_owned_ambiguous_and_different_identity_rows(self):
+        portal = object.__new__(runner.CuracelPilesRunner)
+        portal._persist_relocated_plans = lambda plans: self.assertEqual(plans, [])
+        row = make_pile(1)
+        plan = types.SimpleNamespace(pile_key=row.key, tracking_key=row.tracking_key,
+                                     source_page_number=row.page_number)
+        row.assigned = "Manual Owner"
+        self.assertEqual(portal._match_page_plans([plan], [row]), [])
+        self.assertEqual(portal._match_page_plans([plan], [row], allow_assigned=True), [plan])
+        row.assigned = ""
+        with self.assertRaises(runner.IncompleteScan):
+            portal._match_page_plans([plan], [row, row])
+        plan.tracking_key = "different-identity"
+        self.assertEqual(portal._match_page_plans([plan], [row]), [])
+
+    def test_read_safe_pagination_failures_retry_but_identity_collisions_do_not(self):
+        for message in (
+            "The next Piles page request was not confirmed: timeout",
+            "The next Piles page response payload contained no readable rows.",
+            "The next Piles page did not settle into a readable row state.",
+            "The next Piles page response completed but the visible rows did not change.",
+            "Piles filters were not confirmed: filter_response_failed",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(runner.is_retryable_scan_error(RuntimeError(message)))
+        self.assertFalse(runner.is_retryable_scan_error(RuntimeError("Tracking key collision")))
+
+    def test_failed_read_retry_propagates_instead_of_reporting_an_empty_scan(self):
+        portal = object.__new__(runner.CuracelPilesRunner)
+        calls = []
+        def scan(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise runner.IncompleteScan("The next Piles page did not settle into a readable row state.")
+        portal.scan_status = scan
+        portal.open_piles = lambda: None
+        with self.assertRaises(runner.IncompleteScan):
+            portal._scan_status_with_transient_retry("All", "All", "Vetting Pending", only_unassigned=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
     def test_scan_context_reloads_once_after_a_transient_response_timeout(self):
         portal = object.__new__(runner.CuracelPilesRunner)
         attempts = []

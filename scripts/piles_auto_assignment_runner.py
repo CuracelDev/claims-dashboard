@@ -6907,6 +6907,28 @@ class CuracelPilesRunner:
                 },
             )
 
+    def _match_page_plans(self, plans: list[PlannedAssignment], rows: list[PileRow], *, allow_assigned: bool = False) -> list[PlannedAssignment]:
+        """Relocate by stable identity before selecting; never take an owned row."""
+        matched = []
+        relocated = []
+        for plan in plans:
+            candidates = [row for row in rows if (
+                row.tracking_key == plan.tracking_key
+                if norm(plan.tracking_key) else row.key == plan.pile_key
+            )]
+            if len(candidates) > 1:
+                raise IncompleteScan("Ambiguous pile identity during planned row relocation.")
+            if not candidates or (norm(candidates[0].assigned) and not allow_assigned):
+                continue
+            row = candidates[0]
+            if row.key != plan.pile_key or row.page_number != plan.source_page_number:
+                plan.pile_key = row.key
+                plan.source_page_number = row.page_number
+                relocated.append(plan)
+            matched.append(plan)
+        self._persist_relocated_plans(relocated)
+        return matched
+
     def execute_assignment_plan(
         self,
         month_labels: list[str],
@@ -6917,6 +6939,7 @@ class CuracelPilesRunner:
         *,
         persist_attempts: bool = True,
         defer_unresolved: bool = True,
+        allow_assigned: bool = False,
     ) -> tuple[dict[str, int], list[AppliedAssignment]]:
         if execute and persist_attempts:
             self.persist_assignment_plans(plans, minimum_claim_chunk)
@@ -6946,8 +6969,7 @@ class CuracelPilesRunner:
                     if fingerprint in seen_pages:
                         break
                     seen_pages.add(fingerprint)
-                    current_keys = {row.key for row in current_rows}
-                    page_plans = [plan for plan in pending_status_plans if plan.pile_key in current_keys]
+                    page_plans = self._match_page_plans(pending_status_plans, current_rows, allow_assigned=allow_assigned)
                     if page_plans:
                         grouped: dict[tuple[str, str], list[PlannedAssignment]] = {}
                         for plan in page_plans:
@@ -8147,8 +8169,13 @@ def is_retryable_scan_error(exc: Exception) -> bool:
         "no completed piles data request confirmed",
         "piles filters were not confirmed: filter_settlement_timeout",
         "piles filters were not confirmed: filter_dom_response_mismatch",
+        "piles filters were not confirmed: filter_response_failed",
         "piles table did not settle into a readable row state",
         "piles table did not match the selected page size response",
+        "the next piles page request was not confirmed",
+        "the next piles page response payload contained no readable rows",
+        "the next piles page did not settle into a readable row state",
+        "the next piles page response completed but the visible rows did not change",
     )
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
@@ -8582,6 +8609,7 @@ def _run_for_insurer_once(
                     reassignment_plans,
                     execute=args.execute,
                     minimum_claim_chunk=rule.minimum_claim_chunk if rule else 25,
+                    allow_assigned=True,
                 )
                 print("\nReassignment groups touched:")
                 for assignee_name, count in reassignment_results.items():
