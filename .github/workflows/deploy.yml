@@ -47,24 +47,27 @@ jobs:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "scripts/piles-auto-assignment-schema.sql,scripts/apply-piles-auto-assignment-schema.mjs,scripts/audit-piles-auto-assignment-readiness.mjs,scripts/db-schema-audit.mjs"
+          source: "scripts/piles-auto-assignment-schema.sql,scripts/apply-piles-auto-assignment-schema.mjs,scripts/audit-piles-auto-assignment-readiness.mjs,scripts/audit-piles-assignment-provenance.mjs,scripts/piles-auto-assignment-locks.mjs,scripts/db-schema-audit.mjs"
           target: "~/claims-dashboard"
 
       - name: Apply and audit database schema
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PILES_ASSIGNMENT_PROVENANCE_V2: ${{ vars.PILES_ASSIGNMENT_PROVENANCE_V2 }}
+          PILES_EXECUTION_LEDGER_ENABLED: ${{ vars.PILES_EXECUTION_LEDGER_ENABLED }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DATABASE_URL
+          envs: DATABASE_URL,PILES_ASSIGNMENT_PROVENANCE_V2,PILES_EXECUTION_LEDGER_ENABLED
           script: |
             set -eu
             cd ~/claims-dashboard
             node scripts/apply-piles-auto-assignment-schema.mjs
             node scripts/db-schema-audit.mjs
             node scripts/audit-piles-auto-assignment-readiness.mjs --mode deployment
+            node scripts/audit-piles-assignment-provenance.mjs --hours 720
 
       - name: Rsync files to server
         uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
@@ -80,11 +83,12 @@ jobs:
         env:
           PILES_AUTO_ASSIGNMENT_DISPATCHER_V2: ${{ vars.PILES_AUTO_ASSIGNMENT_DISPATCHER_V2 }}
           PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY: ${{ vars.PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY }}
+          PILES_ASSIGNMENT_PROVENANCE_V2: ${{ vars.PILES_ASSIGNMENT_PROVENANCE_V2 }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: PILES_AUTO_ASSIGNMENT_DISPATCHER_V2,PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY
+          envs: PILES_AUTO_ASSIGNMENT_DISPATCHER_V2,PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY,PILES_ASSIGNMENT_PROVENANCE_V2
           script: |
             set -eu
             cd ~/claims-dashboard
@@ -92,6 +96,10 @@ jobs:
             # Empty configuration leaves v2 disabled and concurrency at one.
             PILES_AUTO_ASSIGNMENT_DISPATCHER_V2="${PILES_AUTO_ASSIGNMENT_DISPATCHER_V2:-false}"
             PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="${PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY:-1}"
+            case "$PILES_ASSIGNMENT_PROVENANCE_V2" in
+              disabled|shadow|enabled) ;;
+              *) echo "PILES_ASSIGNMENT_PROVENANCE_V2 must be explicitly disabled, shadow, or enabled." >&2; exit 1 ;;
+            esac
             case "$PILES_AUTO_ASSIGNMENT_DISPATCHER_V2" in
               false|true) ;;
               *) echo "PILES_AUTO_ASSIGNMENT_DISPATCHER_V2 must be false or true." >&2; exit 1 ;;
@@ -122,6 +130,7 @@ jobs:
             CURACEL_PORTAL_ENVIRONMENT="${{ vars.CURACEL_PORTAL_ENVIRONMENT }}"
             PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND="${{ vars.PILES_AUTO_ASSIGNMENT_RUNNER_BACKEND }}"
             PILES_EXECUTION_LEDGER_ENABLED="${{ vars.PILES_EXECUTION_LEDGER_ENABLED }}"
+            PILES_ASSIGNMENT_PROVENANCE_V2="$PILES_ASSIGNMENT_PROVENANCE_V2"
             PILES_AUTO_ASSIGNMENT_DISPATCHER_V2="$PILES_AUTO_ASSIGNMENT_DISPATCHER_V2"
             PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="$PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY"
             PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python"

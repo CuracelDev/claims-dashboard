@@ -928,6 +928,40 @@ def make_pile(index, claims=100, *, filter_year="2026"):
 
 
 class AssignmentProvenanceDetectionTests(unittest.TestCase):
+    def test_provenance_rollout_mode_is_bounded_and_preserves_enabled_default(self):
+        self.assertEqual(runner.assignment_provenance_mode({}), "enabled")
+        for value in ("disabled", "shadow", "enabled"):
+            self.assertEqual(
+                runner.assignment_provenance_mode({"PILES_ASSIGNMENT_PROVENANCE_V2": value}),
+                value,
+            )
+        with self.assertRaisesRegex(RuntimeError, "PILES_ASSIGNMENT_PROVENANCE_V2"):
+            runner.assignment_provenance_mode({"PILES_ASSIGNMENT_PROVENANCE_V2": "unsafe"})
+
+    def test_shadow_provenance_compares_ledger_without_mutation(self):
+        row = runner.replace(make_pile(1), assigned="primary")
+        calls = []
+
+        class Ledger:
+            def find_assignment_ownership(self, insurer, identities, hashes):
+                calls.append((insurer, identities, hashes))
+                return [{
+                    "id": "attempt-1", "insurer_run_id": "run-1",
+                    "tracking_key": row.tracking_key, "last_pile_key": row.key,
+                    "intended_portal_assignee": "primary",
+                    "intended_owner_name": "Owner", "status": "confirmed_visible",
+                    "evidence_details": {},
+                }]
+
+        summary = runner.shadow_assignment_provenance_summary(
+            "DEFMIS", [row], set(), Ledger(),
+        )
+
+        self.assertEqual(summary["runner_confirmed"], 1)
+        self.assertEqual(summary["legacy_disagreements"], 1)
+        self.assertEqual(summary["rows_evaluated"], 1)
+        self.assertEqual(len(calls), 1)
+
     def store(self, existing=()):
         state = types.SimpleNamespace(saved=[], cleared=[], events=[], synced=[])
 

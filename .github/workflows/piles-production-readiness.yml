@@ -44,9 +44,16 @@ jobs:
             . ./.env
             set +a
 
+            case "$PILES_ASSIGNMENT_PROVENANCE_V2" in
+              disabled|shadow|enabled) ;;
+              *) echo "PILES_ASSIGNMENT_PROVENANCE_V2 is not explicitly configured." >&2; exit 1 ;;
+            esac
+
             node scripts/db-schema-audit.mjs
             readiness_status=0
             node scripts/audit-piles-auto-assignment-readiness.mjs --mode database || readiness_status=$?
+            provenance_status=0
+            node scripts/audit-piles-assignment-provenance.mjs --hours 720 || provenance_status=$?
 
             probe_status=0
             if [ "$PROBE_SCOPE" = "all-active" ]; then
@@ -80,4 +87,9 @@ jobs:
               echo "Runtime readiness audit failed with status $readiness_status." >&2
               exit "$readiness_status"
             fi
+            if [ "$provenance_status" -ne 0 ]; then
+              echo "Provenance readiness audit failed with status $provenance_status." >&2
+              exit "$provenance_status"
+            fi
+            echo "Provenance readiness audit completed successfully."
             echo "Runtime readiness audit completed successfully."

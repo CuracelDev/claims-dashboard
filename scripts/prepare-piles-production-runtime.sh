@@ -9,6 +9,11 @@ READY_MARKER=${PILES_RUNTIME_READY_MARKER:-"$VENV_DIR/.piles-runtime-ready"}
 MAX_ATTEMPTS=${PILES_RUNTIME_MAX_ATTEMPTS:-6}
 RETRY_DELAY_SECONDS=${PILES_RUNTIME_RETRY_DELAY_SECONDS:-10}
 
+case "${PILES_ASSIGNMENT_PROVENANCE_V2:-}" in
+  ''|disabled|shadow|enabled) ;;
+  *) echo "PILES_ASSIGNMENT_PROVENANCE_V2 must be disabled, shadow, or enabled." >&2; exit 2 ;;
+esac
+
 case "$MAX_ATTEMPTS" in
   ''|*[!0-9]*|0) echo "PILES_RUNTIME_MAX_ATTEMPTS must be a positive integer." >&2; exit 2 ;;
 esac

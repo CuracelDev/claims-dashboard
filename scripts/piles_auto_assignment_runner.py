@@ -168,6 +168,16 @@ def dispatcher_v2_enabled(environ=os.environ) -> bool:
     return str(environ.get("PILES_AUTO_ASSIGNMENT_DISPATCHER_V2", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def assignment_provenance_mode(environ=os.environ) -> str:
+    """Return the bounded provenance rollout mode without changing assignment behavior."""
+    value = str(environ.get("PILES_ASSIGNMENT_PROVENANCE_V2", "enabled")).strip().lower()
+    if value not in {"disabled", "shadow", "enabled"}:
+        raise RuntimeError(
+            "PILES_ASSIGNMENT_PROVENANCE_V2 must be disabled, shadow, or enabled."
+        )
+    return value
+
+
 def is_test_portal(url: str) -> bool:
     lowered = norm(url).lower()
     return "dev.claims.curacel.co" in lowered
@@ -7780,6 +7790,83 @@ def reconcile_tracked_assignments(
     }
 
 
+def shadow_assignment_provenance_summary(
+    insurer_name: str,
+    rows: list[PileRow],
+    tracked_keys: set[str],
+    execution_ledger: Any,
+) -> dict[str, int]:
+    """Compare V2 ownership with legacy tracking, without writes or notifications."""
+    summary = {
+        "rows_evaluated": 0,
+        "runner_confirmed": 0,
+        "runner_pending": 0,
+        "conflict": 0,
+        "unlinked": 0,
+        "verified_external": 0,
+        "legacy_disagreements": 0,
+    }
+    assigned_rows = [row for row in rows if norm(row.assigned)]
+    if not assigned_rows or execution_ledger is None:
+        return summary
+    identity_keys = expanded_tracking_key_set(
+        key for row in assigned_rows
+        for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+    )
+    attempts = execution_ledger.find_assignment_ownership(
+        insurer_name,
+        sorted(identity_keys),
+        sorted({
+            row.portal_identity_hash for row in assigned_rows
+            if re.fullmatch(r"[0-9a-f]{64}", row.portal_identity_hash)
+        }),
+    )
+    tracked_key_set = expanded_tracking_key_set(tracked_keys)
+    grouped: dict[str, list[PileRow]] = {}
+    for row in assigned_rows:
+        identity = canonical_pile_tracking_key(row.tracking_key) or row.tracking_key
+        grouped.setdefault(identity, []).append(row)
+    for grouped_rows in grouped.values():
+        summary["rows_evaluated"] += len(grouped_rows)
+        if len({row.key for row in grouped_rows if norm(row.key)}) > 1:
+            summary["conflict"] += len(grouped_rows)
+            summary["legacy_disagreements"] += len(grouped_rows)
+            continue
+        row = grouped_rows[0]
+        row_keys = expanded_tracking_key_set([
+            row.tracking_key, row.legacy_tracking_key, row.key,
+        ])
+        attempt_matches = [
+            attempt for attempt in attempts
+            if (
+                row_keys & expanded_tracking_key_set([
+                    attempt.get("tracking_key"), attempt.get("last_pile_key"),
+                ])
+                or (
+                    row.portal_identity_hash
+                    and isinstance(attempt.get("evidence_details"), dict)
+                    and row.portal_identity_hash
+                    == norm(attempt["evidence_details"].get("portal_identity_hash"))
+                )
+            )
+        ]
+        tracked_matches = (
+            [{"id": row.tracking_key, "current_assigned": row.assigned}]
+            if row_keys & tracked_key_set else []
+        )
+        ownership = classify_assignment_ownership(
+            observed_assignee=row.assigned,
+            configured_owner="",
+            tracked_matches=tracked_matches,
+            attempt_matches=attempt_matches,
+        ).ownership.value
+        summary[ownership] += 1
+        legacy_ownership = "runner_confirmed" if tracked_matches else "unlinked"
+        if ownership != legacy_ownership:
+            summary["legacy_disagreements"] += 1
+    return summary
+
+
 def detect_external_assignments(
     store: DataStore,
     master_account_id: str,
@@ -8944,6 +9031,21 @@ def _run_for_insurer_once(
                 )
 
         tracked_keys = store.get_all_tracked_tracking_keys(insurer_name)
+        provenance_mode = assignment_provenance_mode()
+        if provenance_mode == "shadow":
+            try:
+                shadow_summary = shadow_assignment_provenance_summary(
+                    insurer_name,
+                    scanned_rows,
+                    tracked_keys,
+                    execution_ledger,
+                )
+                print(
+                    "Assignment provenance shadow summary: "
+                    + json.dumps(shadow_summary, sort_keys=True, separators=(",", ":"))
+                )
+            except Exception:
+                print("Warning: assignment provenance shadow comparison unavailable.")
         external_detection = detect_external_assignments(
             store,
             master.id,
@@ -8953,7 +9055,7 @@ def _run_for_insurer_once(
             tracked_keys,
             team_slack_map,
             rule,
-            execution_ledger=execution_ledger,
+            execution_ledger=(execution_ledger if provenance_mode == "enabled" else None),
         )
         if external_detection["new_detection_count"]:
             print("\nObserved assigned piles without matching runner evidence:")
