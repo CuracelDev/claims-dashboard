@@ -959,8 +959,8 @@ class AssignmentProvenanceDetectionTests(unittest.TestCase):
         store, state = self.store([prior])
 
         class Ledger:
-            def find_assignment_ownership(self, insurer, identities):
-                self.lookup = (insurer, set(identities))
+            def find_assignment_ownership(self, insurer, identities, portal_hashes=()):
+                self.lookup = (insurer, set(identities), set(portal_hashes))
                 return [{
                     "id": "attempt-1", "insurer_run_id": "run-1",
                     "status": "confirmed_visible", "tracking_key": row.tracking_key,
@@ -1093,6 +1093,94 @@ class AssignmentProvenanceDetectionTests(unittest.TestCase):
         })
 
 
+class DurablePortalIdentityTests(unittest.TestCase):
+    def test_natural_identity_tolerates_formatting_status_synced_and_amount_drift(self):
+        original = runner.replace(
+            make_pile(1), provider="  BRISTOL Park ", month="June",
+            submitted_date="9 Jun 2025", amount_text="KES 1,200.00",
+            synced_claims=0, status="Vetting Pending",
+        )
+        changed = runner.replace(
+            original, provider="bristol   park", month="06",
+            submitted_date="2025-06-09T10:00:00Z", amount_text="KES 1,350",
+            synced_claims=7, status="Vetting Ongoing",
+        )
+
+        self.assertEqual(
+            runner.natural_pile_identity_hash(original),
+            runner.natural_pile_identity_hash(changed),
+        )
+
+    def test_response_hash_is_attached_only_after_unique_dom_match(self):
+        snapshot = {
+            "row_attributes": [["/piles/pile-live-123"], ["/piles/pile-live-456"]],
+        }
+        expected = runner.response_row_id_hashes([
+            {"id": "pile-live-456"}, {"id": "pile-live-123"},
+        ])
+        self.assertEqual(
+            runner.portal_identity_hashes_for_snapshot(snapshot, expected),
+            [expected[1], expected[0]],
+        )
+        ambiguous = {"row_attributes": [["pile-live-123"], ["pile-live-123"]]}
+        self.assertEqual(runner.portal_identity_hashes_for_snapshot(ambiguous, expected[:1]), [])
+        duplicate_hash = runner.response_row_id_hashes([
+            {"id": "pile-live-123"}, {"id": "pile-live-123"},
+        ])
+        self.assertEqual(
+            runner.portal_identity_hashes_for_snapshot(ambiguous, duplicate_hash), [],
+        )
+
+    def test_planning_and_attempt_evidence_contain_hash_but_never_raw_portal_id(self):
+        raw_id = "pile-live-sensitive-123"
+        pile = runner.replace(
+            make_pile(1), portal_identity_hash=runner.response_row_id_hashes([{"id": raw_id}])[0],
+        )
+        plans, _ = runner.build_assignment_plan(
+            "OLD MUTUAL", [pile], [make_bot("primary", "primary")], {},
+        )
+        self.assertEqual(plans[0].portal_identity_hash, pile.portal_identity_hash)
+        serialized = runner.json.dumps(plans[0].__dict__)
+        self.assertIn(pile.portal_identity_hash, serialized)
+        self.assertNotIn(raw_id, serialized)
+
+    def test_hash_bridges_display_drift_but_ambiguous_natural_identity_does_not(self):
+        portal_hash = "a" * 64
+        original = runner.replace(make_pile(1), portal_identity_hash=portal_hash)
+        changed = runner.replace(
+            original, key="changed-key", tracking_key="changed-tracking",
+            legacy_tracking_key="changed-legacy", provider=" provider 1 ",
+            amount_text="KES 9,999", submitted_date="1 Jul 2026",
+            assigned="primary",
+        )
+        hash_attempt = {
+            "tracking_key": original.tracking_key,
+            "last_pile_key": original.key,
+            "evidence_details": {"portal_identity_hash": portal_hash},
+        }
+        observations = runner.observations_for_scanned_attempt([changed], hash_attempt)
+        self.assertEqual([item.row for item in observations], [changed])
+        self.assertIn("portal_identity_hash", observations[0].source)
+        from scripts.piles_auto_assignment.reconciliation import reconcile_attempt
+        decision = reconcile_attempt(observations, "primary")
+        self.assertEqual(
+            decision.evidence.details["identity_match_method"],
+            "portal_identity_hash",
+        )
+
+        duplicate = runner.replace(changed, key="another", portal_identity_hash="")
+        natural_attempt = {
+            "tracking_key": "old", "last_pile_key": "old-key",
+            "evidence_details": {
+                "natural_identity_hash": runner.natural_pile_identity_hash(changed),
+            },
+        }
+        self.assertEqual(
+            runner.observations_for_scanned_attempt([changed, duplicate], natural_attempt),
+            [],
+        )
+
+
 class LateArrivalWorkflowTests(unittest.TestCase):
     def test_planning_and_reconciliation_are_aggregate_only_operations(self):
         row = runner.replace(make_pile(1), assigned='Daniel')
@@ -1129,7 +1217,10 @@ class LateArrivalWorkflowTests(unittest.TestCase):
                 item["status"] = target.value
                 state.transitions.append((attempt_id, target.value))
 
-            def relocate_planned_attempt(self, attempt_id, *, last_pile_key, filter_context):
+            def relocate_planned_attempt(
+                self, attempt_id, *, last_pile_key, filter_context, identity_evidence=None,
+            ):
+                del identity_evidence
                 state.relocations.append((attempt_id, last_pile_key, filter_context))
 
         class Portal(runner.CuracelPilesRunner):

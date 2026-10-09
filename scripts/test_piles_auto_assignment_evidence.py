@@ -7,6 +7,7 @@ from scripts.piles_auto_assignment.domain import AttemptStatus
 from scripts.piles_auto_assignment.evidence import (
     classify_assignment_observations,
     evaluate_filter_evidence,
+    select_identity_match_indexes,
 )
 
 
@@ -194,6 +195,50 @@ class FilterEvidenceTests(unittest.TestCase):
 
 
 class AssignmentEvidenceTests(unittest.TestCase):
+    def test_identity_precedence_prefers_exact_portal_hash_over_changed_aliases(self):
+        match = select_identity_match_indexes(
+            [
+                {"portal_identity_hash": "a" * 64, "aliases": {"changed"}, "natural_identity_hash": "n"},
+                {"portal_identity_hash": "b" * 64, "aliases": {"old"}, "natural_identity_hash": "n"},
+            ],
+            expected_portal_identity_hash="a" * 64,
+            expected_aliases={"old"},
+            expected_natural_identity_hash="n",
+        )
+        self.assertEqual(match.indexes, (0,))
+        self.assertEqual(match.method, "portal_identity_hash")
+        self.assertFalse(match.ambiguous)
+
+    def test_identity_falls_back_to_exact_alias_then_unique_natural_identity(self):
+        candidates = [
+            {"portal_identity_hash": "", "aliases": {"new-a"}, "natural_identity_hash": "natural-a"},
+            {"portal_identity_hash": "", "aliases": {"new-b"}, "natural_identity_hash": "natural-b"},
+        ]
+        alias_match = select_identity_match_indexes(
+            candidates, expected_aliases={"new-b"}, expected_natural_identity_hash="natural-a",
+        )
+        natural_match = select_identity_match_indexes(
+            candidates, expected_aliases={"old"}, expected_natural_identity_hash="natural-a",
+        )
+        self.assertEqual((alias_match.indexes, alias_match.method), ((1,), "canonical_alias"))
+        self.assertEqual((natural_match.indexes, natural_match.method), ((0,), "unique_natural_identity"))
+
+    def test_ambiguous_portal_or_natural_identity_fails_closed(self):
+        duplicate_hash = [
+            {"portal_identity_hash": "a" * 64, "aliases": {"one"}, "natural_identity_hash": "n"},
+            {"portal_identity_hash": "a" * 64, "aliases": {"two"}, "natural_identity_hash": "n"},
+        ]
+        by_hash = select_identity_match_indexes(
+            duplicate_hash, expected_portal_identity_hash="a" * 64,
+        )
+        by_natural = select_identity_match_indexes(
+            duplicate_hash, expected_natural_identity_hash="n",
+        )
+        self.assertTrue(by_hash.ambiguous)
+        self.assertEqual(by_hash.method, "portal_identity_hash")
+        self.assertTrue(by_natural.ambiguous)
+        self.assertEqual(by_natural.method, "unique_natural_identity")
+
     def test_missing_rows_are_pending_not_failed_or_confirmed(self):
         decisions = classify_assignment_observations(
             {

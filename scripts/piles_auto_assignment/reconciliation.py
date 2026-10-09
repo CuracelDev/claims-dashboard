@@ -55,11 +55,23 @@ def reconcile_attempt(
             AttemptEvidence("reconciled_unexpected_assignee", {"observed_assignees": unexpected}),
         )
     if expected and expected in nonblank:
+        identity_methods = {
+            item.source.rsplit(":", 1)[-1]
+            for item in items
+            if _label(item.assignee) == expected and ":" in item.source
+            and item.source.rsplit(":", 1)[-1] in {
+                "portal_identity_hash", "canonical_alias", "unique_natural_identity",
+            }
+        }
         return AttemptDecision(
             attempt_id,
             tracking_key,
             AttemptStatus.CONFIRMED_RECONCILED,
-            AttemptEvidence("reconciled_expected_assignee", {}),
+            AttemptEvidence(
+                "reconciled_expected_assignee",
+                ({"identity_match_method": next(iter(identity_methods))}
+                 if len(identity_methods) == 1 else {}),
+            ),
         )
     if any(item.assignable and not _label(item.assignee) for item in items):
         return AttemptDecision(

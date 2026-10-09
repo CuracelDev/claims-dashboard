@@ -1278,7 +1278,7 @@ class ExecutionLedger:
                     UPDATE piles_auto_assignment_attempts
                     SET status = %s,
                         evidence_code = %s,
-                        evidence_details = %s::jsonb,
+                        evidence_details = coalesce(evidence_details, '{}'::jsonb) || %s::jsonb,
                         selected_at = CASE WHEN %s = 'selected' THEN now() ELSE selected_at END,
                         submitted_at = CASE WHEN %s = 'submitted' THEN now() ELSE submitted_at END,
                         confirmed_at = CASE WHEN %s IN ('confirmed_visible','confirmed_reconciled') THEN now() ELSE confirmed_at END,
@@ -1347,6 +1347,7 @@ class ExecutionLedger:
         *,
         last_pile_key: str,
         filter_context: Mapping[str, Any],
+        identity_evidence: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist the current portal location before retrying a planned attempt."""
         try:
@@ -1356,11 +1357,15 @@ class ExecutionLedger:
                     UPDATE piles_auto_assignment_attempts
                     SET last_pile_key = %s,
                         filter_context = %s::jsonb,
+                        evidence_details = coalesce(evidence_details, '{}'::jsonb) || %s::jsonb,
                         updated_at = now()
                     WHERE id = %s AND status = 'planned'
                     RETURNING id
                     """,
-                    (last_pile_key, _json(filter_context), attempt_id),
+                    (
+                        last_pile_key, _json(filter_context),
+                        _json(identity_evidence), attempt_id,
+                    ),
                 )
                 if not cursor.fetchone():
                     raise ConcurrentStateChange(attempt_id)
@@ -1375,6 +1380,7 @@ class ExecutionLedger:
                 """
                 SELECT id, insurer_run_id, batch_id, tracking_key, last_pile_key,
                        intended_portal_assignee, status, attempt_number, filter_context,
+                       evidence_details,
                        submitted_at, updated_at, clock_timestamp() AS observed_at
                 FROM piles_auto_assignment_attempts
                 WHERE insurer_name = %s
@@ -1390,6 +1396,7 @@ class ExecutionLedger:
         self,
         insurer_name: str,
         identity_keys: Iterable[str],
+        portal_identity_hashes: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         """Return durable runner evidence for only the identities in this scan."""
         identities = list(dict.fromkeys(
@@ -1397,7 +1404,12 @@ class ExecutionLedger:
             for value in identity_keys
             if value is not None and str(value).strip()
         ))
-        if not identities:
+        identity_hashes = list(dict.fromkeys(
+            str(value).strip().lower()
+            for value in portal_identity_hashes
+            if re.fullmatch(r"[0-9a-f]{64}", str(value or "").strip().lower())
+        ))
+        if not identities and not identity_hashes:
             return []
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -1406,6 +1418,7 @@ class ExecutionLedger:
                   SELECT id, insurer_run_id, bot_account_id,
                          intended_owner_name, intended_portal_assignee, status,
                          tracking_key, last_pile_key, claim_count, evidence_code,
+                         evidence_details,
                          selected_at, submitted_at, confirmed_at, created_at, updated_at
                   FROM piles_auto_assignment_attempts
                   WHERE insurer_name = %s
@@ -1418,10 +1431,24 @@ class ExecutionLedger:
                   SELECT id, insurer_run_id, bot_account_id,
                          intended_owner_name, intended_portal_assignee, status,
                          tracking_key, last_pile_key, claim_count, evidence_code,
+                         evidence_details,
                          selected_at, submitted_at, confirmed_at, created_at, updated_at
                   FROM piles_auto_assignment_attempts
                   WHERE insurer_name = %s
                     AND last_pile_key = ANY(%s)
+                    AND status IN (
+                      'selected', 'submitted', 'confirmed_visible',
+                      'confirmed_reconciled', 'reconciliation_pending'
+                    )
+                  UNION ALL
+                  SELECT id, insurer_run_id, bot_account_id,
+                         intended_owner_name, intended_portal_assignee, status,
+                         tracking_key, last_pile_key, claim_count, evidence_code,
+                         evidence_details,
+                         selected_at, submitted_at, confirmed_at, created_at, updated_at
+                  FROM piles_auto_assignment_attempts
+                  WHERE insurer_name = %s
+                    AND evidence_details ->> 'portal_identity_hash' = ANY(%s)
                     AND status IN (
                       'selected', 'submitted', 'confirmed_visible',
                       'confirmed_reconciled', 'reconciliation_pending'
@@ -1440,12 +1467,16 @@ class ExecutionLedger:
                          THEN evidence_code
                          ELSE NULL
                        END AS evidence_code,
+                       evidence_details,
                        selected_at, submitted_at, confirmed_at,
                        created_at, updated_at
                 FROM deduplicated
                 ORDER BY updated_at DESC, id
                 """,
-                (insurer_name, identities, insurer_name, identities),
+                (
+                    insurer_name, identities, insurer_name, identities,
+                    insurer_name, identity_hashes,
+                ),
             )
             columns = [item[0] for item in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -1473,7 +1504,8 @@ class ExecutionLedger:
                            insurer_run.master_account_id, attempt.tracked_pile_id,
                            attempt.insurer_name, attempt.tracking_key,
                            attempt.last_pile_key, attempt.bot_account_id,
-                           attempt.intended_portal_assignee, attempt.status
+                           attempt.intended_portal_assignee, attempt.status,
+                           attempt.evidence_details
                     FROM piles_auto_assignment_attempts attempt
                     JOIN piles_auto_assignment_insurer_runs insurer_run
                       ON insurer_run.id = attempt.insurer_run_id
@@ -1505,7 +1537,32 @@ class ExecutionLedger:
                     observed_pile_key,
                     str(_value(observation, "legacy_tracking_key", "") or "").strip(),
                 }
-                if not (attempt_identities - {""}) & (observed_identities - {""}):
+                evidence_details = attempt.get("evidence_details") or {}
+                expected_portal_hash = str(
+                    evidence_details.get("portal_identity_hash") or ""
+                ).strip().lower() if isinstance(evidence_details, Mapping) else ""
+                observed_portal_hash = str(
+                    _value(observation, "portal_identity_hash", "") or ""
+                ).strip().lower()
+                expected_natural_hash = str(
+                    evidence_details.get("natural_identity_hash") or ""
+                ).strip().lower() if isinstance(evidence_details, Mapping) else ""
+                observed_natural_hash = str(
+                    _value(observation, "natural_identity_hash", "") or ""
+                ).strip().lower()
+                hash_match = bool(
+                    expected_portal_hash
+                    and observed_portal_hash
+                    and expected_portal_hash == observed_portal_hash
+                )
+                natural_match = bool(
+                    expected_natural_hash
+                    and observed_natural_hash
+                    and expected_natural_hash == observed_natural_hash
+                )
+                if not hash_match and not natural_match and not (
+                    (attempt_identities - {""}) & (observed_identities - {""})
+                ):
                     raise ValueError("observation does not match the confirmed attempt identity")
 
                 tracked_id = str(attempt.get("tracked_pile_id") or uuid.uuid4())
@@ -1578,7 +1635,18 @@ class ExecutionLedger:
                         observed_assignee,
                         str(_value(observation, "filter_month", "") or ""),
                         synced_claims,
-                        _json({"source": "runner_ledger"}),
+                        _json({
+                            "source": "runner_ledger",
+                            **({"portal_identity_hash": observed_portal_hash}
+                               if re.fullmatch(r"[0-9a-f]{64}", observed_portal_hash) else {}),
+                            **({"natural_identity_hash": observed_natural_hash}
+                               if re.fullmatch(r"[0-9a-f]{64}", observed_natural_hash) else {}),
+                            "identity_match_method": (
+                                "portal_identity_hash" if hash_match
+                                else "unique_natural_identity" if natural_match
+                                else "canonical_alias"
+                            ),
+                        }),
                     ),
                 )
                 tracked_row = cursor.fetchone()
@@ -1811,8 +1879,9 @@ class ReadOnlyExecutionLedger:
         *,
         last_pile_key: str,
         filter_context: Mapping[str, Any],
+        identity_evidence: Mapping[str, Any] | None = None,
     ) -> None:
-        del last_pile_key, filter_context
+        del last_pile_key, filter_context, identity_evidence
 
     def pending_attempts(self, _insurer_name: str) -> list[dict[str, Any]]:
         return []
@@ -1821,6 +1890,7 @@ class ReadOnlyExecutionLedger:
         self,
         _insurer_name: str,
         _identity_keys: Iterable[str],
+        _portal_identity_hashes: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         return []
 

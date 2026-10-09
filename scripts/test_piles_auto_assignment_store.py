@@ -1056,6 +1056,18 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertIn("confirmed_pile_count", self.connection.statements[-1][0])
         self.assertEqual(self.connection.commit_count, 1)
 
+    def test_transition_merges_evidence_without_erasing_identity_hashes(self):
+        self.ledger.transition_attempt(
+            "attempt-1", AttemptStatus.SUBMITTED,
+            expected={AttemptStatus.SELECTED},
+            evidence={"code": "submitted", "details": {"safe": True}},
+        )
+        sql, _params = self.connection.statements[-2]
+        self.assertIn(
+            "evidence_details = coalesce(evidence_details, '{}'::jsonb) || %s::jsonb",
+            sql,
+        )
+
     def test_transition_rejects_an_illegal_state_edge_before_writing(self):
         with self.assertRaises(ValueError):
             self.ledger.transition_attempt(
@@ -1162,6 +1174,7 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertEqual(params, (
             "DEFMIS", ["stable-key", "volatile-key"],
             "DEFMIS", ["stable-key", "volatile-key"],
+            "DEFMIS", [],
         ))
         self.assertEqual(connection.responses, [])
 
@@ -1189,6 +1202,20 @@ class ExecutionLedgerTests(unittest.TestCase):
 
         self.assertEqual(matches, [])
         self.assertEqual(connection.statements, [])
+
+    def test_assignment_ownership_lookup_accepts_only_hashed_portal_identity(self):
+        connection = DispatchConnection([])
+        portal_hash = "a" * 64
+
+        matches = ExecutionLedger(connection).find_assignment_ownership(
+            "DEFMIS", [], [portal_hash, "raw-portal-id"],
+        )
+
+        self.assertEqual(matches, [])
+        sql, params = connection.statements[0]
+        self.assertIn("evidence_details ->> 'portal_identity_hash' = ANY(%s)", sql)
+        self.assertEqual(params[-2:], ("DEFMIS", [portal_hash]))
+        self.assertNotIn("raw-portal-id", str(params))
 
     def test_confirmed_attempt_materialization_atomically_upserts_and_links_tracking(self):
         connection = DispatchConnection(
@@ -1260,6 +1287,37 @@ class ExecutionLedgerTests(unittest.TestCase):
 
         self.assertEqual((first, second), ("tracked-legacy", "tracked-legacy"))
         self.assertEqual(connection.commit_count, 2)
+
+    def test_confirmed_materialization_accepts_exact_hash_after_display_identity_drift(self):
+        portal_hash = "a" * 64
+        connection = DispatchConnection(
+            [{
+                "id": "attempt-1", "insurer_run_id": "run-1",
+                "master_account_id": "master-1", "tracked_pile_id": None,
+                "insurer_name": "DEFMIS", "tracking_key": "old-stable",
+                "last_pile_key": "old-volatile", "bot_account_id": "bot-1",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+                "evidence_details": {"portal_identity_hash": portal_hash},
+            }],
+            [{"id": "tracked-1"}],
+            [{"tracked_pile_id": "tracked-1"}],
+        )
+
+        tracked_id = ExecutionLedger(connection).materialize_confirmed_assignment(
+            "attempt-1",
+            {
+                "key": "new-volatile", "tracking_key": "new-stable",
+                "portal_identity_hash": portal_hash,
+                "provider": "Provider", "claims": 3, "remaining_claims": 3,
+                "assigned": "CVEBOT1",
+            },
+        )
+
+        self.assertEqual(tracked_id, "tracked-1")
+        details = json.loads(connection.statements[1][1][-1])
+        self.assertEqual(details["portal_identity_hash"], portal_hash)
+        self.assertEqual(details["identity_match_method"], "portal_identity_hash")
 
     def test_materialization_rejects_unassigned_or_unconfirmed_evidence_without_writing(self):
         empty_connection = RecordingConnection()

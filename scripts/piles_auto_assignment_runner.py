@@ -52,7 +52,8 @@ try:
     from piles_auto_assignment.domain import (AssignmentOwnership, AttemptStatus, FilterEvidence,
         InsurerRunStatus, ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from piles_auto_assignment.ownership import classify_assignment_ownership
-    from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
+    from piles_auto_assignment.evidence import (classify_assignment_observations,
+        evaluate_filter_evidence, decide_filter_wait, select_identity_match_indexes)
     from piles_auto_assignment.timing import PhaseTimer, timed_operation
     from piles_auto_assignment.diagnostics import failure_diagnostic
     from piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
@@ -74,7 +75,8 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
     from scripts.piles_auto_assignment.domain import (AssignmentOwnership, AttemptStatus, FilterEvidence,
         InsurerRunStatus, ParentRunStatus, RequestScope, WorkRequest, WorkSource)
     from scripts.piles_auto_assignment.ownership import classify_assignment_ownership
-    from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
+    from scripts.piles_auto_assignment.evidence import (classify_assignment_observations,
+        evaluate_filter_evidence, decide_filter_wait, select_identity_match_indexes)
     from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
     from scripts.piles_auto_assignment.diagnostics import failure_diagnostic
     from scripts.piles_auto_assignment.scanning import ContextStatus, FilterContext, IncompleteScan, ScanAccumulator, late_arrival_contexts
@@ -732,6 +734,36 @@ def response_row_id_hashes(rows: list[Any]) -> list[str]:
     ]
 
 
+def portal_identity_hashes_for_snapshot(
+    snapshot: dict[str, Any],
+    response_id_hashes: list[str],
+) -> list[str]:
+    """Map hashed response IDs to DOM row order only when the match is bijective."""
+    if not response_id_hashes or not all(
+        re.fullmatch(r"[0-9a-f]{64}", norm(value)) for value in response_id_hashes
+    ):
+        return []
+    if len(set(response_id_hashes)) != len(response_id_hashes):
+        return []
+    row_attributes = snapshot.get("row_attributes") or []
+    candidate_sets = [_dom_attribute_id_hashes(values) for values in row_attributes]
+    if len(candidate_sets) != len(response_id_hashes):
+        return []
+    mapped = [""] * len(candidate_sets)
+    used_rows: set[int] = set()
+    for expected_hash in response_id_hashes:
+        matches = [
+            index for index, candidates in enumerate(candidate_sets)
+            if index not in used_rows and expected_hash in candidates
+        ]
+        if len(matches) != 1:
+            return []
+        index = matches[0]
+        mapped[index] = expected_hash
+        used_rows.add(index)
+    return mapped if all(mapped) else []
+
+
 def _dom_attribute_id_hashes(values: Any) -> set[str]:
     hashes: set[str] = set()
     for value in values if isinstance(values, list) else []:
@@ -1373,6 +1405,27 @@ class PileRow:
     filter_month: str
     filter_year: str
     legacy_tracking_key: str = ""
+    portal_identity_hash: str = ""
+    natural_identity_hash: str = ""
+
+
+def natural_identity_hash(provider: Any, claims: Any, month: Any, submitted_date: Any) -> str:
+    """Hash stable display identity while excluding mutable amount/progress/status."""
+    identity = "|".join([
+        norm_key(provider),
+        str(max(safe_int(claims, -1), -1)),
+        _canonical_month(month),
+        _canonical_date(submitted_date),
+    ])
+    if any(value in {"", "-1"} for value in identity.split("|")):
+        return ""
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def natural_pile_identity_hash(pile: "PileRow") -> str:
+    return pile.natural_identity_hash or natural_identity_hash(
+        pile.provider, pile.claims, pile.month, pile.submitted_date,
+    )
 
 
 def effective_filter_year(pile: "PileRow", requested_year: str) -> str:
@@ -1407,14 +1460,61 @@ def index_scanned_rows(rows: list["PileRow"]) -> dict[str, list["PileRow"]]:
     return indexed
 
 
+def rows_matching_attempt_identity(
+    rows: list["PileRow"],
+    attempt: dict[str, Any],
+) -> tuple[list["PileRow"], str]:
+    details = attempt.get("evidence_details") or {}
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except (TypeError, ValueError):
+            details = {}
+    candidates = [{
+        "portal_identity_hash": row.portal_identity_hash,
+        "aliases": expanded_tracking_key_set([
+            row.tracking_key, row.legacy_tracking_key, row.key,
+        ]),
+        "natural_identity_hash": natural_pile_identity_hash(row),
+    } for row in rows]
+    match = select_identity_match_indexes(
+        candidates,
+        expected_portal_identity_hash=norm(details.get("portal_identity_hash")),
+        expected_aliases=expanded_tracking_key_set([
+            attempt.get("tracking_key"), attempt.get("last_pile_key"),
+        ]),
+        expected_natural_identity_hash=norm(details.get("natural_identity_hash")),
+    )
+    if match.ambiguous:
+        return [], f"ambiguous_{match.method}"
+    matched_rows = [rows[index] for index in match.indexes]
+    for row in matched_rows:
+        row.natural_identity_hash = natural_pile_identity_hash(row)
+    return matched_rows, match.method
+
+
 def observations_for_scanned_attempt(rows: list["PileRow"], attempt: dict[str, Any], *, indexed_rows=None) -> list[Observation]:
     """Keep all matching context aliases; positive ownership outranks blanks."""
-    keys = expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
-    indexed = index_scanned_rows(rows) if indexed_rows is None else indexed_rows
-    matching = {id(row): row for key in keys for row in indexed.get(key, [])}
+    if indexed_rows is not None:
+        indexed = indexed_rows
+        keys = expanded_tracking_key_set([
+            attempt.get("tracking_key"), attempt.get("last_pile_key"),
+        ])
+        candidate_rows = list({
+            id(row): row for key in keys for row in indexed.get(key, [])
+        }.values())
+        details = attempt.get("evidence_details") or {}
+        if isinstance(details, dict) and (
+            norm(details.get("portal_identity_hash"))
+            or norm(details.get("natural_identity_hash"))
+        ):
+            candidate_rows = list({id(row): row for values in indexed.values() for row in values}.values())
+    else:
+        candidate_rows = rows
+    matching, method = rows_matching_attempt_identity(candidate_rows, attempt)
     return [Observation(assignable=not norm(row.assigned), assignee=norm(row.assigned),
-                        source="complete_initial_scan", row=row)
-            for row in matching.values()]
+                        source=f"complete_initial_scan:{method or 'none'}", row=row)
+            for row in matching]
 
 
 def unique_unassigned_rows(rows: list["PileRow"]) -> list["PileRow"]:
@@ -1450,6 +1550,7 @@ class PlannedAssignment:
     filter_year: str
     source_page_number: int
     legacy_tracking_key: str = ""
+    portal_identity_hash: str = ""
 
 
 @dataclass
@@ -2512,6 +2613,8 @@ class DataStore:
         details = {
             "source": "runner",
             "last_assignment_type": plan.assignment_type,
+            **({"portal_identity_hash": plan.portal_identity_hash}
+               if re.fullmatch(r"[0-9a-f]{64}", plan.portal_identity_hash) else {}),
         }
 
         if existing:
@@ -5500,7 +5603,26 @@ class CuracelPilesRunner:
                 filter_month=filter_month,
                 filter_year=filter_year,
                 legacy_tracking_key=legacy_tracking_key,
+                natural_identity_hash=natural_identity_hash(
+                    provider, claims, month, submitted_date,
+                ),
             ))
+        try:
+            network_state, network = self._filter_network_state(
+                0, filter_month, filter_year, status_bucket, page_number=page_number,
+            )
+            if network_state == "succeeded":
+                portal_hashes = portal_identity_hashes_for_snapshot(
+                    self._table_context_snapshot(),
+                    network.get("row_id_hashes") or [],
+                )
+                if len(portal_hashes) == len(piles):
+                    for pile, portal_hash in zip(piles, portal_hashes):
+                        pile.portal_identity_hash = portal_hash
+        except Exception:
+            # This evidence is optional. Filter coherence remains independently
+            # enforced before rows are accepted.
+            pass
         return piles
 
     def _table_preview_fingerprint(self) -> tuple[str, ...]:
@@ -6942,6 +7064,13 @@ class CuracelPilesRunner:
                             "status": plan.status_bucket,
                             "source_page": plan.source_page_number,
                         },
+                        "evidence_details": {
+                            **({"portal_identity_hash": plan.portal_identity_hash}
+                               if re.fullmatch(r"[0-9a-f]{64}", plan.portal_identity_hash) else {}),
+                            "natural_identity_hash": natural_identity_hash(
+                                plan.provider, plan.claims, plan.claim_month, plan.submitted_date,
+                            ),
+                        },
                     })
                 ledger.create_batch_with_attempts(
                     {
@@ -7006,6 +7135,14 @@ class CuracelPilesRunner:
                     "status": plan.status_bucket,
                     "source_page": plan.source_page_number,
                 },
+                identity_evidence={
+                    **({"portal_identity_hash": plan.portal_identity_hash}
+                       if re.fullmatch(r"[0-9a-f]{64}", plan.portal_identity_hash) else {}),
+                    "natural_identity_hash": natural_identity_hash(
+                        plan.provider, plan.claims, plan.claim_month, plan.submitted_date,
+                    ),
+                    "identity_match_method": "page_relocation",
+                },
             )
 
     def _match_page_plans(self, plans: list[PlannedAssignment], rows: list[PileRow], *, allow_assigned: bool = False) -> list[PlannedAssignment]:
@@ -7013,18 +7150,45 @@ class CuracelPilesRunner:
         matched = []
         relocated = []
         for plan in plans:
-            candidates = [row for row in rows if (
-                row.tracking_key == plan.tracking_key
-                if norm(plan.tracking_key) else row.key == plan.pile_key
-            )]
-            if len(candidates) > 1:
+            plan_portal_hash = norm(getattr(plan, "portal_identity_hash", ""))
+            plan_tracking_key = norm(getattr(plan, "tracking_key", ""))
+            plan_aliases = (
+                [plan_tracking_key, getattr(plan, "legacy_tracking_key", "")]
+                if plan_tracking_key else [getattr(plan, "pile_key", "")]
+            )
+            plan_natural_hash = natural_identity_hash(
+                getattr(plan, "provider", ""),
+                getattr(plan, "claims", -1),
+                getattr(plan, "claim_month", ""),
+                getattr(plan, "submitted_date", ""),
+            )
+            selection = select_identity_match_indexes(
+                [{
+                    "portal_identity_hash": row.portal_identity_hash,
+                    "aliases": expanded_tracking_key_set([
+                        row.tracking_key, row.legacy_tracking_key, row.key,
+                    ]),
+                    "natural_identity_hash": natural_pile_identity_hash(row),
+                } for row in rows],
+                expected_portal_identity_hash=plan_portal_hash,
+                expected_aliases=expanded_tracking_key_set(plan_aliases),
+                expected_natural_identity_hash=plan_natural_hash,
+            )
+            candidates = [rows[index] for index in selection.indexes]
+            if selection.ambiguous or len(candidates) > 1:
                 raise IncompleteScan("Ambiguous pile identity during planned row relocation.")
             if not candidates or (norm(candidates[0].assigned) and not allow_assigned):
                 continue
             row = candidates[0]
-            if row.key != plan.pile_key or row.page_number != plan.source_page_number:
+            if (
+                row.key != plan.pile_key
+                or row.page_number != plan.source_page_number
+                or (row.portal_identity_hash and row.portal_identity_hash != plan_portal_hash)
+            ):
                 plan.pile_key = row.key
                 plan.source_page_number = row.page_number
+                if re.fullmatch(r"[0-9a-f]{64}", row.portal_identity_hash):
+                    plan.portal_identity_hash = row.portal_identity_hash
                 relocated.append(plan)
             matched.append(plan)
         self._persist_relocated_plans(relocated)
@@ -7610,6 +7774,10 @@ def detect_external_assignments(
         execution_ledger.find_assignment_ownership(
             insurer_name,
             sorted(assigned_identity_keys),
+            sorted({
+                row.portal_identity_hash for row in rows
+                if re.fullmatch(r"[0-9a-f]{64}", row.portal_identity_hash)
+            }),
         )
         if execution_ledger and assigned_identity_keys
         else []
@@ -7676,9 +7844,17 @@ def detect_external_assignments(
         ])
         attempt_matches = [
             attempt for attempt in ledger_attempts
-            if row_keys & expanded_tracking_key_set([
-                attempt.get("tracking_key"), attempt.get("last_pile_key"),
-            ])
+            if (
+                row_keys & expanded_tracking_key_set([
+                    attempt.get("tracking_key"), attempt.get("last_pile_key"),
+                ])
+                or (
+                    row.portal_identity_hash
+                    and isinstance(attempt.get("evidence_details"), dict)
+                    and row.portal_identity_hash
+                    == norm(attempt["evidence_details"].get("portal_identity_hash"))
+                )
+            )
         ]
         tracked_matches = (
             [{"id": identity, "current_assigned": row.assigned}]
@@ -7907,6 +8083,8 @@ def build_stale_reassignment_plans(
             filter_month=observed_row.filter_month,
             filter_year=observed_row.filter_year,
             source_page_number=observed_row.page_number,
+            legacy_tracking_key=observed_row.legacy_tracking_key,
+            portal_identity_hash=observed_row.portal_identity_hash,
         ))
 
         entry = summary.setdefault(target.id, {
@@ -7996,6 +8174,7 @@ def build_assignment_plan(
             filter_year=decision.pile.filter_year,
             source_page_number=decision.pile.page_number,
             legacy_tracking_key=decision.pile.legacy_tracking_key,
+            portal_identity_hash=decision.pile.portal_identity_hash,
         )
         for decision in planning.plans
     ]
@@ -8100,6 +8279,8 @@ def build_assignment_plan_from_portal_options(
                 filter_month=pile.filter_month,
                 filter_year=pile.filter_year,
                 source_page_number=pile.page_number,
+                legacy_tracking_key=pile.legacy_tracking_key,
+                portal_identity_hash=pile.portal_identity_hash,
             ))
 
     for pile in remaining_piles:
@@ -8123,6 +8304,8 @@ def build_assignment_plan_from_portal_options(
             filter_month=pile.filter_month,
             filter_year=pile.filter_year,
             source_page_number=pile.page_number,
+            legacy_tracking_key=pile.legacy_tracking_key,
+            portal_identity_hash=pile.portal_identity_hash,
         ))
 
     summary = {
@@ -9088,20 +9271,18 @@ def _run_for_insurer_once(
                     key for attempt in final_pending
                     for key in (attempt.get("tracking_key"), attempt.get("last_pile_key"))
                 ))
-                observations_by_key: dict[str, list[Observation]] = {}
-                for row in follow_up_rows:
-                    for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]):
-                        observations_by_key.setdefault(key, []).append(Observation(
-                            assignable=not norm(row.assigned), assignee=norm(row.assigned),
-                            source="complete_final_scan", row=row,
-                        ))
-
                 class FinalScanPortal:
                     def observe_attempt(self, attempt):
                         runner._heartbeat("reconcile")
-                        return [observation
-                                for key in expanded_tracking_key_set([attempt.get("tracking_key"), attempt.get("last_pile_key")])
-                                for observation in observations_by_key.get(key, [])]
+                        matched_rows, method = rows_matching_attempt_identity(
+                            follow_up_rows, attempt,
+                        )
+                        return [Observation(
+                            assignable=not norm(row.assigned),
+                            assignee=norm(row.assigned),
+                            source=f"complete_final_scan:{method or 'none'}",
+                            row=row,
+                        ) for row in matched_rows]
 
                 for attempt in final_pending:
                     runner._heartbeat("reconcile")

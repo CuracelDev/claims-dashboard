@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import re
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .domain import AttemptStatus, FilterEvidence, WaitDecision
 
@@ -25,6 +25,65 @@ class AttemptDecision:
     tracking_key: str
     status: AttemptStatus
     evidence: AttemptEvidence
+
+
+@dataclass(frozen=True)
+class IdentityMatch:
+    indexes: tuple[int, ...]
+    method: str = ""
+    ambiguous: bool = False
+
+
+def select_identity_match_indexes(
+    candidates: Iterable[Mapping[str, Any]],
+    *,
+    expected_portal_identity_hash: str = "",
+    expected_aliases: Iterable[str] = (),
+    expected_natural_identity_hash: str = "",
+) -> IdentityMatch:
+    """Select one exact identity by descending evidence strength."""
+    rows = tuple(candidates)
+
+    def result(
+        indexes: list[int], method: str, *, require_unique: bool,
+    ) -> IdentityMatch:
+        return IdentityMatch(
+            tuple(indexes), method,
+            ambiguous=require_unique and len(indexes) > 1,
+        )
+
+    portal_hash = str(expected_portal_identity_hash or "").strip().lower()
+    if portal_hash:
+        matched = [
+            index for index, candidate in enumerate(rows)
+            if str(candidate.get("portal_identity_hash") or "").strip().lower() == portal_hash
+        ]
+        if matched:
+            return result(matched, "portal_identity_hash", require_unique=True)
+
+    aliases = {str(value or "").strip() for value in expected_aliases if str(value or "").strip()}
+    if aliases:
+        matched = [
+            index for index, candidate in enumerate(rows)
+            if aliases & {
+                str(value or "").strip()
+                for value in candidate.get("aliases", ())
+                if str(value or "").strip()
+            }
+        ]
+        if matched:
+            return result(matched, "canonical_alias", require_unique=False)
+
+    natural_hash = str(expected_natural_identity_hash or "").strip().lower()
+    if natural_hash:
+        matched = [
+            index for index, candidate in enumerate(rows)
+            if str(candidate.get("natural_identity_hash") or "").strip().lower() == natural_hash
+        ]
+        if matched:
+            return result(matched, "unique_natural_identity", require_unique=True)
+
+    return IdentityMatch(())
 
 
 def _label(value: Any) -> str:
