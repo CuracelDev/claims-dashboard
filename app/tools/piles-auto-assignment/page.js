@@ -2442,9 +2442,9 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
     <div style={cardStyle(C)}>
       <SectionHeader
         C={C}
-        icon="🚨"
-        title="Externally Assigned Piles"
-        text="These are piles the runner did not assign itself, but later found already assigned during a scan. They are logged separately so skipped/manual assignments are still visible and reviewable."
+        icon="🔎"
+        title="Unlinked / Externally Observed Assignments"
+        text="These piles were observed with a portal assignee. Unlinked does not prove a manual action or identify the actor; only verified external evidence does."
       />
       <div style={{ display: 'grid', gridTemplateColumns: '0.9fr 1fr 1fr', gap: 12, marginBottom: 16 }}>
         <select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)} style={inputStyle(C)}>
@@ -2457,21 +2457,21 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
           {insurerOptions.map((insurer) => <option key={insurer.value} value={insurer.value}>{insurer.label}</option>)}
         </select>
         <div style={{ background: C.elevated, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.sub, fontSize: 12, display: 'flex', alignItems: 'center' }}>
-          Showing {rows.length} stored external-assignment detection{rows.length === 1 ? '' : 's'}.
+          Showing {rows.length} stored assignment observation{rows.length === 1 ? '' : 's'}.
         </div>
       </div>
       {!rows.length ? (
         <EmptyState
           C={C}
-          title="No externally assigned piles logged"
-          text="When a pile the runner did not assign later shows an assignee on the portal, it will appear here for review."
+          title="No unlinked or externally observed assignments logged"
+          text="Assigned portal rows that cannot yet be linked to runner evidence will appear here for review."
         />
       ) : (
         <div style={{ overflowX: 'auto', maxHeight: 430, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 12 }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead style={{ position: 'sticky', top: 0, background: C.card, zIndex: 1 }}>
               <tr>
-                {['Detected', 'Insurer', 'Bot Owner', 'Bot Name', 'Provider', 'Claims', 'Remaining', 'Status', 'Month', 'State'].map((label) => (
+                {['Detected', 'Insurer', 'Provenance', 'Portal Assignee', 'Configured Owner', 'Provider', 'Claims', 'Unsynced', 'Status', 'Month', 'Runner Evidence', 'Clear Reason', 'State'].map((label) => (
                   <th key={label} style={{ textAlign: 'left', color: C.sub, fontSize: 11, fontWeight: 700, padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
                     {label}
                   </th>
@@ -2485,19 +2485,23 @@ function ExternalAssignmentLogSection({ C, externalAssignments, botAccounts }) {
                     canonicalInsurerKeyClient(bot.insurer_name) === canonicalInsurerKeyClient(item.insurer_name)
                     && normKeyClient(bot.bot_name) === normKeyClient(item.current_assigned)
                   ));
-                const ownerName = item.owner_name || matchedBot?.owner_name || '—';
-                const botName = item.current_assigned || matchedBot?.bot_name || '—';
+                const ownerName = item.configured_owner || item.owner_name || matchedBot?.owner_name || '—';
+                const botName = item.portal_assignee || item.current_assigned || matchedBot?.bot_name || '—';
+                const provenance = item.provenance_status || 'legacy_unverified';
                 return (
                   <tr key={item.id}>
                     <td style={{ color: C.muted, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.first_detected_at ? new Date(item.first_detected_at).toLocaleString('en-GB') : '—'}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{displayInsurerName(item.insurer_name)}</td>
-                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{ownerName}</td>
+                    <td style={{ color: provenance === 'verified_external' ? C.warn : C.sub, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{provenance.replaceAll('_', ' ')}</td>
                     <td style={{ color: C.text, fontSize: 13, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{botName}</td>
+                    <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{ownerName}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.provider || '—'}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.claims_total ?? 0}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.remaining_claims ?? 0}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.current_status_bucket || item.current_status || '—'}</td>
                     <td style={{ color: C.text, fontSize: 13, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.claim_month || '—'}</td>
+                    <td style={{ color: C.sub, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.related_runner_evidence || 'None recorded'}</td>
+                    <td style={{ color: C.sub, fontSize: 12, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.clear_reason || '—'}</td>
                     <td style={{ color: item.is_active ? C.warn : C.sub, fontSize: 12, fontWeight: 700, padding: '12px', borderBottom: `1px solid ${C.border}` }}>{item.is_active ? 'Active' : 'Cleared'}</td>
                   </tr>
                 );
@@ -2751,7 +2755,7 @@ export default function PilesAutoAssignmentPage() {
         <StatCard C={C} label="Active Claim Load" value={data.overview?.activeClaimLoad ?? '—'} hint="Current open claims assigned" />
         <StatCard C={C} label="Tracked Piles" value={data.overview?.activeTrackedPiles ?? '—'} hint="Runner-managed active assignments" />
         <StatCard C={C} label="Stale Tracked" value={data.overview?.staleTrackedPiles ?? '—'} hint="Candidates for reassignment" />
-        <StatCard C={C} label="External Assignments" value={data.overview?.activeExternalAssignments ?? '—'} hint="Assigned outside runner tracking" />
+        <StatCard C={C} label="Observed Assignments" value={data.overview?.activeObservedAssignments ?? data.overview?.activeExternalAssignments ?? '—'} hint="Unlinked or verified external observations" />
         <StatCard C={C} label="Late Arrivals" value={data.overview?.lateArrivalPileDetections ?? '—'} hint="Caught in the follow-up mini-pass" />
         <StatCard C={C} label="Weekend Rosters" value={data.overview?.weekendRostersConfigured ?? '—'} hint="n8n roster syncs stored" />
       </div>

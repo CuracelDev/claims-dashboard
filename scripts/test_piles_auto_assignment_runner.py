@@ -1018,6 +1018,37 @@ class AssignmentProvenanceDetectionTests(unittest.TestCase):
         self.assertEqual(result["manual_review_count"], 0)
         self.assertEqual(state.saved, [])
 
+    def test_unlinked_observation_persists_and_notifies_with_explicit_provenance(self):
+        row = runner.replace(make_pile(1), assigned="primary")
+        store, state = self.store()
+
+        def save(*args, **kwargs):
+            state.saved.append((args, kwargs))
+            return types.SimpleNamespace(
+                id="observed-1", tracking_key=row.tracking_key,
+                assignment_type=row.assignment_type, first_detected_at="",
+                last_seen_at="", synced_claims=0, owner_name="Owner",
+            ), True
+
+        store.save_external_assignment = save
+
+        class Ledger:
+            def find_assignment_ownership(self, *_args):
+                return []
+
+        result = runner.detect_external_assignments(
+            store, "master-1", "OLD MUTUAL", [row],
+            [make_bot("primary", "primary")], set(), {}, None,
+            execution_ledger=Ledger(),
+        )
+
+        self.assertEqual(state.saved[0][1]["provenance_status"], "unlinked")
+        self.assertEqual(
+            state.saved[0][1]["provenance_reason_code"],
+            "no_runner_or_actor_evidence",
+        )
+        self.assertEqual(result["notifications"][0].provenance_status, "unlinked")
+
     def test_ambiguous_current_rows_fail_closed_without_alert_or_reassignment(self):
         first = runner.replace(make_pile(1), assigned="primary")
         second = runner.replace(first, key="different-volatile-key")
@@ -1091,6 +1122,47 @@ class AssignmentProvenanceDetectionTests(unittest.TestCase):
             "confirming_attempt_id": "attempt-1",
             "confirming_insurer_run_id": "run-1",
         })
+
+    def test_unlinked_slack_copy_never_attributes_action_to_configured_owner(self):
+        item = runner.ExternalNotificationItem(
+            "DEFMIS", "BRISTOL PARK", 3, 3, "June 2025",
+            "Vetting Ongoing", "CVEBOT1", "Sophie", "U123",
+            provenance_status="unlinked",
+            provenance_reason_code="no_runner_or_actor_evidence",
+            related_runner_evidence="No matching runner attempt",
+        )
+        sent = []
+        with patch.object(runner, "SLACK_PRISM_BOT_TOKEN", "fixture"), \
+                patch.object(runner, "SLACK_ALERTS_CHANNEL_ID", "fixture"), \
+                patch.object(runner, "slack_post_message", lambda *args, **kwargs: sent.append(kwargs)):
+            self.assertTrue(runner.send_external_assignment_alert(
+                [item], "production", "schedule",
+            ))
+
+        rendered = runner.json.dumps(sent)
+        self.assertIn("Unlinked Assigned Piles Detected", rendered)
+        self.assertIn("Portal assignee: *CVEBOT1*", rendered)
+        self.assertIn("Configured owner: <@U123>", rendered)
+        self.assertIn("Provenance: unlinked", rendered)
+        self.assertIn("Unsynced: 3", rendered)
+        self.assertNotIn("Externally Assigned", rendered)
+        self.assertNotIn("Remaining:", rendered)
+        self.assertNotIn("assigned by sophie", rendered.lower())
+
+    def test_runner_confirmed_items_are_defensively_excluded_from_alerts(self):
+        item = runner.ExternalNotificationItem(
+            "DEFMIS", "Provider", 1, 1, "Jun", "Vetting",
+            "CVEBOT1", "Sophie", "",
+            provenance_status="runner_confirmed",
+        )
+        sent = []
+        with patch.object(runner, "SLACK_PRISM_BOT_TOKEN", "fixture"), \
+                patch.object(runner, "SLACK_ALERTS_CHANNEL_ID", "fixture"), \
+                patch.object(runner, "slack_post_message", lambda *args, **kwargs: sent.append(kwargs)):
+            self.assertFalse(runner.send_external_assignment_alert(
+                [item], "production", "schedule",
+            ))
+        self.assertEqual(sent, [])
 
 
 class DurablePortalIdentityTests(unittest.TestCase):
@@ -1948,6 +2020,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
         self.assertEqual(record.tracking_key, pile.tracking_key)
         self.assertEqual(record.current_assigned, "Primary Bot")
         self.assertEqual(record.bot_account_id, bot.id)
+        self.assertEqual(record.details["provenance_status"], "legacy_unverified")
 
     def test_transient_scan_response_timeout_is_retryable(self):
         self.assertTrue(runner.is_retryable_scan_error(RuntimeError(

@@ -1185,27 +1185,40 @@ def send_external_assignment_alert(
     run_source: str,
     *, safe_diagnostics: bool = False,
 ) -> bool:
+    items = [
+        item for item in items
+        if item.provenance_status in {"unlinked", "verified_external", "legacy_unverified"}
+    ]
     if not (SLACK_PRISM_BOT_TOKEN and SLACK_ALERTS_CHANNEL_ID):
         return False
     if not items:
         return False
 
     insurer_count = len({norm(item.insurer_name).lower() for item in items if norm(item.insurer_name)})
+    all_verified = all(item.provenance_status == "verified_external" for item in items)
+    alert_title = (
+        "Verified External Assigned Piles Detected"
+        if all_verified else "Unlinked Assigned Piles Detected"
+    )
     header_lines = [
-        "⚠️ *Externally Assigned Piles Detected*",
+        f"⚠️ *{alert_title}*",
         f"*{len(items)} pile(s)* were already assigned when scanned on the *{portal_environment}* portal.",
         f"Detected during a *{run_source or 'manual'}* run across *{insurer_count} insurer(s)*.",
-        "_These piles were not assigned by the runner, so they are being logged separately for review._",
+        (
+            "_Positive portal audit evidence identifies a non-runner actor._"
+            if all_verified
+            else "_No matching runner evidence was found. This does not prove a manual action or identify who assigned the pile._"
+        ),
         "",
     ]
     detail_lines: list[str] = []
     for item in items:
-        owner_text = slack_mention(item.owner_slack_user_id, item.owner_name) if norm(item.owner_name) else "Unmapped owner"
+        owner_text = slack_mention(item.owner_slack_user_id, item.owner_name) if norm(item.owner_name) else "Unmapped"
         line = (
-            f"• *{item.insurer_name}* — {owner_text} — *{item.current_assigned or 'Unknown assignee'}* — "
-            f"{item.claims} claims"
+            f"• *{item.insurer_name}* — Portal assignee: *{item.current_assigned or 'Unknown'}* — "
+            f"Configured owner: {owner_text} — {item.claims} claims"
         )
-        meta_parts = []
+        meta_parts = [f"Provenance: {item.provenance_status}"]
         if norm(item.provider):
             meta_parts.append(f"Provider: {item.provider}")
         if norm(item.claim_month):
@@ -1213,7 +1226,9 @@ def send_external_assignment_alert(
         if norm(item.status_bucket):
             meta_parts.append(f"Status: {item.status_bucket}")
         if item.remaining_claims > 0:
-            meta_parts.append(f"Remaining: {item.remaining_claims}")
+            meta_parts.append(f"Unsynced: {item.remaining_claims}")
+        if norm(item.related_runner_evidence):
+            meta_parts.append(f"Runner evidence: {item.related_runner_evidence}")
         detail_lines.append(line)
         if meta_parts:
             detail_lines.append("  " + " • ".join(meta_parts))
@@ -1231,7 +1246,7 @@ def send_external_assignment_alert(
         slack_post_message(
             SLACK_PRISM_BOT_TOKEN,
             SLACK_ALERTS_CHANNEL_ID,
-            text=f"Externally assigned piles detected: {len(items)} pile(s)",
+            text=f"{alert_title}: {len(items)} pile(s)",
             blocks=blocks,
         )
         return True
@@ -1706,6 +1721,9 @@ class ExternalNotificationItem:
     current_assigned: str
     owner_name: str
     owner_slack_user_id: str
+    provenance_status: str = "unlinked"
+    provenance_reason_code: str = ""
+    related_runner_evidence: str = ""
 
 
 @dataclass
@@ -2939,6 +2957,9 @@ class DataStore:
         row: PileRow,
         matched_bot: BotAccount | None = None,
         last_progress_at: str | None = None,
+        provenance_status: str = "legacy_unverified",
+        provenance_reason_code: str = "",
+        related_runner_evidence: dict[str, Any] | None = None,
     ) -> tuple[ExternalAssignment, bool]:
         now_iso = datetime.now(timezone.utc).isoformat()
         aliases = insurer_aliases(insurer_name)
@@ -2965,8 +2986,23 @@ class DataStore:
             ][:1]
         existing = self._rows_to_external_assignments(rows)[0] if rows else None
         previous_details = existing.details if existing and isinstance(existing.details, dict) else {}
+        safe_provenance_status = (
+            provenance_status
+            if provenance_status in {"unlinked", "verified_external", "legacy_unverified"}
+            else "legacy_unverified"
+        )
         details = {
-            "source": "runner_detected_external_assignment",
+            "source": "runner_observed_assigned_pile",
+            "provenance_status": safe_provenance_status,
+            "provenance_reason_code": (
+                provenance_reason_code
+                if re.fullmatch(r"[a-z0-9._-]{1,80}", provenance_reason_code or "")
+                else ""
+            ),
+            "related_runner_evidence": related_runner_evidence or {
+                "attempt_match_count": 0,
+                "summary": "No matching runner attempt",
+            },
             "identity_version": "stable_v2",
             "legacy_tracking_key": row.legacy_tracking_key,
             "assigned_name": row.assigned,
@@ -7930,6 +7966,15 @@ def detect_external_assignments(
             row,
             matched_bot,
             last_progress_at=last_progress_at,
+            provenance_status=ownership.ownership.value,
+            provenance_reason_code=ownership.reason_code,
+            related_runner_evidence={
+                "attempt_match_count": len(attempt_matches),
+                "summary": (
+                    "No matching runner attempt"
+                    if not attempt_matches else "Related runner evidence requires review"
+                ),
+            },
         )
         if matched_bot is not None:
             idle_since = parse_iso_datetime(last_progress_at or record.first_detected_at or record.last_seen_at)
@@ -7965,6 +8010,12 @@ def detect_external_assignments(
             current_assigned=row.assigned,
             owner_name=matched_bot.owner_name if matched_bot else record.owner_name,
             owner_slack_user_id=norm(owner_info.get("slack_user_id")),
+            provenance_status=ownership.ownership.value,
+            provenance_reason_code=ownership.reason_code,
+            related_runner_evidence=(
+                "No matching runner attempt"
+                if not attempt_matches else "Related runner evidence requires review"
+            ),
         ))
         store.log_runner_event(
             insurer_name=insurer_name,
@@ -8905,7 +8956,7 @@ def _run_for_insurer_once(
             execution_ledger=execution_ledger,
         )
         if external_detection["new_detection_count"]:
-            print("\nDetected externally assigned piles the runner is not tracking:")
+            print("\nObserved assigned piles without matching runner evidence:")
             for item in external_detection["notifications"]:
                 owner_label = item.owner_name or "Unmapped owner"
                 print(
