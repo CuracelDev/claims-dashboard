@@ -1411,7 +1411,7 @@ def observations_for_scanned_attempt(rows: list["PileRow"], attempt: dict[str, A
     indexed = index_scanned_rows(rows) if indexed_rows is None else indexed_rows
     matching = {id(row): row for key in keys for row in indexed.get(key, [])}
     return [Observation(assignable=not norm(row.assigned), assignee=norm(row.assigned),
-                        source="complete_initial_scan")
+                        source="complete_initial_scan", row=row)
             for row in matching.values()]
 
 
@@ -1517,6 +1517,7 @@ class AssignmentVerificationResult:
     missing_count: int
     wrong_values: list[str]
     decisions: list[Any] = field(default_factory=list)
+    matched_rows: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -6094,7 +6095,7 @@ class CuracelPilesRunner:
                 year_label,
                 status_label,
                 selected_keys,
-                selected_assignee,
+                assignee_name,
                 tracking_keys=[plan.tracking_key for plan in selected_group],
                 source_pages=source_pages,
             )
@@ -6112,6 +6113,16 @@ class CuracelPilesRunner:
                         expected={AttemptStatus.SUBMITTED},
                         evidence=decision.evidence,
                     )
+                    if decision.status == AttemptStatus.CONFIRMED_VISIBLE:
+                        matched_row = verification.matched_rows.get(decision.tracking_key)
+                        if matched_row is None:
+                            raise RuntimeError(
+                                "Confirmed portal verification is missing its matched row."
+                            )
+                        ledger.materialize_confirmed_assignment(
+                            decision.attempt_id,
+                            matched_row,
+                        )
             if verification.missing_count or verification.wrong_values:
                 print(
                     f"  Per-pile verification for '{selected_assignee}': "
@@ -6257,6 +6268,7 @@ class CuracelPilesRunner:
         missing_count = len(target_keys)
         wrong_values: list[str] = []
         decisions: list[Any] = []
+        matched_rows: dict[str, PileRow] = {}
         page_candidates = list(dict.fromkeys(page for page in (source_pages or []) if page > 0))
         target_key_set = set(target_keys)
         while time.time() < deadline:
@@ -6316,6 +6328,7 @@ class CuracelPilesRunner:
             ]
             expected_observations = {}
             observed_assignments = {}
+            matched_rows = {}
             for key in target_keys:
                 tracking_key = target_tracking_by_key.get(key) or key
                 expected_observations[tracking_key] = {
@@ -6324,6 +6337,7 @@ class CuracelPilesRunner:
                 }
                 if key in row_map:
                     observed_assignments[tracking_key] = row_map[key].assigned
+                    matched_rows[tracking_key] = row_map[key]
             decisions = list(classify_assignment_observations(
                 expected_observations,
                 observed_assignments,
@@ -6352,6 +6366,7 @@ class CuracelPilesRunner:
                     missing_count,
                     wrong_values,
                     decisions,
+                    matched_rows,
                 )
             if any(decision.status == AttemptStatus.CONFLICT for decision in decisions):
                 return AssignmentVerificationResult(
@@ -6361,6 +6376,7 @@ class CuracelPilesRunner:
                     missing_count,
                     wrong_values,
                     decisions,
+                    matched_rows,
                 )
             time.sleep(1)
         return AssignmentVerificationResult(
@@ -6370,6 +6386,7 @@ class CuracelPilesRunner:
             missing_count,
             wrong_values,
             decisions,
+            matched_rows,
         )
 
     def _open_assign_modal(self) -> None:
@@ -8653,13 +8670,14 @@ def _run_for_insurer_once(
                         )
                         candidate = reassignment_source_by_tracking.get(item.plan.tracking_key)
                         if planned_assignee and item.matched_planned_assignee and item.verified_on_table:
-                            store.save_tracked_assignment(
-                                master.id,
-                                item.plan,
-                                item.actual_assignee_name,
-                                planned_assignee.id,
-                                reassigned=True,
-                            )
+                            if not execution_ledger:
+                                store.save_tracked_assignment(
+                                    master.id,
+                                    item.plan,
+                                    item.actual_assignee_name,
+                                    planned_assignee.id,
+                                    reassigned=True,
+                                )
                             if candidate and candidate.source_kind == "external":
                                 store.clear_external_assignment(candidate.source_id)
                 else:
@@ -8952,7 +8970,7 @@ def _run_for_insurer_once(
                     for key in expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key, row.key]):
                         observations_by_key.setdefault(key, []).append(Observation(
                             assignable=not norm(row.assigned), assignee=norm(row.assigned),
-                            source="complete_final_scan",
+                            source="complete_final_scan", row=row,
                         ))
 
                 class FinalScanPortal:
@@ -9080,13 +9098,14 @@ def _run_for_insurer_once(
                                 )
                                 candidate = reassignment_source_by_tracking.get(item.plan.tracking_key)
                                 if planned_assignee and item.matched_planned_assignee and item.verified_on_table:
-                                    store.save_tracked_assignment(
-                                        master.id,
-                                        item.plan,
-                                        item.actual_assignee_name,
-                                        planned_assignee.id,
-                                        reassigned=True,
-                                    )
+                                    if not execution_ledger:
+                                        store.save_tracked_assignment(
+                                            master.id,
+                                            item.plan,
+                                            item.actual_assignee_name,
+                                            planned_assignee.id,
+                                            reassigned=True,
+                                        )
                                     if candidate and candidate.source_kind == "external":
                                         store.clear_external_assignment(candidate.source_id)
                             if resolved_bots:
@@ -9225,13 +9244,14 @@ def _run_for_insurer_once(
                 observed_assigned_values=item.observed_assigned_values,
             )
             if planned_assignee and item.matched_planned_assignee and item.verified_on_table:
-                store.save_tracked_assignment(
-                    master.id,
-                    item.plan,
-                    item.actual_assignee_name,
-                    planned_assignee.id,
-                    reassigned=False,
-                )
+                if not execution_ledger:
+                    store.save_tracked_assignment(
+                        master.id,
+                        item.plan,
+                        item.actual_assignee_name,
+                        planned_assignee.id,
+                        reassigned=False,
+                    )
     else:
         for plan in plans:
             planned_assignee = next((bot for bot in resolved_bots if bot.id == plan.assignee_id), None)

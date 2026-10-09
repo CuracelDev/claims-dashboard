@@ -3842,6 +3842,55 @@ class AssignmentRuleLoadingTests(unittest.TestCase):
 
 
 class PerPileVerificationIntegrationTests(unittest.TestCase):
+    def test_confirmed_immediate_verification_materializes_before_returning_applied_item(self):
+        events = []
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._heartbeat = lambda _phase: None
+        portal_runner._open_assign_modal = lambda: None
+        portal_runner._apply_assignment_modal = lambda *_args: "Daniel"
+        row = runner.replace(make_pile(1), assigned="Daniel")
+        plan = runner.PlannedAssignment(
+            pile_key=row.key, tracking_key=row.tracking_key,
+            assignee_id="daniel", assignee_name="Daniel", assignment_type="Vetting",
+            insurer_name="Jubilee Uganda", provider=row.provider,
+            claim_month=row.month, submitted_date=row.submitted_date,
+            claims=row.claims, synced_claims=row.synced_claims,
+            remaining_claims=row.remaining_claims, current_status=row.status,
+            status_bucket=row.status_bucket, filter_month=row.filter_month,
+            filter_year=row.filter_year, source_page_number=1,
+        )
+        portal_runner.assignment_attempt_ids = {plan.tracking_key: "attempt-1"}
+        decision = runner.classify_assignment_observations(
+            {plan.tracking_key: {
+                "attempt_id": "attempt-1", "expected_assignee": "Daniel",
+            }},
+            {plan.tracking_key: "Daniel"},
+        )[0]
+
+        class Ledger:
+            def transition_attempt(self, attempt_id, status, **_kwargs):
+                events.append(("transition", attempt_id, status))
+
+            def materialize_confirmed_assignment(self, attempt_id, observation):
+                events.append(("materialize", attempt_id, observation.tracking_key))
+
+        portal_runner.execution_ledger = Ledger()
+        portal_runner.verify_assigned_rows = lambda *_args, **_kwargs: runner.AssignmentVerificationResult(
+            True, ["Daniel"], 1, 0, [], [decision], {plan.tracking_key: row},
+        )
+
+        _assignee, applied = runner.CuracelPilesRunner._apply_selected_group(
+            portal_runner, "All", "2026", "Vetting Pending", "Daniel", "Vetting",
+            [plan], True,
+        )
+
+        self.assertTrue(applied[0].verified_on_table)
+        self.assertEqual(events, [
+            ("transition", "attempt-1", runner.AttemptStatus.SUBMITTED),
+            ("transition", "attempt-1", runner.AttemptStatus.CONFIRMED_VISIBLE),
+            ("materialize", "attempt-1", plan.tracking_key),
+        ])
+
     def test_uncertain_item_does_not_abort_the_batch(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
         portal_runner.execution_ledger = None

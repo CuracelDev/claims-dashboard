@@ -26,6 +26,10 @@ class ConcurrentStateChange(RuntimeError):
     """Raised when another worker changed an attempt before our CAS update."""
 
 
+class TrackedMaterializationPending(ValueError):
+    """A confirmation is durable but its safe tracked-row projection is incomplete."""
+
+
 class ParentWorkPending(ValueError):
     """Owned or referenced work is still live; this is not a parent failure."""
 
@@ -53,6 +57,10 @@ def _json(value: Any) -> str:
 def _insurer_lock_key(value: Any) -> str:
     label = " ".join(str(value or "").strip().lower().split())
     return "OLD MUTUAL" if label in {"uapom", "old mutual"} else label
+
+
+def _normalized_label(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
 def notification_fingerprint(work_id: str, insurer_name: str, tracking_key: str) -> str:
@@ -1442,6 +1450,160 @@ class ExecutionLedger:
             columns = [item[0] for item in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
+    def materialize_confirmed_assignment(
+        self,
+        attempt_id: str,
+        observation: Any,
+    ) -> str:
+        """Atomically project positive confirmation into the tracked-pile mirror."""
+        observed_assignee = str(_value(observation, "assigned", "") or "").strip()
+        observed_tracking_key = str(_value(observation, "tracking_key", "") or "").strip()
+        observed_pile_key = str(_value(observation, "key", "") or "").strip()
+        provider = str(_value(observation, "provider", "") or "").strip()
+        if not observed_assignee or not observed_tracking_key or not observed_pile_key or not provider:
+            raise TrackedMaterializationPending(
+                "tracked materialization requires a positive assigned observation with row metadata"
+            )
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT attempt.id, attempt.insurer_run_id,
+                           insurer_run.master_account_id, attempt.tracked_pile_id,
+                           attempt.insurer_name, attempt.tracking_key,
+                           attempt.last_pile_key, attempt.bot_account_id,
+                           attempt.intended_portal_assignee, attempt.status
+                    FROM piles_auto_assignment_attempts attempt
+                    JOIN piles_auto_assignment_insurer_runs insurer_run
+                      ON insurer_run.id = attempt.insurer_run_id
+                    WHERE attempt.id = %s
+                    FOR UPDATE OF attempt
+                    """,
+                    (attempt_id,),
+                )
+                locked = cursor.fetchone()
+                if not locked:
+                    raise ConcurrentStateChange(attempt_id)
+                columns = [item[0] for item in cursor.description]
+                attempt = dict(zip(columns, locked))
+                if attempt.get("status") not in {
+                    AttemptStatus.CONFIRMED_VISIBLE.value,
+                    AttemptStatus.CONFIRMED_RECONCILED.value,
+                }:
+                    raise ValueError("tracked materialization requires a confirmed attempt")
+                if _normalized_label(observed_assignee) != _normalized_label(
+                    attempt.get("intended_portal_assignee")
+                ):
+                    raise ValueError("observed assignee does not match the confirmed attempt")
+                attempt_identities = {
+                    str(attempt.get("tracking_key") or "").strip(),
+                    str(attempt.get("last_pile_key") or "").strip(),
+                }
+                observed_identities = {
+                    observed_tracking_key,
+                    observed_pile_key,
+                    str(_value(observation, "legacy_tracking_key", "") or "").strip(),
+                }
+                if not (attempt_identities - {""}) & (observed_identities - {""}):
+                    raise ValueError("observation does not match the confirmed attempt identity")
+
+                tracked_id = str(attempt.get("tracked_pile_id") or uuid.uuid4())
+                synced_claims = max(int(_value(observation, "synced_claims", 0) or 0), 0)
+                cursor.execute(
+                    """
+                    INSERT INTO piles_auto_assignment_tracked_piles
+                        (id, master_account_id, bot_account_id, insurer_name,
+                         tracking_key, last_pile_key, provider, claim_month,
+                         submitted_date, claims_total, synced_claims, remaining_claims,
+                         assignment_type, current_status, current_status_bucket,
+                         current_assigned, filter_month, first_assigned_at, assigned_at,
+                         first_seen_at, last_seen_at, last_progress_at, completed_at,
+                         is_active, is_stale, stale_reason, details)
+                    VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                         %s, %s, %s, %s, %s, now(), now(), now(), now(),
+                         CASE WHEN %s > 0 THEN now() END, NULL, true, false, NULL,
+                         %s::jsonb)
+                    ON CONFLICT (insurer_name, tracking_key) DO UPDATE SET
+                        master_account_id = EXCLUDED.master_account_id,
+                        bot_account_id = EXCLUDED.bot_account_id,
+                        last_pile_key = EXCLUDED.last_pile_key,
+                        provider = EXCLUDED.provider,
+                        claim_month = EXCLUDED.claim_month,
+                        submitted_date = EXCLUDED.submitted_date,
+                        claims_total = EXCLUDED.claims_total,
+                        synced_claims = EXCLUDED.synced_claims,
+                        remaining_claims = EXCLUDED.remaining_claims,
+                        assignment_type = EXCLUDED.assignment_type,
+                        current_status = EXCLUDED.current_status,
+                        current_status_bucket = EXCLUDED.current_status_bucket,
+                        current_assigned = EXCLUDED.current_assigned,
+                        filter_month = EXCLUDED.filter_month,
+                        assigned_at = now(),
+                        last_seen_at = now(),
+                        last_progress_at = CASE
+                          WHEN EXCLUDED.synced_claims > piles_auto_assignment_tracked_piles.synced_claims
+                          THEN now()
+                          ELSE coalesce(
+                            piles_auto_assignment_tracked_piles.last_progress_at,
+                            EXCLUDED.last_progress_at
+                          )
+                        END,
+                        completed_at = NULL,
+                        is_active = true,
+                        is_stale = false,
+                        stale_reason = NULL,
+                        details = coalesce(piles_auto_assignment_tracked_piles.details, '{}'::jsonb)
+                                  || EXCLUDED.details,
+                        updated_at = now()
+                    RETURNING id
+                    """,
+                    (
+                        tracked_id,
+                        attempt.get("master_account_id"),
+                        attempt.get("bot_account_id"),
+                        attempt.get("insurer_name"),
+                        attempt.get("tracking_key"),
+                        observed_pile_key,
+                        provider,
+                        _value(observation, "month", ""),
+                        _value(observation, "submitted_date", ""),
+                        max(int(_value(observation, "claims", 0) or 0), 0),
+                        synced_claims,
+                        max(int(_value(observation, "remaining_claims", 0) or 0), 0),
+                        str(_value(observation, "assignment_type", "Vetting") or "Vetting"),
+                        str(_value(observation, "status", "") or ""),
+                        str(_value(observation, "status_bucket", "") or ""),
+                        observed_assignee,
+                        str(_value(observation, "filter_month", "") or ""),
+                        synced_claims,
+                        _json({"source": "runner_ledger"}),
+                    ),
+                )
+                tracked_row = cursor.fetchone()
+                if not tracked_row:
+                    raise ConcurrentStateChange(attempt_id)
+                materialized_id = str(tracked_row[0])
+                cursor.execute(
+                    """
+                    UPDATE piles_auto_assignment_attempts
+                    SET tracked_pile_id = %s, updated_at = now()
+                    WHERE id = %s
+                      AND status IN ('confirmed_visible', 'confirmed_reconciled')
+                    RETURNING tracked_pile_id
+                    """,
+                    (materialized_id, attempt_id),
+                )
+                linked = cursor.fetchone()
+                if not linked or str(linked[0]) != materialized_id:
+                    raise ConcurrentStateChange(attempt_id)
+            self.connection.commit()
+            return materialized_id
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def retryable_attempts(self, insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -1661,6 +1823,9 @@ class ReadOnlyExecutionLedger:
         _identity_keys: Iterable[str],
     ) -> list[dict[str, Any]]:
         return []
+
+    def materialize_confirmed_assignment(self, _attempt_id: str, _observation: Any) -> str:
+        return ""
 
     def retryable_attempts(self, _insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
         del max_attempts

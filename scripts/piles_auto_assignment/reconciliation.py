@@ -14,6 +14,7 @@ class Observation:
     assignable: bool
     assignee: str
     source: str = "original_context"
+    row: Any = None
 
 
 def _label(value: Any) -> str:
@@ -97,7 +98,7 @@ def reconcile_pending_for_insurer(
                 evidence=AttemptEvidence("reconciliation_started", {}),
             )
             current = AttemptStatus.RECONCILIATION_PENDING
-        observations = portal.observe_attempt(attempt)
+        observations = tuple(portal.observe_attempt(attempt))
         decision = reconcile_attempt(
             observations,
             str(attempt.get("intended_portal_assignee") or ""),
@@ -123,6 +124,25 @@ def reconcile_pending_for_insurer(
                     {"requires_portal_review": True},
                 ),
             )
+        matched_observation = next((
+            item for item in observations
+            if decision.status == AttemptStatus.CONFIRMED_RECONCILED
+            and _label(item.assignee) == _label(attempt.get("intended_portal_assignee"))
+            and item.row is not None
+        ), None)
+        if (
+            decision.status == AttemptStatus.CONFIRMED_RECONCILED
+            and matched_observation is None
+        ):
+            decision = AttemptDecision(
+                decision.attempt_id,
+                decision.tracking_key,
+                decision.status,
+                AttemptEvidence(
+                    "tracked_materialization_pending",
+                    {"confirmation_code": decision.evidence.code},
+                ),
+            )
         if decision.status != AttemptStatus.RECONCILIATION_PENDING:
             ledger.transition_attempt(
                 attempt_id,
@@ -130,5 +150,7 @@ def reconcile_pending_for_insurer(
                 expected={current},
                 evidence=decision.evidence,
             )
+            if matched_observation is not None:
+                ledger.materialize_confirmed_assignment(attempt_id, matched_observation.row)
         decisions.append(decision)
     return tuple(decisions)
