@@ -1056,6 +1056,18 @@ class ExecutionLedgerTests(unittest.TestCase):
         self.assertIn("confirmed_pile_count", self.connection.statements[-1][0])
         self.assertEqual(self.connection.commit_count, 1)
 
+    def test_transition_merges_evidence_without_erasing_identity_hashes(self):
+        self.ledger.transition_attempt(
+            "attempt-1", AttemptStatus.SUBMITTED,
+            expected={AttemptStatus.SELECTED},
+            evidence={"code": "submitted", "details": {"safe": True}},
+        )
+        sql, _params = self.connection.statements[-2]
+        self.assertIn(
+            "evidence_details = coalesce(evidence_details, '{}'::jsonb) || %s::jsonb",
+            sql,
+        )
+
     def test_transition_rejects_an_illegal_state_edge_before_writing(self):
         with self.assertRaises(ValueError):
             self.ledger.transition_attempt(
@@ -1098,6 +1110,292 @@ class ExecutionLedgerTests(unittest.TestCase):
                 filter_context={},
             )
         self.assertEqual(self.connection.rollback_count, 1)
+
+    def test_assignment_ownership_lookup_is_bounded_to_current_identity_aliases(self):
+        rows = [
+            {
+                "id": "confirmed-attempt",
+                "insurer_run_id": "run-1",
+                "bot_account_id": "bot-1",
+                "intended_owner_name": "Sophie",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+                "tracking_key": "stable-key",
+                "last_pile_key": "volatile-key",
+                "claim_count": 3,
+                "evidence_code": "visible_after_submit",
+                "selected_at": None,
+                "submitted_at": "2026-10-08T08:23:25Z",
+                "confirmed_at": "2026-10-08T08:26:08Z",
+                "created_at": "2026-10-08T08:23:20Z",
+                "updated_at": "2026-10-08T08:26:08Z",
+            },
+            {
+                "id": "pending-attempt",
+                "insurer_run_id": "run-2",
+                "bot_account_id": "bot-1",
+                "intended_owner_name": "Sophie",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.RECONCILIATION_PENDING.value,
+                "tracking_key": "other-stable-key",
+                "last_pile_key": "stable-key",
+                "claim_count": 3,
+                "evidence_code": "submit_unverified",
+                "selected_at": "2026-10-08T08:23:24Z",
+                "submitted_at": "2026-10-08T08:23:25Z",
+                "confirmed_at": None,
+                "created_at": "2026-10-08T08:23:20Z",
+                "updated_at": "2026-10-08T08:23:30Z",
+            },
+        ]
+        connection = DispatchConnection(rows)
+        ledger = ExecutionLedger(connection)
+
+        matches = ledger.find_assignment_ownership(
+            "DEFMIS",
+            ["stable-key", "volatile-key", "stable-key", ""],
+        )
+
+        self.assertEqual([row["id"] for row in matches], [
+            "confirmed-attempt", "pending-attempt",
+        ])
+        sql, params = connection.statements[0]
+        self.assertIn("tracking_key = ANY(%s)", sql)
+        self.assertIn("last_pile_key = ANY(%s)", sql)
+        self.assertIn("UNION ALL", sql)
+        self.assertIn("DISTINCT ON (id)", sql)
+        self.assertIn("confirmed_visible", sql)
+        self.assertIn("confirmed_reconciled", sql)
+        self.assertIn("selected", sql)
+        self.assertIn("submitted", sql)
+        self.assertIn("reconciliation_pending", sql)
+        self.assertNotIn("manual_action_required", sql)
+        self.assertNotIn("status = 'failed'", sql)
+        self.assertEqual(params, (
+            "DEFMIS", ["stable-key", "volatile-key"],
+            "DEFMIS", ["stable-key", "volatile-key"],
+            "DEFMIS", [],
+        ))
+        self.assertEqual(connection.responses, [])
+
+    def test_assignment_ownership_lookup_preserves_duplicate_matches_for_conflict_classification(self):
+        rows = [
+            {
+                "id": "attempt-1", "status": AttemptStatus.SUBMITTED.value,
+                "tracking_key": "pile-1", "last_pile_key": None,
+            },
+            {
+                "id": "attempt-2", "status": AttemptStatus.CONFIRMED_RECONCILED.value,
+                "tracking_key": "pile-1", "last_pile_key": "old-pile-1",
+            },
+        ]
+        ledger = ExecutionLedger(DispatchConnection(rows))
+
+        matches = ledger.find_assignment_ownership("DEFMIS", ["pile-1"])
+
+        self.assertEqual([row["id"] for row in matches], ["attempt-1", "attempt-2"])
+
+    def test_assignment_ownership_lookup_does_not_query_for_empty_identities(self):
+        connection = RecordingConnection()
+
+        matches = ExecutionLedger(connection).find_assignment_ownership("DEFMIS", [None, "", "  "])
+
+        self.assertEqual(matches, [])
+        self.assertEqual(connection.statements, [])
+
+    def test_assignment_ownership_lookup_accepts_only_hashed_portal_identity(self):
+        connection = DispatchConnection([])
+        portal_hash = "a" * 64
+
+        matches = ExecutionLedger(connection).find_assignment_ownership(
+            "DEFMIS", [], [portal_hash, "raw-portal-id"],
+        )
+
+        self.assertEqual(matches, [])
+        sql, params = connection.statements[0]
+        self.assertIn("evidence_details ->> 'portal_identity_hash' = ANY(%s)", sql)
+        self.assertEqual(params[-2:], ("DEFMIS", [portal_hash]))
+        self.assertNotIn("raw-portal-id", str(params))
+
+    def test_confirmed_attempt_materialization_atomically_upserts_and_links_tracking(self):
+        connection = DispatchConnection(
+            [{
+                "id": "attempt-1",
+                "insurer_run_id": "run-1",
+                "master_account_id": "master-1",
+                "tracked_pile_id": None,
+                "insurer_name": "DEFMIS",
+                "tracking_key": "stable-key",
+                "last_pile_key": "volatile-key",
+                "bot_account_id": "bot-1",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+            }],
+            [{"id": "tracked-1"}],
+            [{"tracked_pile_id": "tracked-1"}],
+        )
+        ledger = ExecutionLedger(connection)
+
+        tracked_id = ledger.materialize_confirmed_assignment(
+            "attempt-1",
+            {
+                "key": "volatile-key", "tracking_key": "stable-key",
+                "provider": "BRISTOL PARK HEALTHCARE CENTRE",
+                "claims": 3, "synced_claims": 0, "remaining_claims": 3,
+                "month": "June 2025", "submitted_date": "08/10/2026",
+                "status": "Vetting Ongoing", "status_bucket": "Vetting Ongoing",
+                "assigned": "CVEBOT1", "assignment_type": "Vetting",
+                "filter_month": "Jun",
+            },
+        )
+
+        self.assertEqual(tracked_id, "tracked-1")
+        self.assertEqual(connection.commit_count, 1)
+        self.assertEqual(connection.rollback_count, 0)
+        self.assertEqual(len(connection.statements), 3)
+        self.assertIn("FOR UPDATE OF attempt", connection.statements[0][0])
+        self.assertIn("ON CONFLICT (insurer_name, tracking_key)", connection.statements[1][0])
+        self.assertIn("is_active = true", connection.statements[1][0])
+        self.assertIn("completed_at = NULL", connection.statements[1][0])
+        self.assertIn("tracked_pile_id = %s", connection.statements[2][0])
+        self.assertEqual(connection.statements[2][1], ("tracked-1", "attempt-1"))
+
+    def test_confirmed_attempt_materialization_reuses_legacy_mirror_and_is_idempotent(self):
+        attempt = {
+            "id": "attempt-1", "insurer_run_id": "run-1",
+            "master_account_id": "master-1", "tracked_pile_id": "tracked-legacy",
+            "insurer_name": "DEFMIS", "tracking_key": "stable-key",
+            "last_pile_key": "old-key", "bot_account_id": "bot-1",
+            "intended_portal_assignee": "CVEBOT1",
+            "status": AttemptStatus.CONFIRMED_RECONCILED.value,
+        }
+        observation = {
+            "key": "current-key", "tracking_key": "stable-key", "provider": "Provider",
+            "claims": 3, "synced_claims": 1, "remaining_claims": 2,
+            "month": "June 2025", "submitted_date": "08/10/2026",
+            "status": "Vetting Ongoing", "status_bucket": "Vetting Ongoing",
+            "assigned": "CVEBOT1", "assignment_type": "Vetting", "filter_month": "Jun",
+        }
+        connection = DispatchConnection(
+            [attempt], [{"id": "tracked-legacy"}], [{"tracked_pile_id": "tracked-legacy"}],
+            [attempt], [{"id": "tracked-legacy"}], [{"tracked_pile_id": "tracked-legacy"}],
+        )
+        ledger = ExecutionLedger(connection)
+
+        first = ledger.materialize_confirmed_assignment("attempt-1", observation)
+        second = ledger.materialize_confirmed_assignment("attempt-1", observation)
+
+        self.assertEqual((first, second), ("tracked-legacy", "tracked-legacy"))
+        self.assertEqual(connection.commit_count, 2)
+
+    def test_confirmed_materialization_accepts_exact_hash_after_display_identity_drift(self):
+        portal_hash = "a" * 64
+        connection = DispatchConnection(
+            [{
+                "id": "attempt-1", "insurer_run_id": "run-1",
+                "master_account_id": "master-1", "tracked_pile_id": None,
+                "insurer_name": "DEFMIS", "tracking_key": "old-stable",
+                "last_pile_key": "old-volatile", "bot_account_id": "bot-1",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+                "evidence_details": {"portal_identity_hash": portal_hash},
+            }],
+            [{"id": "tracked-1"}],
+            [{"tracked_pile_id": "tracked-1"}],
+        )
+
+        tracked_id = ExecutionLedger(connection).materialize_confirmed_assignment(
+            "attempt-1",
+            {
+                "key": "new-volatile", "tracking_key": "new-stable",
+                "portal_identity_hash": portal_hash,
+                "provider": "Provider", "claims": 3, "remaining_claims": 3,
+                "assigned": "CVEBOT1",
+            },
+        )
+
+        self.assertEqual(tracked_id, "tracked-1")
+        details = json.loads(connection.statements[1][1][-1])
+        self.assertEqual(details["portal_identity_hash"], portal_hash)
+        self.assertEqual(details["identity_match_method"], "portal_identity_hash")
+
+    def test_materialization_rejects_unassigned_or_unconfirmed_evidence_without_writing(self):
+        empty_connection = RecordingConnection()
+        with self.assertRaisesRegex(ValueError, "positive assigned observation"):
+            ExecutionLedger(empty_connection).materialize_confirmed_assignment(
+                "attempt-1", {"tracking_key": "stable-key", "assigned": ""},
+            )
+        self.assertEqual(empty_connection.statements, [])
+
+        connection = DispatchConnection([{
+            "id": "attempt-1", "insurer_run_id": "run-1", "master_account_id": "master-1",
+            "tracked_pile_id": None, "insurer_name": "DEFMIS", "tracking_key": "stable-key",
+            "last_pile_key": "volatile-key", "bot_account_id": "bot-1",
+            "intended_portal_assignee": "CVEBOT1", "status": AttemptStatus.SUBMITTED.value,
+        }])
+        with self.assertRaisesRegex(ValueError, "confirmed attempt"):
+            ExecutionLedger(connection).materialize_confirmed_assignment(
+                "attempt-1", {
+                    "key": "volatile-key", "tracking_key": "stable-key",
+                    "provider": "Provider", "assigned": "CVEBOT1",
+                },
+            )
+        self.assertEqual(connection.commit_count, 0)
+        self.assertEqual(connection.rollback_count, 1)
+
+    def test_materialization_rolls_back_after_lock_or_upsert_failure_for_later_self_heal(self):
+        attempt = {
+            "id": "attempt-1", "insurer_run_id": "run-1", "master_account_id": "master-1",
+            "tracked_pile_id": None, "insurer_name": "DEFMIS", "tracking_key": "stable-key",
+            "last_pile_key": "volatile-key", "bot_account_id": "bot-1",
+            "intended_portal_assignee": "CVEBOT1", "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+        }
+        observation = {
+            "key": "volatile-key", "tracking_key": "stable-key", "provider": "Provider",
+            "claims": 3, "synced_claims": 0, "remaining_claims": 3,
+            "month": "June 2025", "submitted_date": "08/10/2026",
+            "status": "Vetting Ongoing", "status_bucket": "Vetting Ongoing",
+            "assigned": "CVEBOT1", "assignment_type": "Vetting", "filter_month": "Jun",
+        }
+        for responses in (
+            ([attempt], RuntimeError("after row lock")),
+            ([attempt], [{"id": "tracked-1"}], RuntimeError("before attempt link")),
+        ):
+            with self.subTest(responses=len(responses)):
+                connection = DispatchConnection(*responses)
+                with self.assertRaises(RuntimeError):
+                    ExecutionLedger(connection).materialize_confirmed_assignment(
+                        "attempt-1", observation,
+                    )
+                self.assertEqual(connection.commit_count, 0)
+                self.assertEqual(connection.rollback_count, 1)
+
+    def test_materialization_rolls_back_when_commit_fails(self):
+        class CommitFailureConnection(DispatchConnection):
+            def commit(self):
+                raise RuntimeError("commit failed")
+
+        connection = CommitFailureConnection(
+            [{
+                "id": "attempt-1", "insurer_run_id": "run-1",
+                "master_account_id": "master-1", "tracked_pile_id": None,
+                "insurer_name": "DEFMIS", "tracking_key": "stable-key",
+                "last_pile_key": "volatile-key", "bot_account_id": "bot-1",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+            }],
+            [{"id": "tracked-1"}],
+            [{"tracked_pile_id": "tracked-1"}],
+        )
+        with self.assertRaisesRegex(RuntimeError, "commit failed"):
+            ExecutionLedger(connection).materialize_confirmed_assignment(
+                "attempt-1",
+                {
+                    "key": "volatile-key", "tracking_key": "stable-key",
+                    "provider": "Provider", "assigned": "CVEBOT1",
+                },
+            )
+        self.assertEqual(connection.rollback_count, 1)
 
     def test_batch_and_attempt_creation_is_one_transaction(self):
         batch_id = self.ledger.create_batch_with_attempts(

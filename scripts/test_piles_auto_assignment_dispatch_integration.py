@@ -66,7 +66,10 @@ class SqlDatabase:
         self.sessions = []
         self.admin = self.connect()
         schema = Path(__file__).with_name("piles-auto-assignment-schema.sql").read_text()
-        tables = ("runner_runs", "insurer_runs", "scan_contexts", "batches", "attempts", "work_items")
+        tables = (
+            "tracked_piles", "runner_runs", "insurer_runs", "scan_contexts",
+            "batches", "attempts", "work_items",
+        )
         ddl = "CREATE TABLE piles_auto_assignment_master_accounts(id TEXT PRIMARY KEY, insurer_name TEXT, is_active BOOLEAN);"
         for table in tables:
             # Execute the actual table contracts; only dialect defaults/types are
@@ -210,7 +213,7 @@ class SqlCursor:
 
     def execute(self, sql, params=()):
         sql = " ".join(sql.split()).replace("%s", "?")
-        sql = re.sub(r" FOR UPDATE(?: OF work| SKIP LOCKED)?", "", sql)
+        sql = re.sub(r" FOR UPDATE(?: OF (?:work|attempt)| SKIP LOCKED)?", "", sql)
         sql = sql.replace("completed.months @> ?::jsonb", "json_contains(completed.months, ?)")
         sql = re.sub(r"jsonb_set\(coalesce\(details, '\{\}'::jsonb\), '\{(\w+)\}', \?::jsonb\)",
                      r"json_set(coalesce(details, '{}'), '$.\1', json(?))", sql)
@@ -396,13 +399,26 @@ class AcceptanceHarness:
                 return harness.modal_assignee or assignee
             def verify_assigned_rows(self, month, year, status, keys, assignee, *, tracking_keys, **_):
                 expected = {key: {"attempt_id": self.assignment_attempt_ids[key], "expected_assignee": assignee} for key in tracking_keys}
-                observed = {key: assignee for key in tracking_keys if harness.verdicts.get(key, "confirmed") == "confirmed"}
+                observed_assignee = harness.modal_assignee or assignee
+                observed = {key: observed_assignee for key in tracking_keys if harness.verdicts.get(key, "confirmed") == "confirmed"}
                 observed.update({key: "Different owner" for key in tracking_keys if harness.verdicts.get(key) == "conflict"})
                 decisions = list(runner.classify_assignment_observations(expected, observed))
                 confirmed = sum(d.status == runner.AttemptStatus.CONFIRMED_VISIBLE for d in decisions)
                 pending = sum(d.status == runner.AttemptStatus.RECONCILIATION_PENDING for d in decisions)
                 wrong = [d.evidence.details.get("observed_assignee", "") for d in decisions if d.status == runner.AttemptStatus.CONFLICT]
-                return runner.AssignmentVerificationResult(confirmed == len(keys), list(observed.values()), confirmed, pending, wrong, decisions)
+                rows_by_tracking = {row.tracking_key: row for row in self.visible_rows}
+                matched_rows = {
+                    decision.tracking_key: runner.replace(
+                        rows_by_tracking[decision.tracking_key], assigned=assignee,
+                    )
+                    for decision in decisions
+                    if decision.status == runner.AttemptStatus.CONFIRMED_VISIBLE
+                    and decision.tracking_key in rows_by_tracking
+                }
+                return runner.AssignmentVerificationResult(
+                    confirmed == len(keys), list(observed.values()), confirmed, pending,
+                    wrong, decisions, matched_rows,
+                )
         return Portal
 
     def invoke(self, *, parent="parent", insurer=None, maximum=1, portal="test", month="Jul", year="2026"):
@@ -494,10 +510,61 @@ class DispatcherAcceptanceTests(unittest.TestCase):
         self.assertEqual(harness.db.rows("SELECT last_pile_key,status FROM piles_auto_assignment_attempts ORDER BY last_pile_key"),
                          [{"last_pile_key": "confirmed", "status": "confirmed_visible"},
                           {"last_pile_key": "pending", "status": "reconciliation_pending"}])
+        linked = harness.db.rows(
+            "SELECT attempt.last_pile_key, attempt.tracked_pile_id, tracked.id, tracked.is_active "
+            "FROM piles_auto_assignment_attempts attempt "
+            "LEFT JOIN piles_auto_assignment_tracked_piles tracked "
+            "ON tracked.id=attempt.tracked_pile_id ORDER BY attempt.last_pile_key"
+        )
+        self.assertTrue(linked[0]["tracked_pile_id"])
+        self.assertEqual(linked[0]["tracked_pile_id"], linked[0]["id"])
+        self.assertEqual(linked[0]["is_active"], 1)
+        self.assertIsNone(linked[1]["tracked_pile_id"])
         self.assertEqual([key for _work, key in harness.clicks], ["confirmed", "pending"])
         self.assertEqual(harness.results, [("parent", "confirmed")])
         self.assertEqual([(status, fields["assigned_piles"]) for _parent, status, fields in harness.deliveries],
                          [("completed_with_issues", 1)])
+
+    def test_materialization_is_idempotent_concurrent_and_reactivates_the_same_mirror(self):
+        harness = self.harness
+        source_row = harness.pile("confirmed")
+        harness.initial["DEFMIS"] = [source_row]
+        _result, error = harness.invoke(insurer="DEFMIS")
+        self.assertIsNone(error, str(error))
+        attempt = harness.db.rows(
+            "SELECT id,tracked_pile_id FROM piles_auto_assignment_attempts"
+        )[0]
+        tracked_id = attempt["tracked_pile_id"]
+        harness.db.admin.raw.execute(
+            "UPDATE piles_auto_assignment_tracked_piles "
+            "SET is_active=0, completed_at=now() WHERE id=?",
+            (tracked_id,),
+        )
+        harness.db.admin.raw.commit()
+        observed = runner.replace(source_row, assigned="Acceptance owner")
+        results = []
+
+        def materialize():
+            ledger = runner.ExecutionLedger(harness.db.connect())
+            try:
+                results.append(ledger.materialize_confirmed_assignment(attempt["id"], observed))
+            finally:
+                ledger.close()
+
+        workers = [threading.Thread(target=materialize) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(results, [tracked_id, tracked_id])
+        self.assertEqual(harness.db.rows(
+            "SELECT id,is_active,completed_at FROM piles_auto_assignment_tracked_piles"
+        ), [{"id": tracked_id, "is_active": 1, "completed_at": None}])
+        self.assertEqual(harness.db.rows(
+            "SELECT tracked_pile_id FROM piles_auto_assignment_attempts"
+        ), [{"tracked_pile_id": tracked_id}])
 
     def test_complete_lifecycle_has_one_generation_per_insurer_and_one_explicit_manual_follow_up(self):
         # Breaks caught: overlapping enqueue becomes executable, manual work is
@@ -648,6 +715,16 @@ class DispatcherAcceptanceTests(unittest.TestCase):
                         self.assertEqual(result.status.value, "completed")
                         self.assertEqual(harness.db.rows("SELECT id,status,attempt_number FROM piles_auto_assignment_attempts"),
                                          [{"id": "historical-attempt", "status": expected, "attempt_number": 1}])
+                        if expected == "confirmed_reconciled":
+                            self.assertEqual(
+                                harness.db.rows(
+                                    "SELECT count(*) n FROM piles_auto_assignment_tracked_piles"
+                                ),
+                                [{"n": 1}],
+                            )
+                            self.assertTrue(harness.db.rows(
+                                "SELECT tracked_pile_id FROM piles_auto_assignment_attempts"
+                            )[0]["tracked_pile_id"])
                         self.assertEqual(harness.clicks, [])
                         self.assertEqual(harness.deliveries, [])
                         self.assertEqual(harness.results, [])

@@ -51,6 +51,23 @@ class ExecutionLedgerSchemaTests(unittest.TestCase):
         ):
             self.assertIn(f"'{status}'", self.sql)
 
+    def test_attempt_provenance_lookups_have_additive_indexes_and_audit_guards(self):
+        indexes = {
+            "piles_auto_assignment_attempts_provenance_tracking_idx":
+                "(insurer_name, tracking_key, status)",
+            "piles_auto_assignment_attempts_provenance_last_pile_idx":
+                "(insurer_name, last_pile_key, status)",
+        }
+        for name, columns in indexes.items():
+            with self.subTest(index=name):
+                self.assertRegex(
+                    self.sql,
+                    rf"CREATE INDEX IF NOT EXISTS {name}\s+ON "
+                    rf"piles_auto_assignment_attempts\s+{re.escape(columns)}",
+                )
+                self.assertIn(name, self.migration)
+                self.assertIn(name, self.audit)
+
     def test_legacy_logs_can_reference_ledger_rows(self):
         self.assertIn("ADD COLUMN IF NOT EXISTS insurer_run_id text", self.sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS batch_id text", self.sql)

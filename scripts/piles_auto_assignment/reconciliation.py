@@ -14,6 +14,7 @@ class Observation:
     assignable: bool
     assignee: str
     source: str = "original_context"
+    row: Any = None
 
 
 def _label(value: Any) -> str:
@@ -54,11 +55,23 @@ def reconcile_attempt(
             AttemptEvidence("reconciled_unexpected_assignee", {"observed_assignees": unexpected}),
         )
     if expected and expected in nonblank:
+        identity_methods = {
+            item.source.rsplit(":", 1)[-1]
+            for item in items
+            if _label(item.assignee) == expected and ":" in item.source
+            and item.source.rsplit(":", 1)[-1] in {
+                "portal_identity_hash", "canonical_alias", "unique_natural_identity",
+            }
+        }
         return AttemptDecision(
             attempt_id,
             tracking_key,
             AttemptStatus.CONFIRMED_RECONCILED,
-            AttemptEvidence("reconciled_expected_assignee", {}),
+            AttemptEvidence(
+                "reconciled_expected_assignee",
+                ({"identity_match_method": next(iter(identity_methods))}
+                 if len(identity_methods) == 1 else {}),
+            ),
         )
     if any(item.assignable and not _label(item.assignee) for item in items):
         return AttemptDecision(
@@ -97,7 +110,7 @@ def reconcile_pending_for_insurer(
                 evidence=AttemptEvidence("reconciliation_started", {}),
             )
             current = AttemptStatus.RECONCILIATION_PENDING
-        observations = portal.observe_attempt(attempt)
+        observations = tuple(portal.observe_attempt(attempt))
         decision = reconcile_attempt(
             observations,
             str(attempt.get("intended_portal_assignee") or ""),
@@ -123,6 +136,25 @@ def reconcile_pending_for_insurer(
                     {"requires_portal_review": True},
                 ),
             )
+        matched_observation = next((
+            item for item in observations
+            if decision.status == AttemptStatus.CONFIRMED_RECONCILED
+            and _label(item.assignee) == _label(attempt.get("intended_portal_assignee"))
+            and item.row is not None
+        ), None)
+        if (
+            decision.status == AttemptStatus.CONFIRMED_RECONCILED
+            and matched_observation is None
+        ):
+            decision = AttemptDecision(
+                decision.attempt_id,
+                decision.tracking_key,
+                decision.status,
+                AttemptEvidence(
+                    "tracked_materialization_pending",
+                    {"confirmation_code": decision.evidence.code},
+                ),
+            )
         if decision.status != AttemptStatus.RECONCILIATION_PENDING:
             ledger.transition_attempt(
                 attempt_id,
@@ -130,5 +162,7 @@ def reconcile_pending_for_insurer(
                 expected={current},
                 evidence=decision.evidence,
             )
+            if matched_observation is not None:
+                ledger.materialize_confirmed_assignment(attempt_id, matched_observation.row)
         decisions.append(decision)
     return tuple(decisions)

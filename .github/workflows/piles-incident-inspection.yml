@@ -3,11 +3,23 @@ name: Piles Incident Inspection
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: Read-only inspection to run
+        required: true
+        default: provenance
+        type: choice
+        options:
+          - provenance
+          - incident
       hours:
-        description: Incident window in hours (1 through 168)
+        description: Inspection window in hours (provenance supports up to 720)
         required: true
         default: 24
         type: number
+      insurer:
+        description: Optional insurer filter for provenance inspection
+        required: false
+        type: string
       run_id:
         description: Optional parent runner UUID
         required: false
@@ -24,13 +36,15 @@ jobs:
       - name: Inspect sanitized Piles incident evidence
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         env:
+          INSPECTION_OPERATION: ${{ inputs.operation }}
           INCIDENT_HOURS: ${{ inputs.hours }}
           INCIDENT_RUN_ID: ${{ inputs.run_id }}
+          PROVENANCE_INSURER: ${{ inputs.insurer }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: INCIDENT_HOURS,INCIDENT_RUN_ID
+          envs: INSPECTION_OPERATION,INCIDENT_HOURS,INCIDENT_RUN_ID,PROVENANCE_INSURER
           script: |
             set -eu
             cd ~/claims-dashboard
@@ -38,7 +52,16 @@ jobs:
             . ./.env
             set +a
 
-            if [ -n "$INCIDENT_RUN_ID" ]; then
+            if [ "$INSPECTION_OPERATION" = "provenance" ]; then
+              if [ -n "$PROVENANCE_INSURER" ]; then
+                node scripts/audit-piles-assignment-provenance.mjs \
+                  --hours "$INCIDENT_HOURS" \
+                  --insurer "$PROVENANCE_INSURER"
+              else
+                node scripts/audit-piles-assignment-provenance.mjs \
+                  --hours "$INCIDENT_HOURS"
+              fi
+            elif [ -n "$INCIDENT_RUN_ID" ]; then
               node scripts/inspect-piles-runner-incidents.mjs \
                 --hours "$INCIDENT_HOURS" \
                 --run-id "$INCIDENT_RUN_ID"

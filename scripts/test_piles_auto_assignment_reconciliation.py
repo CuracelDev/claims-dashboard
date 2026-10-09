@@ -39,6 +39,66 @@ class ReconciliationDecisionTests(unittest.TestCase):
 
 
 class ReconciliationWorkflowTests(unittest.TestCase):
+    def test_positive_reconciliation_materializes_the_matched_row_after_confirmation(self):
+        events = []
+        row = {"tracking_key": "pile-1", "assigned": "CVEBOT3", "provider": "Provider"}
+
+        class Portal:
+            def observe_attempt(self, _attempt):
+                return iter([Observation(
+                    assignable=False, assignee="CVEBOT3", source="complete_scan", row=row,
+                )])
+
+        class Ledger:
+            def transition_attempt(self, attempt_id, status, **kwargs):
+                events.append(("transition", attempt_id, status, kwargs["evidence"].code))
+
+            def materialize_confirmed_assignment(self, attempt_id, observation):
+                events.append(("materialize", attempt_id, observation))
+
+        decisions = reconcile_pending_for_insurer(
+            Portal(), Ledger(), [{
+                "id": "attempt-1", "tracking_key": "pile-1",
+                "status": "reconciliation_pending",
+                "intended_portal_assignee": "CVEBOT3",
+            }],
+        )
+
+        self.assertEqual(decisions[0].status, AttemptStatus.CONFIRMED_RECONCILED)
+        self.assertEqual(events, [
+            ("transition", "attempt-1", AttemptStatus.CONFIRMED_RECONCILED,
+             "reconciled_expected_assignee"),
+            ("materialize", "attempt-1", row),
+        ])
+
+    def test_positive_reconciliation_without_row_metadata_emits_materialization_pending(self):
+        events = []
+
+        class Portal:
+            def observe_attempt(self, _attempt):
+                return [Observation(assignable=False, assignee="CVEBOT3")]
+
+        class Ledger:
+            def transition_attempt(self, attempt_id, status, **kwargs):
+                events.append((attempt_id, status, kwargs["evidence"].code))
+
+            def materialize_confirmed_assignment(self, *_args):
+                raise AssertionError("missing row metadata must not be materialized")
+
+        decisions = reconcile_pending_for_insurer(
+            Portal(), Ledger(), [{
+                "id": "attempt-1", "tracking_key": "pile-1",
+                "status": "reconciliation_pending",
+                "intended_portal_assignee": "CVEBOT3",
+            }],
+        )
+
+        self.assertEqual(decisions[0].status, AttemptStatus.CONFIRMED_RECONCILED)
+        self.assertEqual(events, [(
+            "attempt-1", AttemptStatus.CONFIRMED_RECONCILED,
+            "tracked_materialization_pending",
+        )])
+
     def test_submitted_attempt_enters_reconciliation_before_terminal_decision(self):
         events = []
 

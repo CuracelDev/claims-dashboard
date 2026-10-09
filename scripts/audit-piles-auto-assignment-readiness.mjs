@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
+import { buildProvenanceAuditQuery } from './audit-piles-assignment-provenance.mjs';
 
 const { Pool } = pg;
 const modeFlagIndex = process.argv.indexOf('--mode');
@@ -14,7 +15,12 @@ const REQUIRED_TABLES = [
   'piles_auto_assignment_insurer_runs', 'piles_auto_assignment_scan_contexts',
   'piles_auto_assignment_batches', 'piles_auto_assignment_attempts',
   'piles_auto_assignment_bot_account_history', 'piles_auto_assignment_schedule_requests',
-  'piles_auto_assignment_work_items',
+  'piles_auto_assignment_work_items', 'piles_auto_assignment_tracked_piles',
+  'piles_auto_assignment_external_assignments',
+];
+const REQUIRED_PROVENANCE_INDEXES = [
+  'piles_auto_assignment_attempts_provenance_tracking_idx',
+  'piles_auto_assignment_attempts_provenance_last_pile_idx',
 ];
 
 function report(name, ok, detail, severity = ok ? 'pass' : 'error') {
@@ -24,15 +30,31 @@ function report(name, ok, detail, severity = ok ? 'pass' : 'error') {
   return item;
 }
 
-function localChecks() {
+export function evaluateProvenanceConfiguration(environment = process.env) {
+  const mode = String(environment.PILES_ASSIGNMENT_PROVENANCE_V2 || '').trim().toLowerCase();
+  const ledgerEnabled = String(environment.PILES_EXECUTION_LEDGER_ENABLED || '').trim().toLowerCase() === 'true';
+  if (!['disabled', 'shadow', 'enabled'].includes(mode)) {
+    return { ok: false, mode, detail: 'PILES_ASSIGNMENT_PROVENANCE_V2 must be explicitly disabled, shadow, or enabled' };
+  }
+  if (!ledgerEnabled) {
+    return { ok: false, mode, detail: 'PILES_EXECUTION_LEDGER_ENABLED=true is required for provenance rollout' };
+  }
+  return { ok: true, mode, detail: `explicit ${mode} mode with ledger enabled` };
+}
+
+function localChecks(environment = process.env) {
   const schema = readFileSync(new URL('./piles-auto-assignment-schema.sql', import.meta.url), 'utf8');
   const runner = readFileSync(new URL('./piles_auto_assignment_runner.py', import.meta.url), 'utf8');
+  const configuration = evaluateProvenanceConfiguration(environment);
   return [
     report('additive schema', REQUIRED_TABLES.every((table) => schema.includes(`CREATE TABLE IF NOT EXISTS ${table}`)), `${REQUIRED_TABLES.length} required table definitions`),
     report('attempt idempotency', schema.includes('piles_auto_assignment_attempts_active_key_idx'), 'active pile key is unique'),
     report('transactional bot history', schema.includes('piles_update_bot_account_with_history'), 'audited mutation function is defined'),
     report('read-only execute guard', runner.includes('--read-only cannot be combined with --execute'), 'probe cannot click Assign Claims'),
     report('insurer overlap coalescing', runner.includes('mark_coalesced_request'), 'overlaps become one pending follow-up'),
+    report('provenance indexes', REQUIRED_PROVENANCE_INDEXES.every((index) => schema.includes(index)), 'both bounded ledger indexes are defined'),
+    report('provenance audit tool', existsSync(new URL('./audit-piles-assignment-provenance.mjs', import.meta.url)), 'read-only audit is installed'),
+    report('provenance rollout configuration', configuration.ok, configuration.detail),
   ];
 }
 
@@ -147,20 +169,32 @@ export async function databaseChecks({ pool: suppliedPool, deploymentMode: suppl
   const connectionString = process.env.DATABASE_URL;
   if (!suppliedPool && !connectionString) return [report('database connection', false, 'DATABASE_URL is required for database mode')];
   const pool = suppliedPool || new Pool({ connectionString, ssl: sslFor(connectionString), max: 1 });
+  let transactionOpen = false;
   try {
     await pool.query('BEGIN READ ONLY');
+    transactionOpen = true;
     const tableResult = await pool.query(
       `select table_name from information_schema.tables where table_schema = 'public' and table_name = any($1)`,
       [REQUIRED_TABLES],
     );
     const present = new Set(tableResult.rows.map((row) => row.table_name));
     const missing = REQUIRED_TABLES.filter((table) => !present.has(table));
-    const checks = [report('database schema', missing.length === 0, missing.length ? `${missing.length} required tables missing` : 'all required tables present')];
+    const configuration = evaluateProvenanceConfiguration();
+    const checks = [
+      report('provenance rollout configuration', configuration.ok, configuration.detail),
+      report('database schema', missing.length === 0, missing.length ? `${missing.length} required tables missing` : 'all required tables present'),
+    ];
     if (missing.length) {
       await pool.query('ROLLBACK');
+      transactionOpen = false;
       return checks;
     }
-    const [linkage, owners, stale, pending, unsubmitted, unsupported, queueHealth] = await Promise.all([
+    const [indexes, provenance, linkage, owners, stale, pending, unsubmitted, unsupported, queueHealth] = await Promise.all([
+      pool.query(
+        `select indexname from pg_indexes where schemaname = 'public' and indexname = any($1)`,
+        [REQUIRED_PROVENANCE_INDEXES],
+      ),
+      pool.query(buildProvenanceAuditQuery({ hours: 720, insurer: null })),
       pool.query(`select count(*)::int count from piles_auto_assignment_master_accounts m left join piles_auto_assignment_rules r on lower(r.insurer_name)=lower(m.insurer_name) and r.is_active=true where m.is_active=true and r.id is null`),
       pool.query(`select count(*)::int count from piles_auto_assignment_master_accounts m where m.is_active=true and not exists (select 1 from piles_auto_assignment_bot_accounts b where lower(b.insurer_name)=lower(m.insurer_name) and b.is_active=true and b.is_available=true)`),
       pool.query(`select count(*)::int count from piles_auto_assignment_insurer_runs where status='running' and coalesce(heartbeat_at, started_at, created_at) < now() - interval '15 minutes'`),
@@ -169,7 +203,18 @@ export async function databaseChecks({ pool: suppliedPool, deploymentMode: suppl
       pool.query(`select count(*)::int count from piles_auto_assignment_rules where distribution_mode not in ('balanced_finish','single_owner','manual_override') or minimum_claim_chunk < 1`),
       inspectQueueHealth(pool),
     ]);
+    const presentIndexes = new Set(indexes.rows.map((row) => row.indexname));
+    const missingIndexes = REQUIRED_PROVENANCE_INDEXES.filter((index) => !presentIndexes.has(index));
+    const provenanceFindings = provenance.rows[0] || {};
     checks.push(
+      report('provenance lookup indexes', missingIndexes.length === 0, missingIndexes.length ? `${missingIndexes.length} required index(es) missing` : 'all required indexes present'),
+      report('ambiguous provenance identities', Number(provenanceFindings.ambiguous_identities || 0) === 0, `${Number(provenanceFindings.ambiguous_identities || 0)} ambiguous identity candidate(s)`),
+      report(
+        'provenance repair candidates',
+        true,
+        `${Number(provenanceFindings.repairable_exact_matches || 0)} exact repair candidate(s)`,
+        Number(provenanceFindings.repairable_exact_matches || 0) > 0 ? 'warning' : 'pass',
+      ),
       report('active insurer rules', linkage.rows[0].count === 0, `${linkage.rows[0].count} active insurers without an active rule`),
       report('eligible owners', owners.rows[0].count === 0, `${owners.rows[0].count} active insurers without an eligible owner`),
       report(
@@ -188,15 +233,26 @@ export async function databaseChecks({ pool: suppliedPool, deploymentMode: suppl
       )),
     );
     await pool.query('ROLLBACK');
+    transactionOpen = false;
     return checks;
   } finally {
+    if (transactionOpen) {
+      try { await pool.query('ROLLBACK'); } catch {}
+    }
     if (!suppliedPool) await pool.end();
   }
 }
 
 async function main() {
   const deploymentMode = modeArg === 'deployment';
-  const results = modeArg === 'local' ? localChecks() : await databaseChecks({ deploymentMode });
+  const results = modeArg === 'local'
+    ? localChecks()
+    : modeArg === 'fixture'
+      ? localChecks({
+        PILES_ASSIGNMENT_PROVENANCE_V2: 'shadow',
+        PILES_EXECUTION_LEDGER_ENABLED: 'true',
+      })
+      : await databaseChecks({ deploymentMode });
   if (!results.every((result) => result.ok)) process.exitCode = 1;
 }
 

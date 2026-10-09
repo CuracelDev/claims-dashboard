@@ -9,9 +9,9 @@ The runner must account for every expected month/year/status context and every p
 ## Deployment order
 
 1. Back up the database and apply `scripts/piles-auto-assignment-schema.sql`. The changes are additive.
-2. Run `npm run db:audit` and `npm run audit:piles-readiness -- --mode database` against the target database. Both are read-only.
+2. Run `npm run db:audit`, `npm run audit:piles-readiness -- --mode database`, and `npm run audit:piles-provenance -- --hours 720` against the target database. These are read-only. Require both provenance indexes and zero ambiguous identities before cutover.
 3. Audit legacy pending requests using the read-only command below. With new launches stopped and dispatcher v2 still disabled, separately approve cancellation of each demonstrably obsolete request; never bulk-delete the backlog.
-4. Deploy the application and worker from the same commit with `PILES_EXECUTION_LEDGER_ENABLED=true`, `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false`, and `PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1`. Only `1` or `2` is accepted; enabling v2 or concurrency two requires a separately approved rollout.
+4. Deploy the application and worker from the same commit with `PILES_EXECUTION_LEDGER_ENABLED=true`, `PILES_ASSIGNMENT_PROVENANCE_V2=shadow`, `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false`, and `PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1`. Shadow mode computes only aggregate V2 disagreements; legacy records/alerts remain authoritative and assignment planning/execution is unchanged. Only `1` or `2` concurrency is accepted; enabling dispatcher v2 or concurrency two requires a separately approved rollout.
 5. Confirm the dashboard can queue a preview and display per-insurer heartbeats. Do not enable assignment merely to test deployment.
 6. Run a read-only portal probe for one active insurer, then all active insurers:
 
@@ -22,8 +22,9 @@ The runner must account for every expected month/year/status context and every p
 
    On the production host, these probes can also be run from the **Piles Production Readiness** GitHub Actions workflow. It always uses `--read-only` and cannot click **Assign Claims**.
 
-7. Compare expected contexts with complete/empty contexts. Resolve any failed or missing context before authorizing assignment.
-8. A live one-insurer canary requires separate explicit approval and `ALLOW_PRODUCTION_ASSIGNMENTS=true`. Remove that variable after the canary.
+7. Compare expected contexts with complete/empty contexts and inspect shadow disagreement aggregates. Resolve any failed/missing context, pending provenance evidence, or ambiguity before authorizing assignment.
+8. Set `PILES_ASSIGNMENT_PROVENANCE_V2=enabled`, rerun both readiness and provenance audits, and require zero ambiguous repair candidates. Exact historical repair remains separately approved and one-attempt-at-a-time.
+9. A live one-insurer canary requires separate explicit approval and `ALLOW_PRODUCTION_ASSIGNMENTS=true`. Remove that variable after the canary. Observe at least two complete scheduled all-insurer cycles after provenance cutover and reconcile ledger, mirror, and notification totals.
 
 The additive schema must be applied and audited before deploying code that consumes work-item leases or `cancelled_legacy`, including the recovery scripts. Leave these additions in place on rollback. The fresh migration script tolerates a source database that does not yet have those additive tables; it is not an incident recovery tool.
 
@@ -56,6 +57,7 @@ Parent notification limitation: SIGTERM drains active work at a safe evidence bo
 
 - `DATABASE_URL`: required for shared advisory locks and transactional ledger writes.
 - `PILES_EXECUTION_LEDGER_ENABLED=true`: enables durable context, batch, and per-pile state.
+- `PILES_ASSIGNMENT_PROVENANCE_V2=disabled|shadow|enabled`: required explicit rollout state. `shadow` calculates sanitized aggregate disagreements while retaining legacy classification; `enabled` makes the ledger-aware classifier/self-healing authoritative; `disabled` is rollback-only legacy classification. This flag does not alter assignment planning or execution.
 - `PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1`: safe default; `2` is permitted only after capacity review.
 - `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false`: default-disabled dispatcher rollout/rollback switch.
 - `HEADLESS=true`: normal server operation.
@@ -130,7 +132,7 @@ For every run, verify this invariant: submitted attempts equal confirmed-visible
    node scripts/inspect-piles-runner-incidents.mjs --hours 24 --run-id 123e4567-e89b-42d3-a456-426614174000
    ```
 
-   The **Piles Incident Inspection** GitHub Actions workflow runs these same read-only commands. It accepts only `hours` and optional `run_id`. The inspector starts a read-only database transaction, prints only bounded operational fields, and rolls the transaction back. `work_items_available=false` is expected before the dispatcher work-item schema is deployed; use `pending_requests` for the legacy queue view in that case.
+   The **Piles Incident Inspection** GitHub Actions workflow defaults to the read-only provenance audit and can select the existing incident report. It accepts bounded hours plus only the filter relevant to the selected operation. Both inspectors start a read-only database transaction, print only bounded operational fields, and roll the transaction back. `work_items_available=false` is expected before the dispatcher work-item schema is deployed; use `pending_requests` for the legacy queue view in that case.
 3. For filter or scan failures, use a read-only visible-browser probe; do not bypass evidence checks.
 4. For pending attempts, observe the original filter context. Retry only if the pile is positively visible and unassigned.
 5. For conflicts, preserve the observed assignment and resolve manually. Never overwrite an unexpected assignee automatically.
@@ -145,6 +147,28 @@ Interpret the incident report as follows:
 - A large elapsed duration is not itself a failure. Treat a heartbeat as stale only when `heartbeat_age_seconds` exceeds the 15-minute threshold and lock evidence shows that no live insurer worker owns the run.
 
 ## Guarded recovery and legacy backlog
+
+### Assignment provenance audit and repair
+
+The provenance audit is database-only and read-only by default. It reports bounded aggregate counts for confirmed attempts missing tracked links, exact matches to active assignment observations, ambiguous identities, pending runner-owned submissions, genuinely unlinked observations, and exact repair candidates. It never prints insurer names, provider names, claim identifiers, tracking keys, raw errors, or credentials.
+
+```bash
+npm run audit:piles-provenance -- --hours 24
+npm run audit:piles-provenance -- --hours 168 --insurer "DEFMIS"
+```
+
+The **Piles Incident Inspection** workflow defaults to this read-only provenance audit. Its `incident` operation retains the existing sanitized runner inspection. The workflow has no mutation path.
+
+Historical repair is a separately approved direct-host operation. Stop new launches, back up the database, inspect the exact candidate, and target one confirmed attempt at a time:
+
+```bash
+node scripts/audit-piles-assignment-provenance.mjs \
+  --apply \
+  --confirmation REPAIR_PILES_PROVENANCE \
+  --attempt-id ATTEMPT_ID
+```
+
+Repair requires one active, exact, one-to-one observation under the intended portal assignee, a confirmed attempt with no tracked link, and a free insurer advisory lock. It atomically materializes or refreshes the tracked mirror, links the attempt, and clears the false observation while preserving its history. Ambiguous, conflicting, pending, already-linked, missing, or concurrently changed evidence is blocked and rolled back. The tool never contacts the portal, changes attempt confirmation, assigns or reassigns a pile, or deletes evidence. Exit `2` means the candidate was blocked; reinspect rather than retrying blindly.
 
 These scripts do not launch the runner, contact the portal, assign claims, delete rows, or change attempt/batch evidence. Requeuing makes work eligible for a later dispatcher claim, so stop new scheduled/manual launches and let active workers reach a safe evidence boundary before approving any mutation. Do not use a live worker's token or force an advisory unlock. Back up the database, confirm the deployed commit, and apply/audit the additive schema first.
 
@@ -195,7 +219,7 @@ Exit 0 means the selected operation completed; read-only counts may still report
 
 ## Rollback
 
-Stop new scheduled/manual launches, return concurrency to `1`, then set `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false` for future launches. Remove `ALLOW_PRODUCTION_ASSIGNMENTS` from future process configuration; changing an environment file does not stop an already-running process. Let active workers reach a safe evidence boundary, then inspect leases, locks, and submission state. Keep `PILES_EXECUTION_LEDGER_ENABLED=true`: disabling it removes per-pile reconciliation protection and is not a normal dispatcher rollback.
+Stop new scheduled/manual launches, return concurrency to `1`, then set `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false` and `PILES_ASSIGNMENT_PROVENANCE_V2=disabled` for future launches. This restores legacy classification only; it does not undo ledger rows, tracked mirrors, clear reasons, or audit history. Remove `ALLOW_PRODUCTION_ASSIGNMENTS` from future process configuration; changing an environment file does not stop an already-running process. Let active workers reach a safe evidence boundary, then inspect leases, locks, submission state, and provenance aggregates. Keep `PILES_EXECUTION_LEDGER_ENABLED=true`: disabling it removes per-pile reconciliation protection and is not a normal rollback.
 
 In the authorized host shell, the exact process-local rollback settings and read-only checks are:
 
@@ -203,6 +227,7 @@ In the authorized host shell, the exact process-local rollback settings and read
 export PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1
 export PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false
 export PILES_EXECUTION_LEDGER_ENABLED=true
+export PILES_ASSIGNMENT_PROVENANCE_V2=disabled
 unset ALLOW_PRODUCTION_ASSIGNMENTS
 node scripts/inspect-piles-runner-incidents.mjs --hours 24
 node scripts/recover-piles-stale-runs.mjs

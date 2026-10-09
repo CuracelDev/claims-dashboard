@@ -8,6 +8,38 @@ function isMissingTableError(error) {
   return /does not exist|relation .* not found|42P01/i.test(String(error?.message || error || ''));
 }
 
+const ASSIGNMENT_PROVENANCE = new Set([
+  'unlinked',
+  'verified_external',
+  'runner_confirmed',
+  'runner_pending',
+  'conflict',
+  'legacy_unverified',
+]);
+
+function assignmentObservationView(item) {
+  const details = item?.details && typeof item.details === 'object' && !Array.isArray(item.details)
+    ? item.details
+    : {};
+  const recordedStatus = String(details.provenance_status || '').trim();
+  const provenanceStatus = ASSIGNMENT_PROVENANCE.has(recordedStatus)
+    ? recordedStatus
+    : 'legacy_unverified';
+  const related = details.related_runner_evidence;
+  const relatedRunnerEvidence = related && typeof related === 'object' && !Array.isArray(related)
+    ? String(related.summary || (Number(related.attempt_match_count || 0) > 0 ? 'Related runner evidence recorded' : 'None recorded'))
+    : String(related || 'None recorded');
+  return {
+    ...item,
+    provenance_status: provenanceStatus,
+    provenance_reason_code: String(details.provenance_reason_code || ''),
+    portal_assignee: String(item.current_assigned || details.assigned_name || ''),
+    configured_owner: String(item.owner_name || details.owner_name || ''),
+    related_runner_evidence: relatedRunnerEvidence,
+    clear_reason: String(details.clear_reason || ''),
+  };
+}
+
 export async function GET() {
   try {
     const supabase = getSupabase();
@@ -46,10 +78,7 @@ export async function GET() {
     const botMetrics = metricsRes.data || [];
     const recentLogs = logsRes.data || [];
     const trackedPiles = trackedRes.data || [];
-    const knownBotIds = new Set(botAccounts.map((bot) => String(bot.id)).filter(Boolean));
-    const externalAssignments = (externalRes.data || []).filter((item) => (
-      item.bot_account_id && knownBotIds.has(String(item.bot_account_id))
-    ));
+    const externalAssignments = (externalRes.data || []).map(assignmentObservationView);
     const weekendRosters = weekendSchemaReady ? (weekendRostersRes.data || []) : [];
     const weekendRosterMembers = weekendSchemaReady ? (weekendMembersRes.data || []) : [];
 
@@ -97,6 +126,7 @@ export async function GET() {
         staleTrackedPiles: staleTrackedPiles.length,
         completedTrackedPiles: completedTrackedPiles.length,
         activeExternalAssignments: activeExternalAssignments.length,
+        activeObservedAssignments: activeExternalAssignments.length,
         lateArrivalPileDetections,
         weekendRostersConfigured: weekendRosters.length,
       },
