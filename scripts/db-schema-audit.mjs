@@ -84,6 +84,10 @@ const EXPECTED = {
     },
     preferredTypes: { evidence_details: ['jsonb'] },
     uniqueGroups: [['batch_id', 'tracking_key']],
+    requiredIndexes: [
+      { name: 'piles_auto_assignment_attempts_provenance_tracking_idx', unique: false, columns: ['insurer_name', 'tracking_key', 'status'] },
+      { name: 'piles_auto_assignment_attempts_provenance_last_pile_idx', unique: false, columns: ['insurer_name', 'last_pile_key', 'status'] },
+    ],
   },
   piles_auto_assignment_bot_account_history: {
     requiredColumns: {
@@ -579,7 +583,7 @@ export function evaluateTable(
     if (actualColumns.join(',') !== requiredColumns.join(',')) {
       issues.push(`index ${requirement.name} has incorrect key columns`);
     }
-    if (!predicateMatches(index.predicate, requirement.predicate)) {
+    if (requirement.predicate && !predicateMatches(index.predicate, requirement.predicate)) {
       issues.push(`index ${requirement.name} has incorrect predicate`);
     }
   }

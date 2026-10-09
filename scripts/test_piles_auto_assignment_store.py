@@ -1099,6 +1099,97 @@ class ExecutionLedgerTests(unittest.TestCase):
             )
         self.assertEqual(self.connection.rollback_count, 1)
 
+    def test_assignment_ownership_lookup_is_bounded_to_current_identity_aliases(self):
+        rows = [
+            {
+                "id": "confirmed-attempt",
+                "insurer_run_id": "run-1",
+                "bot_account_id": "bot-1",
+                "intended_owner_name": "Sophie",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.CONFIRMED_VISIBLE.value,
+                "tracking_key": "stable-key",
+                "last_pile_key": "volatile-key",
+                "claim_count": 3,
+                "evidence_code": "visible_after_submit",
+                "selected_at": None,
+                "submitted_at": "2026-10-08T08:23:25Z",
+                "confirmed_at": "2026-10-08T08:26:08Z",
+                "created_at": "2026-10-08T08:23:20Z",
+                "updated_at": "2026-10-08T08:26:08Z",
+            },
+            {
+                "id": "pending-attempt",
+                "insurer_run_id": "run-2",
+                "bot_account_id": "bot-1",
+                "intended_owner_name": "Sophie",
+                "intended_portal_assignee": "CVEBOT1",
+                "status": AttemptStatus.RECONCILIATION_PENDING.value,
+                "tracking_key": "other-stable-key",
+                "last_pile_key": "stable-key",
+                "claim_count": 3,
+                "evidence_code": "submit_unverified",
+                "selected_at": "2026-10-08T08:23:24Z",
+                "submitted_at": "2026-10-08T08:23:25Z",
+                "confirmed_at": None,
+                "created_at": "2026-10-08T08:23:20Z",
+                "updated_at": "2026-10-08T08:23:30Z",
+            },
+        ]
+        connection = DispatchConnection(rows)
+        ledger = ExecutionLedger(connection)
+
+        matches = ledger.find_assignment_ownership(
+            "DEFMIS",
+            ["stable-key", "volatile-key", "stable-key", ""],
+        )
+
+        self.assertEqual([row["id"] for row in matches], [
+            "confirmed-attempt", "pending-attempt",
+        ])
+        sql, params = connection.statements[0]
+        self.assertIn("tracking_key = ANY(%s)", sql)
+        self.assertIn("last_pile_key = ANY(%s)", sql)
+        self.assertIn("UNION ALL", sql)
+        self.assertIn("DISTINCT ON (id)", sql)
+        self.assertIn("confirmed_visible", sql)
+        self.assertIn("confirmed_reconciled", sql)
+        self.assertIn("selected", sql)
+        self.assertIn("submitted", sql)
+        self.assertIn("reconciliation_pending", sql)
+        self.assertNotIn("manual_action_required", sql)
+        self.assertNotIn("status = 'failed'", sql)
+        self.assertEqual(params, (
+            "DEFMIS", ["stable-key", "volatile-key"],
+            "DEFMIS", ["stable-key", "volatile-key"],
+        ))
+        self.assertEqual(connection.responses, [])
+
+    def test_assignment_ownership_lookup_preserves_duplicate_matches_for_conflict_classification(self):
+        rows = [
+            {
+                "id": "attempt-1", "status": AttemptStatus.SUBMITTED.value,
+                "tracking_key": "pile-1", "last_pile_key": None,
+            },
+            {
+                "id": "attempt-2", "status": AttemptStatus.CONFIRMED_RECONCILED.value,
+                "tracking_key": "pile-1", "last_pile_key": "old-pile-1",
+            },
+        ]
+        ledger = ExecutionLedger(DispatchConnection(rows))
+
+        matches = ledger.find_assignment_ownership("DEFMIS", ["pile-1"])
+
+        self.assertEqual([row["id"] for row in matches], ["attempt-1", "attempt-2"])
+
+    def test_assignment_ownership_lookup_does_not_query_for_empty_identities(self):
+        connection = RecordingConnection()
+
+        matches = ExecutionLedger(connection).find_assignment_ownership("DEFMIS", [None, "", "  "])
+
+        self.assertEqual(matches, [])
+        self.assertEqual(connection.statements, [])
+
     def test_batch_and_attempt_creation_is_one_transaction(self):
         batch_id = self.ledger.create_batch_with_attempts(
             {

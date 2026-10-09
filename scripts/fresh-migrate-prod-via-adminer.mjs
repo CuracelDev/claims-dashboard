@@ -951,6 +951,8 @@ const INDEX_SQL = [
   'CREATE INDEX piles_auto_assignment_batches_run_idx ON piles_auto_assignment_batches (insurer_run_id, status, created_at)',
   "CREATE UNIQUE INDEX piles_auto_assignment_attempts_active_key_idx ON piles_auto_assignment_attempts (insurer_name, tracking_key) WHERE status IN ('planned', 'selected', 'submitted', 'reconciliation_pending', 'still_unassigned')",
   'CREATE INDEX piles_auto_assignment_attempts_run_idx ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at)',
+  'CREATE INDEX piles_auto_assignment_attempts_provenance_tracking_idx ON piles_auto_assignment_attempts (insurer_name, tracking_key, status)',
+  'CREATE INDEX piles_auto_assignment_attempts_provenance_last_pile_idx ON piles_auto_assignment_attempts (insurer_name, last_pile_key, status)',
   'CREATE INDEX piles_auto_assignment_bot_account_history_bot_idx ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC)',
   "CREATE UNIQUE INDEX piles_auto_assignment_schedule_requests_pending_idx ON piles_auto_assignment_schedule_requests (lower(insurer_name)) WHERE status = 'pending'",
   "CREATE UNIQUE INDEX piles_auto_assignment_work_items_queued_generation_idx ON piles_auto_assignment_work_items (canonical_insurer_name, source, request_scope, portal_environment, months, year) WHERE disposition = 'queued'",

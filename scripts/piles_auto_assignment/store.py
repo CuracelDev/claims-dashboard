@@ -1378,6 +1378,70 @@ class ExecutionLedger:
             columns = [item[0] for item in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
+    def find_assignment_ownership(
+        self,
+        insurer_name: str,
+        identity_keys: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        """Return durable runner evidence for only the identities in this scan."""
+        identities = list(dict.fromkeys(
+            str(value).strip()
+            for value in identity_keys
+            if value is not None and str(value).strip()
+        ))
+        if not identities:
+            return []
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH matched AS (
+                  SELECT id, insurer_run_id, bot_account_id,
+                         intended_owner_name, intended_portal_assignee, status,
+                         tracking_key, last_pile_key, claim_count, evidence_code,
+                         selected_at, submitted_at, confirmed_at, created_at, updated_at
+                  FROM piles_auto_assignment_attempts
+                  WHERE insurer_name = %s
+                    AND tracking_key = ANY(%s)
+                    AND status IN (
+                      'selected', 'submitted', 'confirmed_visible',
+                      'confirmed_reconciled', 'reconciliation_pending'
+                    )
+                  UNION ALL
+                  SELECT id, insurer_run_id, bot_account_id,
+                         intended_owner_name, intended_portal_assignee, status,
+                         tracking_key, last_pile_key, claim_count, evidence_code,
+                         selected_at, submitted_at, confirmed_at, created_at, updated_at
+                  FROM piles_auto_assignment_attempts
+                  WHERE insurer_name = %s
+                    AND last_pile_key = ANY(%s)
+                    AND status IN (
+                      'selected', 'submitted', 'confirmed_visible',
+                      'confirmed_reconciled', 'reconciliation_pending'
+                    )
+                ), deduplicated AS (
+                  SELECT DISTINCT ON (id) *
+                  FROM matched
+                  ORDER BY id, updated_at DESC
+                )
+                SELECT id, insurer_run_id, bot_account_id,
+                       intended_owner_name, intended_portal_assignee, status,
+                       tracking_key, last_pile_key, claim_count,
+                       CASE
+                         WHEN char_length(evidence_code) <= 80
+                          AND evidence_code ~ '^[a-z0-9._-]+$'
+                         THEN evidence_code
+                         ELSE NULL
+                       END AS evidence_code,
+                       selected_at, submitted_at, confirmed_at,
+                       created_at, updated_at
+                FROM deduplicated
+                ORDER BY updated_at DESC, id
+                """,
+                (insurer_name, identities, insurer_name, identities),
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
     def retryable_attempts(self, insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -1589,6 +1653,13 @@ class ReadOnlyExecutionLedger:
         del last_pile_key, filter_context
 
     def pending_attempts(self, _insurer_name: str) -> list[dict[str, Any]]:
+        return []
+
+    def find_assignment_ownership(
+        self,
+        _insurer_name: str,
+        _identity_keys: Iterable[str],
+    ) -> list[dict[str, Any]]:
         return []
 
     def retryable_attempts(self, _insurer_name: str, *, max_attempts: int) -> list[dict[str, Any]]:

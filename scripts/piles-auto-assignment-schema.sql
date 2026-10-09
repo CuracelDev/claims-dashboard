@@ -500,6 +500,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS piles_auto_assignment_attempts_active_key_idx
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_attempts_run_idx
   ON piles_auto_assignment_attempts (insurer_run_id, status, updated_at);
 
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_attempts_provenance_tracking_idx
+  ON piles_auto_assignment_attempts (insurer_name, tracking_key, status);
+
+CREATE INDEX IF NOT EXISTS piles_auto_assignment_attempts_provenance_last_pile_idx
+  ON piles_auto_assignment_attempts (insurer_name, last_pile_key, status);
+
 CREATE TABLE IF NOT EXISTS piles_auto_assignment_bot_account_history (
   id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
   bot_account_id text NOT NULL REFERENCES piles_auto_assignment_bot_accounts(id) ON DELETE CASCADE,
