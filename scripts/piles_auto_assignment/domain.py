@@ -76,6 +76,16 @@ class AttemptStatus(str, Enum):
     FAILED = "failed"
 
 
+class AssignmentOwnership(str, Enum):
+    """Evidence-backed provenance for an assigned portal pile."""
+
+    RUNNER_CONFIRMED = "runner_confirmed"
+    RUNNER_PENDING = "runner_pending"
+    CONFLICT = "conflict"
+    UNLINKED = "unlinked"
+    VERIFIED_EXTERNAL = "verified_external"
+
+
 class BatchStatus(str, Enum):
     PLANNED = "planned"
     SELECTING = "selecting"
