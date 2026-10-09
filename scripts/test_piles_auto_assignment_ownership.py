@@ -115,6 +115,29 @@ class AssignmentOwnershipTests(unittest.TestCase):
         self.assertEqual(evidence.reason_code, "ambiguous_runner_evidence")
         self.assertTrue(evidence.ambiguous)
 
+    def test_exact_tracked_match_outweighs_stale_duplicate_attempts(self):
+        evidence = self.classify(
+            tracked_matches=[{
+                "id": "tracked-1", "current_assigned": "CVEBOT1",
+            }],
+            attempt_matches=[
+                attempt(AttemptStatus.CONFIRMED_VISIBLE.value, attempt_id="attempt-1"),
+                attempt(AttemptStatus.CONFIRMED_VISIBLE.value, attempt_id="attempt-2"),
+            ],
+        )
+
+        self.assertEqual(evidence.ownership, AssignmentOwnership.RUNNER_CONFIRMED)
+        self.assertEqual(evidence.evidence_source, "tracked_pile")
+
+    def test_single_confirmed_attempt_outweighs_a_pending_attempt(self):
+        evidence = self.classify(attempt_matches=[
+            attempt(AttemptStatus.CONFIRMED_VISIBLE.value, attempt_id="confirmed"),
+            attempt(AttemptStatus.RECONCILIATION_PENDING.value, attempt_id="pending"),
+        ])
+
+        self.assertEqual(evidence.ownership, AssignmentOwnership.RUNNER_CONFIRMED)
+        self.assertEqual(evidence.attempt_id, "confirmed")
+
     def test_no_runner_or_actor_evidence_is_unlinked_not_external(self):
         evidence = self.classify()
 

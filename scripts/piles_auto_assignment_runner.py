@@ -49,8 +49,9 @@ try:
         dispatch_parent, execute_claimed_insurer)
     from piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
         ParentAlreadyTerminal, ParentScopeMismatch)
-    from piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
-        ParentRunStatus, RequestScope, WorkRequest, WorkSource)
+    from piles_auto_assignment.domain import (AssignmentOwnership, AttemptStatus, FilterEvidence,
+        InsurerRunStatus, ParentRunStatus, RequestScope, WorkRequest, WorkSource)
+    from piles_auto_assignment.ownership import classify_assignment_ownership
     from piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
     from piles_auto_assignment.timing import PhaseTimer, timed_operation
     from piles_auto_assignment.diagnostics import failure_diagnostic
@@ -70,8 +71,9 @@ except ModuleNotFoundError:  # Repository-level unittest import path.
         dispatch_parent, execute_claimed_insurer)
     from scripts.piles_auto_assignment.store import (DispatchStore, ExecutionLedger, ReadOnlyExecutionLedger,
         ParentAlreadyTerminal, ParentScopeMismatch)
-    from scripts.piles_auto_assignment.domain import (AttemptStatus, FilterEvidence, InsurerRunStatus,
-        ParentRunStatus, RequestScope, WorkRequest, WorkSource)
+    from scripts.piles_auto_assignment.domain import (AssignmentOwnership, AttemptStatus, FilterEvidence,
+        InsurerRunStatus, ParentRunStatus, RequestScope, WorkRequest, WorkSource)
+    from scripts.piles_auto_assignment.ownership import classify_assignment_ownership
     from scripts.piles_auto_assignment.evidence import classify_assignment_observations, evaluate_filter_evidence, decide_filter_wait
     from scripts.piles_auto_assignment.timing import PhaseTimer, timed_operation
     from scripts.piles_auto_assignment.diagnostics import failure_diagnostic
@@ -3071,28 +3073,71 @@ class DataStore:
             ]
         return self._rows_to_external_assignments(rows)
 
-    def clear_external_assignment(self, external_assignment_id: str) -> None:
+    def clear_external_assignment(
+        self,
+        external_assignment_id: str,
+        *,
+        reason: str = "",
+        attempt_id: str = "",
+        insurer_run_id: str = "",
+    ) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
+        safe_reference = lambda value: (
+            value if re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", str(value or "")) else ""
+        )
+        provenance = {}
+        if reason == "runner_provenance_confirmed":
+            provenance = {
+                "clear_reason": reason,
+                "confirming_attempt_id": safe_reference(attempt_id),
+                "confirming_insurer_run_id": safe_reference(insurer_run_id),
+            }
         if self.mode == "postgres":
-            self._execute_postgres(
-                """
-                update piles_auto_assignment_external_assignments
-                set is_active = false,
-                    cleared_at = coalesce(cleared_at, %s),
-                    updated_at = now()
-                where id = %s
-                """,
-                (now_iso, external_assignment_id),
-            )
+            if provenance:
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_external_assignments
+                    set is_active = false,
+                        cleared_at = coalesce(cleared_at, %s),
+                        details = coalesce(details, '{}'::jsonb) || %s::jsonb,
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (now_iso, json.dumps(provenance), external_assignment_id),
+                )
+            else:
+                self._execute_postgres(
+                    """
+                    update piles_auto_assignment_external_assignments
+                    set is_active = false,
+                        cleared_at = coalesce(cleared_at, %s),
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (now_iso, external_assignment_id),
+                )
         else:
+            details = {}
+            cleared_at = now_iso
+            if provenance:
+                existing = self._fetchall_supabase(
+                    "piles_auto_assignment_external_assignments",
+                    filters=[("id", "eq", external_assignment_id)],
+                )
+                if existing:
+                    cleared_at = norm(existing[0].get("cleared_at")) or now_iso
+                    if isinstance(existing[0].get("details"), dict):
+                        details.update(existing[0]["details"])
+                details.update(provenance)
             self._update_supabase(
                 "piles_auto_assignment_external_assignments",
                 "id",
                 external_assignment_id,
                 {
                     "is_active": False,
-                    "cleared_at": now_iso,
+                    "cleared_at": cleared_at,
                     "updated_at": now_iso,
+                    **({"details": details} if provenance else {}),
                 },
             )
 
@@ -7544,6 +7589,8 @@ def detect_external_assignments(
     tracked_keys: set[str],
     team_slack_map: dict[str, dict[str, str]],
     rule: AssignmentRule | None,
+    *,
+    execution_ledger: Any = None,
 ) -> dict[str, Any]:
     existing_records = store.get_active_external_assignments(insurer_name)
     existing_by_tracking: dict[str, ExternalAssignment] = {}
@@ -7553,6 +7600,20 @@ def detect_external_assignments(
         existing_by_tracking[record.tracking_key] = record
         existing_by_tracking[canonical_pile_tracking_key(record.tracking_key)] = record
     tracked_key_set = expanded_tracking_key_set(tracked_keys)
+    assigned_identity_keys = expanded_tracking_key_set(
+        key
+        for row in rows
+        if norm(row.assigned)
+        for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+    )
+    ledger_attempts = (
+        execution_ledger.find_assignment_ownership(
+            insurer_name,
+            sorted(assigned_identity_keys),
+        )
+        if execution_ledger and assigned_identity_keys
+        else []
+    )
     candidate_rows_by_tracking: dict[str, list[PileRow]] = {}
     matched_bot_by_tracking: dict[str, BotAccount] = {}
     unmapped_assignment_count = 0
@@ -7562,6 +7623,111 @@ def detect_external_assignments(
         if not norm(row.assigned):
             continue
         matched_bot = match_bot_to_portal_name(bots, row.assigned) if bots else None
+        identity = canonical_pile_tracking_key(row.tracking_key) or row.tracking_key
+        candidate_rows_by_tracking.setdefault(identity, []).append(row)
+        if matched_bot is not None:
+            matched_bot_by_tracking[identity] = matched_bot
+
+    assigned_rows_by_tracking: dict[str, PileRow] = {}
+    skipped_active_tracking_keys: set[str] = set()
+    identity_collision_count = 0
+    manual_review_count = 0
+    for tracking_key, matches in candidate_rows_by_tracking.items():
+        distinct_volatile_keys = {row.key for row in matches if norm(row.key)}
+        if len(distinct_volatile_keys) > 1:
+            identity_collision_count += 1
+            manual_review_count += 1
+            skipped_active_tracking_keys.add(tracking_key)
+            sample = matches[0]
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="assignment_provenance_ambiguous",
+                status="manual_action_required",
+                pile_count=len(matches),
+                claim_count=sum(max(row.claims, 0) for row in matches),
+                details={
+                    "reason_code": "multiple_current_rows_share_identity",
+                    "volatile_key_count": len(distinct_volatile_keys),
+                    "provider": sample.provider,
+                    "claim_month": sample.month,
+                    "submitted_date": sample.submitted_date,
+                    "amount": sample.amount_text,
+                    "claims_total": sample.claims,
+                    "assigned_values": sorted({norm(row.assigned) for row in matches if norm(row.assigned)}),
+                },
+            )
+            continue
+        row = matches[0]
+        existing = assigned_rows_by_tracking.get(tracking_key)
+        if existing is None or (not norm(existing.assigned) and norm(row.assigned)):
+            assigned_rows_by_tracking[tracking_key] = row
+
+    notifications: list[ExternalNotificationItem] = []
+    stale_candidates: list[ReassignmentCandidate] = []
+    active_tracking_keys = expanded_tracking_key_set(skipped_active_tracking_keys)
+    new_detection_count = 0
+    now = datetime.now(timezone.utc)
+
+    for identity, row in assigned_rows_by_tracking.items():
+        previous_record = existing_by_tracking.get(row.tracking_key) or existing_by_tracking.get(canonical_pile_tracking_key(row.tracking_key))
+        matched_bot = matched_bot_by_tracking.get(identity)
+        row_keys = expanded_tracking_key_set([
+            row.tracking_key, row.legacy_tracking_key, row.key,
+        ])
+        attempt_matches = [
+            attempt for attempt in ledger_attempts
+            if row_keys & expanded_tracking_key_set([
+                attempt.get("tracking_key"), attempt.get("last_pile_key"),
+            ])
+        ]
+        tracked_matches = (
+            [{"id": identity, "current_assigned": row.assigned}]
+            if row_keys & tracked_key_set
+            else []
+        )
+        ownership = classify_assignment_ownership(
+            observed_assignee=row.assigned,
+            configured_owner=matched_bot.owner_name if matched_bot else "",
+            tracked_matches=tracked_matches,
+            attempt_matches=attempt_matches,
+        )
+        active_tracking_keys.update(row_keys)
+        if ownership.ownership == AssignmentOwnership.RUNNER_CONFIRMED:
+            if ownership.attempt_id:
+                execution_ledger.materialize_confirmed_assignment(
+                    ownership.attempt_id,
+                    row,
+                )
+            if previous_record is not None:
+                store.clear_external_assignment(
+                    previous_record.id,
+                    reason="runner_provenance_confirmed",
+                    attempt_id=ownership.attempt_id,
+                    insurer_run_id=ownership.insurer_run_id,
+                )
+            continue
+        if ownership.ownership == AssignmentOwnership.RUNNER_PENDING:
+            continue
+        if ownership.ownership == AssignmentOwnership.CONFLICT:
+            manual_review_count += 1
+            if ownership.ambiguous:
+                identity_collision_count += 1
+            store.log_runner_event(
+                insurer_name=insurer_name,
+                event_type="assignment_provenance_ambiguous",
+                status="manual_action_required",
+                pile_count=1,
+                claim_count=max(row.claims, 0),
+                details={
+                    "reason_code": ownership.reason_code,
+                    "attempt_match_count": len(attempt_matches),
+                    "ambiguous": ownership.ambiguous,
+                    "provider": row.provider,
+                    "claim_month": row.month,
+                    "status_bucket": row.status_bucket,
+                },
+            )
+            continue
         if matched_bot is None:
             unmapped_assignment_count += 1
             unmapped_assignment_claims += max(row.claims, 0)
@@ -7575,73 +7741,6 @@ def detect_external_assignments(
                     "amount": row.amount_text,
                     "status_bucket": row.status_bucket,
                 })
-            continue
-        row_keys = expanded_tracking_key_set([row.tracking_key, row.legacy_tracking_key])
-        if row_keys & tracked_key_set:
-            continue
-        candidate_rows_by_tracking.setdefault(row.tracking_key, []).append(row)
-        matched_bot_by_tracking[row.tracking_key] = matched_bot
-
-    if unmapped_assignment_count:
-        store.log_runner_event(
-            insurer_name=insurer_name,
-            event_type="external_assignment_unmapped_assignee_skipped",
-            status="skipped",
-            pile_count=unmapped_assignment_count,
-            claim_count=unmapped_assignment_claims,
-            details={
-                "reason": "Assigned portal rows were skipped because their assignee did not match any configured bot owner/account.",
-                "sample_count": len(unmapped_assignment_samples),
-                "samples": unmapped_assignment_samples,
-            },
-        )
-
-    assigned_rows_by_tracking: dict[str, PileRow] = {}
-    skipped_active_tracking_keys: set[str] = set()
-    identity_collision_count = 0
-    for tracking_key, matches in candidate_rows_by_tracking.items():
-        distinct_volatile_keys = {row.key for row in matches if norm(row.key)}
-        if len(distinct_volatile_keys) > 1:
-            identity_collision_count += 1
-            skipped_active_tracking_keys.add(tracking_key)
-            sample = matches[0]
-            store.log_runner_event(
-                insurer_name=insurer_name,
-                event_type="external_assignment_identity_collision",
-                status="skipped",
-                pile_count=len(matches),
-                claim_count=sum(max(row.claims, 0) for row in matches),
-                details={
-                    "reason": "Multiple assigned rows shared the same stable tracking key, so external detection skipped them to avoid a false callout.",
-                    "tracking_key": tracking_key,
-                    "volatile_keys": sorted(distinct_volatile_keys)[:10],
-                    "provider": sample.provider,
-                    "claim_month": sample.month,
-                    "submitted_date": sample.submitted_date,
-                    "amount": sample.amount_text,
-                    "claims_total": sample.claims,
-                    "assigned_values": sorted({norm(row.assigned) for row in matches if norm(row.assigned)}),
-                },
-            )
-            continue
-        row = matches[0]
-        existing = assigned_rows_by_tracking.get(row.tracking_key)
-        if existing is None or (not norm(existing.assigned) and norm(row.assigned)):
-            assigned_rows_by_tracking[row.tracking_key] = row
-
-    notifications: list[ExternalNotificationItem] = []
-    stale_candidates: list[ReassignmentCandidate] = []
-    active_tracking_keys = expanded_tracking_key_set([
-        *assigned_rows_by_tracking.keys(),
-        *skipped_active_tracking_keys,
-    ])
-    new_detection_count = 0
-    now = datetime.now(timezone.utc)
-
-    for row in assigned_rows_by_tracking.values():
-        previous_record = existing_by_tracking.get(row.tracking_key) or existing_by_tracking.get(canonical_pile_tracking_key(row.tracking_key))
-        matched_bot = matched_bot_by_tracking.get(row.tracking_key)
-        if matched_bot is None:
             continue
         progress_claims = max(0, row.synced_claims - safe_int(previous_record.synced_claims if previous_record else 0, 0))
         last_progress_at = (
@@ -7717,11 +7816,26 @@ def detect_external_assignments(
             },
         )
 
+    if unmapped_assignment_count:
+        store.log_runner_event(
+            insurer_name=insurer_name,
+            event_type="external_assignment_unmapped_assignee_skipped",
+            status="skipped",
+            pile_count=unmapped_assignment_count,
+            claim_count=unmapped_assignment_claims,
+            details={
+                "reason": "Assigned portal rows were skipped because their assignee did not match any configured bot owner/account.",
+                "sample_count": len(unmapped_assignment_samples),
+                "samples": unmapped_assignment_samples,
+            },
+        )
+
     store.sync_external_assignments_for_insurer(insurer_name, active_tracking_keys)
     return {
         "active_count": len(active_tracking_keys),
         "new_detection_count": new_detection_count,
         "identity_collision_count": identity_collision_count,
+        "manual_review_count": manual_review_count,
         "notifications": notifications,
         "stale_candidates": stale_candidates,
     }
@@ -8605,6 +8719,7 @@ def _run_for_insurer_once(
             tracked_keys,
             team_slack_map,
             rule,
+            execution_ledger=execution_ledger,
         )
         if external_detection["new_detection_count"]:
             print("\nDetected externally assigned piles the runner is not tracking:")
@@ -8792,6 +8907,8 @@ def _run_for_insurer_once(
             "external_detection": {
                 "active_count": external_detection["active_count"],
                 "new_detection_count": external_detection["new_detection_count"],
+                "identity_collision_count": external_detection["identity_collision_count"],
+                "manual_review_count": external_detection["manual_review_count"],
             },
             "reassignment_summary": reassignment_summary,
             "summary": summary,
@@ -8801,7 +8918,7 @@ def _run_for_insurer_once(
         }
         output_path.write_text(json.dumps(payload, indent=2))
 
-        manual_action_count = reconciliation_manual_count + (
+        manual_action_count = reconciliation_manual_count + external_detection["manual_review_count"] + (
             len(unassigned)
             if rule and rule.distribution_mode == "manual_override"
             else 0
@@ -8840,6 +8957,12 @@ def _run_for_insurer_once(
                     "completed_count": tracked_reconcile["completed_count"],
                     "stale_count": tracked_reconcile["stale_count"],
                     "active_count": tracked_reconcile["active_count"],
+                },
+                "external_detection": {
+                    "active_count": external_detection["active_count"],
+                    "new_detection_count": external_detection["new_detection_count"],
+                    "identity_collision_count": external_detection["identity_collision_count"],
+                    "manual_review_count": external_detection["manual_review_count"],
                 },
                 "reassignment_summary": reassignment_summary,
                 "summary": summary,

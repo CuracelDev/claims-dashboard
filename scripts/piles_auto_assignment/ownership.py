@@ -59,8 +59,7 @@ def classify_assignment_ownership(
     attempts = tuple(attempt_matches)
 
     distinct_tracked = {_value(item, "id") for item in tracked if _value(item, "id")}
-    distinct_attempts = {_value(item, "id") for item in attempts if _value(item, "id")}
-    if len(distinct_tracked) > 1 or len(distinct_attempts) > 1:
+    if len(distinct_tracked) > 1:
         return OwnershipEvidence(
             AssignmentOwnership.CONFLICT,
             "ambiguous_runner_evidence",
@@ -69,25 +68,16 @@ def classify_assignment_ownership(
             ambiguous=True,
         )
 
-    expected_assignees = {
-        _label(_value(item, "current_assigned"))
-        for item in tracked
-        if _label(_value(item, "current_assigned"))
-    } | {
-        _label(_value(item, "intended_portal_assignee"))
-        for item in attempts
-        if _label(_value(item, "intended_portal_assignee"))
-    }
-    if expected_assignees and _label(observed) not in expected_assignees:
-        return OwnershipEvidence(
-            AssignmentOwnership.CONFLICT,
-            "runner_evidence_assignee_conflict",
-            observed,
-            configured_owner=owner,
-        )
-
     if tracked:
         matched = tracked[0]
+        expected = _label(_value(matched, "current_assigned"))
+        if expected and _label(observed) != expected:
+            return OwnershipEvidence(
+                AssignmentOwnership.CONFLICT,
+                "runner_evidence_assignee_conflict",
+                observed,
+                configured_owner=owner,
+            )
         return OwnershipEvidence(
             AssignmentOwnership.RUNNER_CONFIRMED,
             "tracked_assignment_matches_assignee",
@@ -98,8 +88,25 @@ def classify_assignment_ownership(
         )
 
     confirmed = [item for item in attempts if _value(item, "status") in _CONFIRMED_STATUSES]
+    distinct_confirmed = {_value(item, "id") for item in confirmed if _value(item, "id")}
+    if len(distinct_confirmed) > 1:
+        return OwnershipEvidence(
+            AssignmentOwnership.CONFLICT,
+            "ambiguous_runner_evidence",
+            observed,
+            configured_owner=owner,
+            ambiguous=True,
+        )
     if confirmed:
         matched = confirmed[0]
+        expected = _label(_value(matched, "intended_portal_assignee"))
+        if expected and _label(observed) != expected:
+            return OwnershipEvidence(
+                AssignmentOwnership.CONFLICT,
+                "runner_evidence_assignee_conflict",
+                observed,
+                configured_owner=owner,
+            )
         return OwnershipEvidence(
             AssignmentOwnership.RUNNER_CONFIRMED,
             "confirmed_attempt_matches_assignee",
@@ -112,8 +119,25 @@ def classify_assignment_ownership(
         )
 
     pending = [item for item in attempts if _value(item, "status") in _PENDING_STATUSES]
+    distinct_pending = {_value(item, "id") for item in pending if _value(item, "id")}
+    if len(distinct_pending) > 1:
+        return OwnershipEvidence(
+            AssignmentOwnership.CONFLICT,
+            "ambiguous_runner_evidence",
+            observed,
+            configured_owner=owner,
+            ambiguous=True,
+        )
     if pending:
         matched = pending[0]
+        expected = _label(_value(matched, "intended_portal_assignee"))
+        if expected and _label(observed) != expected:
+            return OwnershipEvidence(
+                AssignmentOwnership.CONFLICT,
+                "runner_evidence_assignee_conflict",
+                observed,
+                configured_owner=owner,
+            )
         return OwnershipEvidence(
             AssignmentOwnership.RUNNER_PENDING,
             "pending_attempt_matches_assignee",

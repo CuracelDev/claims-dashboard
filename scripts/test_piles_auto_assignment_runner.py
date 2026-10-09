@@ -927,6 +927,172 @@ def make_pile(index, claims=100, *, filter_year="2026"):
     )
 
 
+class AssignmentProvenanceDetectionTests(unittest.TestCase):
+    def store(self, existing=()):
+        state = types.SimpleNamespace(saved=[], cleared=[], events=[], synced=[])
+
+        class Store:
+            def get_active_external_assignments(self, _insurer):
+                return list(existing)
+
+            def save_external_assignment(self, *args, **kwargs):
+                state.saved.append((args, kwargs))
+                raise AssertionError("runner-owned evidence must not be persisted as external")
+
+            def clear_external_assignment(self, record_id, **details):
+                state.cleared.append((record_id, details))
+
+            def log_runner_event(self, **event):
+                state.events.append(event)
+
+            def sync_external_assignments_for_insurer(self, insurer, keys):
+                state.synced.append((insurer, set(keys)))
+
+        return Store(), state
+
+    def test_confirmed_attempt_without_mirror_self_heals_and_clears_false_external_record(self):
+        row = runner.replace(make_pile(1), assigned="primary")
+        prior = types.SimpleNamespace(
+            id="external-1", tracking_key=row.tracking_key,
+            synced_claims=0, details={},
+        )
+        store, state = self.store([prior])
+
+        class Ledger:
+            def find_assignment_ownership(self, insurer, identities):
+                self.lookup = (insurer, set(identities))
+                return [{
+                    "id": "attempt-1", "insurer_run_id": "run-1",
+                    "status": "confirmed_visible", "tracking_key": row.tracking_key,
+                    "last_pile_key": row.key, "intended_portal_assignee": "primary",
+                }]
+
+            def materialize_confirmed_assignment(self, attempt_id, observation):
+                self.materialized = (attempt_id, observation)
+                return "tracked-1"
+
+        ledger = Ledger()
+        result = runner.detect_external_assignments(
+            store, "master-1", "OLD MUTUAL", [row],
+            [make_bot("primary", "primary")], set(), {}, None,
+            execution_ledger=ledger,
+        )
+
+        self.assertEqual(result["new_detection_count"], 0)
+        self.assertEqual(result["notifications"], [])
+        self.assertEqual(result["stale_candidates"], [])
+        self.assertEqual(runner.unique_unassigned_rows([row]), [])
+        self.assertEqual(ledger.materialized, ("attempt-1", row))
+        self.assertEqual(state.saved, [])
+        self.assertEqual(state.cleared, [(
+            "external-1",
+            {
+                "reason": "runner_provenance_confirmed",
+                "attempt_id": "attempt-1",
+                "insurer_run_id": "run-1",
+            },
+        )])
+
+    def test_pending_runner_attempt_suppresses_external_persistence_and_reassignment(self):
+        row = runner.replace(make_pile(1), assigned="primary")
+        store, state = self.store()
+
+        class Ledger:
+            def find_assignment_ownership(self, *_args):
+                return [{
+                    "id": "attempt-1", "insurer_run_id": "run-1",
+                    "status": "reconciliation_pending", "tracking_key": row.tracking_key,
+                    "last_pile_key": row.key, "intended_portal_assignee": "primary",
+                }]
+
+            def materialize_confirmed_assignment(self, *_args):
+                raise AssertionError("pending evidence cannot be materialized")
+
+        result = runner.detect_external_assignments(
+            store, "master-1", "OLD MUTUAL", [row],
+            [make_bot("primary", "primary")], set(), {}, None,
+            execution_ledger=Ledger(),
+        )
+
+        self.assertEqual(result["new_detection_count"], 0)
+        self.assertEqual(result["manual_review_count"], 0)
+        self.assertEqual(state.saved, [])
+
+    def test_ambiguous_current_rows_fail_closed_without_alert_or_reassignment(self):
+        first = runner.replace(make_pile(1), assigned="primary")
+        second = runner.replace(first, key="different-volatile-key")
+        store, state = self.store()
+
+        class Ledger:
+            def find_assignment_ownership(self, *_args):
+                return []
+
+        result = runner.detect_external_assignments(
+            store, "master-1", "OLD MUTUAL", [first, second],
+            [make_bot("primary", "primary")], set(), {}, None,
+            execution_ledger=Ledger(),
+        )
+
+        self.assertEqual(result["notifications"], [])
+        self.assertEqual(result["stale_candidates"], [])
+        self.assertEqual(result["manual_review_count"], 1)
+        self.assertEqual(state.saved, [])
+        self.assertIn(
+            "assignment_provenance_ambiguous",
+            [event["event_type"] for event in state.events],
+        )
+
+    def test_clear_false_external_record_sanitizes_provenance_references(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "postgres"
+        captured = []
+        store._execute_postgres = lambda sql, params: captured.append((sql, params))
+
+        store.clear_external_assignment(
+            "external-1",
+            reason="runner_provenance_confirmed",
+            attempt_id="attempt-1; unsafe",
+            insurer_run_id="run:1",
+        )
+
+        self.assertEqual(len(captured), 1)
+        sql, params = captured[0]
+        self.assertIn("cleared_at = coalesce(cleared_at", sql)
+        details = runner.json.loads(params[1])
+        self.assertEqual(details, {
+            "clear_reason": "runner_provenance_confirmed",
+            "confirming_attempt_id": "",
+            "confirming_insurer_run_id": "run:1",
+        })
+        self.assertEqual(params[2], "external-1")
+
+    def test_supabase_clear_preserves_existing_history_and_cleared_timestamp(self):
+        store = runner.DataStore.__new__(runner.DataStore)
+        store.mode = "supabase"
+        store._fetchall_supabase = lambda *_args, **_kwargs: [{
+            "cleared_at": "2026-10-01T01:02:03+00:00",
+            "details": {"first_detection": "retained"},
+        }]
+        captured = []
+        store._update_supabase = lambda *args: captured.append(args)
+
+        store.clear_external_assignment(
+            "external-1",
+            reason="runner_provenance_confirmed",
+            attempt_id="attempt-1",
+            insurer_run_id="run-1",
+        )
+
+        payload = captured[0][3]
+        self.assertEqual(payload["cleared_at"], "2026-10-01T01:02:03+00:00")
+        self.assertEqual(payload["details"], {
+            "first_detection": "retained",
+            "clear_reason": "runner_provenance_confirmed",
+            "confirming_attempt_id": "attempt-1",
+            "confirming_insurer_run_id": "run-1",
+        })
+
+
 class LateArrivalWorkflowTests(unittest.TestCase):
     def test_planning_and_reconciliation_are_aggregate_only_operations(self):
         row = runner.replace(make_pile(1), assigned='Daniel')
