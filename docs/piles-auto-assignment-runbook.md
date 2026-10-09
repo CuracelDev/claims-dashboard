@@ -146,6 +146,28 @@ Interpret the incident report as follows:
 
 ## Guarded recovery and legacy backlog
 
+### Assignment provenance audit and repair
+
+The provenance audit is database-only and read-only by default. It reports bounded aggregate counts for confirmed attempts missing tracked links, exact matches to active assignment observations, ambiguous identities, pending runner-owned submissions, genuinely unlinked observations, and exact repair candidates. It never prints insurer names, provider names, claim identifiers, tracking keys, raw errors, or credentials.
+
+```bash
+npm run audit:piles-provenance -- --hours 24
+npm run audit:piles-provenance -- --hours 168 --insurer "DEFMIS"
+```
+
+The **Piles Incident Inspection** workflow defaults to this read-only provenance audit. Its `incident` operation retains the existing sanitized runner inspection. The workflow has no mutation path.
+
+Historical repair is a separately approved direct-host operation. Stop new launches, back up the database, inspect the exact candidate, and target one confirmed attempt at a time:
+
+```bash
+node scripts/audit-piles-assignment-provenance.mjs \
+  --apply \
+  --confirmation REPAIR_PILES_PROVENANCE \
+  --attempt-id ATTEMPT_ID
+```
+
+Repair requires one active, exact, one-to-one observation under the intended portal assignee, a confirmed attempt with no tracked link, and a free insurer advisory lock. It atomically materializes or refreshes the tracked mirror, links the attempt, and clears the false observation while preserving its history. Ambiguous, conflicting, pending, already-linked, missing, or concurrently changed evidence is blocked and rolled back. The tool never contacts the portal, changes attempt confirmation, assigns or reassigns a pile, or deletes evidence. Exit `2` means the candidate was blocked; reinspect rather than retrying blindly.
+
 These scripts do not launch the runner, contact the portal, assign claims, delete rows, or change attempt/batch evidence. Requeuing makes work eligible for a later dispatcher claim, so stop new scheduled/manual launches and let active workers reach a safe evidence boundary before approving any mutation. Do not use a live worker's token or force an advisory unlock. Back up the database, confirm the deployed commit, and apply/audit the additive schema first.
 
 Default inspection opens `BEGIN READ ONLY` and always rolls back. Reports contain only fixed aggregate fields, not raw errors, names, IDs, tokens, HTML, or claim identifiers:

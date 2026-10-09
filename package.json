@@ -11,6 +11,7 @@
     "test:piles:domain": "python3 -m unittest scripts/test_piles_auto_assignment_domain.py",
     "test:piles:rules": "node --test lib/piles-auto-assignment-rules.test.mjs",
     "audit:piles-readiness": "node scripts/audit-piles-auto-assignment-readiness.mjs",
+    "audit:piles-provenance": "node scripts/audit-piles-assignment-provenance.mjs",
     "db:audit": "node scripts/db-schema-audit.mjs",
     "db:prism-chat": "node scripts/apply-prism-chat-schema.mjs",
     "db:piles-auto-assignment": "node scripts/apply-piles-auto-assignment-schema.mjs",
