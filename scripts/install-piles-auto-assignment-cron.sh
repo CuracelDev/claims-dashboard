@@ -33,7 +33,7 @@ shell_quote() {
   printf '%s' "$1" | sed "s/'/'\\\\''/g"
   printf "'"
 }
-CRON_SCRIPT="cd $(shell_quote "$ROOT_DIR") && set -a && . $(shell_quote "$ENV_FILE") && set +a && ./scripts/run-piles-auto-assignment.sh --run-source schedule >> $(shell_quote "$LOG_FILE") 2>&1"
+CRON_SCRIPT="cd $(shell_quote "$ROOT_DIR") && set -a && . $(shell_quote "$ENV_FILE") && set +a && ./scripts/rotate-piles-auto-assignment-log.sh $(shell_quote "$LOG_FILE") && ./scripts/run-piles-auto-assignment.sh --run-source schedule >> $(shell_quote "$LOG_FILE") 2>&1"
 CRON_COMMAND="/bin/sh -c $(shell_quote "$CRON_SCRIPT")"
 CRON_COMMAND="$(printf '%s' "$CRON_COMMAND" | sed 's/%/\\%/g')"
 printf '%s %s %s\n' "$SCHEDULE" "$CRON_COMMAND" "$MARKER" >> "$TMP_FILE"

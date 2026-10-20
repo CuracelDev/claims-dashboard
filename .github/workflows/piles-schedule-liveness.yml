@@ -1,0 +1,33 @@
+name: Piles Schedule Liveness
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+concurrency:
+  group: piles-schedule-liveness
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit durable production schedule evidence
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 8m
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+            mkdir -p tmp
+            node scripts/audit-piles-schedule-liveness.mjs \
+              --threshold-minutes 75 \
+              --state-file tmp/piles-schedule-liveness-state.json
