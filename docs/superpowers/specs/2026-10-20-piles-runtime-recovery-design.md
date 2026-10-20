@@ -10,7 +10,7 @@ Every scheduled launch must either use a verified, immutable runtime generation 
 
 ## Architecture
 
-Production runtimes live under `.piles-runtime/generations/<fingerprint>`. The fingerprint binds the requirements file, Python major/minor version, runtime-builder version, and browser configuration. `.piles-runtime/current` and `.piles-runtime/previous` are atomic symlink pointers. A generation is built in a same-filesystem temporary directory, bootstraps `pip`, installs pinned dependencies and Playwright, passes import and browser probes, receives a JSON manifest, and only then becomes `current`.
+Production runtimes live under `.piles-runtime/generations/<fingerprint>-<generation-id>`. The fingerprint binds the requirements file, Python major/minor version, runtime-builder version, and browser configuration; the unique generation ID permits a damaged generation to be replaced without mutating or temporarily removing it. `.piles-runtime/current` and `.piles-runtime/previous` are atomic symlink pointers. A generation is built in a same-filesystem temporary directory, bootstraps `pip`, installs pinned dependencies and Playwright, passes import and browser probes, receives a JSON manifest, and only then becomes `current`.
 
 A standard-library-only checker validates the configured generation and emits sanitized JSON. The schedule wrapper runs this checker before every execution. In `audit` mode it fails closed when unhealthy. In `repair` mode it invokes the atomic builder under a dedicated filesystem lock, rechecks the new generation, and only then starts the existing assignment runner. The runtime-repair lock remains independent from the assignment-cycle overlap lock.
 

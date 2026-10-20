@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,12 @@ with sync_playwright() as playwright:
 print("ok")
 """
 
+BROWSER_EXECUTABLE_PROGRAM = """# RUNTIME_BROWSER_EXECUTABLE
+from playwright.sync_api import sync_playwright
+with sync_playwright() as playwright:
+    print(playwright.chromium.executable_path)
+"""
+
 
 def requirements_sha256(requirements_path: str | Path) -> str:
     return hashlib.sha256(Path(requirements_path).read_bytes()).hexdigest()
@@ -68,6 +75,32 @@ def compute_runtime_fingerprint(
 
 # Keep requirements hashing discoverable from the public fingerprint contract.
 compute_runtime_fingerprint.requirements_sha256 = requirements_sha256  # type: ignore[attr-defined]
+
+
+def write_runtime_manifest(
+    generation: str | Path,
+    requirements_path: str | Path,
+    python_version: str,
+    builder_version: str,
+    browser_config: str,
+) -> Path:
+    generation_path = Path(generation)
+    manifest_path = generation_path / MANIFEST_NAME
+    payload = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "fingerprint": compute_runtime_fingerprint(
+            requirements_path, python_version, builder_version, browser_config
+        ),
+        "python_version": str(python_version),
+        "requirements_sha256": requirements_sha256(requirements_path),
+        "builder_version": str(builder_version),
+        "browser_config": str(browser_config),
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    temporary = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, manifest_path)
+    return manifest_path
 
 
 def _run_safe(command: list[str], *, env: dict[str, str] | None = None) -> tuple[bool, str]:
@@ -187,8 +220,14 @@ def inspect_runtime(
         except OSError:
             states.append("manifest_mismatch")
 
-    browser = Path(browser_path) if browser_path else None
-    if browser is not None and (not browser.is_file() or not os.access(browser, os.X_OK)):
+    browser: Path | None = Path(browser_path) if browser_path else None
+    if browser is None:
+        executable_ok, executable_output = _run_safe(
+            [str(python), "-c", BROWSER_EXECUTABLE_PROGRAM], env=import_env
+        )
+        if executable_ok and executable_output:
+            browser = Path(executable_output.splitlines()[-1])
+    if browser is None or not browser.is_file() or not os.access(browser, os.X_OK):
         states.append("browser_missing")
     elif mode == "full":
         browser_ok, _ = _run_safe([str(python), "-c", BROWSER_PROGRAM], env=import_env)
