@@ -534,8 +534,12 @@ ALTER TABLE IF EXISTS piles_auto_assignment_bot_account_history
 ALTER TABLE IF EXISTS piles_auto_assignment_bot_account_history
   ADD COLUMN IF NOT EXISTS new_values jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+DO $audit_owner_guard$
+BEGIN
+  BEGIN
+    EXECUTE $audit_ddl$
 CREATE OR REPLACE FUNCTION piles_audit_bot_account_insert()
-RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $$
+RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $audit_body$
 BEGIN
   INSERT INTO piles_auto_assignment_bot_account_history
     (bot_account_id, insurer_name, owner_name, assignment_role, support_capacity_ratio,
@@ -561,13 +565,53 @@ BEGIN
        'password_configured', coalesce(NEW.bot_password, '') <> ''
      ));
   RETURN NEW;
-END $$;
+END $audit_body$;
+$audit_ddl$;
+  EXCEPTION WHEN insufficient_privilege THEN
+    IF to_regprocedure('public.piles_audit_bot_account_insert()') IS NULL THEN
+      RAISE;
+    END IF;
+  END;
+END
+$audit_owner_guard$;
 
-DROP TRIGGER IF EXISTS piles_audit_bot_account_insert_trigger ON piles_auto_assignment_bot_accounts;
-CREATE TRIGGER piles_audit_bot_account_insert_trigger
-AFTER INSERT ON piles_auto_assignment_bot_accounts
-FOR EACH ROW EXECUTE FUNCTION piles_audit_bot_account_insert();
+DO $audit_privilege_guard$
+BEGIN
+  BEGIN
+    EXECUTE 'REVOKE ALL ON FUNCTION piles_audit_bot_account_insert() FROM PUBLIC';
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL; -- The transactional routine contract audit verifies the existing ACL.
+  END;
+END
+$audit_privilege_guard$;
 
+DO $audit_trigger_guard$
+BEGIN
+  BEGIN
+    DROP TRIGGER IF EXISTS piles_audit_bot_account_insert_trigger ON piles_auto_assignment_bot_accounts;
+    CREATE TRIGGER piles_audit_bot_account_insert_trigger
+    AFTER INSERT ON piles_auto_assignment_bot_accounts
+    FOR EACH ROW EXECUTE FUNCTION piles_audit_bot_account_insert();
+  EXCEPTION WHEN insufficient_privilege THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_trigger trigger
+      WHERE trigger.tgname = 'piles_audit_bot_account_insert_trigger'
+        AND trigger.tgrelid = to_regclass('public.piles_auto_assignment_bot_accounts')
+        AND trigger.tgfoid = to_regprocedure('public.piles_audit_bot_account_insert()')
+        AND trigger.tgtype = 5
+        AND NOT trigger.tgisinternal
+    ) THEN
+      RAISE;
+    END IF;
+  END;
+END
+$audit_trigger_guard$;
+
+DO $update_owner_guard$
+BEGIN
+  BEGIN
+    EXECUTE $update_ddl$
 CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history(
   target_bot_id text,
   patch jsonb,
@@ -576,7 +620,7 @@ CREATE OR REPLACE FUNCTION piles_update_bot_account_with_history(
   change_source text,
   change_reason text
 ) RETURNS piles_auto_assignment_bot_accounts
-LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $update_body$
 DECLARE previous_row piles_auto_assignment_bot_accounts;
 DECLARE next_row piles_auto_assignment_bot_accounts;
 DECLARE previous_safe jsonb;
@@ -649,14 +693,28 @@ BEGIN
      actor_name, actor_member_id, coalesce(nullif(change_source, ''), 'dashboard'),
      change_reason, previous_safe, next_safe);
   RETURN next_row;
-END $$;
+END $update_body$;
+$update_ddl$;
+  EXCEPTION WHEN insufficient_privilege THEN
+    IF to_regprocedure('public.piles_update_bot_account_with_history(text, jsonb, text, text, text, text)') IS NULL THEN
+      RAISE;
+    END IF;
+  END;
+END
+$update_owner_guard$;
 
-REVOKE ALL ON FUNCTION piles_update_bot_account_with_history(text, jsonb, text, text, text, text) FROM PUBLIC;
-DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-    GRANT EXECUTE ON FUNCTION piles_update_bot_account_with_history(text, jsonb, text, text, text, text) TO service_role;
-  END IF;
-END $$;
+DO $update_privilege_guard$
+BEGIN
+  BEGIN
+    EXECUTE 'REVOKE ALL ON FUNCTION piles_update_bot_account_with_history(text, jsonb, text, text, text, text) FROM PUBLIC';
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+      EXECUTE 'GRANT EXECUTE ON FUNCTION piles_update_bot_account_with_history(text, jsonb, text, text, text, text) TO service_role';
+    END IF;
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL; -- The transactional routine contract audit verifies the existing ACL.
+  END;
+END
+$update_privilege_guard$;
 
 CREATE INDEX IF NOT EXISTS piles_auto_assignment_bot_account_history_bot_idx
   ON piles_auto_assignment_bot_account_history (bot_account_id, effective_at DESC);
