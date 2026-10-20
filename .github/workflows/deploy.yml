@@ -133,7 +133,9 @@ jobs:
             PILES_ASSIGNMENT_PROVENANCE_V2="$PILES_ASSIGNMENT_PROVENANCE_V2"
             PILES_AUTO_ASSIGNMENT_DISPATCHER_V2="$PILES_AUTO_ASSIGNMENT_DISPATCHER_V2"
             PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY="$PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY"
-            PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.venv-piles-auto-assignment/bin/python"
+            PILES_RUNTIME_ROOT="$HOME/claims-dashboard/.piles-runtime"
+            PILES_RUNTIME_RECOVERY_MODE="repair"
+            PILES_ASSIGNMENT_PYTHON_BIN="$HOME/claims-dashboard/.piles-runtime/current/bin/python"
             PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
             ALLOW_PRODUCTION_ASSIGNMENTS="${{ vars.ALLOW_PRODUCTION_ASSIGNMENTS }}"
             HEADLESS="${{ vars.HEADLESS }}"
@@ -149,7 +151,13 @@ jobs:
             set +a
             export PATH="$HOME/.local/bin:$PATH"
             export PLAYWRIGHT_BROWSERS_PATH="$HOME/claims-dashboard/.playwright-browsers"
-            sh ./scripts/prepare-piles-production-runtime.sh
+            PILES_RUNTIME_INSTALL_OS_DEPS=true sh ./scripts/prepare-piles-production-runtime.sh
+            python3 ./scripts/piles_runtime_health.py \
+              --runtime-root "$PILES_RUNTIME_ROOT" \
+              --requirements ./scripts/piles-auto-assignment-requirements.txt \
+              --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+              --mode full \
+              --json
             npm run db:piles-auto-assignment
             chmod +x scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh
             ./scripts/install-piles-auto-assignment-cron.sh

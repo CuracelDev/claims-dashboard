@@ -17,10 +17,15 @@ BROWSER_CONFIG=${PILES_RUNTIME_BROWSER_CONFIG:-chromium}
 MAX_ATTEMPTS=${PILES_RUNTIME_MAX_ATTEMPTS:-6}
 RETRY_DELAY_SECONDS=${PILES_RUNTIME_RETRY_DELAY_SECONDS:-10}
 REPAIR_WAIT_SECONDS=${PILES_RUNTIME_REPAIR_WAIT_SECONDS:-900}
+INSTALL_OS_DEPS=${PILES_RUNTIME_INSTALL_OS_DEPS:-false}
 
 case "${PILES_ASSIGNMENT_PROVENANCE_V2:-}" in
   ''|disabled|shadow|enabled) ;;
   *) echo "PILES_ASSIGNMENT_PROVENANCE_V2 must be disabled, shadow, or enabled." >&2; exit 2 ;;
+esac
+case "$INSTALL_OS_DEPS" in
+  false|true) ;;
+  *) echo "PILES_RUNTIME_INSTALL_OS_DEPS must be false or true." >&2; exit 2 ;;
 esac
 case "$MAX_ATTEMPTS" in
   ''|*[!0-9]*|0) echo "PILES_RUNTIME_MAX_ATTEMPTS must be a positive integer." >&2; exit 2 ;;
@@ -158,7 +163,11 @@ retry_quiet "Virtual environment creation" "$BASE_PYTHON" -m venv "$TEMP_GENERAT
 retry_quiet "pip bootstrap" "$TEMP_GENERATION/bin/python" -m ensurepip --upgrade
 retry_quiet "pip upgrade" "$TEMP_GENERATION/bin/python" -m pip install --upgrade pip
 retry_quiet "Pinned dependency installation" "$TEMP_GENERATION/bin/python" -m pip install -r "$REQUIREMENTS_FILE"
-retry_quiet "Playwright browser installation" "$TEMP_GENERATION/bin/python" -m playwright install chromium chromium-headless-shell
+if [ "$INSTALL_OS_DEPS" = true ]; then
+  retry_quiet "Playwright browser and OS dependency installation" "$TEMP_GENERATION/bin/python" -m playwright install --with-deps chromium chromium-headless-shell
+else
+  retry_quiet "Playwright browser installation" "$TEMP_GENERATION/bin/python" -m playwright install chromium chromium-headless-shell
+fi
 
 PYTHONPATH="$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$CONTROL_PYTHON" -c '
 import sys

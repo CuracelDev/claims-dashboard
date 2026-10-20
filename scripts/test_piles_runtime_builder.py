@@ -54,7 +54,7 @@ if args[:3] == ["-m", "pip", "install"]:
         time.sleep(float(os.environ["FAKE_INSTALL_SLEEP"]))
     raise SystemExit(0)
 if args[:3] == ["-m", "playwright", "install"]:
-    record("browser-install")
+    record("browser-install-with-deps" if "--with-deps" in args else "browser-install")
     browser = Path(os.environ["FAKE_BROWSER_PATH"])
     browser.parent.mkdir(parents=True, exist_ok=True)
     browser.write_text("browser", encoding="utf-8")
@@ -164,6 +164,11 @@ class PilesRuntimeBuilderTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.fixture.runtime / "current").exists())
         self.assertIn("browser_launch_failed", result.stderr)
+
+    def test_only_explicit_deployment_mode_may_install_os_dependencies(self):
+        result = self.fixture.run(PILES_RUNTIME_INSTALL_OS_DEPS="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("browser-install-with-deps", self.fixture.commands())
 
     def test_requirements_change_promotes_new_generation_and_preserves_previous(self):
         self.assertEqual(self.fixture.run().returncode, 0)
