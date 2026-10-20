@@ -118,8 +118,30 @@ jobs:
             fi
             if [ -n "${PILES_ASSIGNMENT_PYTHON_BIN:-}" ] && [ -x "$PILES_ASSIGNMENT_PYTHON_BIN" ]; then
               printf 'python_runtime_executable|1\n'
+              PYTHONPATH="$PWD/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PILES_ASSIGNMENT_PYTHON_BIN" - <<'PY'
+            import importlib.util
+
+            modules = {
+                "python_module_psycopg2": "psycopg2",
+                "python_module_requests": "requests",
+                "python_module_dotenv": "dotenv",
+                "python_module_playwright": "playwright.sync_api",
+                "python_module_piles_auto_assignment": "piles_auto_assignment",
+            }
+            for label, module in modules.items():
+                try:
+                    available = int(importlib.util.find_spec(module) is not None)
+                except (ImportError, ModuleNotFoundError, ValueError):
+                    available = 0
+                print(f"{label}|{available}")
+            PY
             else
               printf 'python_runtime_executable|0\n'
+              printf 'python_module_psycopg2|0\n'
+              printf 'python_module_requests|0\n'
+              printf 'python_module_dotenv|0\n'
+              printf 'python_module_playwright|0\n'
+              printf 'python_module_piles_auto_assignment|0\n'
             fi
 
             cron_log="${PILES_AUTO_ASSIGNMENT_CRON_LOG:-${PILES_AUTO_ASSIGNMENT_CRON_LOG_DIR:-$PWD/tmp}/piles-auto-assignment-cron.log}"
