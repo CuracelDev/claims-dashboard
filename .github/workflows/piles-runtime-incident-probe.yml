@@ -137,7 +137,22 @@ jobs:
               printf 'cron_log_age_seconds|%s\n' "$log_age"
               printf 'cron_log_size_bytes|%s\n' "$log_size"
               cutoff="$(date -d '72 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '0000-00-00 00:00:00')"
+              recent_log_count() {
+                awk -v cutoff="$cutoff" -v pattern="$1" '
+                  /Starting Piles Auto-Assignment schedule/ { recent = (substr($0,2,19) >= cutoff) }
+                  recent && $0 ~ pattern { n++ }
+                  END { print n+0 }
+                ' "$cron_log"
+              }
               printf 'cron_start_markers_72h|%s\n' "$(awk -v cutoff="$cutoff" 'substr($0,2,19) >= cutoff && /Starting Piles Auto-Assignment schedule/ {n++} END {print n+0}' "$cron_log")"
+              printf 'cron_tracebacks_72h|%s\n' "$(recent_log_count 'Traceback \\(most recent call last\\)')"
+              printf 'cron_runner_failures_72h|%s\n' "$(recent_log_count '^RUN FAILED:')"
+              printf 'cron_runtime_errors_72h|%s\n' "$(recent_log_count '(^|[.])RuntimeError:')"
+              printf 'cron_operational_errors_72h|%s\n' "$(recent_log_count '(^|[.])OperationalError:')"
+              printf 'cron_import_errors_72h|%s\n' "$(recent_log_count '(^|[.])(ModuleNotFoundError|ImportError):')"
+              printf 'cron_file_not_found_errors_72h|%s\n' "$(recent_log_count '(^|[.])FileNotFoundError:')"
+              printf 'cron_playwright_errors_72h|%s\n' "$(recent_log_count '(Playwright|playwright|BrowserType|TargetClosedError|chromium)')"
+              printf 'cron_configuration_errors_72h|%s\n' "$(recent_log_count '(required|must be|not explicitly configured|not enabled|Invalid configuration)')"
               printf 'cron_tracebacks_total|%s\n' "$(awk '/Traceback \(most recent call last\)/ {n++} END {print n+0}' "$cron_log")"
               printf 'cron_command_not_found_total|%s\n' "$(awk 'tolower($0) ~ /command not found|no such file or directory|can.t open/ {n++} END {print n+0}' "$cron_log")"
               printf 'cron_permission_errors_total|%s\n' "$(awk 'tolower($0) ~ /permission denied/ {n++} END {print n+0}' "$cron_log")"
@@ -146,6 +161,14 @@ jobs:
               printf 'cron_log_age_seconds|-1\n'
               printf 'cron_log_size_bytes|0\n'
               printf 'cron_start_markers_72h|0\n'
+              printf 'cron_tracebacks_72h|0\n'
+              printf 'cron_runner_failures_72h|0\n'
+              printf 'cron_runtime_errors_72h|0\n'
+              printf 'cron_operational_errors_72h|0\n'
+              printf 'cron_import_errors_72h|0\n'
+              printf 'cron_file_not_found_errors_72h|0\n'
+              printf 'cron_playwright_errors_72h|0\n'
+              printf 'cron_configuration_errors_72h|0\n'
               printf 'cron_tracebacks_total|0\n'
               printf 'cron_command_not_found_total|0\n'
               printf 'cron_permission_errors_total|0\n'
