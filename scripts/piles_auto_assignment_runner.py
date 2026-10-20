@@ -353,18 +353,47 @@ def postgres_rejects_startup_options(error: BaseException) -> bool:
 
 
 def normalize_psycopg_database_url(database_url: str) -> str:
-    """Translate the Node-postgres SSL alias to its libpq equivalent."""
+    """Translate bounded Node/client URL options to libpq equivalents."""
     try:
         parsed = urlsplit(database_url)
         query = parse_qsl(parsed.query, keep_blank_values=True)
     except ValueError:
         return database_url
-    if not any(key.lower() == "sslmode" and value.lower() == "no-verify" for key, value in query):
-        return database_url
-    normalized_query = [
-        (key, "require" if key.lower() == "sslmode" and value.lower() == "no-verify" else value)
+    node_client_only = {
+        "connection_limit", "pgbouncer", "pool_timeout", "statement_cache_size", "uselibpqcompat",
+    }
+    has_sslmode = any(key.lower() == "sslmode" for key, _value in query)
+    needs_normalization = any(
+        key.lower() in node_client_only
+        or key.lower() == "ssl"
+        or (key.lower() == "sslmode" and value.lower() == "no-verify")
         for key, value in query
-    ]
+    )
+    if not needs_normalization:
+        return database_url
+    normalized_query = []
+    ssl_alias_added = False
+    for key, value in query:
+        normalized_key = key.lower()
+        normalized_value = value.lower()
+        if normalized_key in node_client_only:
+            continue
+        if normalized_key == "ssl":
+            if has_sslmode:
+                continue
+            sslmode = "require" if normalized_value in {"1", "true", "no-verify"} else (
+                "disable" if normalized_value in {"0", "false"} else ""
+            )
+            if sslmode and not ssl_alias_added:
+                normalized_query.append(("sslmode", sslmode))
+                ssl_alias_added = True
+            elif not sslmode:
+                normalized_query.append((key, value))
+            continue
+        if normalized_key == "sslmode" and normalized_value == "no-verify":
+            normalized_query.append((key, "require"))
+            continue
+        normalized_query.append((key, value))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(normalized_query), parsed.fragment))
 
 
