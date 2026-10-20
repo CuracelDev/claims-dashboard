@@ -5423,6 +5423,8 @@ class DispatcherMainTests(unittest.TestCase):
                     runner.main()
         self.assertNotIn("SECRET", str(failure.exception))
         self.assertNotIn("patient", str(failure.exception))
+        self.assertIn("location=scripts.piles_auto_assignment_runner.main", str(failure.exception))
+        self.assertNotIn(str(Path.home()), str(failure.exception))
 
     def test_actual_v2_weekend_notification_does_not_leak_into_logs_or_durable_outcomes(self):
         from scripts.test_piles_auto_assignment_dispatch import DispatchState
