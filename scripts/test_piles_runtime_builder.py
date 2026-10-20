@@ -68,6 +68,9 @@ if "RUNTIME_BROWSER_EXECUTABLE" in command:
     print(os.environ["FAKE_BROWSER_PATH"])
     raise SystemExit(0)
 if "RUNTIME_BROWSER_LAUNCH" in command:
+    record("browser-launch")
+    if os.environ.get("FAKE_LAUNCH_SLEEP"):
+        time.sleep(float(os.environ["FAKE_LAUNCH_SLEEP"]))
     raise SystemExit(23 if os.environ.get("FAKE_BROWSER_LAUNCH_FAIL") == "1" else 0)
 raise SystemExit(2)
 '''
@@ -170,6 +173,11 @@ class PilesRuntimeBuilderTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("browser-install-with-deps", self.fixture.commands())
 
+    def test_runtime_build_artifacts_are_owner_only(self):
+        result = self.fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.runtime.stat().st_mode & 0o077, 0)
+
     def test_requirements_change_promotes_new_generation_and_preserves_previous(self):
         self.assertEqual(self.fixture.run().returncode, 0)
         first = self.fixture.current_target()
@@ -208,6 +216,26 @@ class PilesRuntimeBuilderTests(unittest.TestCase):
         self.assertEqual(self.fixture.current_target(), before)
         leftovers = list(self.fixture.runtime.glob(".build-*"))
         self.assertEqual(leftovers, [])
+
+    def test_termination_during_candidate_verification_removes_unpromoted_generation(self):
+        self.assertEqual(self.fixture.run().returncode, 0)
+        before = self.fixture.current_target()
+        self.fixture.requirements.write_text("requests==2.32.6\n", encoding="utf-8")
+        self.fixture.command_log.write_text("", encoding="utf-8")
+        process = subprocess.Popen(
+            ["/bin/sh", str(BUILDER)], cwd=REPOSITORY,
+            env=self.fixture.env(FAKE_LAUNCH_SLEEP="2"),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline and self.fixture.commands().count("browser-launch") < 2:
+            time.sleep(0.05)
+        self.assertEqual(self.fixture.commands().count("browser-launch"), 2)
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=5)
+        self.assertEqual(self.fixture.current_target(), before)
+        generations = [path.resolve() for path in (self.fixture.runtime / "generations").iterdir()]
+        self.assertEqual(generations, [before])
 
 
 if __name__ == "__main__":

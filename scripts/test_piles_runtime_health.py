@@ -25,7 +25,7 @@ class RuntimeFixture:
     def make_python(self, *, pip=True, imports=True, browser_launch=True, secret=""):
         self.bin_dir.mkdir(parents=True, exist_ok=True)
         script = f"""#!{os.sys.executable}
-import json, sys
+import json, os, sys
 command = " ".join(sys.argv[1:])
 if "RUNTIME_IDENTITY" in command:
     print(json.dumps({{"prefix": {str(self.generation)!r}, "base_prefix": "/usr", "version": "3.11"}}))
@@ -34,6 +34,8 @@ if "-m pip --version" in command:
     print({(secret or 'pip missing')!r}, file=sys.stderr)
     raise SystemExit({0 if pip else 1})
 if "RUNTIME_IMPORTS" in command:
+    if "runtime-poison" in os.environ.get("PYTHONPATH", ""):
+        raise SystemExit(9)
     print({(secret or 'import failed')!r}, file=sys.stderr)
     raise SystemExit({0 if imports else 1})
 if "RUNTIME_BROWSER_LAUNCH" in command:
@@ -147,6 +149,18 @@ class PilesRuntimeHealthTests(unittest.TestCase):
         result = self.fixture.inspect(mode="light")
         self.assertTrue(result["healthy"], result)
         self.assertEqual(result["states"], ["healthy"])
+
+    def test_import_probe_does_not_inherit_ambient_pythonpath(self):
+        self.fixture.healthy()
+        previous = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = "/tmp/runtime-poison"
+        self.addCleanup(
+            lambda: os.environ.pop("PYTHONPATH", None)
+            if previous is None
+            else os.environ.__setitem__("PYTHONPATH", previous)
+        )
+        result = self.fixture.inspect()
+        self.assertTrue(result["healthy"], result)
 
     def test_full_mode_distinguishes_missing_browser_and_launch_failure(self):
         self.fixture.make_python()

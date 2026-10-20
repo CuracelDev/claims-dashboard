@@ -137,7 +137,7 @@ group by insurer_name;
 
 For every run, verify this invariant: submitted attempts equal confirmed-visible plus confirmed-reconciled plus reconciliation-pending plus conflict plus failed/manual dispositions.
 
-The independent **Piles Schedule Liveness** workflow checks only bounded scheduled-parent and insurer aggregate evidence in a read-only transaction. It runs after the 75-minute window, deduplicates an unchanged incident, and sends a recovery signal when evidence becomes healthy again. `Scheduler healthy · no eligible piles` means a recent scheduled parent completed with zero confirmed piles; `assignments confirmed` requires positive confirmed counts. `cycle completed with issues` is deliberately distinct from both. `covered_by_active_cycle` is request deduplication evidence and never assignment success. Cron output is rotated before each launch so liveness evidence cannot grow without bound.
+The independent **Piles Schedule Liveness** workflow checks only bounded scheduled-parent and insurer aggregate evidence in a read-only transaction. It runs after the 75-minute window, deduplicates an unchanged incident, and sends a recovery signal when evidence becomes healthy again. `Scheduler healthy · no eligible piles` requires a recent completed scheduled parent with zero discovered, planned, confirmed, pending, conflicting, and failed pile evidence; `assignments confirmed` requires positive confirmations with no unresolved planned outcome. `cycle completed with issues` is deliberately distinct from both. `covered_by_active_cycle` proves the scheduled request was deduplicated but never claims assignment success. Cron output is rotated before each launch so liveness evidence cannot grow without bound.
 
 ## Incident response
 

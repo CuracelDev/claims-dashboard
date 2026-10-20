@@ -75,7 +75,7 @@ jobs:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: ".next,public,package.json,package-lock.json,next.config.js,scripts"
+          source: ".next,public,package.json,package-lock.json,next.config.js,scripts,lib"
           target: "~/claims-dashboard"
 
       - name: Restart App via SSH

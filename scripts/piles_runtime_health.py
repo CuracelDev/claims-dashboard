@@ -189,8 +189,9 @@ def inspect_runtime(
 
     import_env = os.environ.copy()
     repository_scripts = str(Path(__file__).resolve().parent)
-    existing_pythonpath = import_env.get("PYTHONPATH", "")
-    import_env["PYTHONPATH"] = repository_scripts + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    # The probe must prove that this generation supplies its dependencies.
+    # Ambient paths can otherwise make a damaged runtime look healthy.
+    import_env["PYTHONPATH"] = repository_scripts
     imports_ok, _ = _run_safe([str(python), "-c", IMPORT_PROGRAM], env=import_env)
     if not imports_ok:
         states.append("missing_imports")

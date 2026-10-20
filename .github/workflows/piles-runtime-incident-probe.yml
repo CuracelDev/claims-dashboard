@@ -116,34 +116,47 @@ jobs:
             else
               printf 'runner_wrapper_executable|0\n'
             fi
+            runtime_root="${PILES_RUNTIME_ROOT:-$PWD/.piles-runtime}"
+            expected_python="$runtime_root/current/bin/python"
             if [ -n "${PILES_ASSIGNMENT_PYTHON_BIN:-}" ] && [ -x "$PILES_ASSIGNMENT_PYTHON_BIN" ]; then
               printf 'python_runtime_executable|1\n'
-              if [ "$PILES_ASSIGNMENT_PYTHON_BIN" = "$PWD/.venv-piles-auto-assignment/bin/python" ]; then
+              if [ "$PILES_ASSIGNMENT_PYTHON_BIN" = "$expected_python" ]; then
                 printf 'runtime_expected_path_configured|1\n'
               else
                 printf 'runtime_expected_path_configured|0\n'
               fi
-              runtime_marker="${PILES_RUNTIME_READY_MARKER:-$PWD/.venv-piles-auto-assignment/.piles-runtime-ready}"
-              if [ -f "$runtime_marker" ]; then
-                printf 'runtime_ready_marker_exists|1\n'
-                marker_mtime="$(stat -c %Y "$runtime_marker" 2>/dev/null || stat -f %m "$runtime_marker" 2>/dev/null || printf '0')"
-                case "$marker_mtime" in (*[!0-9]*|'') marker_mtime=0 ;; esac
-                marker_now="$(date +%s)"
-                if [ "$marker_mtime" -gt 0 ] && [ "$marker_now" -ge "$marker_mtime" ]; then
-                  printf 'runtime_ready_marker_age_seconds|%s\n' "$((marker_now - marker_mtime))"
+              runtime_manifest="$runtime_root/current/piles-runtime-manifest.json"
+              if [ -f "$runtime_manifest" ]; then
+                printf 'runtime_manifest_exists|1\n'
+                manifest_mtime="$(stat -c %Y "$runtime_manifest" 2>/dev/null || stat -f %m "$runtime_manifest" 2>/dev/null || printf '0')"
+                case "$manifest_mtime" in (*[!0-9]*|'') manifest_mtime=0 ;; esac
+                manifest_now="$(date +%s)"
+                if [ "$manifest_mtime" -gt 0 ] && [ "$manifest_now" -ge "$manifest_mtime" ]; then
+                  printf 'runtime_manifest_age_seconds|%s\n' "$((manifest_now - manifest_mtime))"
                 else
-                  printf 'runtime_ready_marker_age_seconds|-1\n'
+                  printf 'runtime_manifest_age_seconds|-1\n'
                 fi
               else
-                printf 'runtime_ready_marker_exists|0\n'
-                printf 'runtime_ready_marker_age_seconds|-1\n'
+                printf 'runtime_manifest_exists|0\n'
+                printf 'runtime_manifest_age_seconds|-1\n'
               fi
-              if [ -f "$PWD/.venv-piles-auto-assignment/pyvenv.cfg" ]; then
+              runtime_health_status=0
+              "${PILES_RUNTIME_CONTROL_PYTHON:-python3}" scripts/piles_runtime_health.py \
+                --runtime-root "$runtime_root" \
+                --requirements scripts/piles-auto-assignment-requirements.txt \
+                --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+                --mode light --json >/dev/null 2>&1 || runtime_health_status=$?
+              if [ "$runtime_health_status" -eq 0 ]; then
+                printf 'runtime_health_check_passed|1\n'
+              else
+                printf 'runtime_health_check_passed|0\n'
+              fi
+              if [ -f "$runtime_root/current/pyvenv.cfg" ]; then
                 printf 'runtime_pyvenv_config_exists|1\n'
               else
                 printf 'runtime_pyvenv_config_exists|0\n'
               fi
-              PYTHONPATH="$PWD/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PILES_ASSIGNMENT_PYTHON_BIN" - <<'PY'
+              PYTHONPATH="$PWD/scripts" "$PILES_ASSIGNMENT_PYTHON_BIN" - <<'PY'
             import importlib.util
             import importlib.metadata
             import os
@@ -174,8 +187,9 @@ jobs:
             else
               printf 'python_runtime_executable|0\n'
               printf 'runtime_expected_path_configured|0\n'
-              printf 'runtime_ready_marker_exists|0\n'
-              printf 'runtime_ready_marker_age_seconds|-1\n'
+              printf 'runtime_manifest_exists|0\n'
+              printf 'runtime_manifest_age_seconds|-1\n'
+              printf 'runtime_health_check_passed|0\n'
               printf 'runtime_pyvenv_config_exists|0\n'
               printf 'python_module_psycopg2|0\n'
               printf 'python_module_requests|0\n'

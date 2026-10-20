@@ -41,7 +41,22 @@ export async function readScheduleSnapshot(pool) {
        where insurer.runner_run_id = runner.id) as heartbeat_at,
       (select coalesce(sum(insurer.confirmed_pile_count), 0)::int
        from piles_auto_assignment_insurer_runs insurer
-       where insurer.runner_run_id = runner.id) as confirmed_piles
+       where insurer.runner_run_id = runner.id) as confirmed_piles,
+      (select coalesce(sum(insurer.discovered_pile_count), 0)::int
+       from piles_auto_assignment_insurer_runs insurer
+       where insurer.runner_run_id = runner.id) as discovered_piles,
+      (select coalesce(sum(insurer.planned_pile_count), 0)::int
+       from piles_auto_assignment_insurer_runs insurer
+       where insurer.runner_run_id = runner.id) as planned_piles,
+      (select coalesce(sum(insurer.reconciliation_pending_pile_count), 0)::int
+       from piles_auto_assignment_insurer_runs insurer
+       where insurer.runner_run_id = runner.id) as pending_piles,
+      (select coalesce(sum(insurer.conflict_pile_count), 0)::int
+       from piles_auto_assignment_insurer_runs insurer
+       where insurer.runner_run_id = runner.id) as conflict_piles,
+      (select coalesce(sum(insurer.failed_pile_count), 0)::int
+       from piles_auto_assignment_insurer_runs insurer
+       where insurer.runner_run_id = runner.id) as failed_piles
     from piles_auto_assignment_runner_runs runner
     where runner.run_source = 'schedule'
     order by runner.started_at desc nulls last, runner.created_at desc
