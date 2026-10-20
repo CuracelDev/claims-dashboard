@@ -3977,6 +3977,29 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
             runner.open_postgres_connection(database_url, autocommit=True)
         self.assertEqual(connect.call_args.args[0], database_url)
 
+    def test_node_client_and_pool_tuning_options_are_removed_for_libpq(self):
+        connection = types.SimpleNamespace(autocommit=None)
+        database_url = (
+            "postgresql://fixture/claims?application_name=piles&ssl=true&pgbouncer=true"
+            "&connection_limit=1&pool_timeout=10&statement_cache_size=0&uselibpqcompat=true"
+        )
+        with patch.object(runner.psycopg2, "connect", return_value=connection, create=True) as connect:
+            runner.open_postgres_connection(database_url, autocommit=True)
+        self.assertEqual(
+            connect.call_args.args[0],
+            "postgresql://fixture/claims?application_name=piles&sslmode=require",
+        )
+
+    def test_explicit_sslmode_wins_over_node_ssl_alias_and_schema_is_preserved(self):
+        connection = types.SimpleNamespace(autocommit=None)
+        database_url = "postgresql://fixture/claims?ssl=false&sslmode=verify-full&schema=private"
+        with patch.object(runner.psycopg2, "connect", return_value=connection, create=True) as connect:
+            runner.open_postgres_connection(database_url, autocommit=True)
+        self.assertEqual(
+            connect.call_args.args[0],
+            "postgresql://fixture/claims?sslmode=verify-full&schema=private",
+        )
+
     def test_postgres_pooler_retries_without_startup_options_only_for_recognized_rejection(self):
         connection = types.SimpleNamespace(autocommit=None)
         calls = []
