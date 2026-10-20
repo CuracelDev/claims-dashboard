@@ -19,6 +19,7 @@ MAX_ATTEMPTS=${PILES_RUNTIME_MAX_ATTEMPTS:-6}
 RETRY_DELAY_SECONDS=${PILES_RUNTIME_RETRY_DELAY_SECONDS:-10}
 REPAIR_WAIT_SECONDS=${PILES_RUNTIME_REPAIR_WAIT_SECONDS:-900}
 INSTALL_OS_DEPS=${PILES_RUNTIME_INSTALL_OS_DEPS:-false}
+SUDO_BIN=${PILES_RUNTIME_SUDO_BIN:-/usr/bin/sudo}
 
 case "${PILES_ASSIGNMENT_PROVENANCE_V2:-}" in
   ''|disabled|shadow|enabled) ;;
@@ -27,6 +28,10 @@ esac
 case "$INSTALL_OS_DEPS" in
   false|true) ;;
   *) echo "PILES_RUNTIME_INSTALL_OS_DEPS must be false or true." >&2; exit 2 ;;
+esac
+case "$SUDO_BIN" in
+  /*) ;;
+  *) echo "PILES_RUNTIME_SUDO_BIN must be an absolute path." >&2; exit 2 ;;
 esac
 case "$MAX_ATTEMPTS" in
   ''|*[!0-9]*|0) echo "PILES_RUNTIME_MAX_ATTEMPTS must be a positive integer." >&2; exit 2 ;;
@@ -160,7 +165,25 @@ generation_id="${fingerprint}-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 TEMP_GENERATION="$RUNTIME_ROOT/.build-$generation_id"
 FINAL_GENERATION="$GENERATIONS_DIR/$generation_id"
 
-retry_quiet "Virtual environment creation" "$BASE_PYTHON" -m venv "$TEMP_GENERATION"
+create_candidate_venv() {
+  status=0
+  "$BASE_PYTHON" -m venv "$TEMP_GENERATION" >"$COMMAND_OUTPUT" 2>&1 || status=$?
+  if [ "$status" -eq 0 ]; then
+    return 0
+  fi
+
+  rm -rf "$TEMP_GENERATION"
+  if [ "$INSTALL_OS_DEPS" = true ]; then
+    # Debian/Ubuntu split ensurepip into python3-venv. Only an explicitly
+    # privileged deployment or repair may restore it; hourly self-repair never
+    # runs sudo or apt-get.
+    retry_quiet "Python package index refresh" "$SUDO_BIN" -n /usr/bin/apt-get update
+    retry_quiet "Python virtual-environment package installation" "$SUDO_BIN" -n /usr/bin/apt-get install -y python3-venv
+  fi
+  retry_quiet "Virtual environment creation" "$BASE_PYTHON" -m venv "$TEMP_GENERATION"
+}
+
+create_candidate_venv
 retry_quiet "pip bootstrap" "$TEMP_GENERATION/bin/python" -m ensurepip --upgrade
 retry_quiet "pip upgrade" "$TEMP_GENERATION/bin/python" -m pip install --upgrade pip
 retry_quiet "Pinned dependency installation" "$TEMP_GENERATION/bin/python" -m pip install -r "$REQUIREMENTS_FILE"

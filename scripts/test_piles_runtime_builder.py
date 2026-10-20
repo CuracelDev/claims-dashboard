@@ -30,6 +30,9 @@ if "RUNTIME_BASE_VERSION" in command:
     print("3.11")
     raise SystemExit(0)
 if args[:2] == ["-m", "venv"]:
+    if os.environ.get("FAKE_REQUIRE_VENV_PACKAGE") == "1" and not Path(os.environ["FAKE_VENV_PACKAGE_MARKER"]).exists():
+        record("venv-missing-package")
+        raise SystemExit(1)
     target = Path(args[2])
     target.joinpath("bin").mkdir(parents=True)
     target.joinpath("lib/python3.11/site-packages").mkdir(parents=True)
@@ -86,6 +89,18 @@ class BuilderFixture:
         self.command_log = root / "commands.log"
         self.command_log.write_text("", encoding="utf-8")
         self.browser = root / "browsers/chromium/chrome"
+        self.venv_package_marker = root / "python-venv-package.installed"
+        self.fake_bin = root / "fake-bin"
+        self.fake_bin.mkdir()
+        self.fake_sudo = self.fake_bin / "sudo"
+        self.fake_sudo.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"sudo:$*\" >> \"$FAKE_COMMAND_LOG\"\n"
+            "case \" $* \" in *' /usr/bin/apt-get install -y python3-venv '*) : > \"$FAKE_VENV_PACKAGE_MARKER\";; esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        self.fake_sudo.chmod(0o700)
         self.base_python.write_text(
             FAKE_PYTHON.replace("__SYSTEM_PYTHON__", sys.executable), encoding="utf-8"
         )
@@ -104,6 +119,9 @@ class BuilderFixture:
             "PLAYWRIGHT_BROWSERS_PATH": str(self.browser.parent.parent),
             "FAKE_BROWSER_PATH": str(self.browser),
             "FAKE_COMMAND_LOG": str(self.command_log),
+            "FAKE_VENV_PACKAGE_MARKER": str(self.venv_package_marker),
+            "PILES_RUNTIME_SUDO_BIN": str(self.fake_sudo),
+            "PATH": f"{self.fake_bin}:{env['PATH']}",
             "DATABASE_URL": "postgres://user:secret@example.invalid/private",
         })
         env.update(values)
@@ -172,6 +190,22 @@ class PilesRuntimeBuilderTests(unittest.TestCase):
         result = self.fixture.run(PILES_RUNTIME_INSTALL_OS_DEPS="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("browser-install-with-deps", self.fixture.commands())
+
+    def test_deployment_repairs_missing_python_venv_package_before_retry(self):
+        result = self.fixture.run(
+            PILES_RUNTIME_INSTALL_OS_DEPS="true",
+            FAKE_REQUIRE_VENV_PACKAGE="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("venv-missing-package", self.fixture.commands())
+        self.assertIn("sudo:-n /usr/bin/apt-get update", self.fixture.commands())
+        self.assertIn("sudo:-n /usr/bin/apt-get install -y python3-venv", self.fixture.commands())
+        self.assertEqual(self.fixture.commands().count("venv"), 1)
+
+    def test_schedule_mode_never_attempts_privileged_venv_package_repair(self):
+        result = self.fixture.run(FAKE_REQUIRE_VENV_PACKAGE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(command.startswith("sudo:") for command in self.fixture.commands()))
 
     def test_runtime_build_artifacts_are_owner_only(self):
         result = self.fixture.run()
