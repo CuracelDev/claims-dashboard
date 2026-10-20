@@ -17,6 +17,9 @@ on:
         default: DEFMIS
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
   group: piles-production-host
   cancel-in-progress: false

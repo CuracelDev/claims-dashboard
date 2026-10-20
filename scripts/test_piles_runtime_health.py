@@ -121,6 +121,34 @@ class PilesRuntimeHealthTests(unittest.TestCase):
         result = self.fixture.inspect()
         self.assertIn("not_virtualenv", result["states"])
 
+    def test_runtime_outside_managed_generations_is_rejected(self):
+        external_root = Path(self.temp.name) / "external"
+        external_root.mkdir()
+        external = RuntimeFixture(external_root)
+        external.healthy()
+        result = inspect_runtime(
+            runtime_root=self.fixture.root,
+            requirements_path=external.requirements,
+            python_bin=external.python,
+            browser_path=external.browser,
+            mode="light",
+            builder_version="1",
+            browser_config="chromium",
+        )
+        self.assertFalse(result["healthy"])
+        self.assertIn("runtime_outside_generations", result["states"])
+
+    def test_python_path_must_belong_to_reported_generation(self):
+        self.fixture.healthy()
+        reported = self.fixture.root / "generations" / "other"
+        script = self.fixture.python.read_text(encoding="utf-8").replace(
+            str(self.fixture.generation), str(reported)
+        )
+        self.fixture.python.write_text(script, encoding="utf-8")
+        result = self.fixture.inspect()
+        self.assertFalse(result["healthy"])
+        self.assertIn("python_generation_mismatch", result["states"])
+
     def test_manifest_missing_invalid_and_mismatch_are_distinct(self):
         self.fixture.make_python()
         self.fixture.make_site_packages()

@@ -177,6 +177,14 @@ def inspect_runtime(
         states.append("not_virtualenv")
 
     generation = Path(identity.get("prefix") or python.parent.parent)
+    resolved_generation = generation.resolve()
+    managed_generations = root / "generations"
+    try:
+        resolved_generation.relative_to(managed_generations)
+    except ValueError:
+        states.append("runtime_outside_generations")
+    if python.absolute().parent.resolve() != resolved_generation / "bin":
+        states.append("python_generation_mismatch")
     python_version = identity.get("version", "unknown")
     result["generation"] = str(generation)
     result["python_version"] = python_version
