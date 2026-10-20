@@ -35,7 +35,7 @@ from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -352,6 +352,22 @@ def postgres_rejects_startup_options(error: BaseException) -> bool:
     return "options" in message and "unsupported startup parameter" in message
 
 
+def normalize_psycopg_database_url(database_url: str) -> str:
+    """Translate the Node-postgres SSL alias to its libpq equivalent."""
+    try:
+        parsed = urlsplit(database_url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return database_url
+    if not any(key.lower() == "sslmode" and value.lower() == "no-verify" for key, value in query):
+        return database_url
+    normalized_query = [
+        (key, "require" if key.lower() == "sslmode" and value.lower() == "no-verify" else value)
+        for key, value in query
+    ]
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(normalized_query), parsed.fragment))
+
+
 def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: bool = False):
     """Bound individual database operations without bounding the whole run."""
     statement_ms = _bounded_env_int("PILES_DB_STATEMENT_TIMEOUT_MS", 45_000, 5_000, 90_000)
@@ -363,9 +379,10 @@ def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: 
         "-c idle_in_transaction_session_timeout=60000"
         + (" -c default_transaction_read_only=on" if read_only else "")
     )
+    psycopg_database_url = normalize_psycopg_database_url(database_url)
     try:
         connection = psycopg2.connect(
-            database_url, connect_timeout=connect_timeout, options=options,
+            psycopg_database_url, connect_timeout=connect_timeout, options=options,
         )
     except Exception as error:
         if not postgres_rejects_startup_options(error):
@@ -374,7 +391,7 @@ def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: 
         # Retry only that known compatibility failure. Read-only probes retain
         # the DataStore/ledger write guards, and all other failures remain fatal.
         try:
-            connection = psycopg2.connect(database_url, connect_timeout=connect_timeout)
+            connection = psycopg2.connect(psycopg_database_url, connect_timeout=connect_timeout)
         except Exception as fallback_error:
             raise WorkerUnavailable(
                 postgres_connection_failure_code(fallback_error, pooler_fallback=True)
