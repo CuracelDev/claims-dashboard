@@ -146,6 +146,7 @@ jobs:
               PYTHONPATH="$PWD/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PILES_ASSIGNMENT_PYTHON_BIN" - <<'PY'
             import importlib.util
             import importlib.metadata
+            import os
             import site
             import sys
 
@@ -164,8 +165,11 @@ jobs:
                 print(f"{label}|{available}")
             print(f"python_is_virtualenv|{int(sys.prefix != sys.base_prefix)}")
             print(f"python_pip_available|{int(importlib.util.find_spec('pip') is not None)}")
-            print(f"runtime_site_packages_dirs|{len(site.getsitepackages())}")
+            site_directories = [path for path in site.getsitepackages() if os.path.isdir(path)]
+            print(f"runtime_site_packages_dirs|{len(site_directories)}")
             print(f"runtime_installed_distributions|{sum(1 for _ in importlib.metadata.distributions())}")
+            print(f"runtime_site_packages_mtime_epoch|{int(max((os.stat(path).st_mtime for path in site_directories), default=0))}")
+            print(f"runtime_bin_mtime_epoch|{int(os.stat(os.path.dirname(sys.executable)).st_mtime)}")
             PY
             else
               printf 'python_runtime_executable|0\n'
@@ -182,6 +186,8 @@ jobs:
               printf 'python_pip_available|0\n'
               printf 'runtime_site_packages_dirs|0\n'
               printf 'runtime_installed_distributions|0\n'
+              printf 'runtime_site_packages_mtime_epoch|0\n'
+              printf 'runtime_bin_mtime_epoch|0\n'
             fi
 
             cron_log="${PILES_AUTO_ASSIGNMENT_CRON_LOG:-${PILES_AUTO_ASSIGNMENT_CRON_LOG_DIR:-$PWD/tmp}/piles-auto-assignment-cron.log}"
