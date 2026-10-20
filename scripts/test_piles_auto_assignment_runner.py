@@ -3973,11 +3973,29 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
         self.assertNotIn("options", calls[1])
         self.assertTrue(result.autocommit)
 
-    def test_postgres_connection_does_not_retry_unrecognized_failures(self):
+    def test_postgres_connection_does_not_retry_and_safely_classifies_unrecognized_failures(self):
         with patch.object(runner.psycopg2, "connect", side_effect=RuntimeError("private authentication failure"), create=True) as connect:
-            with self.assertRaisesRegex(RuntimeError, "private authentication failure"):
+            with self.assertRaises(runner.WorkerUnavailable) as raised:
                 runner.open_postgres_connection("postgresql://fixture", autocommit=True)
         self.assertEqual(connect.call_count, 1)
+        self.assertEqual(raised.exception.code, "database_connection_authentication_failed")
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_postgres_pooler_fallback_safely_classifies_its_own_failure(self):
+        with patch.object(
+            runner.psycopg2,
+            "connect",
+            side_effect=[
+                RuntimeError("unsupported startup parameter: options"),
+                RuntimeError("connection timed out for private-host"),
+            ],
+            create=True,
+        ) as connect:
+            with self.assertRaises(runner.WorkerUnavailable) as raised:
+                runner.open_postgres_connection("postgresql://fixture", autocommit=True)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(raised.exception.code, "database_pooler_fallback_timeout")
+        self.assertNotIn("private-host", str(raised.exception))
 
     @staticmethod
     def make_tracked_fixture():

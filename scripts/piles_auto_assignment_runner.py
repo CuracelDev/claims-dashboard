@@ -315,6 +315,43 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
     return min(max(safe_int(os.getenv(name), default), minimum), maximum)
 
 
+def postgres_connection_failure_code(error: BaseException, *, pooler_fallback: bool = False) -> str:
+    """Classify connection failures without returning driver text or endpoint data."""
+    message = str(error).lower()
+    sqlstate = norm(getattr(error, "pgcode", ""))
+    if sqlstate in {"28000", "28P01"} or any(
+        marker in message for marker in (
+            "authentication failed", "authentication failure", "password authentication", "tenant or user not found",
+        )
+    ):
+        reason = "authentication_failed"
+    elif "invalid dsn" in message or "invalid connection option" in message:
+        reason = "invalid_configuration"
+    elif sqlstate == "53300" or "too many connections" in message:
+        reason = "capacity_exhausted"
+    elif "timeout" in message or "timed out" in message:
+        reason = "timeout"
+    elif "could not translate host name" in message or "name or service not known" in message:
+        reason = "dns_failed"
+    elif "connection refused" in message:
+        reason = "refused"
+    elif "no route to host" in message or "network is unreachable" in message:
+        reason = "network_unreachable"
+    elif "certificate" in message or "ssl error" in message or "tls" in message:
+        reason = "tls_failed"
+    elif "unsupported startup parameter" in message:
+        reason = "unsupported_startup_parameter"
+    else:
+        reason = "failed"
+    prefix = "database_pooler_fallback" if pooler_fallback else "database_connection"
+    return f"{prefix}_{reason}"
+
+
+def postgres_rejects_startup_options(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "options" in message and "unsupported startup parameter" in message
+
+
 def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: bool = False):
     """Bound individual database operations without bounding the whole run."""
     statement_ms = _bounded_env_int("PILES_DB_STATEMENT_TIMEOUT_MS", 45_000, 5_000, 90_000)
@@ -331,13 +368,17 @@ def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: 
             database_url, connect_timeout=connect_timeout, options=options,
         )
     except Exception as error:
-        message = str(error).lower()
-        if "unsupported startup parameter" not in message or "options" not in message:
-            raise
+        if not postgres_rejects_startup_options(error):
+            raise WorkerUnavailable(postgres_connection_failure_code(error)) from None
         # Transaction poolers can reject libpq's `options` startup parameter.
         # Retry only that known compatibility failure. Read-only probes retain
         # the DataStore/ledger write guards, and all other failures remain fatal.
-        connection = psycopg2.connect(database_url, connect_timeout=connect_timeout)
+        try:
+            connection = psycopg2.connect(database_url, connect_timeout=connect_timeout)
+        except Exception as fallback_error:
+            raise WorkerUnavailable(
+                postgres_connection_failure_code(fallback_error, pooler_fallback=True)
+            ) from None
     connection.autocommit = autocommit
     return connection
 
