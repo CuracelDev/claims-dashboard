@@ -10391,6 +10391,22 @@ def main_v2() -> DispatchResult:
                 raise WorkerUnavailable(code) from None
 
 
+def safe_internal_failure_location(error: BaseException) -> str:
+    """Return only a repository-owned module/function label, never error text."""
+    scripts_root = (ROOT / "scripts").resolve()
+    for frame in reversed(traceback.extract_tb(error.__traceback__)):
+        try:
+            relative = Path(frame.filename).resolve().relative_to(scripts_root)
+        except (OSError, ValueError):
+            continue
+        if relative.suffix != ".py":
+            continue
+        module = ".".join(("scripts", *relative.with_suffix("").parts))
+        function = re.sub(r"[^A-Za-z0-9_<>]", "", frame.name) or "unknown"
+        return f"{module}.{function}"
+    return "runner_boundary"
+
+
 def main() -> None:
     if dispatcher_v2_enabled():
         try:
@@ -10401,7 +10417,8 @@ def main() -> None:
             raise
         except Exception as error:
             code, _ = safe_worker_error(error)
-            raise RuntimeError(f"Dispatcher could not complete ({code}).") from None
+            location = safe_internal_failure_location(error)
+            raise RuntimeError(f"Dispatcher could not complete ({code}; location={location}).") from None
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     stdout_capture = TeeCapture(original_stdout)
