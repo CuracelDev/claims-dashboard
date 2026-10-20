@@ -6,12 +6,34 @@ The runner must account for every expected month/year/status context and every p
 
 `--read-only` blocks database writes and cannot be combined with `--execute`. It may log into and read the configured portal, acquire advisory locks, and write the local plan file, but it cannot click **Assign Claims**.
 
+## Atomic Python runtime
+
+Piles must run from `PILES_RUNTIME_ROOT/current/bin/python`; do not install packages into `current` or point the service back to a mutable `.venv`. Each deployment computes a fingerprint from the pinned requirements, Python major/minor version, runtime-builder version, and browser configuration. `scripts/prepare-piles-production-runtime.sh` builds a unique immutable generation under `PILES_RUNTIME_ROOT/generations`, verifies imports plus an actual Chromium launch, and only then atomically replaces the `current` symlink. The former target is retained as `previous`. A failed or interrupted build does not change either pointer.
+
+Every scheduled launch runs the standard-library health checker before importing runner dependencies. `PILES_RUNTIME_RECOVERY_MODE=audit` blocks the launch when the runtime is unhealthy. `repair` takes the shared builder lock, builds or reuses a verified generation, rechecks it, and only then launches the runner. Schedule-time repair never installs operating-system packages; those are permitted only during deployment or the approval-gated **Piles Runtime Repair** workflow. Neither health checking nor repair invokes the assignment runner or accepts `--execute`.
+
+Use these non-assignment checks from the authorized production host without enabling shell tracing:
+
+```bash
+cd ~/claims-dashboard
+set -a
+. ./.env
+set +a
+python3 scripts/piles_runtime_health.py \
+  --runtime-root "$PILES_RUNTIME_ROOT" \
+  --requirements scripts/piles-auto-assignment-requirements.txt \
+  --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+  --mode full --json
+```
+
+The sanitized result must be `healthy`; a Python executable existing on disk is not enough. Missing `pip`, missing imports/site-packages, a fingerprint or manifest mismatch, a missing browser, or a failed Chromium launch all make the runtime unhealthy and block assignment execution.
+
 ## Deployment order
 
 1. Back up the database and apply `scripts/piles-auto-assignment-schema.sql`. The changes are additive.
 2. Run `npm run db:audit`, `npm run audit:piles-readiness -- --mode database`, and `npm run audit:piles-provenance -- --hours 720` against the target database. These are read-only. Require both provenance indexes and zero ambiguous identities before cutover.
 3. Audit legacy pending requests using the read-only command below. With new launches stopped and dispatcher v2 still disabled, separately approve cancellation of each demonstrably obsolete request; never bulk-delete the backlog.
-4. Deploy the application and worker from the same commit with `PILES_EXECUTION_LEDGER_ENABLED=true`, `PILES_ASSIGNMENT_PROVENANCE_V2=shadow`, `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false`, and `PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1`. Shadow mode computes only aggregate V2 disagreements; legacy records/alerts remain authoritative and assignment planning/execution is unchanged. Only `1` or `2` concurrency is accepted; enabling dispatcher v2 or concurrency two requires a separately approved rollout.
+4. Deploy the application and worker from the same commit with `PILES_EXECUTION_LEDGER_ENABLED=true`, `PILES_ASSIGNMENT_PROVENANCE_V2=shadow`, `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false`, and `PILES_AUTO_ASSIGNMENT_MAX_CONCURRENCY=1`. Deployment must write `PILES_RUNTIME_ROOT`, `PILES_ASSIGNMENT_PYTHON_BIN=$PILES_RUNTIME_ROOT/current/bin/python`, and `PILES_RUNTIME_RECOVERY_MODE=repair`; build and fully verify the immutable runtime before installing cron or restarting the application. Any runtime failure stops deployment before cron installation. Shadow mode computes only aggregate V2 disagreements; legacy records/alerts remain authoritative and assignment planning/execution is unchanged. Only `1` or `2` concurrency is accepted; enabling dispatcher v2 or concurrency two requires a separately approved rollout.
 5. Confirm the dashboard can queue a preview and display per-insurer heartbeats. Do not enable assignment merely to test deployment.
 6. Run a read-only portal probe for one active insurer, then all active insurers:
 
@@ -26,6 +48,8 @@ The runner must account for every expected month/year/status context and every p
 8. Set `PILES_ASSIGNMENT_PROVENANCE_V2=enabled`, rerun both readiness and provenance audits, and require zero ambiguous repair candidates. Exact historical repair remains separately approved and one-attempt-at-a-time.
 9. A live one-insurer canary requires separate explicit approval and `ALLOW_PRODUCTION_ASSIGNMENTS=true`. Remove that variable after the canary. Observe at least two complete scheduled all-insurer cycles after provenance cutover and reconcile ledger, mirror, and notification totals.
 
+For runtime-only recovery after deployment, use **Piles Runtime Repair**, approve its protected `production` environment, and enter exactly `REPAIR PILES RUNTIME`. It refuses to start while a runner process is visible, performs an atomic off-side build and full verification, and never runs a portal probe or assignment. After repair, run **Piles Production Readiness** first for one insurer and then all active insurers; both use full runtime verification and `--read-only`. Restore or retain the normal cron only after those gates pass. Observe the next scheduled parent, all owned insurer outcomes, context settlement, and confirmed/reconciliation totals.
+
 The additive schema must be applied and audited before deploying code that consumes work-item leases or `cancelled_legacy`, including the recovery scripts. Leave these additions in place on rollback. The fresh migration script tolerates a source database that does not yet have those additive tables; it is not an incident recovery tool.
 
 Expanded legacy status checks are replaced with PostgreSQL's `NOT VALID` form and immediately validated in the same schema transaction. The preceding `ALTER TABLE ... DROP/ADD CONSTRAINT` operations take `ACCESS EXCLUSIVE` locks on the affected runner, insurer-run, and schedule-request tables and retain them until commit; `NOT VALID` avoids an add-time table scan but does **not** make this migration online. Before production, inspect those tables' size and activity, choose a quiet maintenance window, and set reviewed lock/statement timeouts with enough time for validation. A timeout, validation error, or blocked lock must abort and roll back the entire schema transaction; do not retry blindly or continue to application copy. `npm run db:audit` then requires validated constraints and distinguishes an unvalidated check from a changed expression. Continue only after both apply and audit pass.
@@ -34,7 +58,7 @@ Expanded legacy status checks are replaced with PostgreSQL's `NOT VALID` form an
 
 This checklist is an approval record, not authorization to deploy, activate flags, run a live canary, or recover work. Complete the offline gates before requesting production approval. Record the commit, operator, timestamp, aggregate counts and inspection/workflow links for each stage; do not retain credentials, claim identities, raw plan files or portal HTML.
 
-- [ ] Offline gate: run `npm run test:piles:acceptance`, `python3 -m py_compile scripts/piles_auto_assignment_runner.py scripts/piles_auto_assignment/*.py`, `sh -n scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh`, `npm run test:piles`, `npm run build`, `npm audit --audit-level=high`, and `git diff --check`. The full Piles discovery includes acceptance automatically. The offline acceptance suite uses actual scheduler/dispatcher/store/ledger/runner logic with fake PostgreSQL dialect/session locks and fake portal/delivery boundaries; it never performs real assignments. It does not replace the separate real-PostgreSQL row-wait/lease race gate. Compare audit findings with the recorded branch baseline (7 moderate, 8 high, 1 critical), requiring zero newly introduced findings and no unresolved high/critical finding in a production dependency changed for this work.
+- [ ] Offline gate: run `npm run test:piles:acceptance`, `python3 -m py_compile scripts/piles_auto_assignment_runner.py scripts/piles_auto_assignment/*.py`, `sh -n scripts/run-piles-auto-assignment.sh scripts/install-piles-auto-assignment-cron.sh`, `npm run test:piles`, `npm run build`, `npm audit --audit-level=high`, and `git diff --check`. The full Piles discovery includes acceptance automatically. The offline acceptance suite uses actual scheduler/dispatcher/store/ledger/runner logic with fake PostgreSQL dialect/session locks and fake portal/delivery boundaries; it never performs real assignments. It does not replace the separate real-PostgreSQL row-wait/lease race gate. Compare audit findings with the recorded branch baseline (7 moderate, 7 high, 1 critical as of 2026-10-20), requiring zero newly introduced findings and no unresolved high/critical finding in a production dependency changed for this work.
 - [ ] Schema first: back up the target database; stage only the additive schema and audit scripts from the approved commit; apply with `npm run db:piles-auto-assignment`; run `npm run db:audit` and `npm run audit:piles-readiness -- --mode database`. Inspect legacy requests using `node scripts/audit-piles-legacy-requests.mjs`; any exact-row cancellation remains separately approved. Only then deploy the matching app/worker code with ledger `true`, dispatcher v2 `false`, concurrency `1`. Verify installed cron/source, Python executable, deployed commit and app health without printing environment values.
 - [ ] Inspection baseline: in the authorized host shell and exported environment described under Incident response, run `node scripts/inspect-piles-runner-incidents.mjs --hours 24` and `node scripts/recover-piles-stale-runs.mjs`. Resolve duplicates, stale/free-lock work, failed contexts and unexplained legacy backlog before continuing. Elapsed duration alone is not a stale-work finding.
 - [ ] Read-only one-insurer probes: run the commands below for Jubilee Tanzania and Jubilee Uganda, followed by all-active at concurrency one. Each command must exit successfully; any manual-action, mapping-warning, missing-roster, failed, or otherwise unconfirmed insurer outcome makes the command fail after all requested insurers have been probed. Confirm every expected context is complete/empty, provenance is `readiness`, and probes create no assignment attempts or execute work. A same-insurer lock conflict must return the explicit blocked code; do not force the lock. Retain aggregate evidence only.
@@ -82,6 +106,8 @@ A no-work result is trustworthy only when every expected context is `complete` o
 
 Alert when any of these occur:
 
+- no scheduled parent has started within 75 minutes, the latest scheduled heartbeat is older than 75 minutes, or two scheduled parents fail consecutively;
+- the runtime health checker reports anything except `healthy` (including missing `pip`/imports or an unlaunchable browser);
 - a `running` insurer heartbeat is older than 15 minutes and its canonical insurer lock is free;
 - reconciliation remains pending longer than 30 minutes;
 - any conflict appears;
@@ -110,6 +136,8 @@ group by insurer_name;
 ```
 
 For every run, verify this invariant: submitted attempts equal confirmed-visible plus confirmed-reconciled plus reconciliation-pending plus conflict plus failed/manual dispositions.
+
+The independent **Piles Schedule Liveness** workflow checks only bounded scheduled-parent and insurer aggregate evidence in a read-only transaction. It runs after the 75-minute window, deduplicates an unchanged incident, and sends a recovery signal when evidence becomes healthy again. `Scheduler healthy · no eligible piles` means a recent scheduled parent completed with zero confirmed piles; `assignments confirmed` requires positive confirmed counts. `cycle completed with issues` is deliberately distinct from both. `covered_by_active_cycle` is request deduplication evidence and never assignment success. Cron output is rotated before each launch so liveness evidence cannot grow without bound.
 
 ## Incident response
 
@@ -218,6 +246,44 @@ The **Piles Stale Run Recovery** workflow has four disjoint actions: `inspect` (
 Exit 0 means the selected operation completed; read-only counts may still report unhealthy candidates. Exit 2 means a mutation was blocked and rolled back. Exit 1 means invalid input/schema/access or a database failure; the transaction is rolled back (or disconnected if access was lost), and no raw driver diagnostic is logged. Reinspect exact targets after any failure or uncertain connection outcome; never assume a failed CLI means a commit could not have reached the database. Do not repeatedly apply based on an old inspection.
 
 ## Rollback
+
+For a runtime-specific rollback, first stop new cron/manual launches and set `PILES_RUNTIME_RECOVERY_MODE=audit` in the persistent host configuration. Do not delete a damaged generation or mutate it in place. Confirm `previous` exists and passes the full checker before changing `current`:
+
+```bash
+cd ~/claims-dashboard
+set -a
+. ./.env
+set +a
+python3 scripts/piles_runtime_health.py \
+  --runtime-root "$PILES_RUNTIME_ROOT" \
+  --requirements scripts/piles-auto-assignment-requirements.txt \
+  --python-bin "$PILES_RUNTIME_ROOT/previous/bin/python" \
+  --mode full --json
+python3 - "$PILES_RUNTIME_ROOT" <<'PY'
+import os
+import sys
+import uuid
+
+root = os.path.abspath(sys.argv[1])
+target = os.readlink(os.path.join(root, 'previous'))
+temporary = os.path.join(root, f'.current.rollback.{uuid.uuid4().hex}')
+try:
+    os.symlink(target, temporary)
+    os.replace(temporary, os.path.join(root, 'current'))
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+python3 scripts/piles_runtime_health.py \
+  --runtime-root "$PILES_RUNTIME_ROOT" \
+  --requirements scripts/piles-auto-assignment-requirements.txt \
+  --python-bin "$PILES_RUNTIME_ROOT/current/bin/python" \
+  --mode full --json
+```
+
+Keep launches paused if either verification fails. A requirements/Python/browser fingerprint change intentionally rejects an incompatible `previous`; rebuild with the approval-gated repair instead of forcing the pointer. After a successful rollback, run the database audits and read-only readiness probes, restore the reviewed recovery mode and cron configuration, then monitor one complete scheduled cycle. Record the deployed commit, runtime fingerprint, sanitized checker state, pointer targets, workflow links, and aggregate outcome counts; never record credentials, portal HTML, or claim identities.
 
 Stop new scheduled/manual launches, return concurrency to `1`, then set `PILES_AUTO_ASSIGNMENT_DISPATCHER_V2=false` and `PILES_ASSIGNMENT_PROVENANCE_V2=disabled` for future launches. This restores legacy classification only; it does not undo ledger rows, tracked mirrors, clear reasons, or audit history. Remove `ALLOW_PRODUCTION_ASSIGNMENTS` from future process configuration; changing an environment file does not stop an already-running process. Let active workers reach a safe evidence boundary, then inspect leases, locks, submission state, and provenance aggregates. Keep `PILES_EXECUTION_LEDGER_ENABLED=true`: disabling it removes per-pile reconciliation protection and is not a normal rollback.
 

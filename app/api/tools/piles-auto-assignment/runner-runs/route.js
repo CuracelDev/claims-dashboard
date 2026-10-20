@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getSupabase } from '../../../../../lib/supabase';
-import { toRunnerProgressView } from '../../../../../lib/piles-auto-assignment-view-model.mjs';
+import { deriveSchedulerHealthView, toRunnerProgressView } from '../../../../../lib/piles-auto-assignment-view-model.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -58,25 +58,40 @@ export async function GET(request) {
     if (runResponse.error) throw runResponse.error;
     const runs = runResponse.data || [];
     const runIds = runs.map((run) => run.id);
-    if (!runIds.length) return NextResponse.json({ success: true, runs: [] });
 
-    const insurerRuns = await loadRows(() => supabase
+    // Scheduler health must not depend on the visible history page or an
+    // individual-run lookup. Read its bounded evidence independently so a
+    // burst of manual requests cannot hide a missed scheduled launch.
+    const scheduleResponse = await supabase
+      .from('piles_auto_assignment_runner_runs')
+      .select('id,run_source,status,started_at,finished_at')
+      .eq('run_source', 'schedule')
+      .order('started_at', { ascending: false })
+      .limit(6);
+    if (scheduleResponse.error) throw scheduleResponse.error;
+    const scheduleRuns = scheduleResponse.data || [];
+    const evidenceRunIds = [...new Set([...runIds, ...scheduleRuns.map((run) => run.id)])];
+
+    const insurerRuns = evidenceRunIds.length ? await loadRows(() => supabase
       .from('piles_auto_assignment_insurer_runs')
       .select('id,runner_run_id,insurer_name,status,phase,error_code,error_message,heartbeat_at,started_at,finished_at,discovered_pile_count,discovered_claim_count,planned_pile_count,submitted_pile_count,confirmed_pile_count,reconciliation_pending_pile_count,conflict_pile_count,failed_pile_count,details')
-      .in('runner_run_id', runIds), 64000);
-    const insurerRunIds = insurerRuns.map((item) => item.id);
+      .in('runner_run_id', evidenceRunIds), 64000) : [];
+    const selectedInsurerRuns = insurerRuns.filter((item) => runIds.includes(item.runner_run_id));
+    const insurerRunIds = selectedInsurerRuns.map((item) => item.id);
 
     let workItems = [];
     let workItemsAvailable = true;
-    try {
-      workItems = await loadRows(() => supabase.from('piles_auto_assignment_work_items')
-        .select('id,parent_runner_run_id,insurer_name,source,request_scope,disposition,covered_by_insurer_run_id,heartbeat_at,started_at,finished_at,reason_code')
-        .in('parent_runner_run_id', runIds), 64000);
-    } catch (error) {
-      // Table feature detection on the exact optional-table read, for pg and
-      // PostgREST. Permission, missing-column, and network errors remain errors.
-      if (!['42P01', 'PGRST205'].includes(error.code)) throw error;
-      workItemsAvailable = false;
+    if (runIds.length) {
+      try {
+        workItems = await loadRows(() => supabase.from('piles_auto_assignment_work_items')
+          .select('id,parent_runner_run_id,insurer_name,source,request_scope,disposition,covered_by_insurer_run_id,heartbeat_at,started_at,finished_at,reason_code')
+          .in('parent_runner_run_id', runIds), 64000);
+      } catch (error) {
+        // Table feature detection on the exact optional-table read, for pg and
+        // PostgREST. Permission, missing-column, and network errors remain errors.
+        if (!['42P01', 'PGRST205'].includes(error.code)) throw error;
+        workItemsAvailable = false;
+      }
     }
 
     let contexts = [];
@@ -94,9 +109,10 @@ export async function GET(request) {
 
     return NextResponse.json({
       success: true,
+      scheduler_health: deriveSchedulerHealthView(scheduleRuns, insurerRuns),
       work_items_available: workItemsAvailable,
       runs: runs.map((run) => {
-        const ownInsurers = insurerRuns.filter((item) => item.runner_run_id === run.id);
+        const ownInsurers = selectedInsurerRuns.filter((item) => item.runner_run_id === run.id);
         const ownIds = new Set(ownInsurers.map((item) => item.id));
         return toRunnerProgressView(
           run,
