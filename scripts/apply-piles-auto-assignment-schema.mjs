@@ -47,7 +47,9 @@ const ROUTINE_CONTRACTS = [
   {
     signature: 'public.piles_update_bot_account_with_history(text,jsonb,text,text,text,text)',
     serviceRoleExecute: true,
-    publicExecuteAllowed: false,
+    // SECURITY INVOKER preserves the caller's table and RLS permissions, so a
+    // legacy owner-managed PUBLIC EXECUTE ACL does not add database authority.
+    publicExecuteAllowed: true,
     fragments: [
       'select * into previous_row from piles_auto_assignment_bot_accounts',
       'for update',
