@@ -87,3 +87,175 @@ jobs:
             kernel_log="$(journalctl -k --since '12 hours ago' --no-pager 2>/dev/null || true)"
             printf 'oom_events|%s\n' "$(printf '%s\n' "$kernel_log" | awk 'tolower($0) ~ /out of memory|oom-kill|killed process/ {n++} END {print n+0}')"
             printf 'runner_processes|%s\n' "$(ps -eo comm=,args= | awk '$1 ~ /^python([0-9.]*)?$/ && /piles_auto_assignment_runner[.]py/ {n++} END {print n+0}')"
+
+            echo "Sanitized scheduler runtime evidence"
+            cron_service_active=0
+            cron_service_enabled=0
+            if command -v systemctl >/dev/null 2>&1; then
+              if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
+                cron_service_active=1
+              fi
+              if systemctl is-enabled --quiet cron 2>/dev/null || systemctl is-enabled --quiet crond 2>/dev/null; then
+                cron_service_enabled=1
+              fi
+            fi
+            printf 'cron_service_active|%s\n' "$cron_service_active"
+            printf 'cron_service_enabled|%s\n' "$cron_service_enabled"
+            printf 'cron_daemon_processes|%s\n' "$(ps -eo comm= | awk '$1 == "cron" || $1 == "crond" {n++} END {print n+0}')"
+
+            cron_lines="$(crontab -l 2>/dev/null || true)"
+            printf 'managed_cron_entries|%s\n' "$(printf '%s\n' "$cron_lines" | awk '/# piles-auto-assignment$/ {n++} END {print n+0}')"
+            printf 'hourly_managed_cron_entries|%s\n' "$(printf '%s\n' "$cron_lines" | awk '$1 == "0" && $2 == "*" && $3 == "*" && $4 == "*" && $5 == "*" && /# piles-auto-assignment$/ {n++} END {print n+0}')"
+            if [ "${PILES_AUTO_ASSIGNMENT_CRON_SCHEDULE:-}" = "0 * * * *" ]; then
+              printf 'schedule_configured|1\n'
+            else
+              printf 'schedule_configured|0\n'
+            fi
+            if [ -x ./scripts/run-piles-auto-assignment.sh ]; then
+              printf 'runner_wrapper_executable|1\n'
+            else
+              printf 'runner_wrapper_executable|0\n'
+            fi
+            runtime_root="${PILES_RUNTIME_ROOT:-$PWD/.piles-runtime}"
+            expected_python="$runtime_root/current/bin/python"
+            if [ -n "${PILES_ASSIGNMENT_PYTHON_BIN:-}" ] && [ -x "$PILES_ASSIGNMENT_PYTHON_BIN" ]; then
+              printf 'python_runtime_executable|1\n'
+              if [ "$PILES_ASSIGNMENT_PYTHON_BIN" = "$expected_python" ]; then
+                printf 'runtime_expected_path_configured|1\n'
+              else
+                printf 'runtime_expected_path_configured|0\n'
+              fi
+              runtime_manifest="$runtime_root/current/piles-runtime-manifest.json"
+              if [ -f "$runtime_manifest" ]; then
+                printf 'runtime_manifest_exists|1\n'
+                manifest_mtime="$(stat -c %Y "$runtime_manifest" 2>/dev/null || stat -f %m "$runtime_manifest" 2>/dev/null || printf '0')"
+                case "$manifest_mtime" in (*[!0-9]*|'') manifest_mtime=0 ;; esac
+                manifest_now="$(date +%s)"
+                if [ "$manifest_mtime" -gt 0 ] && [ "$manifest_now" -ge "$manifest_mtime" ]; then
+                  printf 'runtime_manifest_age_seconds|%s\n' "$((manifest_now - manifest_mtime))"
+                else
+                  printf 'runtime_manifest_age_seconds|-1\n'
+                fi
+              else
+                printf 'runtime_manifest_exists|0\n'
+                printf 'runtime_manifest_age_seconds|-1\n'
+              fi
+              runtime_health_status=0
+              "${PILES_RUNTIME_CONTROL_PYTHON:-python3}" scripts/piles_runtime_health.py \
+                --runtime-root "$runtime_root" \
+                --requirements scripts/piles-auto-assignment-requirements.txt \
+                --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+                --mode light --json >/dev/null 2>&1 || runtime_health_status=$?
+              if [ "$runtime_health_status" -eq 0 ]; then
+                printf 'runtime_health_check_passed|1\n'
+              else
+                printf 'runtime_health_check_passed|0\n'
+              fi
+              if [ -f "$runtime_root/current/pyvenv.cfg" ]; then
+                printf 'runtime_pyvenv_config_exists|1\n'
+              else
+                printf 'runtime_pyvenv_config_exists|0\n'
+              fi
+              PYTHONPATH="$PWD/scripts" "$PILES_ASSIGNMENT_PYTHON_BIN" - <<'PY'
+            import importlib.util
+            import importlib.metadata
+            import os
+            import site
+            import sys
+
+            modules = {
+                "python_module_psycopg2": "psycopg2",
+                "python_module_requests": "requests",
+                "python_module_dotenv": "dotenv",
+                "python_module_playwright": "playwright.sync_api",
+                "python_module_piles_auto_assignment": "piles_auto_assignment",
+            }
+            for label, module in modules.items():
+                try:
+                    available = int(importlib.util.find_spec(module) is not None)
+                except (ImportError, ModuleNotFoundError, ValueError):
+                    available = 0
+                print(f"{label}|{available}")
+            print(f"python_is_virtualenv|{int(sys.prefix != sys.base_prefix)}")
+            print(f"python_pip_available|{int(importlib.util.find_spec('pip') is not None)}")
+            site_directories = [path for path in site.getsitepackages() if os.path.isdir(path)]
+            print(f"runtime_site_packages_dirs|{len(site_directories)}")
+            print(f"runtime_installed_distributions|{sum(1 for _ in importlib.metadata.distributions())}")
+            print(f"runtime_site_packages_mtime_epoch|{int(max((os.stat(path).st_mtime for path in site_directories), default=0))}")
+            print(f"runtime_bin_mtime_epoch|{int(os.stat(os.path.dirname(sys.executable)).st_mtime)}")
+            PY
+            else
+              printf 'python_runtime_executable|0\n'
+              printf 'runtime_expected_path_configured|0\n'
+              printf 'runtime_manifest_exists|0\n'
+              printf 'runtime_manifest_age_seconds|-1\n'
+              printf 'runtime_health_check_passed|0\n'
+              printf 'runtime_pyvenv_config_exists|0\n'
+              printf 'python_module_psycopg2|0\n'
+              printf 'python_module_requests|0\n'
+              printf 'python_module_dotenv|0\n'
+              printf 'python_module_playwright|0\n'
+              printf 'python_module_piles_auto_assignment|0\n'
+              printf 'python_is_virtualenv|0\n'
+              printf 'python_pip_available|0\n'
+              printf 'runtime_site_packages_dirs|0\n'
+              printf 'runtime_installed_distributions|0\n'
+              printf 'runtime_site_packages_mtime_epoch|0\n'
+              printf 'runtime_bin_mtime_epoch|0\n'
+            fi
+
+            cron_log="${PILES_AUTO_ASSIGNMENT_CRON_LOG:-${PILES_AUTO_ASSIGNMENT_CRON_LOG_DIR:-$PWD/tmp}/piles-auto-assignment-cron.log}"
+            if [ -f "$cron_log" ]; then
+              printf 'cron_log_exists|1\n'
+              log_mtime="$(stat -c %Y "$cron_log" 2>/dev/null || stat -f %m "$cron_log" 2>/dev/null || printf '0')"
+              log_size="$(stat -c %s "$cron_log" 2>/dev/null || stat -f %z "$cron_log" 2>/dev/null || printf '0')"
+              now_epoch="$(date +%s)"
+              case "$log_mtime" in (*[!0-9]*|'') log_mtime=0 ;; esac
+              if [ "$log_mtime" -gt 0 ] && [ "$now_epoch" -ge "$log_mtime" ]; then
+                log_age=$((now_epoch - log_mtime))
+              else
+                log_age=-1
+              fi
+              printf 'cron_log_age_seconds|%s\n' "$log_age"
+              printf 'cron_log_size_bytes|%s\n' "$log_size"
+              cutoff="$(date -d '72 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '0000-00-00 00:00:00')"
+              recent_log_count() {
+                awk -v cutoff="$cutoff" -v pattern="$1" '
+                  /Starting Piles Auto-Assignment schedule/ { recent = (substr($0,2,19) >= cutoff) }
+                  recent && $0 ~ pattern { n++ }
+                  END { print n+0 }
+                ' "$cron_log"
+              }
+              printf 'cron_start_markers_72h|%s\n' "$(awk -v cutoff="$cutoff" 'substr($0,2,19) >= cutoff && /Starting Piles Auto-Assignment schedule/ {n++} END {print n+0}' "$cron_log")"
+              printf 'cron_tracebacks_72h|%s\n' "$(recent_log_count 'Traceback \\(most recent call last\\)')"
+              printf 'cron_runner_failures_72h|%s\n' "$(recent_log_count '^RUN FAILED:')"
+              printf 'cron_runtime_errors_72h|%s\n' "$(recent_log_count '(^|[.])RuntimeError:')"
+              printf 'cron_operational_errors_72h|%s\n' "$(recent_log_count '(^|[.])OperationalError:')"
+              printf 'cron_import_errors_72h|%s\n' "$(recent_log_count '(^|[.])(ModuleNotFoundError|ImportError):')"
+              printf 'cron_file_not_found_errors_72h|%s\n' "$(recent_log_count '(^|[.])FileNotFoundError:')"
+              printf 'cron_playwright_errors_72h|%s\n' "$(recent_log_count '(Playwright|playwright|BrowserType|TargetClosedError|chromium)')"
+              printf 'cron_configuration_errors_72h|%s\n' "$(recent_log_count '(required|must be|not explicitly configured|not enabled|Invalid configuration)')"
+              printf 'cron_tracebacks_total|%s\n' "$(awk '/Traceback \(most recent call last\)/ {n++} END {print n+0}' "$cron_log")"
+              printf 'cron_command_not_found_total|%s\n' "$(awk 'tolower($0) ~ /command not found|no such file or directory|can.t open/ {n++} END {print n+0}' "$cron_log")"
+              printf 'cron_permission_errors_total|%s\n' "$(awk 'tolower($0) ~ /permission denied/ {n++} END {print n+0}' "$cron_log")"
+            else
+              printf 'cron_log_exists|0\n'
+              printf 'cron_log_age_seconds|-1\n'
+              printf 'cron_log_size_bytes|0\n'
+              printf 'cron_start_markers_72h|0\n'
+              printf 'cron_tracebacks_72h|0\n'
+              printf 'cron_runner_failures_72h|0\n'
+              printf 'cron_runtime_errors_72h|0\n'
+              printf 'cron_operational_errors_72h|0\n'
+              printf 'cron_import_errors_72h|0\n'
+              printf 'cron_file_not_found_errors_72h|0\n'
+              printf 'cron_playwright_errors_72h|0\n'
+              printf 'cron_configuration_errors_72h|0\n'
+              printf 'cron_tracebacks_total|0\n'
+              printf 'cron_command_not_found_total|0\n'
+              printf 'cron_permission_errors_total|0\n'
+            fi
+
+            printf 'cron_journal_invocations_72h|%s\n' "$(journalctl -u cron -u crond --since '72 hours ago' --no-pager 2>/dev/null | awk '/run-piles-auto-assignment[.]sh/ {n++} END {print n+0}')"
+            printf 'host_boot_epoch|%s\n' "$(awk '$1 == "btime" {print $2}' /proc/stat 2>/dev/null | head -n 1)"
+            printf 'root_filesystem_use_percent|%s\n' "$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"

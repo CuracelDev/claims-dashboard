@@ -1,6 +1,7 @@
 node_modules/
 .next/
 .playwright-browsers/
+.piles-runtime/
 .worktrees/
 .env.local
 .env

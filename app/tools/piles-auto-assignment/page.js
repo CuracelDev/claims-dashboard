@@ -756,6 +756,7 @@ function RunnerHistorySection({ C, refreshToken }) {
   const [scope, setScope] = useState('today');
   const [selectedDay, setSelectedDay] = useState(toDateInputValue(new Date()));
   const [runs, setRuns] = useState([]);
+  const [schedulerHealth, setSchedulerHealth] = useState(null);
   const [error, setError] = useState('');
   const [reloadToken, setReloadToken] = useState(0);
   const [loadedAt, setLoadedAt] = useState(null);
@@ -772,6 +773,7 @@ function RunnerHistorySection({ C, refreshToken }) {
         if (!res.ok || !json.success) throw new Error('Failed to load runner history.');
         if (!active) return;
         setRuns(json.runs || []);
+        setSchedulerHealth(json.scheduler_health || null);
         setLoadedAt(new Date().toISOString());
         setError('');
         refreshDelay = (json.runs || []).some(isRunnerActive) ? 5000 : 30000;
@@ -811,6 +813,23 @@ function RunnerHistorySection({ C, refreshToken }) {
         title="Runner History"
         text="The latest 150 recorded requests, with safe insurer outcomes, timing and assignment evidence. Expand a request, then an insurer, for diagnostics."
       />
+      {schedulerHealth && (
+        <div
+          role={schedulerHealth.state === 'unhealthy' ? 'alert' : 'status'}
+          style={{
+            background: C.elevated,
+            border: `1px solid ${schedulerHealth.tone === 'danger' ? C.danger : schedulerHealth.tone === 'warning' ? C.warn : schedulerHealth.tone === 'success' ? C.success : C.border}`,
+            borderRadius: 10,
+            padding: '11px 13px',
+            marginBottom: 14,
+          }}
+        >
+          <div style={{ color: schedulerHealth.tone === 'danger' ? C.danger : schedulerHealth.tone === 'warning' ? C.warn : schedulerHealth.tone === 'success' ? C.success : C.text, fontWeight: 700, fontSize: 13 }}>
+            {schedulerHealth.label}
+          </div>
+          <div style={{ color: C.sub, fontSize: 12, marginTop: 4 }}>{schedulerHealth.explanation}</div>
+        </div>
+      )}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 180px), 1fr))', gap: 12, marginBottom: 16 }}>
         <select aria-label="Runner history date range" value={scope} onChange={(e) => setScope(e.target.value)} style={{ ...inputStyle(C), outline: 'revert' }}>
           <option value="today">Today</option>

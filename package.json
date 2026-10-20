@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test:piles": "python3 -m unittest discover -s scripts -p 'test_piles_auto_assignment*.py' && node --test lib/piles-auto-assignment*.test.mjs",
+    "test:piles": "python3 -m unittest scripts/test_piles_runtime_health.py scripts/test_piles_runtime_builder.py && python3 -m unittest discover -s scripts -p 'test_piles_auto_assignment*.py' && node --test lib/piles-auto-assignment*.test.mjs",
     "test:piles:acceptance": "python3 -m unittest scripts/test_piles_auto_assignment_dispatch_integration.py -v",
     "test:piles:domain": "python3 -m unittest scripts/test_piles_auto_assignment_domain.py",
     "test:piles:rules": "node --test lib/piles-auto-assignment-rules.test.mjs",
@@ -34,7 +34,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^2.12.7",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@types/node": "^25.3.2",

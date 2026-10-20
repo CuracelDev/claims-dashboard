@@ -1,0 +1,55 @@
+name: Piles Runtime Repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type REPAIR PILES RUNTIME to rebuild and verify without assignments
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: piles-production-host
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - name: Atomically repair and verify the production runtime
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          REPAIR_CONFIRMATION: ${{ inputs.confirmation }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 55m
+          envs: REPAIR_CONFIRMATION
+          script: |
+            set -eu
+            if [ "$REPAIR_CONFIRMATION" != "REPAIR PILES RUNTIME" ]; then
+              echo "Exact runtime-repair confirmation was not supplied." >&2
+              exit 2
+            fi
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+            if pgrep -f '[p]iles_auto_assignment_runner[.]py' >/dev/null 2>&1; then
+              echo "A Piles assignment runner is active; runtime repair was not started." >&2
+              exit 3
+            fi
+            PILES_RUNTIME_INSTALL_OS_DEPS=true sh scripts/prepare-piles-production-runtime.sh
+            "${PILES_RUNTIME_CONTROL_PYTHON:-python3}" "${PILES_RUNTIME_HEALTH_SCRIPT:-scripts/piles_runtime_health.py}" \
+              --runtime-root "${PILES_RUNTIME_ROOT:-.piles-runtime}" \
+              --requirements scripts/piles-auto-assignment-requirements.txt \
+              --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+              --mode full \
+              --json
+            echo "Piles runtime repair and full verification completed without running assignments."

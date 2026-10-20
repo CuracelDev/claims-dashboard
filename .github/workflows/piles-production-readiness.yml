@@ -17,6 +17,9 @@ on:
         default: DEFMIS
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
   group: piles-production-host
   cancel-in-progress: false
@@ -48,6 +51,13 @@ jobs:
               disabled|shadow|enabled) ;;
               *) echo "PILES_ASSIGNMENT_PROVENANCE_V2 is not explicitly configured." >&2; exit 1 ;;
             esac
+
+            "${PILES_RUNTIME_CONTROL_PYTHON:-python3}" "${PILES_RUNTIME_HEALTH_SCRIPT:-scripts/piles_runtime_health.py}" \
+              --runtime-root "${PILES_RUNTIME_ROOT:-.piles-runtime}" \
+              --requirements scripts/piles-auto-assignment-requirements.txt \
+              --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+              --mode full \
+              --json
 
             node scripts/db-schema-audit.mjs
             readiness_status=0
