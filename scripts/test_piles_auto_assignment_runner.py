@@ -3955,6 +3955,30 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
             runner.open_postgres_connection("postgresql://fixture", autocommit=True, read_only=True)
         self.assertIn("default_transaction_read_only=on", connect.call_args.kwargs["options"])
 
+    def test_postgres_pooler_retries_without_startup_options_only_for_recognized_rejection(self):
+        connection = types.SimpleNamespace(autocommit=None)
+        calls = []
+
+        def connect(url, **options):
+            calls.append(options)
+            if len(calls) == 1:
+                raise RuntimeError("unsupported startup parameter: options")
+            return connection
+
+        with patch.object(runner.psycopg2, "connect", connect, create=True):
+            result = runner.open_postgres_connection("postgresql://fixture", autocommit=True, read_only=True)
+        self.assertIs(result, connection)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("options", calls[0])
+        self.assertNotIn("options", calls[1])
+        self.assertTrue(result.autocommit)
+
+    def test_postgres_connection_does_not_retry_unrecognized_failures(self):
+        with patch.object(runner.psycopg2, "connect", side_effect=RuntimeError("private authentication failure"), create=True) as connect:
+            with self.assertRaisesRegex(RuntimeError, "private authentication failure"):
+                runner.open_postgres_connection("postgresql://fixture", autocommit=True)
+        self.assertEqual(connect.call_count, 1)
+
     @staticmethod
     def make_tracked_fixture():
         return runner.TrackedPile(
