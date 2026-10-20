@@ -319,16 +319,25 @@ def open_postgres_connection(database_url: str, *, autocommit: bool, read_only: 
     """Bound individual database operations without bounding the whole run."""
     statement_ms = _bounded_env_int("PILES_DB_STATEMENT_TIMEOUT_MS", 45_000, 5_000, 90_000)
     lock_ms = _bounded_env_int("PILES_DB_LOCK_TIMEOUT_MS", 5_000, 1_000, 30_000)
-    connection = psycopg2.connect(
-        database_url,
-        connect_timeout=_bounded_env_int("PILES_DB_CONNECT_TIMEOUT_SECONDS", 10, 2, 30),
-        options=(
-            f"-c statement_timeout={statement_ms} "
-            f"-c lock_timeout={lock_ms} "
-            "-c idle_in_transaction_session_timeout=60000"
-            + (" -c default_transaction_read_only=on" if read_only else "")
-        ),
+    connect_timeout = _bounded_env_int("PILES_DB_CONNECT_TIMEOUT_SECONDS", 10, 2, 30)
+    options = (
+        f"-c statement_timeout={statement_ms} "
+        f"-c lock_timeout={lock_ms} "
+        "-c idle_in_transaction_session_timeout=60000"
+        + (" -c default_transaction_read_only=on" if read_only else "")
     )
+    try:
+        connection = psycopg2.connect(
+            database_url, connect_timeout=connect_timeout, options=options,
+        )
+    except Exception as error:
+        message = str(error).lower()
+        if "unsupported startup parameter" not in message or "options" not in message:
+            raise
+        # Transaction poolers can reject libpq's `options` startup parameter.
+        # Retry only that known compatibility failure. Read-only probes retain
+        # the DataStore/ledger write guards, and all other failures remain fatal.
+        connection = psycopg2.connect(database_url, connect_timeout=connect_timeout)
     connection.autocommit = autocommit
     return connection
 
