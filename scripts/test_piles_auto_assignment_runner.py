@@ -3955,6 +3955,28 @@ class ExecutionLedgerIntegrationTests(unittest.TestCase):
             runner.open_postgres_connection("postgresql://fixture", autocommit=True, read_only=True)
         self.assertIn("default_transaction_read_only=on", connect.call_args.kwargs["options"])
 
+    def test_node_postgres_no_verify_sslmode_is_normalized_for_libpq(self):
+        connection = types.SimpleNamespace(autocommit=None)
+        database_url = (
+            "postgresql://user:encoded%40secret@db.example.test:5432/claims"
+            "?application_name=piles&sslmode=no-verify"
+        )
+        with patch.object(runner.psycopg2, "connect", return_value=connection, create=True) as connect:
+            runner.open_postgres_connection(database_url, autocommit=True)
+        normalized_url = connect.call_args.args[0]
+        self.assertEqual(
+            normalized_url,
+            "postgresql://user:encoded%40secret@db.example.test:5432/claims"
+            "?application_name=piles&sslmode=require",
+        )
+
+    def test_libpq_sslmode_is_not_changed_when_already_supported(self):
+        connection = types.SimpleNamespace(autocommit=None)
+        database_url = "postgresql://fixture/claims?sslmode=verify-full"
+        with patch.object(runner.psycopg2, "connect", return_value=connection, create=True) as connect:
+            runner.open_postgres_connection(database_url, autocommit=True)
+        self.assertEqual(connect.call_args.args[0], database_url)
+
     def test_postgres_pooler_retries_without_startup_options_only_for_recognized_rejection(self):
         connection = types.SimpleNamespace(autocommit=None)
         calls = []
