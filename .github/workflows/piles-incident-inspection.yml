@@ -29,10 +29,24 @@ concurrency:
   group: piles-production-host
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   inspection:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Prepare versioned read-only inspector
+        if: inputs.operation == 'incident'
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const source = readFileSync('scripts/inspect-piles-runner-incidents.mjs', 'utf8')
+            + '\nawait main().catch(() => { console.error("Incident inspection failed safely."); process.exitCode = 1; });\n';
+          appendFileSync(process.env.GITHUB_ENV, `INCIDENT_SCRIPT_B64=${Buffer.from(source).toString('base64')}\n`);
+          JS
+          echo "Inspector revision: $GITHUB_SHA"
       - name: Inspect sanitized Piles incident evidence
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         env:
@@ -44,7 +58,7 @@ jobs:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: INSPECTION_OPERATION,INCIDENT_HOURS,INCIDENT_RUN_ID,PROVENANCE_INSURER
+          envs: INSPECTION_OPERATION,INCIDENT_HOURS,INCIDENT_RUN_ID,PROVENANCE_INSURER,INCIDENT_SCRIPT_B64
           script: |
             set -eu
             cd ~/claims-dashboard
@@ -62,10 +76,10 @@ jobs:
                   --hours "$INCIDENT_HOURS"
               fi
             elif [ -n "$INCIDENT_RUN_ID" ]; then
-              node scripts/inspect-piles-runner-incidents.mjs \
+              printf '%s' "$INCIDENT_SCRIPT_B64" | base64 --decode | node --input-type=module - \
                 --hours "$INCIDENT_HOURS" \
                 --run-id "$INCIDENT_RUN_ID"
             else
-              node scripts/inspect-piles-runner-incidents.mjs \
+              printf '%s' "$INCIDENT_SCRIPT_B64" | base64 --decode | node --input-type=module - \
                 --hours "$INCIDENT_HOURS"
             fi

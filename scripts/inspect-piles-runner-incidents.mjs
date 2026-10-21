@@ -8,6 +8,19 @@ export const WORK_ITEMS_TABLE = 'piles_auto_assignment_work_items';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SAFE_ERROR_MESSAGE = 'Operational details redacted; use error_code.';
+const ATTEMPT_REASONS = new Set([
+  'planned_identity_ambiguous_at_final_scan', 'planned_row_missing_at_final_scan',
+  'planned_row_observed_assigned_at_final_scan',
+  'planned_row_not_assignable_at_final_scan', 'planned_selection_retry_exhausted',
+  'historical_submission_missing_after_complete_scan', 'reconciliation_started',
+  'tracked_materialization_pending',
+  'portal_submission_starting', 'portal_submit_returned', 'superseded_unsubmitted_plan',
+  'released_for_bounded_retry', 'retry_limit_exhausted', 'reconciled_expected_assignee',
+  'reconciled_unexpected_assignee', 'positively_observed_unassigned', 'no_positive_assignment_evidence',
+]);
+const ATTEMPT_STATUSES = new Set(['planned', 'selected', 'submitted', 'confirmed_visible',
+  'confirmed_reconciled', 'reconciliation_pending', 'still_unassigned',
+  'manual_action_required', 'conflict', 'failed']);
 
 const SAFE_FIELDS = Object.freeze({
   parents: [
@@ -38,6 +51,8 @@ const SAFE_FIELDS = Object.freeze({
     'created_at', 'updated_at',
   ],
   attempt_states: ['insurer_run_id', 'insurer_name', 'status', 'attempt_count', 'claim_count'],
+  attempt_reasons: ['insurer_name', 'status', 'evidence_code', 'submission_state',
+    'attempt_count', 'unique_pile_count', 'claim_count'],
   pending_requests: [
     'id', 'insurer_name', 'requested_runner_run_id', 'status',
     'claimed_by_runner_run_id', 'requested_at', 'claimed_at', 'created_at', 'updated_at',
@@ -153,6 +168,20 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
       group by a.insurer_run_id, a.insurer_name, a.status
       order by a.insurer_run_id, a.status
     `, hours, runId),
+    attempt_reasons: query(`
+      select a.insurer_name, a.status,
+             case when a.evidence_code = any($3::text[]) then a.evidence_code else 'other' end as evidence_code,
+             case when a.submitted_at is null then 'not_recorded' else 'recorded' end as submission_state,
+             count(*)::int as attempt_count,
+             count(distinct a.tracking_key)::int as unique_pile_count,
+             coalesce(sum(a.claim_count), 0)::bigint as claim_count
+      from piles_auto_assignment_attempts a
+      join piles_auto_assignment_insurer_runs i on i.id = a.insurer_run_id
+      where (($2::text is null and i.created_at >= now() - ($1::int * interval '1 hour'))
+             or i.runner_run_id = $2::text)
+      group by a.insurer_name, a.status, 3, 4
+      order by a.insurer_name, a.status, 3, 4
+    `, hours, runId),
     pending_requests: query(`
       select id, insurer_name, requested_runner_run_id, status,
              claimed_by_runner_run_id, requested_at, claimed_at, created_at, updated_at
@@ -164,6 +193,7 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
     `, hours, runId),
   };
 
+  queries.attempt_reasons.values.push([...ATTEMPT_REASONS]);
   if (workItemsAvailable) {
     queries.work_items = query(`
       select id, parent_runner_run_id, insurer_name, source, request_scope, disposition,
@@ -209,6 +239,17 @@ function projectRows(section, rows) {
     if ('failure' in projected) projected.failure = sanitizeFailure(projected.failure);
     if ('reason_code' in projected) projected.reason_code = normalizeErrorCode(projected.reason_code);
     if ('error_message' in projected) projected.error_message = sanitizeMessage(projected.error_message);
+    if (section === 'attempt_reasons') {
+      projected.evidence_code = ATTEMPT_REASONS.has(projected.evidence_code) ? projected.evidence_code : 'other';
+      projected.status = ATTEMPT_STATUSES.has(projected.status) ? projected.status : 'other';
+      projected.submission_state = ['recorded', 'not_recorded'].includes(projected.submission_state)
+        ? projected.submission_state : 'unknown';
+      for (const key of ['attempt_count', 'unique_pile_count', 'claim_count']) {
+        const raw = projected[key];
+        const value = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : raw;
+        projected[key] = Number.isSafeInteger(value) && value >= 0 ? value : null;
+      }
+    }
     return projected;
   });
 }
@@ -222,6 +263,14 @@ function sanitizeFailure(value) {
   const result = {};
   for (const [key, names] of Object.entries(allowed)) result[key] = names.includes(value?.[key]) ? value[key] : 'other';
   result.line = Number.isInteger(value?.line) && value.line > 0 && value.line <= 1000000 ? value.line : 0;
+  const scan = value?.scan;
+  if (scan && ['response_timeout', 'response_http_error'].includes(scan.code)) {
+    result.scan = { code: scan.code };
+    for (const [key, maximum] of Object.entries({ page_number: 1000000, page_size: 10000,
+      elapsed_ms: 3600000, http_status: 599 })) {
+      if (Number.isInteger(scan[key]) && scan[key] >= 0 && scan[key] <= maximum) result.scan[key] = scan[key];
+    }
+  }
   return result;
 }
 
@@ -232,7 +281,7 @@ export function buildIncidentReport({ hours, runId, workItemsAvailable, sections
     selected_run_id: runId,
     work_items_available: workItemsAvailable,
   };
-  for (const section of ['parents', 'insurers', 'contexts', 'batches', 'attempt_states', 'pending_requests']) {
+  for (const section of ['parents', 'insurers', 'contexts', 'batches', 'attempt_states', 'attempt_reasons', 'pending_requests']) {
     report[section] = projectRows(section, sections[section] ?? []);
   }
   if (workItemsAvailable) report.work_items = projectRows('work_items', sections.work_items ?? []);

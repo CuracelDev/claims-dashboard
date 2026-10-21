@@ -4235,6 +4235,7 @@ class CuracelPilesRunner:
         page_number: int | None = None,
         page_size: int | None = None,
     ) -> None:
+        started = time.monotonic()
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
             self._heartbeat("scan")
@@ -4255,15 +4256,29 @@ class CuracelPilesRunner:
                 status, url, response = matching_events[-1]
                 if 200 <= status < 400:
                     return
-                raise RuntimeError(
+                error = RuntimeError(
                     "Piles data request for "
                     f"'{year_label} / {month_label} / {status_label}' failed with HTTP {status}: {url}"
                 )
-            time.sleep(0.1)
-        raise RuntimeError(
+                error.scan_diagnostic = {
+                    "code": "response_http_error", "http_status": status,
+                    "page_number": page_number, "page_size": page_size,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                }
+                raise error
+            # Sync Playwright dispatches response callbacks while inside its API.
+            # Python sleep starves those callbacks and turns valid delayed
+            # responses into timeouts even after the server has replied.
+            self.page.wait_for_timeout(100)
+        error = RuntimeError(
             "No completed Piles data request confirmed "
             f"'{year_label} / {month_label} / {status_label}' within {timeout_ms}ms."
         )
+        error.scan_diagnostic = {
+            "code": "response_timeout", "page_number": page_number, "page_size": page_size,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+        raise error
 
     def _filter_network_state(
         self,
@@ -9561,42 +9576,56 @@ def _run_for_insurer_once(
             deferred_plans = list(getattr(runner, "deferred_assignment_plans", []))
             runner.deferred_assignment_plans = []
             if deferred_plans:
-                rows_by_identity: dict[str, PileRow] = {}
-                for row in follow_up_rows:
-                    for key in expanded_tracking_key_set([
-                        row.tracking_key, row.legacy_tracking_key, row.key,
-                    ]):
-                        rows_by_identity[key] = row
                 relocated_plans: list[PlannedAssignment] = []
-                unresolved_plans: list[PlannedAssignment] = []
+                unresolved_plans: dict[str, list[PlannedAssignment]] = {}
                 for plan in deferred_plans:
-                    matched_row = next(
-                        (
-                            rows_by_identity.get(key)
-                            for key in expanded_tracking_key_set([
-                                plan.tracking_key, plan.pile_key,
-                            ])
-                            if rows_by_identity.get(key) is not None
-                        ),
-                        None,
+                    selection = select_identity_match_indexes(
+                        [{"portal_identity_hash": row.portal_identity_hash,
+                          "aliases": expanded_tracking_key_set([
+                              row.tracking_key, row.legacy_tracking_key, row.key,
+                          ])} for row in follow_up_rows],
+                        expected_portal_identity_hash=plan.portal_identity_hash,
+                        expected_aliases=expanded_tracking_key_set([
+                            plan.tracking_key, plan.legacy_tracking_key, plan.pile_key,
+                        ]),
                     )
-                    if matched_row is None or norm(matched_row.assigned):
-                        unresolved_plans.append(plan)
+                    matched_rows = [follow_up_rows[index] for index in selection.indexes]
+                    # Matching rows are already accounted for by this persisted
+                    # plan, even when their aliases changed. Never plan them a
+                    # second time as arrivals from the pre-submission snapshot.
+                    prior_attempt_keys.update(expanded_tracking_key_set(
+                        key for row in matched_rows
+                        for key in (row.tracking_key, row.legacy_tracking_key, row.key)
+                    ))
+                    reason = ""
+                    conflicting_identity = bool(plan.portal_identity_hash) and any(
+                        row.portal_identity_hash and row.portal_identity_hash != plan.portal_identity_hash
+                        for row in matched_rows
+                    )
+                    if selection.ambiguous or len(matched_rows) > 1 or conflicting_identity:
+                        reason = "planned_identity_ambiguous_at_final_scan"
+                    elif not matched_rows:
+                        reason = "planned_row_missing_at_final_scan"
+                    elif norm(matched_rows[0].assigned):
+                        reason = "planned_row_observed_assigned_at_final_scan"
+                    if reason:
+                        unresolved_plans.setdefault(reason, []).append(plan)
                         continue
+                    matched_row = matched_rows[0]
                     plan.pile_key = matched_row.key
                     plan.filter_month = matched_row.filter_month
                     plan.filter_year = effective_filter_year(matched_row, year_label)
                     plan.status_bucket = matched_row.status_bucket
                     plan.source_page_number = matched_row.page_number
                     relocated_plans.append(plan)
-                if unresolved_plans:
+                for reason, unresolved in unresolved_plans.items():
                     runner._transition_assignment_attempts(
-                        unresolved_plans,
+                        unresolved,
                         AttemptStatus.FAILED,
                         {AttemptStatus.PLANNED},
                         evidence={
-                            "code": "planned_row_not_assignable_at_final_scan",
-                            "details": {"count": len(unresolved_plans)},
+                            "code": reason,
+                            "details": {"count": len(unresolved)},
                         },
                     )
                 if relocated_plans:
