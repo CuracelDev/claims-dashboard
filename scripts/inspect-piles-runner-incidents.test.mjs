@@ -2,6 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildIncidentReport, buildIncidentQueries } from './inspect-piles-runner-incidents.mjs';
 import pg from 'pg';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+
+test('stdin inspector transport validates arguments and exits safely without touching a database', () => {
+  const source = readFileSync(new URL('./inspect-piles-runner-incidents.mjs', import.meta.url), 'utf8')
+    + '\nawait main().catch(() => { console.error("Incident inspection failed safely."); process.exitCode = 1; });\n';
+  const result = spawnSync(process.execPath, ['--input-type=module', '-', '--hours', 'invalid'], {
+    input: source, encoding: 'utf8', timeout: 10000,
+    cwd: new URL('../', import.meta.url), env: { PATH: process.env.PATH },
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr.trim(), 'Incident inspection failed safely.');
+  assert.equal(result.stdout, '');
+});
 
 test('real SQL groups attempts separately from identities and respects parent scope',
   { skip: !process.env.PILES_TEST_DATABASE_URL }, async () => {
