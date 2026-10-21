@@ -2,18 +2,18 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
-import { evaluateScheduleLiveness } from '../lib/piles-auto-assignment-liveness.mjs';
+import { evaluatePilesHealth } from '../lib/piles-auto-assignment-liveness.mjs';
 
 export { evaluateScheduleLiveness } from '../lib/piles-auto-assignment-liveness.mjs';
 
 const { Pool } = pg;
 
 export function transitionScheduleLiveness(previousState, result) {
-  const incidentKey = result.healthy ? 'healthy' : `${result.code}:${result.latest_id || 'none'}`;
+  const incidentKey = result.healthy ? 'healthy' : result.incident_key || `${result.code}:${result.latest_id || 'none'}`;
   const previousKey = previousState?.incident_key || null;
   const previousHealthy = previousState?.healthy;
   return {
-    notify: previousKey !== incidentKey,
+    notify: previousKey !== incidentKey && (!result.healthy || previousHealthy === false),
     recovered: result.healthy && previousHealthy === false,
     state: {
       schema_version: 1,
@@ -68,7 +68,25 @@ export async function readScheduleSnapshot(pool) {
     if (row.status !== 'failed') break;
     consecutiveFailures += 1;
   }
-  return { latest, consecutive_failures: consecutiveFailures };
+  const issues = await pool.query(`
+    with latest_attempts as (
+      select distinct on (a.insurer_name, a.tracking_key)
+        a.insurer_name, a.status, a.evidence_code, a.updated_at, i.status as run_status
+      from piles_auto_assignment_attempts a
+      join piles_auto_assignment_insurer_runs i on i.id = a.insurer_run_id
+      order by a.insurer_name, a.tracking_key, a.created_at desc, a.updated_at desc, a.id desc
+    )
+    select insurer_name, status, count(*)::int as pile_count, min(updated_at) as oldest_at
+    from latest_attempts
+    where (status in ('failed', 'manual_action_required', 'conflict', 'still_unassigned')
+           and coalesce(evidence_code, '') <> 'planned_row_observed_assigned_at_final_scan')
+       or (status in ('selected', 'submitted', 'reconciliation_pending', 'planned')
+           and (run_status not in ('queued', 'started', 'running')
+                or updated_at < now() - interval '30 minutes'))
+    group by insurer_name, status
+    order by insurer_name, status
+  `);
+  return { latest, consecutive_failures: consecutiveFailures, assignment_issues: issues.rows };
 }
 
 function parseArguments(argv) {
@@ -106,8 +124,10 @@ async function notifyIfNeeded(transition, result) {
   const webhook = process.env.SLACK_WEBHOOK_HEALTHOPS;
   if (!transition.notify || !webhook) return;
   const text = transition.recovered
-    ? `✅ Piles scheduler recovered: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`
-    : `🚨 Piles scheduler unhealthy: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`;
+    ? `✅ Piles recorded health checks recovered: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`
+    : `🚨 Piles health requires attention: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`
+      + (result.assignment_issues?.length ? '\n' + result.assignment_issues.map(issue =>
+        `${issue.insurer_name}: ${issue.pile_count} ${issue.status} (oldest evidence ${issue.oldest_at})`).join('\n') : '');
   const response = await fetch(webhook, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }),
   });
@@ -134,7 +154,7 @@ async function main() {
     const snapshot = await readScheduleSnapshot(pool);
     await pool.query('ROLLBACK');
     transactionOpen = false;
-    const result = evaluateScheduleLiveness(snapshot, new Date(), options.thresholdMinutes);
+    const result = evaluatePilesHealth(snapshot, new Date(), options.thresholdMinutes);
     const transition = transitionScheduleLiveness(readState(options.stateFile), result);
     await deliverScheduleTransition(transition, result, {
       persist: (state) => writeState(options.stateFile, state),
