@@ -3345,6 +3345,7 @@ class YearFilterScanningTests(unittest.TestCase):
 
     def test_filter_wait_rejects_a_response_for_the_previous_year(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = types.SimpleNamespace(wait_for_timeout=lambda ms: runner.time.sleep(ms / 1000))
         portal_runner._piles_response_events = [
             (1, 200, "https://api.health.curacel.co/api/piles?year=2026&page=1", object()),
         ]
@@ -3373,6 +3374,7 @@ class YearFilterScanningTests(unittest.TestCase):
 
     def test_response_wait_exposes_timeout_without_url(self):
         portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner.page = types.SimpleNamespace(wait_for_timeout=lambda ms: runner.time.sleep(ms / 1000))
         portal_runner._piles_response_events = []
         with self.assertRaises(RuntimeError) as caught:
             portal_runner._wait_for_piles_filter_response(0, "All", "2025", "All", timeout_ms=1, page_number=2)

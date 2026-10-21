@@ -4266,7 +4266,10 @@ class CuracelPilesRunner:
                     "elapsed_ms": int((time.monotonic() - started) * 1000),
                 }
                 raise error
-            time.sleep(0.1)
+            # Sync Playwright dispatches response callbacks while inside its API.
+            # Python sleep starves those callbacks and turns valid delayed
+            # responses into timeouts even after the server has replied.
+            self.page.wait_for_timeout(100)
         error = RuntimeError(
             "No completed Piles data request confirmed "
             f"'{year_label} / {month_label} / {status_label}' within {timeout_ms}ms."
