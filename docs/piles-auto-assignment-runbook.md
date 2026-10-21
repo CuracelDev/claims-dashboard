@@ -168,6 +168,9 @@ The independent **Piles Schedule Liveness** workflow checks only bounded schedul
 
 Interpret the incident report as follows:
 
+- `attempt_reasons` groups ledger attempts by insurer, state, allowlisted evidence code and recorded submission timestamp. `attempt_count` and `claim_count` count attempt observations; repeated attempts can repeat the same claims. `unique_pile_count` deduplicates tracking keys only within each group, so groups must not be summed as unique piles. `submission_state=not_recorded` means no timestamp was recorded, not proof that an interrupted portal click never happened. Unknown reason codes are `other`; raw evidence details and identities are never printed.
+- `failure.scan`, when present, distinguishes `response_http_error` from `response_timeout` and provides bounded page/HTTP/timing fields. A timeout means no matching response was observed; it does not by itself establish whether the portal was slow, a filter mismatched, or browser event processing stalled. Older failures may lack this metadata.
+
 - `completed_with_issues` means safe work completed but at least one insurer, context, conflict, or reconciliation outcome still needs attention. Legacy `partial` carries the older mixed-outcome meaning and remains readable.
 - `covered_by_active_cycle` means an already-running all-active cycle owns the request; it is evidence of deduplication, not a new successful assignment run.
 - `follow_up_queued` means a manual request arrived during an active insurer run and one later generation is waiting. Confirm that it is eventually claimed or cancelled explicitly.

@@ -7,6 +7,19 @@ from scripts.test_piles_auto_assignment_store import RecordingConnection
 
 
 class FailureDiagnosticsTests(unittest.TestCase):
+    def test_chained_scan_diagnostics_survive_without_raw_exception_data(self):
+        cause = RuntimeError("secret URL")
+        cause.scan_diagnostic = {"code": "response_timeout", "page_number": 2,
+                                 "elapsed_ms": 10000, "http_status": None,
+                                 "url": "secret", "page_size": True}
+        error = RuntimeError("private wrapper")
+        error.__cause__ = cause
+        diagnostic = failure_diagnostic(error, "scan")
+        self.assertEqual(diagnostic.get("scan"), {"code": "response_timeout", "page_number": 2,
+                                              "elapsed_ms": 10000})
+        self.assertNotIn("secret", json.dumps(diagnostic))
+        self.assertEqual(sanitize_failure(diagnostic), diagnostic)
+
     def test_exception_message_and_locals_are_never_serialized(self):
         try:
             raise TypeError("secret patient token")

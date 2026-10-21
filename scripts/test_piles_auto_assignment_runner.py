@@ -3359,6 +3359,27 @@ class YearFilterScanningTests(unittest.TestCase):
                 timeout_ms=1,
             )
 
+    def test_response_wait_exposes_safe_http_failure_details(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_events = [
+            (1, 503, "https://api.health.curacel.co/api/piles?year=2025&page=2", object()),
+        ]
+        with self.assertRaises(RuntimeError) as caught:
+            portal_runner._wait_for_piles_filter_response(0, "All", "2025", "All", page_number=2)
+        diagnostic = runner.failure_diagnostic(caught.exception, "scan")
+        self.assertEqual(diagnostic.get("scan", {}).get("code"), "response_http_error")
+        self.assertEqual(diagnostic["scan"]["http_status"], 503)
+        self.assertEqual(diagnostic["scan"]["page_number"], 2)
+
+    def test_response_wait_exposes_timeout_without_url(self):
+        portal_runner = object.__new__(runner.CuracelPilesRunner)
+        portal_runner._piles_response_events = []
+        with self.assertRaises(RuntimeError) as caught:
+            portal_runner._wait_for_piles_filter_response(0, "All", "2025", "All", timeout_ms=1, page_number=2)
+        diagnostic = runner.failure_diagnostic(caught.exception, "scan")
+        self.assertEqual(diagnostic.get("scan", {}).get("code"), "response_timeout")
+        self.assertEqual(diagnostic["scan"]["page_number"], 2)
+
     def test_matching_controls_and_stable_table_do_not_require_new_network_event(self):
         timing = EvidenceTimingTests()
         portal_runner, clock = timing.fixture(snapshot=lambda: {

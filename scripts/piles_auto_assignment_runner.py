@@ -4235,6 +4235,7 @@ class CuracelPilesRunner:
         page_number: int | None = None,
         page_size: int | None = None,
     ) -> None:
+        started = time.monotonic()
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
             self._heartbeat("scan")
@@ -4255,15 +4256,26 @@ class CuracelPilesRunner:
                 status, url, response = matching_events[-1]
                 if 200 <= status < 400:
                     return
-                raise RuntimeError(
+                error = RuntimeError(
                     "Piles data request for "
                     f"'{year_label} / {month_label} / {status_label}' failed with HTTP {status}: {url}"
                 )
+                error.scan_diagnostic = {
+                    "code": "response_http_error", "http_status": status,
+                    "page_number": page_number, "page_size": page_size,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                }
+                raise error
             time.sleep(0.1)
-        raise RuntimeError(
+        error = RuntimeError(
             "No completed Piles data request confirmed "
             f"'{year_label} / {month_label} / {status_label}' within {timeout_ms}ms."
         )
+        error.scan_diagnostic = {
+            "code": "response_timeout", "page_number": page_number, "page_size": page_size,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+        raise error
 
     def _filter_network_state(
         self,
