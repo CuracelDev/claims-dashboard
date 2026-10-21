@@ -9,6 +9,8 @@ export const WORK_ITEMS_TABLE = 'piles_auto_assignment_work_items';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SAFE_ERROR_MESSAGE = 'Operational details redacted; use error_code.';
 const ATTEMPT_REASONS = new Set([
+  'planned_identity_ambiguous_at_final_scan', 'planned_row_missing_at_final_scan',
+  'planned_row_observed_assigned_at_final_scan',
   'planned_row_not_assignable_at_final_scan', 'planned_selection_retry_exhausted',
   'historical_submission_missing_after_complete_scan', 'reconciliation_started',
   'tracked_materialization_pending',

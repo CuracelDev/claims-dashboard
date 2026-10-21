@@ -1466,9 +1466,50 @@ class LateArrivalWorkflowTests(unittest.TestCase):
         self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
         self.assertEqual(len(state.applied), 1)
         self.assertIn(
-            (original.tracking_key, "failed", "planned_row_not_assignable_at_final_scan"),
+            (original.tracking_key, "failed", "planned_row_observed_assigned_at_final_scan"),
             state.transitions,
         )
+
+    def test_deferred_plan_uses_portal_identity_after_alias_change_without_double_planning(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = runner.replace(make_pile(1), portal_identity_hash="a" * 64)
+        moved = runner.replace(original, key="new-row", tracking_key="new-tracking",
+                               legacy_tracking_key="new-legacy")
+        state = self.workflow({context: [original]}, {context: [moved]}, defer_first_assignment=True)
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.applied), 2)
+        self.assertEqual(state.applied[1][0].tracking_key, original.tracking_key)
+        self.assertEqual(state.applied[1][0].pile_key, "new-row")
+        self.assertEqual(state.result["late_arrival_detection"]["count"], 0)
+
+    def test_deferred_plan_never_selects_an_arbitrary_alias_collision(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = make_pile(1)
+        collision = runner.replace(original, key="second-row", tracking_key="second-tracking",
+                                   legacy_tracking_key=original.tracking_key, provider="Different provider")
+        state = self.workflow({context: [original]}, {context: [original, collision]}, defer_first_assignment=True)
+        self.assertEqual(len(state.applied), 1)
+        self.assertIn((original.tracking_key, "failed", "planned_identity_ambiguous_at_final_scan"),
+                      state.transitions)
+
+    def test_ambiguous_portal_identity_is_not_replanned_as_late_arrivals(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = runner.replace(make_pile(1), portal_identity_hash="a" * 64)
+        rows = [runner.replace(original, key=f"new-{n}", tracking_key=f"tracking-{n}",
+                               legacy_tracking_key=f"legacy-{n}") for n in (1, 2)]
+        state = self.workflow({context: [original]}, {context: rows}, defer_first_assignment=True)
+        self.assertFalse(hasattr(state, "error"), getattr(state, "error", None))
+        self.assertEqual(len(state.applied), 1)
+        self.assertEqual(state.result["late_arrival_detection"]["count"], 0)
+
+    def test_contradictory_portal_identity_cannot_reuse_an_old_alias(self):
+        context = ("Jul", "2026", "Vetting Pending")
+        original = runner.replace(make_pile(1), portal_identity_hash="a" * 64)
+        other = runner.replace(original, portal_identity_hash="b" * 64)
+        state = self.workflow({context: [original]}, {context: [other]}, defer_first_assignment=True)
+        self.assertEqual(len(state.applied), 1)
+        self.assertIn((original.tracking_key, "failed", "planned_identity_ambiguous_at_final_scan"),
+                      state.transitions)
 
     def test_actual_flow_preserves_concrete_and_all_year_contexts(self):
         for multiple, expected in ((False, {"2026", "2025"}), (True, {"All"})):
