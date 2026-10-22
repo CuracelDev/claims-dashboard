@@ -5,6 +5,79 @@ import pg from 'pg';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
+test('historical diagnostic fingerprints include the deployed scan safety dependency', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/piles-incident-inspection.yml', import.meta.url), 'utf8');
+  const command = workflow.match(/-c '(import hashlib[^\n]+)'/);
+  assert.ok(command, 'fingerprint command must be available for execution');
+  const result = spawnSync('python3', ['-c', command[1]], {
+    cwd: new URL('../', import.meta.url), encoding: 'utf8', timeout: 10000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Deployed dependency sha256: scripts\/piles_auto_assignment\/scanning\.py [0-9a-f]{64}/);
+});
+
+test('historical review query excludes superseded failures and test-portal evidence',
+  { skip: !process.env.PILES_TEST_DATABASE_URL }, async () => {
+    // Execute the actual Python query builder, not a copied SQL fixture.
+    const built = spawnSync('python3', ['-c', `
+import json
+from scripts.review_piles_historical_assignments import load_attempts
+class Store:
+    def _fetchall_postgres(self, sql, params):
+        print(json.dumps({'sql': sql, 'params': params}))
+        return []
+load_attempts(Store(), 'Test', 24, 100)
+`], { cwd: new URL('../', import.meta.url), encoding: 'utf8' });
+    assert.equal(built.status, 0, built.stderr);
+    const statement = JSON.parse(built.stdout);
+    let index = 0;
+    const sql = statement.sql.replaceAll('%s', () => `$${++index}`);
+    const client = new pg.Client({ connectionString: process.env.PILES_TEST_DATABASE_URL });
+    await client.connect();
+    try {
+      await client.query(`begin;
+        create temporary table piles_auto_assignment_runner_runs (id text, portal_environment text);
+        create temporary table piles_auto_assignment_insurer_runs (id text, runner_run_id text);
+        create temporary table piles_auto_assignment_attempts (
+          id text, insurer_run_id text, insurer_name text, tracking_key text, last_pile_key text,
+          intended_portal_assignee text, status text, submitted_at timestamptz, updated_at timestamptz,
+          created_at timestamptz, evidence_details jsonb, filter_context jsonb, claim_count int);
+        insert into piles_auto_assignment_runner_runs values ('prod','production'),('test','test');
+        insert into piles_auto_assignment_insurer_runs values ('prod','prod'),('test','test');
+        insert into piles_auto_assignment_attempts (id, insurer_run_id, insurer_name, tracking_key, status, created_at, updated_at)
+        values
+          ('old','prod','Test','same','failed',now()-interval '2 hours',now()-interval '2 hours'),
+          ('new','prod','Test','same','confirmed_visible',now(),now()),
+          ('review','prod','Test','unresolved','manual_action_required',now(),now()),
+          ('test-only','test','Test','test-pile','failed',now(),now()),
+          ('other','prod','Other','other','failed',now(),now());`);
+      const { rows } = await client.query(sql, statement.params);
+      assert.deepEqual(rows.map(row => row.id), ['review']);
+      await client.query(`update piles_auto_assignment_attempts set
+        evidence_details = jsonb_build_object('portal_identity_hash', repeat('a',64)) where id = 'review';
+        insert into piles_auto_assignment_attempts (id, insurer_run_id, insurer_name, tracking_key,
+          status, intended_portal_assignee, created_at, updated_at, evidence_details)
+        values ('later-key','prod','Test','changed-key','confirmed_visible','Other',
+          now()+interval '1 second',now()+interval '1 second',
+          jsonb_build_object('portal_identity_hash', repeat('a',64)));`);
+      const updated = (await client.query(sql, statement.params)).rows;
+      assert.equal(updated.find(row => row.id === 'review').later_identity_attempt, true);
+      await client.query("update piles_auto_assignment_attempts set created_at=now()-interval '2 hours' where id='later-key'");
+      assert.equal((await client.query(sql, statement.params)).rows.find(row => row.id === 'review').later_identity_attempt,
+        true, 'an older attempt confirmed later must also prevent historical attribution');
+    } finally { await client.query('rollback'); await client.end(); }
+  });
+
+test('historical review stdin transport rejects assignment flags before loading portal dependencies', () => {
+  const source = readFileSync(new URL('./review_piles_historical_assignments.py', import.meta.url), 'utf8');
+  const result = spawnSync('python3', ['-', '--insurer', 'Test', '--execute'], {
+    input: source, encoding: 'utf8', timeout: 10000, env: { PATH: process.env.PATH },
+  });
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /unrecognized arguments/);
+});
+
 test('unresolved follow-up distinguishes later stable-identity evidence without exposing identities',
   { skip: !process.env.PILES_TEST_DATABASE_URL }, async () => {
     const client = new pg.Client({ connectionString: process.env.PILES_TEST_DATABASE_URL });
@@ -80,7 +153,8 @@ test('real SQL groups attempts separately from identities and respects parent sc
       assert.equal(known.unique_pile_count, 1);
       assert.equal(known.claim_count, 6); // Claim observations across attempts, not unique claims.
       assert.equal(report.attempt_reasons.length, 2);
-      assert.doesNotMatch(JSON.stringify(report), /secret|pile-[123]|99/);
+      // The report timestamp may legitimately contain "99" milliseconds.
+      assert.doesNotMatch(JSON.stringify(report.attempt_reasons), /secret|pile-[123]|99/);
     } finally {
       await client.query('ROLLBACK');
       await client.end();

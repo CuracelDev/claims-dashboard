@@ -8,7 +8,7 @@ import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional
 
 from .domain import (
@@ -1259,6 +1259,7 @@ class ExecutionLedger:
         *,
         expected: Iterable[AttemptStatus],
         evidence: Optional[Any] = None,
+        _commit: bool = True,
     ) -> None:
         target_status = AttemptStatus(target)
         expected_statuses = {AttemptStatus(status) for status in expected}
@@ -1336,7 +1337,8 @@ class ExecutionLedger:
                     """,
                     (row[0],),
                 )
-            self.connection.commit()
+            if _commit:
+                self.connection.commit()
         except Exception:
             self.connection.rollback()
             raise
@@ -1485,6 +1487,8 @@ class ExecutionLedger:
         self,
         attempt_id: str,
         observation: Any,
+        *,
+        _commit: bool = True,
     ) -> str:
         """Atomically project positive confirmation into the tracked-pile mirror."""
         observed_assignee = str(_value(observation, "assigned", "") or "").strip()
@@ -1666,8 +1670,124 @@ class ExecutionLedger:
                 linked = cursor.fetchone()
                 if not linked or str(linked[0]) != materialized_id:
                     raise ConcurrentStateChange(attempt_id)
-            self.connection.commit()
+            if _commit:
+                self.connection.commit()
             return materialized_id
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def confirm_historical_attempt(self, *, expected_attempt: Mapping[str, Any],
+                                   observation: Any, observed_at: datetime) -> str:
+        """Exact, non-assigning operator confirmation; atomic with tracked mirror.
+
+        No terminal transition is added to the normal runner state machine.
+        Call only after a complete review and a fresh targeted portal recheck.
+        The independent transaction revalidates identity, ownership, chronology,
+        scope, newer attempts and the insurer lock before changing any record.
+        """
+        def blocked():
+            raise ValueError("historical_confirmation_blocked")
+
+        now = datetime.now(timezone.utc)
+        if (getattr(self.connection, "autocommit", True)
+                or not isinstance(observed_at, datetime) or observed_at.tzinfo is None
+                or not now - timedelta(seconds=60) <= observed_at <= now):
+            blocked()
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                               (f"piles-insurer:{_insurer_lock_key(expected_attempt.get('insurer_name', ''))}",))
+                if not cursor.fetchone()[0]:
+                    blocked()
+                cursor.execute("""
+                    SELECT a.*, r.portal_environment, i.status AS insurer_status
+                    FROM piles_auto_assignment_attempts a
+                    JOIN piles_auto_assignment_insurer_runs i ON i.id=a.insurer_run_id
+                    JOIN piles_auto_assignment_runner_runs r ON r.id=i.runner_run_id
+                    WHERE a.id=%s FOR UPDATE OF a
+                """, (expected_attempt.get("id"),))
+                locked = cursor.fetchone()
+                if not locked:
+                    blocked()
+                current = dict(zip([c[0] for c in cursor.description], locked))
+                exact_fields = ("id", "insurer_name", "status", "updated_at", "submitted_at",
+                                "tracking_key", "last_pile_key", "intended_portal_assignee", "evidence_details")
+                if any(current.get(key) != expected_attempt.get(key) for key in exact_fields):
+                    blocked()
+                details = current.get("evidence_details") or {}
+                identity = details.get("portal_identity_hash", "")
+                owner = lambda value: " ".join(str(value or "").casefold().split())
+                if (current["status"] != "manual_action_required"
+                        or current["portal_environment"] != "production"
+                        or current["insurer_status"] in {"running", "queued"}
+                        or current["updated_at"] > observed_at
+                        or not current["submitted_at"] or current["submitted_at"] > observed_at
+                        or not re.fullmatch(r"[0-9a-f]{64}", identity)
+                        or identity != _value(observation, "portal_identity_hash", "")
+                        or not owner(current["intended_portal_assignee"])
+                        or owner(current["intended_portal_assignee"]) != owner(_value(observation, "assigned", ""))):
+                    blocked()
+                cursor.execute("""
+                    SELECT EXISTS (
+                      SELECT 1 FROM piles_auto_assignment_attempts b
+                      JOIN piles_auto_assignment_insurer_runs i ON i.id=b.insurer_run_id
+                      JOIN piles_auto_assignment_runner_runs r ON r.id=i.runner_run_id
+                      WHERE b.insurer_name=%s AND r.portal_environment='production'
+                        AND b.id<>%s AND (b.created_at >= %s OR b.updated_at >= %s)
+                        AND (b.tracking_key=%s OR b.evidence_details ->> 'portal_identity_hash'=%s)
+                    ), clock_timestamp()
+                """, (current["insurer_name"], current["id"], current["created_at"], current["updated_at"], current["tracking_key"], identity))
+                newer, server_now = cursor.fetchone()
+                if newer or not server_now - timedelta(seconds=60) <= observed_at <= server_now:
+                    blocked()
+                cursor.execute("""
+                    SELECT EXISTS (SELECT 1 FROM piles_auto_assignment_tracked_piles t
+                      WHERE t.insurer_name=%s AND (
+                        ((t.details ->> 'portal_identity_hash'=%s OR t.tracking_key=%s)
+                          AND t.tracking_key<>%s)
+                        OR (t.tracking_key=%s AND t.details ->> 'portal_identity_hash' IS DISTINCT FROM %s)
+                      ))
+                """, (current["insurer_name"], identity, _value(observation, "tracking_key", ""),
+                       current["tracking_key"], current["tracking_key"], identity))
+                if cursor.fetchone()[0]:
+                    blocked()
+                review = {"previous_status": current["status"],
+                          "previous_evidence_code": current.get("evidence_code"),
+                          "previous_evidence_details": details,
+                          "observed_at": observed_at.isoformat(),
+                          "source": "operator_live_ownership_review"}
+                cursor.execute("""
+                    UPDATE piles_auto_assignment_attempts SET status='reconciliation_pending',
+                      evidence_details=coalesce(evidence_details,'{}'::jsonb) || %s::jsonb
+                    WHERE id=%s
+                """, (_json({"historical_review": review}), current["id"]))
+            self.transition_attempt(current["id"], AttemptStatus.CONFIRMED_RECONCILED,
+                expected={AttemptStatus.RECONCILIATION_PENDING},
+                evidence={"code": "reconciled_expected_assignee", "details": {
+                    "identity_match_method": "portal_identity_hash"}}, _commit=False)
+            tracked_id = self.materialize_confirmed_assignment(current["id"], observation, _commit=False)
+            with self.connection.cursor() as cursor:
+                # Preserve original run disposition and timing; refresh evidence
+                # totals only. A historical review is not a new successful run.
+                cursor.execute("""
+                  UPDATE piles_auto_assignment_insurer_runs i SET
+                    confirmed_pile_count=s.confirmed_piles, confirmed_claim_count=s.confirmed_claims,
+                    reconciliation_pending_pile_count=s.pending_piles,
+                    reconciliation_pending_claim_count=s.pending_claims,
+                    conflict_pile_count=s.conflicts, failed_pile_count=s.failures,
+                    updated_at=clock_timestamp()
+                  FROM (SELECT count(*) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')) confirmed_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status IN ('confirmed_visible','confirmed_reconciled')),0) confirmed_claims,
+                    count(*) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')) pending_piles,
+                    coalesce(sum(claim_count) FILTER (WHERE status IN ('reconciliation_pending','still_unassigned')),0) pending_claims,
+                    count(*) FILTER (WHERE status='conflict') conflicts,
+                    count(*) FILTER (WHERE status='failed') failures
+                    FROM piles_auto_assignment_attempts WHERE insurer_run_id=%s) s
+                  WHERE i.id=%s
+                """, (current["insurer_run_id"], current["insurer_run_id"]))
+            self.connection.commit()
+            return tracked_id
         except Exception:
             self.connection.rollback()
             raise

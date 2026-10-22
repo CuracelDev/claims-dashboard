@@ -1,5 +1,77 @@
 # Piles Auto-Assignment Runbook
 
+## Targeted historical ownership review
+
+The **Piles Incident Inspection** workflow supports `operation=historical-review`,
+an explicit `insurer`, and a bounded `hours` window (1–720; default 24).
+It sends the reviewed diagnostic revision to the production Python interpreter
+without installing files or restarting workers. The existing production browser
+scanner is used; retain the diagnostic revision and deployed dependency fingerprints in an audit.
+
+This mode opens a read-only database session, respects insurer/capacity locks,
+loads the latest unresolved attempt per tracking key, and scans all configured
+statuses/months/years. It fails instead of truncating if more than 100 candidates
+are found (the direct CLI supports an explicit limit up to 500). It never submits
+assignments, changes ledger records, or sends Slack messages.
+
+Reports include opaque attempt IDs and aggregate outcomes, not provider names,
+recipient names, raw pile identities, credentials, or portal response bodies.
+`expected_owner` means ownership was observed during this scan, not proof of who
+originally assigned it. `positively_unassigned` is evidence for operator review,
+not authorization for a retry. `missing` may mean movement outside the active
+status set; verify authoritative assignment history before drawing conclusions.
+Conflicting observations, ambiguous identity, incomplete/stale scans and changed
+attempts never qualify for confirmation. Natural/display identity matches are
+informational only; they cannot qualify a historical submission for confirmation.
+
+The `can_confirm` field is only a candidate assessment. The Actions workflow is
+read-only and cannot apply confirmations. Do not reset `manual_action_required`
+to pending to bypass review.
+Normal hourly scheduling stays enabled; if a probe reports `insurer_busy` or
+`capacity_busy`, retry after the active cycle finishes rather than forcing locks.
+
+### Exact historical confirmation (authorized host shell only)
+
+Deploy the reviewer, ledger, and scanner changes together before using this command.
+Verify the deployed scanner fingerprint too: it contains the duplicate-ownership
+and portal-identity conflict safeguard required for confirmation. From
+the authorized production host shell with its existing environment loaded:
+
+```sh
+"$PILES_ASSIGNMENT_PYTHON_BIN" scripts/review_piles_historical_assignments.py \
+  --insurer "INSURER" --hours 24 \
+  --confirm-attempt "EXACT_REVIEWED_ATTEMPT_ID" \
+  --confirmation CONFIRM_HISTORICAL_OWNERSHIP
+```
+
+Use only for an explicitly reviewed submitted `manual_action_required` attempt.
+This command does **not** assign claims. It rescans the portal and rechecks the
+exact observed context immediately before confirming ownership. Confirmation
+requires an exact stable portal identity, the intended recipient, complete/fresh
+evidence, unchanged record, production scope, and no newer attempt for that
+identity. Missing, unassigned, ambiguous, different-owner, pre-submission and
+superseded records remain blocked. No natural/display-only match can be applied.
+Conflicting duplicate scan observations and tracked-pile identity/key collisions
+also block confirmation rather than dropping evidence or overwriting another pile.
+
+The attempt confirmation, tracked-pile projection and evidence counters commit
+atomically. The original status/code/details are retained under
+`evidence_details.historical_review`. Original run dispositions and completion
+times remain unchanged; historical confirmation must not manufacture a new
+successful execution. No Slack summaries are sent. A second confirmation request
+is refused, not replayed. If the connection fails around commit, inspect the exact
+attempt before any further action; do not assume either commit or rollback.
+`attempts_confirmed` counts repaired attempts, not all updated database rows.
+If cleanup/reporting fails after a known successful commit, the CLI returns a
+nonzero exit with `confirmation_committed_followup_failed` and the confirmed
+attempt ID. Inspect that record; do not replay confirmation.
+
+Missing records need authoritative assignment history outside the active status
+set. A successful scan or absence from the table is never proof that their claims
+were assigned, completed, or eligible for retry. `positively_unassigned` findings
+require current eligibility/recipient review through the normal assignment path;
+this tool deliberately provides no assignment or bulk-retry option.
+
 ## Safety contract
 
 The runner must account for every expected month/year/status context and every planned pile. Assignment intent is persisted before a portal click. A submitted pile is retried only after a later positive observation proves it is still unassigned; disappearance remains `reconciliation_pending`. One insurer's failure does not stop another insurer.

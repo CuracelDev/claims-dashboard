@@ -69,11 +69,8 @@ class ScanAccumulator:
         del page_number
         page_rows = list(rows)
         fingerprint = tuple(_identity(row) for row in page_rows)
-        if fingerprint in self._seen_page_fingerprints:
-            return True
-        self._seen_page_fingerprints.add(fingerprint)
-        self._page_fingerprints.append(fingerprint)
-
+        # Validate every observation before repeated-page or row deduplication.
+        # A stable display identity does not imply stable ownership/portal ID.
         for row in page_rows:
             identity = _identity(row)
             tracking_key = identity[0]
@@ -84,8 +81,20 @@ class ScanAccumulator:
             if previous is not None and previous != identity:
                 self._collisions.add(tracking_key)
                 continue
+            previous_row = self._rows.get(tracking_key)
+            if previous_row is not None and any(
+                str(_value(previous_row, field, "") or "").strip()
+                != str(_value(row, field, "") or "").strip()
+                for field in ("assigned", "portal_identity_hash")
+            ):
+                self._collisions.add(tracking_key)
+                continue
             self._identities[tracking_key] = identity
             self._rows.setdefault(tracking_key, row)
+        if fingerprint in self._seen_page_fingerprints:
+            return True
+        self._seen_page_fingerprints.add(fingerprint)
+        self._page_fingerprints.append(fingerprint)
         return False
 
     def finish(self, *, explicit_empty: bool = False) -> ScanResult:
