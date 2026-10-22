@@ -31,6 +31,28 @@ def row(**changes):
 
 
 class HistoricalReviewTests(unittest.TestCase):
+    def test_real_scanner_blocks_conflicting_rows_before_classification(self):
+        from scripts.piles_auto_assignment.scanning import ScanAccumulator, TrackingKeyCollision
+        scan = ScanAccumulator()
+        scan.observe_page(1, [row(), row(assigned="Other")])
+        with self.assertRaises(TrackingKeyCollision):
+            self.classify(scan.finish().rows)
+
+    def test_postcommit_cleanup_error_reports_known_confirmation(self):
+        def completed_then_failed(args, api, committed):
+            committed["attempt_id"] = "attempt-1"
+            raise RuntimeError("private cleanup details")
+        with patch.object(review, "_audit", side_effect=completed_then_failed):
+            report = review.audit(None, None)
+        self.assertEqual(report["attempts_confirmed"], 1)
+        self.assertEqual(report["warning"], "confirmation_committed_followup_failed")
+        self.assertNotIn("private", str(report))
+
+    def test_precommit_error_is_not_reported_as_confirmation(self):
+        with patch.object(review, "_audit", side_effect=RuntimeError("failed")):
+            with self.assertRaises(RuntimeError):
+                review.audit(None, None)
+
     def classify(self, rows, candidate=None, **changes):
         return review.classify_attempt(candidate or attempt(), rows,
             match_rows=runner.rows_matching_attempt_identity,
@@ -99,6 +121,15 @@ class HistoricalReviewTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(SystemExit):
                 review.parse_args(args)
 
+    def test_confirmation_requires_exact_target_and_explicit_phrase(self):
+        for extra in (["--confirm-attempt", "attempt-1"],
+                      ["--confirmation", "CONFIRM_HISTORICAL_OWNERSHIP"]):
+            with self.assertRaises(SystemExit):
+                review.parse_args(["--insurer", "DEFMIS", *extra])
+        parsed = review.parse_args(["--insurer", "DEFMIS", "--confirm-attempt", "attempt-1",
+                                    "--confirmation", "CONFIRM_HISTORICAL_OWNERSHIP"])
+        self.assertEqual(parsed.confirm_attempt, "attempt-1")
+
     def test_context_coverage_requires_every_context_complete(self):
         from types import SimpleNamespace
         from scripts.piles_auto_assignment.domain import ContextStatus
@@ -165,7 +196,7 @@ class AuditBoundaryTests(unittest.TestCase):
         api, events = self.fixture()
         report = review.audit(review.parse_args(["--insurer", "DEFMIS"]), api)
         self.assertEqual(report["outcomes"], {"expected_owner": 1})
-        self.assertEqual(report["records_changed"], 0)
+        self.assertEqual(report["attempts_confirmed"], 0)
         self.assertEqual(report["assignments_submitted"], 0)
         self.assertEqual(events[-3:], ["capacity_released", "insurer_released", "closed"])
 

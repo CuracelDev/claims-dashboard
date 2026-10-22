@@ -51,6 +51,9 @@ load_attempts(Store(), 'Test', 24, 100)
           jsonb_build_object('portal_identity_hash', repeat('a',64)));`);
       const updated = (await client.query(sql, statement.params)).rows;
       assert.equal(updated.find(row => row.id === 'review').later_identity_attempt, true);
+      await client.query("update piles_auto_assignment_attempts set created_at=now()-interval '2 hours' where id='later-key'");
+      assert.equal((await client.query(sql, statement.params)).rows.find(row => row.id === 'review').later_identity_attempt,
+        true, 'an older attempt confirmed later must also prevent historical attribution');
     } finally { await client.query('rollback'); await client.end(); }
   });
 

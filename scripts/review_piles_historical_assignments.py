@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import redirect_stdout, redirect_stderr
 import json
 import os
+import re
 import uuid
 
 
@@ -14,11 +15,17 @@ def parse_args(argv=None):
     parser.add_argument("--insurer", required=True)
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--confirm-attempt")
+    parser.add_argument("--confirmation")
     args = parser.parse_args(argv)
     if not args.insurer.strip() or len(args.insurer) > 120:
         parser.error("insurer is required and must be at most 120 characters")
     if not 1 <= args.hours <= 720 or not 1 <= args.limit <= 500:
         parser.error("hours must be 1..720 and limit must be 1..500")
+    if args.confirm_attempt or args.confirmation:
+        if (not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", args.confirm_attempt or "")
+                or args.confirmation != "CONFIRM_HISTORICAL_OWNERSHIP"):
+            parser.error("confirmation requires one exact attempt and CONFIRM_HISTORICAL_OWNERSHIP")
     return args
 
 
@@ -51,7 +58,7 @@ def load_attempts(store, insurer, hours, limit):
                EXISTS (SELECT 1 FROM scoped b WHERE b.id <> a.id
                  AND a.evidence_details ->> 'portal_identity_hash' ~ '^[0-9a-f]{64}$'
                  AND b.evidence_details ->> 'portal_identity_hash' = a.evidence_details ->> 'portal_identity_hash'
-                 AND (b.created_at, b.id) > (a.created_at, a.id)) AS later_identity_attempt
+                 AND (b.created_at >= a.created_at OR b.updated_at >= a.updated_at)) AS later_identity_attempt
         FROM latest a
         WHERE status IN ('manual_action_required', 'failed', 'conflict', 'still_unassigned')
           AND created_at >= clock_timestamp() - (%s * interval '1 hour')
@@ -104,9 +111,61 @@ def classify_attempt(attempt, rows, *, match_rows, scan_started_at, observed_at,
     )}
 
 
+def confirm_target(args, api, store, browser, attempts, rows, started, *, committed=None):
+    target = next((a for a in attempts if a["id"] == args.confirm_attempt), None)
+    if target is None:
+        raise ValueError("historical_confirmation_blocked")
+    observed = datetime.now(timezone.utc)
+    decision = classify_attempt(target, rows, match_rows=api.rows_matching_attempt_identity,
+        scan_started_at=started, observed_at=observed, now=observed,
+        complete=complete_scan(browser.initial_scan_results))
+    if not decision["can_confirm"]:
+        raise ValueError("historical_confirmation_blocked")
+    matched, _ = api.rows_matching_attempt_identity(rows, target)
+    contexts = sorted({(r.filter_month, r.filter_year, r.status_bucket) for r in matched})
+    # Never apply a saved report: observe again in the same locked session.
+    recheck_started = datetime.now(timezone.utc)
+    fresh = browser.scan_selected_statuses(contexts, "All", only_unassigned=False)
+    now = datetime.now(timezone.utc)
+    fresh_decision = classify_attempt(target, fresh, match_rows=api.rows_matching_attempt_identity,
+        scan_started_at=recheck_started, observed_at=now, now=now,
+        complete=bool(getattr(browser, "_last_scan_result", None))
+                 and browser._last_scan_result.status.value == "complete")
+    if not fresh_decision["can_confirm"] or now - recheck_started > timedelta(seconds=60):
+        raise ValueError("historical_confirmation_blocked")
+    current = next((a for a in load_attempts(store, target["insurer_name"], args.hours, args.limit)
+                    if a["id"] == target["id"]), None)
+    if current != target:
+        raise ValueError("historical_confirmation_blocked")
+    matched, _ = api.rows_matching_attempt_identity(fresh, target)
+    store.conn.autocommit = False
+    try:
+        api.ExecutionLedger(store.conn).confirm_historical_attempt(
+            expected_attempt=target, observation=matched[0], observed_at=recheck_started)
+        if committed is not None:
+            committed["attempt_id"] = target["id"]
+    finally:
+        store.conn.rollback()
+        store.conn.autocommit = True
+
+
 def audit(args, api):
+    committed = {}
+    try:
+        return _audit(args, api, committed)
+    except Exception:
+        if not committed:
+            raise
+        # Cleanup/reporting can fail after COMMIT. Do not invite a duplicate
+        # repair by misreporting that known committed confirmation as failed.
+        return {"mode": "historical_confirmation", "attempts_confirmed": 1,
+                "attempt_id": committed["attempt_id"], "assignments_submitted": 0,
+                "warning": "confirmation_committed_followup_failed"}
+
+
+def _audit(args, api, committed):
     api.configure_portal_environment("production")
-    store = api.DataStore(read_only=True)
+    store = api.DataStore(read_only=not bool(args.confirm_attempt))
     slot = -1
     locked = False
     try:
@@ -127,6 +186,9 @@ def audit(args, api):
         results = []
         contexts = {}
         rows = []
+        attempts_confirmed = 0
+        if args.confirm_attempt and not attempts:
+            raise ValueError("historical_confirmation_blocked")
         if attempts:
             with api.CuracelPilesRunner(visible=False, slow_mo=0) as browser:
                 browser.safe_diagnostics = True
@@ -138,11 +200,18 @@ def audit(args, api):
                 browser.open_piles()
                 rows = browser.scan_all_rows(["All"], "All")
                 contexts = browser.initial_scan_results
+                if args.confirm_attempt:
+                    confirm_target(args, api, store, browser, attempts, rows, started, committed=committed)
+                    attempts_confirmed = 1
             observed = datetime.now(timezone.utc)
             # Re-read after the browser scan. Even an operator bypassing the
             # insurer lock cannot silently change a reviewed attempt snapshot.
             current = {a["id"]: a for a in load_attempts(store, insurer, args.hours, args.limit)}
             for previous in attempts:
+                if attempts_confirmed and previous["id"] == args.confirm_attempt:
+                    results.append({"attempt_id": previous["id"], "status": "confirmed_reconciled",
+                                    "outcome": "confirmed_reconciled", "identity_method": "portal_identity_hash", "can_confirm": False})
+                    continue
                 candidate = current.get(previous["id"])
                 if candidate is None or candidate != previous:
                     results.append({"attempt_id": previous["id"], "status": previous["status"],
@@ -152,13 +221,13 @@ def audit(args, api):
                     match_rows=api.rows_matching_attempt_identity,
                     scan_started_at=started, observed_at=observed,
                     now=datetime.now(timezone.utc), complete=complete_scan(contexts)))
-        return {"mode": "read_only_historical_review", "insurer": insurer,
+        return {"mode": "historical_confirmation" if args.confirm_attempt else "read_only_historical_review", "insurer": insurer,
                 "generated_at": datetime.now(timezone.utc).isoformat(), "window_hours": args.hours,
                 "scan_complete": complete_scan(contexts) if attempts else None,
                 "candidate_count": len(attempts), "discovered_piles": len(rows),
                 "unassigned_piles": sum(not str(row.assigned or "").strip() for row in rows),
                 "outcomes": dict(Counter(r["outcome"] for r in results)), "attempts": results,
-                "assignments_submitted": 0, "records_changed": 0}
+                "assignments_submitted": 0, "attempts_confirmed": attempts_confirmed}
     finally:
         try:
             if slot >= 0:
@@ -183,11 +252,13 @@ def main():
                 import piles_auto_assignment_runner as api
             report = audit(args, api)
     except Exception as error:
-        allowed = {"candidate_limit_exceeded", "postgres_required", "insurer_inactive", "insurer_busy", "capacity_busy"}
+        allowed = {"candidate_limit_exceeded", "postgres_required", "insurer_inactive", "insurer_busy", "capacity_busy", "historical_confirmation_blocked"}
         code = str(error) if isinstance(error, ValueError) and str(error) in allowed else "historical_review_failed"
-        print(json.dumps({"mode": "read_only_historical_review", "error": code}))
+        print(json.dumps({"mode": "historical_confirmation" if args.confirm_attempt else "read_only_historical_review", "error": code}))
         return 1
     print(json.dumps(report, indent=2))
+    if report.get("warning"):
+        return 1
     return 0 if not report["candidate_count"] or report["scan_complete"] else 1
 
 
