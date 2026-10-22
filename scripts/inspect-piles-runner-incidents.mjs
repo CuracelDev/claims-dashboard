@@ -22,7 +22,7 @@ const ATTEMPT_STATUSES = new Set(['planned', 'selected', 'submitted', 'confirmed
   'confirmed_reconciled', 'reconciliation_pending', 'still_unassigned',
   'manual_action_required', 'conflict', 'failed']);
 const FOLLOW_UP_STATES = new Set(['later_same_recipient_confirmation',
-  'later_different_recipient_confirmation', 'no_later_confirmation']);
+  'later_different_recipient_confirmation', 'later_mixed_recipient_confirmations', 'no_later_confirmation']);
 
 const SAFE_FIELDS = Object.freeze({
   parents: [
@@ -117,6 +117,9 @@ export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
       ), follow_up as (
         select a.id, a.insurer_name, a.status, a.submitted_at, a.created_at,
           case
+            when bool_or(c.confirmed_at > a.updated_at and c.intended_portal_assignee = a.intended_portal_assignee)
+             and bool_or(c.confirmed_at > a.updated_at and c.intended_portal_assignee <> a.intended_portal_assignee)
+              then 'later_mixed_recipient_confirmations'
             when bool_or(c.confirmed_at > a.updated_at and c.intended_portal_assignee = a.intended_portal_assignee)
               then 'later_same_recipient_confirmation'
             when bool_or(c.confirmed_at > a.updated_at)

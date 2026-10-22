@@ -34,6 +34,11 @@ test('unresolved follow-up distinguishes later stable-identity evidence without 
       assert.equal(report.unresolved_follow_up.find(row => row.follow_up === 'later_different_recipient_confirmation').pile_count, 1);
       assert.equal(report.unresolved_follow_up.find(row => row.follow_up === 'no_later_confirmation').pile_count, 1);
       assert.doesNotMatch(JSON.stringify(report), /private-user|different-user|hash-a|old-a/);
+      await client.query(`insert into piles_auto_assignment_attempts values
+        ('mixed','run','Test','mixed-a','confirmed_visible','other-user','{"portal_identity_hash":"hash-a"}',now(),now(),now());`);
+      const mixed = (await client.query(statement)).rows;
+      assert.equal(mixed.find(row => row.follow_up === 'later_mixed_recipient_confirmations')?.pile_count, 1,
+        'a same-recipient confirmation must not hide later conflicting recipient evidence');
     } finally { await client.query('rollback'); await client.end(); }
   });
 
