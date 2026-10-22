@@ -1,5 +1,34 @@
 # Piles Auto-Assignment Runbook
 
+## Targeted historical ownership review
+
+The **Piles Incident Inspection** workflow supports `operation=historical-review`,
+an explicit `insurer`, and a bounded `hours` window (1–720; default 24).
+It sends the reviewed diagnostic revision to the production Python interpreter
+without installing files or restarting workers. The existing production browser
+scanner is used; retain both the diagnostic revision and deployed revision in an audit.
+
+This mode opens a read-only database session, respects insurer/capacity locks,
+loads the latest unresolved attempt per tracking key, and scans all configured
+statuses/months/years. It fails instead of truncating if more than 100 candidates
+are found (the direct CLI supports an explicit limit up to 500). It never submits
+assignments, changes ledger records, or sends Slack messages.
+
+Reports include opaque attempt IDs and aggregate outcomes, not provider names,
+recipient names, raw pile identities, credentials, or portal response bodies.
+`expected_owner` means ownership was observed during this scan, not proof of who
+originally assigned it. `positively_unassigned` is evidence for operator review,
+not authorization for a retry. `missing` may mean movement outside the active
+status set; verify authoritative assignment history before drawing conclusions.
+Conflicting observations, ambiguous identity, incomplete/stale scans and changed
+attempts never qualify for confirmation. Natural/display identity matches are
+informational only; they cannot qualify a historical submission for confirmation.
+
+The `can_confirm` field is only a candidate assessment. This diagnostic has no
+apply mode. Do not reset `manual_action_required` to pending to bypass review.
+Normal hourly scheduling stays enabled; if a probe reports `insurer_busy` or
+`capacity_busy`, retry after the active cycle finishes rather than forcing locks.
+
 ## Safety contract
 
 The runner must account for every expected month/year/status context and every planned pile. Assignment intent is persisted before a portal click. A submitted pile is retried only after a later positive observation proves it is still unassigned; disappearance remains `reconciliation_pending`. One insurer's failure does not stop another insurer.

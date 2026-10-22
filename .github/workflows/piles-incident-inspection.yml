@@ -11,6 +11,7 @@ on:
         options:
           - provenance
           - incident
+          - historical-review
       hours:
         description: Inspection window in hours (provenance supports up to 720)
         required: true
@@ -37,6 +38,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare read-only historical ownership reviewer
+        if: inputs.operation == 'historical-review'
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const source = readFileSync('scripts/review_piles_historical_assignments.py');
+          appendFileSync(process.env.GITHUB_ENV, `HISTORICAL_SCRIPT_B64=${source.toString('base64')}\n`);
+          JS
+          echo "Reviewer revision: $GITHUB_SHA"
       - name: Prepare versioned read-only inspector
         if: inputs.operation == 'incident'
         run: |
@@ -58,7 +68,8 @@ jobs:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: INSPECTION_OPERATION,INCIDENT_HOURS,INCIDENT_RUN_ID,PROVENANCE_INSURER,INCIDENT_SCRIPT_B64
+          command_timeout: 30m
+          envs: INSPECTION_OPERATION,INCIDENT_HOURS,INCIDENT_RUN_ID,PROVENANCE_INSURER,INCIDENT_SCRIPT_B64,HISTORICAL_SCRIPT_B64
           script: |
             set -eu
             cd ~/claims-dashboard
@@ -66,7 +77,13 @@ jobs:
             . ./.env
             set +a
 
-            if [ "$INSPECTION_OPERATION" = "provenance" ]; then
+            if [ "$INSPECTION_OPERATION" = "historical-review" ]; then
+              test -n "$PROVENANCE_INSURER"
+              printf 'Deployed scanner revision: '
+              git rev-parse HEAD
+              printf '%s' "$HISTORICAL_SCRIPT_B64" | base64 --decode | "$PILES_ASSIGNMENT_PYTHON_BIN" - \
+                --insurer "$PROVENANCE_INSURER" --hours "$INCIDENT_HOURS"
+            elif [ "$INSPECTION_OPERATION" = "provenance" ]; then
               if [ -n "$PROVENANCE_INSURER" ]; then
                 node scripts/audit-piles-assignment-provenance.mjs \
                   --hours "$INCIDENT_HOURS" \
