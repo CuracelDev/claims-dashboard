@@ -5,6 +5,43 @@ import pg from 'pg';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
+test('unresolved follow-up distinguishes later stable-identity evidence without exposing identities',
+  { skip: !process.env.PILES_TEST_DATABASE_URL }, async () => {
+    const client = new pg.Client({ connectionString: process.env.PILES_TEST_DATABASE_URL });
+    await client.connect();
+    try {
+      await client.query(`begin;
+        create temporary table piles_auto_assignment_attempts (
+          id text, insurer_run_id text, insurer_name text, tracking_key text, status text,
+          intended_portal_assignee text, evidence_details jsonb, submitted_at timestamptz,
+          created_at timestamptz, updated_at timestamptz);
+        create temporary table piles_auto_assignment_insurer_runs (id text, runner_run_id text);
+        insert into piles_auto_assignment_insurer_runs values ('run', 'parent');
+        insert into piles_auto_assignment_attempts values
+        ('a','run','Test','old-a','failed','private-user','{"portal_identity_hash":"hash-a"}',null,now()-interval '2 days',now()-interval '2 days'),
+        ('b','run','Test','new-a','confirmed_visible','private-user','{"portal_identity_hash":"hash-a"}',now(),now(),now()),
+        ('c','run','Test','old-b','manual_action_required','private-user','{"portal_identity_hash":"hash-b"}',now(),now()-interval '2 hours',now()-interval '2 hours'),
+        ('d','run','Test','new-b','confirmed_reconciled','different-user','{"portal_identity_hash":"hash-b"}',now(),now(),now()),
+        ('e','run','Test','unknown','conflict','private-user','{}',now(),now(),now()),
+        ('f','run','Other','irrelevant','confirmed_visible','private-user','{"portal_identity_hash":"hash-b"}',now(),now(),now());`);
+      const statement = buildIncidentQueries({ hours: 24, runId: 'parent', workItemsAvailable: false }).unresolved_follow_up;
+      assert.ok(statement, 'follow-up diagnostic query is required');
+      const { rows } = await client.query(statement);
+      const report = buildIncidentReport({ hours: 24, runId: 'parent', workItemsAvailable: false,
+        sections: { unresolved_follow_up: rows } });
+      assert.equal(report.unresolved_follow_up.length, 3);
+      assert.equal(report.unresolved_follow_up.find(row => row.follow_up === 'later_same_recipient_confirmation').pile_count, 1);
+      assert.equal(report.unresolved_follow_up.find(row => row.follow_up === 'later_different_recipient_confirmation').pile_count, 1);
+      assert.equal(report.unresolved_follow_up.find(row => row.follow_up === 'no_later_confirmation').pile_count, 1);
+      assert.doesNotMatch(JSON.stringify(report), /private-user|different-user|hash-a|old-a/);
+      await client.query(`insert into piles_auto_assignment_attempts values
+        ('mixed','run','Test','mixed-a','confirmed_visible','other-user','{"portal_identity_hash":"hash-a"}',now(),now(),now());`);
+      const mixed = (await client.query(statement)).rows;
+      assert.equal(mixed.find(row => row.follow_up === 'later_mixed_recipient_confirmations')?.pile_count, 1,
+        'a same-recipient confirmation must not hide later conflicting recipient evidence');
+    } finally { await client.query('rollback'); await client.end(); }
+  });
+
 test('stdin inspector transport validates arguments and exits safely without touching a database', () => {
   const source = readFileSync(new URL('./inspect-piles-runner-incidents.mjs', import.meta.url), 'utf8')
     + '\nawait main().catch(() => { console.error("Incident inspection failed safely."); process.exitCode = 1; });\n';
