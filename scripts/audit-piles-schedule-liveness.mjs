@@ -15,9 +15,11 @@ export function transitionScheduleLiveness(previousState, result) {
   return {
     notify: previousKey !== incidentKey && (!result.healthy || previousHealthy === false),
     recovered: result.healthy && previousHealthy === false,
+    operational_recovered: result.operational_healthy === true && previousState?.operational_healthy === false,
     state: {
-      schema_version: 1,
+      schema_version: 2,
       healthy: result.healthy,
+      operational_healthy: result.operational_healthy,
       incident_key: incidentKey,
       code: result.code,
       latest_id: result.latest_id || null,
@@ -71,20 +73,22 @@ export async function readScheduleSnapshot(pool) {
   const issues = await pool.query(`
     with latest_attempts as (
       select distinct on (a.insurer_name, a.tracking_key)
-        a.insurer_name, a.status, a.evidence_code, a.updated_at, i.status as run_status
+        a.insurer_name, a.status, a.evidence_code, a.created_at, a.updated_at, i.status as run_status
       from piles_auto_assignment_attempts a
       join piles_auto_assignment_insurer_runs i on i.id = a.insurer_run_id
       order by a.insurer_name, a.tracking_key, a.created_at desc, a.updated_at desc, a.id desc
     )
-    select insurer_name, status, count(*)::int as pile_count, min(updated_at) as oldest_at
+    select insurer_name, status,
+      case when created_at >= now() - interval '24 hours' then 'recent' else 'historical' end as period,
+      count(*)::int as pile_count, min(created_at) as oldest_at
     from latest_attempts
     where (status in ('failed', 'manual_action_required', 'conflict', 'still_unassigned')
            and coalesce(evidence_code, '') <> 'planned_row_observed_assigned_at_final_scan')
        or (status in ('selected', 'submitted', 'reconciliation_pending', 'planned')
            and (run_status not in ('queued', 'started', 'running')
                 or updated_at < now() - interval '30 minutes'))
-    group by insurer_name, status
-    order by insurer_name, status
+    group by insurer_name, status, 3
+    order by insurer_name, status, 3
   `);
   return { latest, consecutive_failures: consecutiveFailures, assignment_issues: issues.rows };
 }
@@ -123,16 +127,25 @@ function writeState(path, state) {
 async function notifyIfNeeded(transition, result) {
   const webhook = process.env.SLACK_WEBHOOK_HEALTHOPS;
   if (!transition.notify || !webhook) return;
-  const text = transition.recovered
-    ? `✅ Piles recorded health checks recovered: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`
-    : `🚨 Piles health requires attention: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`
-      + (result.assignment_issues?.length ? '\n' + result.assignment_issues.map(issue =>
-        `${issue.insurer_name}: ${issue.pile_count} ${issue.status} (oldest evidence ${issue.oldest_at})`).join('\n') : '');
+  const text = formatHealthNotification(transition, result);
   const response = await fetch(webhook, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!response.ok) throw new Error('Piles liveness notification failed');
 }
+
+export function formatHealthNotification(transition, result) {
+  const headline = transition.recovered
+    ? `✅ Piles recorded health checks recovered: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`
+    : result.operational_healthy
+      ? `⚠️ Piles operations ${transition.operational_recovered ? 'recovered' : 'healthy'}; historical assignment reconciliation remains open. This is not an assignment all-clear.`
+      : `🚨 Piles operational health requires attention: ${result.code}. Latest scheduled run ${result.latest_id || 'unavailable'}.`;
+  return headline + (result.assignment_issues?.length ? '\n' + result.assignment_issues.map(issue =>
+    `${issue.insurer_name}: ${issue.pile_count} ${issue.status} (${issue.period}; oldest attempt ${issue.oldest_at})`).join('\n') : '');
+}
+
+export function healthExitCode(result) { return result.operational_healthy === true ? 0 : 20; }
 
 export async function deliverScheduleTransition(
   transition,
@@ -151,6 +164,7 @@ async function main() {
   try {
     await pool.query('BEGIN READ ONLY');
     transactionOpen = true;
+    await pool.query("SET LOCAL statement_timeout = '60s'");
     const snapshot = await readScheduleSnapshot(pool);
     await pool.query('ROLLBACK');
     transactionOpen = false;
@@ -160,7 +174,7 @@ async function main() {
       persist: (state) => writeState(options.stateFile, state),
     });
     console.log(JSON.stringify({ ...result, notify: transition.notify, recovered: transition.recovered }));
-    process.exitCode = result.healthy ? 0 : 20;
+    process.exitCode = healthExitCode(result);
   } finally {
     if (transactionOpen) {
       try { await pool.query('ROLLBACK'); } catch {}
