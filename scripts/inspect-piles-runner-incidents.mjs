@@ -21,6 +21,8 @@ const ATTEMPT_REASONS = new Set([
 const ATTEMPT_STATUSES = new Set(['planned', 'selected', 'submitted', 'confirmed_visible',
   'confirmed_reconciled', 'reconciliation_pending', 'still_unassigned',
   'manual_action_required', 'conflict', 'failed']);
+const FOLLOW_UP_STATES = new Set(['later_same_recipient_confirmation',
+  'later_different_recipient_confirmation', 'no_later_confirmation']);
 
 const SAFE_FIELDS = Object.freeze({
   parents: [
@@ -53,6 +55,8 @@ const SAFE_FIELDS = Object.freeze({
   attempt_states: ['insurer_run_id', 'insurer_name', 'status', 'attempt_count', 'claim_count'],
   attempt_reasons: ['insurer_name', 'status', 'evidence_code', 'submission_state',
     'attempt_count', 'unique_pile_count', 'claim_count'],
+  unresolved_follow_up: ['insurer_name', 'status', 'period', 'submission_state',
+    'follow_up', 'pile_count', 'oldest_at'],
   pending_requests: [
     'id', 'insurer_name', 'requested_runner_run_id', 'status',
     'claimed_by_runner_run_id', 'requested_at', 'claimed_at', 'created_at', 'updated_at',
@@ -98,6 +102,41 @@ function query(text, hours, runId) {
 
 export function buildIncidentQueries({ hours, runId, workItemsAvailable }) {
   const queries = {
+    unresolved_follow_up: query(`
+      with latest as (
+        select distinct on (insurer_name, tracking_key) *
+        from piles_auto_assignment_attempts
+        order by insurer_name, tracking_key, created_at desc, updated_at desc, id desc
+      ), confirmations as (
+        select insurer_name, evidence_details ->> 'portal_identity_hash' as identity,
+               intended_portal_assignee, max(updated_at) as confirmed_at
+        from piles_auto_assignment_attempts
+        where status in ('confirmed_visible', 'confirmed_reconciled')
+          and nullif(btrim(evidence_details ->> 'portal_identity_hash'), '') is not null
+        group by insurer_name, 2, intended_portal_assignee
+      ), follow_up as (
+        select a.id, a.insurer_name, a.status, a.submitted_at, a.created_at,
+          case
+            when bool_or(c.confirmed_at > a.updated_at and c.intended_portal_assignee = a.intended_portal_assignee)
+              then 'later_same_recipient_confirmation'
+            when bool_or(c.confirmed_at > a.updated_at)
+              then 'later_different_recipient_confirmation'
+            else 'no_later_confirmation' end as follow_up
+        from latest a
+        join piles_auto_assignment_insurer_runs i on i.id = a.insurer_run_id
+        left join confirmations c on c.insurer_name = a.insurer_name
+          and c.identity = nullif(btrim(a.evidence_details ->> 'portal_identity_hash'), '')
+        where a.status in ('failed', 'manual_action_required', 'conflict', 'still_unassigned')
+          and ($2::text is null or i.runner_run_id = $2::text)
+        group by a.id, a.insurer_name, a.status, a.submitted_at, a.created_at
+      )
+      select insurer_name, status,
+        case when created_at >= now() - ($1::int * interval '1 hour') then 'recent' else 'historical' end as period,
+        case when submitted_at is null then 'not_recorded' else 'recorded' end as submission_state,
+        follow_up, count(*)::int as pile_count, min(created_at) as oldest_at
+      from follow_up group by insurer_name, status, 3, 4, follow_up
+      order by insurer_name, status, 3, 4, follow_up
+    `, hours, runId),
     parents: query(`
       select id, insurer_name, run_scope, backend, run_source, mode, status,
              started_at, finished_at, duration_ms, created_at, updated_at
@@ -250,6 +289,14 @@ function projectRows(section, rows) {
         projected[key] = Number.isSafeInteger(value) && value >= 0 ? value : null;
       }
     }
+    if (section === 'unresolved_follow_up') {
+      projected.status = ATTEMPT_STATUSES.has(projected.status) ? projected.status : 'other';
+      projected.follow_up = FOLLOW_UP_STATES.has(projected.follow_up) ? projected.follow_up : 'unknown';
+      projected.period = ['recent', 'historical'].includes(projected.period) ? projected.period : 'unknown';
+      projected.submission_state = ['recorded', 'not_recorded'].includes(projected.submission_state)
+        ? projected.submission_state : 'unknown';
+      projected.pile_count = Number.isSafeInteger(projected.pile_count) && projected.pile_count >= 0 ? projected.pile_count : null;
+    }
     return projected;
   });
 }
@@ -281,7 +328,7 @@ export function buildIncidentReport({ hours, runId, workItemsAvailable, sections
     selected_run_id: runId,
     work_items_available: workItemsAvailable,
   };
-  for (const section of ['parents', 'insurers', 'contexts', 'batches', 'attempt_states', 'attempt_reasons', 'pending_requests']) {
+  for (const section of ['parents', 'insurers', 'contexts', 'batches', 'attempt_states', 'attempt_reasons', 'unresolved_follow_up', 'pending_requests']) {
     report[section] = projectRows(section, sections[section] ?? []);
   }
   if (workItemsAvailable) report.work_items = projectRows('work_items', sections.work_items ?? []);
@@ -305,6 +352,7 @@ export function poolConfigForDatabaseUrl(databaseUrl, environment = process.env)
 export async function inspectIncidents(client, options) {
   try {
     await client.query('BEGIN READ ONLY');
+    await client.query("SET LOCAL statement_timeout = '60s'");
     const availability = await client.query(
       'select to_regclass($1::text) is not null as work_items_available',
       [WORK_ITEMS_TABLE],
