@@ -22,6 +22,20 @@ def row(key, *, provider="Provider", claims=5, assigned=""):
 
 
 class ScanAccumulatorTests(unittest.TestCase):
+    def test_conflicting_ownership_or_portal_identity_cannot_be_deduplicated(self):
+        for changes in ({"assigned": "Other"}, {"assigned": ""},
+                        {"portal_identity_hash": "b" * 64}, {"portal_identity_hash": ""}):
+            for same_page in (True, False):
+                with self.subTest(changes=changes, same_page=same_page):
+                    first = {**row("same", assigned="Bot"), "portal_identity_hash": "a" * 64}
+                    second = {**first, **changes}
+                    scan = ScanAccumulator()
+                    scan.observe_page(1, [first, second] if same_page else [first])
+                    if not same_page:
+                        scan.observe_page(2, [second])
+                    with self.assertRaises(TrackingKeyCollision):
+                        scan.finish()
+
     def test_late_contexts_include_empty_and_assigned_only_and_preserve_years(self):
         self.assertTrue(hasattr(scanning, "late_arrival_contexts"), "Missing settled-context selection")
         empty = ScanAccumulator().finish(explicit_empty=True)
