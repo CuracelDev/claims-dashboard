@@ -79,8 +79,8 @@ jobs:
 
             if [ "$INSPECTION_OPERATION" = "historical-review" ]; then
               test -n "$PROVENANCE_INSURER"
-              printf 'Deployed scanner revision: '
-              git rev-parse HEAD
+              # Deployments are rsync artifacts and need not contain .git.
+              "$PILES_ASSIGNMENT_PYTHON_BIN" -c 'import hashlib,pathlib; files=["scripts/piles_auto_assignment_runner.py", "scripts/piles_auto_assignment/store.py", "scripts/piles_auto_assignment/evidence.py"]; [print("Deployed dependency sha256:", name, hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()) for name in files]'
               printf '%s' "$HISTORICAL_SCRIPT_B64" | base64 --decode | "$PILES_ASSIGNMENT_PYTHON_BIN" - \
                 --insurer "$PROVENANCE_INSURER" --hours "$INCIDENT_HOURS"
             elif [ "$INSPECTION_OPERATION" = "provenance" ]; then
