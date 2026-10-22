@@ -5,6 +5,17 @@ import pg from 'pg';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
+test('historical diagnostic fingerprints include the deployed scan safety dependency', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/piles-incident-inspection.yml', import.meta.url), 'utf8');
+  const command = workflow.match(/-c '(import hashlib[^\n]+)'/);
+  assert.ok(command, 'fingerprint command must be available for execution');
+  const result = spawnSync('python3', ['-c', command[1]], {
+    cwd: new URL('../', import.meta.url), encoding: 'utf8', timeout: 10000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Deployed dependency sha256: scripts\/piles_auto_assignment\/scanning\.py [0-9a-f]{64}/);
+});
+
 test('historical review query excludes superseded failures and test-portal evidence',
   { skip: !process.env.PILES_TEST_DATABASE_URL }, async () => {
     // Execute the actual Python query builder, not a copied SQL fixture.

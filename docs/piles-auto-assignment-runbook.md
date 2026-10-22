@@ -32,7 +32,9 @@ Normal hourly scheduling stays enabled; if a probe reports `insurer_busy` or
 
 ### Exact historical confirmation (authorized host shell only)
 
-Deploy the reviewer and ledger changes together before using this command. From
+Deploy the reviewer, ledger, and scanner changes together before using this command.
+Verify the deployed scanner fingerprint too: it contains the duplicate-ownership
+and portal-identity conflict safeguard required for confirmation. From
 the authorized production host shell with its existing environment loaded:
 
 ```sh
