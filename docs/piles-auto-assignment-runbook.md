@@ -1,8 +1,29 @@
 # Piles Auto-Assignment Runbook
 
+## GitHub Actions maintenance menu
+
+The repository keeps three workflows: **Deploy to GCP (PM2)**, **Piles Regression Tests**, and **Piles Maintenance**. Maintenance is manual-only: it has no scheduled or branch-push trigger and sends no scheduled health notifications. Production assignment scheduling is still managed by the existing host cron, not this menu. Historical executions of deleted workflows may remain visible in GitHub.
+
+Use **Actions → Piles Maintenance → Run workflow**. Select the reviewed `main` revision. Leave unrelated inputs at their defaults: `hours=24`, `scope=one-insurer`, `target_kind=none`, and other fields blank. Invalid or irrelevant inputs fail validation before SSH.
+
+| Operation | Inputs beyond defaults | Effect |
+| --- | --- | --- |
+| `incident` (default) | Optional `hours`; optional `target_kind=parent` plus `target_id` | Read-only runner evidence |
+| `provenance` | Optional `insurer` and `hours` | Read-only assignment provenance |
+| `historical-review` | Required `insurer`; optional `hours` | Read-only historical ownership scan |
+| `readiness` | `insurer` for `scope=one-insurer`, or `scope=all-active` with blank insurer | Read-only runtime/database/portal checks |
+| `runtime-probe` | None | Bounded runtime and scheduling diagnostics |
+| `runtime-repair` | `confirmation=REPAIR PILES RUNTIME` | Rebuild/verify runtime; protected production environment; refuses an active runner |
+| `stale-inspect` | Optional `work`, `insurer-run`, or `parent` target kind and ID | Read-only stale-run inspection |
+| `stale-recover` | Exact `work`, `insurer-run`, or `parent` target; `confirmation=RECOVER_STALE_RUNS`; `claim_token` only for work | Apply guarded stale-run recovery |
+| `legacy-audit` | Optional `legacy-request` target kind and ID | Read-only legacy queue audit |
+| `legacy-apply` | Exact `legacy-request` target and `confirmation=CANCEL_OBSOLETE_LEGACY_REQUESTS` | Cancel the targeted obsolete legacy request |
+
+Inspection lookback accepts 1–720 hours. All jobs share the production-host concurrency group and do not cancel an in-progress maintenance operation. No menu option directly executes assignments. Review diagnostic evidence before selecting a mutating operation; consolidation does not authorize automatic recovery or historical reconciliation.
+
 ## Targeted historical ownership review
 
-The **Piles Incident Inspection** workflow supports `operation=historical-review`,
+The **Piles Maintenance** workflow supports `operation=historical-review`,
 an explicit `insurer`, and a bounded `hours` window (1–720; default 24).
 It sends the reviewed diagnostic revision to the production Python interpreter
 without installing files or restarting workers. The existing production browser
@@ -82,7 +103,7 @@ The runner must account for every expected month/year/status context and every p
 
 Piles must run from `PILES_RUNTIME_ROOT/current/bin/python`; do not install packages into `current` or point the service back to a mutable `.venv`. Each deployment computes a fingerprint from the pinned requirements, Python major/minor version, runtime-builder version, and browser configuration. `scripts/prepare-piles-production-runtime.sh` builds a unique immutable generation under `PILES_RUNTIME_ROOT/generations`, verifies imports plus an actual Chromium launch, and only then atomically replaces the `current` symlink. The former target is retained as `previous`. A failed or interrupted build does not change either pointer.
 
-Every scheduled launch runs the standard-library health checker before importing runner dependencies. `PILES_RUNTIME_RECOVERY_MODE=audit` blocks the launch when the runtime is unhealthy. `repair` takes the shared builder lock, builds or reuses a verified generation, rechecks it, and only then launches the runner. Schedule-time repair never installs operating-system packages; those are permitted only during deployment or the approval-gated **Piles Runtime Repair** workflow. Neither health checking nor repair invokes the assignment runner or accepts `--execute`.
+Every scheduled launch runs the standard-library health checker before importing runner dependencies. `PILES_RUNTIME_RECOVERY_MODE=audit` blocks the launch when the runtime is unhealthy. `repair` takes the shared builder lock, builds or reuses a verified generation, rechecks it, and only then launches the runner. Schedule-time repair never installs operating-system packages; those are permitted only during deployment or the approval-gated **Piles Maintenance** (`operation=runtime-repair`) workflow. Neither health checking nor repair invokes the assignment runner or accepts `--execute`.
 
 Use these non-assignment checks from the authorized production host without enabling shell tracing:
 
@@ -114,13 +135,13 @@ The sanitized result must be `healthy`; a Python executable existing on disk is 
    "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py --all-active --portal-environment production --month All --year All --run-source readiness --read-only
    ```
 
-   On the production host, these probes can also be run from the **Piles Production Readiness** GitHub Actions workflow. It always uses `--read-only` and cannot click **Assign Claims**.
+   On the production host, these probes can also be run from the **Piles Maintenance** (`operation=readiness`) GitHub Actions workflow. It always uses `--read-only` and cannot click **Assign Claims**.
 
 7. Compare expected contexts with complete/empty contexts and inspect shadow disagreement aggregates. Resolve any failed/missing context, pending provenance evidence, or ambiguity before authorizing assignment.
 8. Set `PILES_ASSIGNMENT_PROVENANCE_V2=enabled`, rerun both readiness and provenance audits, and require zero ambiguous repair candidates. Exact historical repair remains separately approved and one-attempt-at-a-time.
 9. A live one-insurer canary requires separate explicit approval and `ALLOW_PRODUCTION_ASSIGNMENTS=true`. Remove that variable after the canary. Observe at least two complete scheduled all-insurer cycles after provenance cutover and reconcile ledger, mirror, and notification totals.
 
-For runtime-only recovery after deployment, use **Piles Runtime Repair**, approve its protected `production` environment, and enter exactly `REPAIR PILES RUNTIME`. It refuses to start while a runner process is visible, performs an atomic off-side build and full verification, and never runs a portal probe or assignment. After repair, run **Piles Production Readiness** first for one insurer and then all active insurers; both use full runtime verification and `--read-only`. Restore or retain the normal cron only after those gates pass. Observe the next scheduled parent, all owned insurer outcomes, context settlement, and confirmed/reconciliation totals.
+For runtime-only recovery after deployment, use **Piles Maintenance** (`operation=runtime-repair`), approve its protected `production` environment, and enter exactly `REPAIR PILES RUNTIME`. It refuses to start while a runner process is visible, performs an atomic off-side build and full verification, and never runs a portal probe or assignment. After repair, run **Piles Maintenance** (`operation=readiness`) first for one insurer and then all active insurers; both use full runtime verification and `--read-only`. Restore or retain the normal cron only after those gates pass. Observe the next scheduled parent, all owned insurer outcomes, context settlement, and confirmed/reconciliation totals.
 
 The additive schema must be applied and audited before deploying code that consumes work-item leases or `cancelled_legacy`, including the recovery scripts. Leave these additions in place on rollback. The fresh migration script tolerates a source database that does not yet have those additive tables; it is not an incident recovery tool.
 
@@ -240,7 +261,7 @@ The incident inspector additionally reports `unresolved_follow_up`: latest unres
    node scripts/inspect-piles-runner-incidents.mjs --hours 24 --run-id 123e4567-e89b-42d3-a456-426614174000
    ```
 
-   The **Piles Incident Inspection** GitHub Actions workflow defaults to the read-only provenance audit and can select the existing incident report. It accepts bounded hours plus only the filter relevant to the selected operation. Both inspectors start a read-only database transaction, print only bounded operational fields, and roll the transaction back. `work_items_available=false` is expected before the dispatcher work-item schema is deployed; use `pending_requests` for the legacy queue view in that case.
+   The **Piles Maintenance** GitHub Actions workflow defaults to the read-only incident report; select `operation=provenance` for the provenance audit. For incident filtering, set `target_kind=parent` and `target_id` to the parent run ID. It accepts bounded hours plus only the filter relevant to the selected operation. Both inspectors start a read-only database transaction, print only bounded operational fields, and roll the transaction back. `work_items_available=false` is expected before the dispatcher work-item schema is deployed; use `pending_requests` for the legacy queue view in that case.
 3. For filter or scan failures, use a read-only visible-browser probe; do not bypass evidence checks.
 4. For pending attempts, observe the original filter context. Retry only if the pile is positively visible and unassigned.
 5. For conflicts, preserve the observed assignment and resolve manually. Never overwrite an unexpected assignee automatically.
@@ -268,7 +289,7 @@ npm run audit:piles-provenance -- --hours 24
 npm run audit:piles-provenance -- --hours 168 --insurer "DEFMIS"
 ```
 
-The **Piles Incident Inspection** workflow defaults to this read-only provenance audit. Its `incident` operation retains the existing sanitized runner inspection. The workflow has no mutation path.
+Select `operation=provenance` in **Piles Maintenance** for this read-only audit. The default `incident` operation retains the sanitized runner inspection. Neither diagnostic operation can select a mutating job.
 
 Historical repair is a separately approved direct-host operation. Stop new launches, back up the database, inspect the exact candidate, and target one confirmed attempt at a time:
 
@@ -324,7 +345,7 @@ Parent repair requires no queued/claimed/follow-up owned work, no active child i
 
 Legacy cancellation is narrower than age-based cleanup. The exact row must still be `pending`, unclaimed, and owned by an existing terminal scheduled all-active **execute** parent with a finish timestamp, no active child, and no owned nonterminal work. A different execute cycle for the same canonical insurer must have started after the request, completed cleanly, and have no pending/conflict/manual-action evidence. It must use the same known portal environment and cover all requested months and years: exact scope is sufficient; explicit `All` can cover a narrower scope; a narrower cycle cannot cover `All`. Persisted month arrays accept known short/full month labels with case/space normalization and set coverage; empty/null/scalar/unknown arrays and mixed `All` plus other labels are not evidence. Years must be explicit `All` or a known four-digit `20xx` value. Missing or unknown scope is never inferred as `All`, even when two missing values match. A manual successor may qualify if its execute scope is sufficient, but manual requests, dry-run cycles, orphaned/active-owner requests, and age alone remain ineligible. The free canonical insurer lock is rechecked before the guarded status transition to `cancelled_legacy`; `updated_at` plus the workflow audit trail preserve the cancellation record without rewriting parent details.
 
-The **Piles Stale Run Recovery** workflow has four disjoint actions: `inspect` (default), `recover`, `legacy-audit`, and `legacy-apply`. Inspection actions reject confirmation/token inputs. Recovery requires exactly one of `work_id` plus `claim_token`, `insurer_run_id`, or `parent_run_id` and exact `RECOVER_STALE_RUNS`; legacy apply accepts only `request_id` and exact `CANCEL_OBSOLETE_LEGACY_REQUESTS`. The first step reads the workflow event JSON privately via `GITHUB_EVENT_PATH`, registers token masking immediately, validates without echoing input, then exports values via `GITHUB_ENV` for later steps. No token value or input expression is placed in job/first-step environment, script, or action inputs before masking, so the runner's initial command/environment preamble cannot print it. Masking protects logs, not workflow-dispatch input metadata: dispatched inputs can remain in event records accessible to authorized workflow operators. If that retention is unsuitable, use the private direct-host recovery command instead; never treat workflow inputs as a secret store. Use the dedicated **Piles Incident Inspection** workflow when no mutation capability is needed.
+The **Piles Maintenance** workflow offers `stale-inspect`, `stale-recover`, `legacy-audit`, and `legacy-apply`. Select `target_kind` and `target_id` rather than separate ID inputs. Stale recovery requires one exact `work`, `insurer-run`, or `parent` target and `RECOVER_STALE_RUNS`; a work target additionally requires its current `claim_token`. Legacy apply requires a `legacy-request` target and `CANCEL_OBSOLETE_LEGACY_REQUESTS`. Diagnostic operations reject confirmation/token inputs. Each selected job reads the event privately, masks the ownership token, validates all inputs, and only then exports values to SSH. Invalid or incompatible inputs fail before contacting production. Masking protects logs, not workflow-dispatch input metadata, which remains accessible to authorized operators. If that retention is unsuitable, use the private direct-host recovery command; never treat workflow inputs as a secret store.
 
 Exit 0 means the selected operation completed; read-only counts may still report unhealthy candidates. Exit 2 means a mutation was blocked and rolled back. Exit 1 means invalid input/schema/access or a database failure; the transaction is rolled back (or disconnected if access was lost), and no raw driver diagnostic is logged. Reinspect exact targets after any failure or uncertain connection outcome; never assume a failed CLI means a commit could not have reached the database. Do not repeatedly apply based on an old inspection.
 

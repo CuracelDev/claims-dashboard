@@ -1,10 +1,54 @@
-name: Piles Runtime Incident Probe
+name: Piles Maintenance
 
 on:
-  push:
-    branches:
-      - AM-253-piles-stale-cycle-weekend-fix
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Diagnostic or explicitly confirmed maintenance operation
+        type: choice
+        required: true
+        default: incident
+        options:
+          - incident
+          - provenance
+          - historical-review
+          - readiness
+          - runtime-probe
+          - runtime-repair
+          - stale-inspect
+          - stale-recover
+          - legacy-audit
+          - legacy-apply
+      insurer:
+        description: Required for historical-review and one-insurer readiness
+        type: string
+        required: false
+      hours:
+        description: Inspection lookback (1-720 hours)
+        type: number
+        default: 24
+      scope:
+        description: Readiness scope
+        type: choice
+        default: one-insurer
+        options: [one-insurer, all-active]
+      target_kind:
+        description: Exact target type; none for untargeted diagnostics
+        type: choice
+        default: none
+        options: [none, parent, insurer-run, work, legacy-request]
+      target_id:
+        description: Exact ID matching target kind
+        type: string
+        required: false
+      claim_token:
+        description: Work recovery only; input metadata is not a secret store
+        type: string
+        required: false
+      confirmation:
+        description: Repair REPAIR PILES RUNTIME; recover RECOVER_STALE_RUNS; legacy CANCEL_OBSOLETE_LEGACY_REQUESTS
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -14,9 +58,175 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  probe:
+  validate:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs privately
+        run: node scripts/validate-piles-maintenance-inputs.mjs
+  inspection:
+    needs: validate
+    if: ${{ contains(fromJSON('["incident","provenance","historical-review"]'), inputs.operation) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs privately
+        run: node scripts/validate-piles-maintenance-inputs.mjs
+      - name: Prepare read-only historical ownership reviewer
+        if: inputs.operation == 'historical-review'
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const source = readFileSync('scripts/review_piles_historical_assignments.py');
+          appendFileSync(process.env.GITHUB_ENV, `HISTORICAL_SCRIPT_B64=${source.toString('base64')}\n`);
+          JS
+          echo "Reviewer revision: $GITHUB_SHA"
+      - name: Prepare versioned read-only inspector
+        if: inputs.operation == 'incident'
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const source = readFileSync('scripts/inspect-piles-runner-incidents.mjs', 'utf8')
+            + '\nawait main().catch(() => { console.error("Incident inspection failed safely."); process.exitCode = 1; });\n';
+          appendFileSync(process.env.GITHUB_ENV, `INCIDENT_SCRIPT_B64=${Buffer.from(source).toString('base64')}\n`);
+          JS
+          echo "Inspector revision: $GITHUB_SHA"
+      - name: Inspect sanitized Piles incident evidence
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          INSPECTION_OPERATION: ${{ env.INSPECTION_OPERATION }}
+          INCIDENT_HOURS: ${{ env.INCIDENT_HOURS }}
+          INCIDENT_RUN_ID: ${{ env.INCIDENT_RUN_ID }}
+          PROVENANCE_INSURER: ${{ env.PROVENANCE_INSURER }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: INSPECTION_OPERATION,INCIDENT_HOURS,INCIDENT_RUN_ID,PROVENANCE_INSURER,INCIDENT_SCRIPT_B64,HISTORICAL_SCRIPT_B64
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+
+            if [ "$INSPECTION_OPERATION" = "historical-review" ]; then
+              test -n "$PROVENANCE_INSURER"
+              # Deployments are rsync artifacts and need not contain .git.
+              "$PILES_ASSIGNMENT_PYTHON_BIN" -c 'import hashlib,pathlib; files=["scripts/piles_auto_assignment_runner.py", "scripts/piles_auto_assignment/store.py", "scripts/piles_auto_assignment/evidence.py", "scripts/piles_auto_assignment/scanning.py"]; [print("Deployed dependency sha256:", name, hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()) for name in files]'
+              printf '%s' "$HISTORICAL_SCRIPT_B64" | base64 --decode | "$PILES_ASSIGNMENT_PYTHON_BIN" - \
+                --insurer "$PROVENANCE_INSURER" --hours "$INCIDENT_HOURS"
+            elif [ "$INSPECTION_OPERATION" = "provenance" ]; then
+              if [ -n "$PROVENANCE_INSURER" ]; then
+                node scripts/audit-piles-assignment-provenance.mjs \
+                  --hours "$INCIDENT_HOURS" \
+                  --insurer "$PROVENANCE_INSURER"
+              else
+                node scripts/audit-piles-assignment-provenance.mjs \
+                  --hours "$INCIDENT_HOURS"
+              fi
+            elif [ -n "$INCIDENT_RUN_ID" ]; then
+              printf '%s' "$INCIDENT_SCRIPT_B64" | base64 --decode | node --input-type=module - \
+                --hours "$INCIDENT_HOURS" \
+                --run-id "$INCIDENT_RUN_ID"
+            else
+              printf '%s' "$INCIDENT_SCRIPT_B64" | base64 --decode | node --input-type=module - \
+                --hours "$INCIDENT_HOURS"
+            fi
+
+  readiness:
+    needs: validate
+    if: ${{ contains(fromJSON('["readiness"]'), inputs.operation) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs privately
+        run: node scripts/validate-piles-maintenance-inputs.mjs
+      - name: Audit production database and portal without assignments
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          PROBE_SCOPE: ${{ env.PROBE_SCOPE }}
+          PROBE_INSURER: ${{ env.PROBE_INSURER }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 110m
+          envs: PROBE_SCOPE,PROBE_INSURER
+          script: |
+            set -eu
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+
+            case "$PILES_ASSIGNMENT_PROVENANCE_V2" in
+              disabled|shadow|enabled) ;;
+              *) echo "PILES_ASSIGNMENT_PROVENANCE_V2 is not explicitly configured." >&2; exit 1 ;;
+            esac
+
+            "${PILES_RUNTIME_CONTROL_PYTHON:-python3}" "${PILES_RUNTIME_HEALTH_SCRIPT:-scripts/piles_runtime_health.py}" \
+              --runtime-root "${PILES_RUNTIME_ROOT:-.piles-runtime}" \
+              --requirements scripts/piles-auto-assignment-requirements.txt \
+              --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+              --mode full \
+              --json
+
+            node scripts/db-schema-audit.mjs
+            readiness_status=0
+            node scripts/audit-piles-auto-assignment-readiness.mjs --mode database || readiness_status=$?
+            provenance_status=0
+            node scripts/audit-piles-assignment-provenance.mjs --hours 720 || provenance_status=$?
+
+            probe_status=0
+            if [ "$PROBE_SCOPE" = "all-active" ]; then
+              "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
+                --all-active \
+                --portal-environment production \
+                --month All \
+                --year All \
+                --run-source readiness \
+                --read-only || probe_status=$?
+            else
+              if [ -z "$PROBE_INSURER" ]; then
+                echo "insurer is required for a one-insurer probe" >&2
+                exit 1
+              fi
+              "$PILES_ASSIGNMENT_PYTHON_BIN" scripts/piles_auto_assignment_runner.py \
+                --insurer "$PROBE_INSURER" \
+                --portal-environment production \
+                --month All \
+                --year All \
+                --run-source readiness \
+                --read-only || probe_status=$?
+            fi
+
+            if [ "$probe_status" -ne 0 ]; then
+              echo "Portal readiness probe failed with status $probe_status." >&2
+              exit "$probe_status"
+            fi
+            echo "Portal readiness probe completed successfully."
+            if [ "$readiness_status" -ne 0 ]; then
+              echo "Runtime readiness audit failed with status $readiness_status." >&2
+              exit "$readiness_status"
+            fi
+            if [ "$provenance_status" -ne 0 ]; then
+              echo "Provenance readiness audit failed with status $provenance_status." >&2
+              exit "$provenance_status"
+            fi
+            echo "Provenance readiness audit completed successfully."
+            echo "Runtime readiness audit completed successfully."
+
+  probe:
+    needs: validate
+    if: ${{ contains(fromJSON('["runtime-probe"]'), inputs.operation) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs privately
+        run: node scripts/validate-piles-maintenance-inputs.mjs
       - name: Inspect bounded production runtime evidence
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
@@ -259,3 +469,116 @@ jobs:
             printf 'cron_journal_invocations_72h|%s\n' "$(journalctl -u cron -u crond --since '72 hours ago' --no-pager 2>/dev/null | awk '/run-piles-auto-assignment[.]sh/ {n++} END {print n+0}')"
             printf 'host_boot_epoch|%s\n' "$(awk '$1 == "btime" {print $2}' /proc/stat 2>/dev/null | head -n 1)"
             printf 'root_filesystem_use_percent|%s\n' "$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"
+
+  repair:
+    needs: validate
+    if: ${{ contains(fromJSON('["runtime-repair"]'), inputs.operation) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs privately
+        run: node scripts/validate-piles-maintenance-inputs.mjs
+      - name: Atomically repair and verify the production runtime
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          REPAIR_CONFIRMATION: ${{ env.REPAIR_CONFIRMATION }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 55m
+          envs: REPAIR_CONFIRMATION
+          script: |
+            set -eu
+            if [ "$REPAIR_CONFIRMATION" != "REPAIR PILES RUNTIME" ]; then
+              echo "Exact runtime-repair confirmation was not supplied." >&2
+              exit 2
+            fi
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+            if pgrep -f '[p]iles_auto_assignment_runner[.]py' >/dev/null 2>&1; then
+              echo "A Piles assignment runner is active; runtime repair was not started." >&2
+              exit 3
+            fi
+            PILES_RUNTIME_INSTALL_OS_DEPS=true sh scripts/prepare-piles-production-runtime.sh
+            "${PILES_RUNTIME_CONTROL_PYTHON:-python3}" "${PILES_RUNTIME_HEALTH_SCRIPT:-scripts/piles_runtime_health.py}" \
+              --runtime-root "${PILES_RUNTIME_ROOT:-.piles-runtime}" \
+              --requirements scripts/piles-auto-assignment-requirements.txt \
+              --python-bin "$PILES_ASSIGNMENT_PYTHON_BIN" \
+              --mode full \
+              --json
+            echo "Piles runtime repair and full verification completed without running assignments."
+
+  recover:
+    needs: validate
+    if: ${{ contains(fromJSON('["stale-inspect","stale-recover","legacy-audit","legacy-apply"]'), inputs.operation) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs privately
+        run: node scripts/validate-piles-maintenance-inputs.mjs
+      - name: Inspect or recover stale Piles runs
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: RECOVERY_ACTION,RECOVERY_CONFIRMATION,RECOVERY_WORK_ID,RECOVERY_CLAIM_TOKEN,RECOVERY_INSURER_RUN_ID,RECOVERY_PARENT_RUN_ID,RECOVERY_REQUEST_ID
+          script: |
+            set -eu
+            # Never enable shell tracing: IDs/tokens and .env must not be echoed.
+            fail() { echo "Invalid recovery action, target or confirmation." >&2; exit 1; }
+            set --
+            case "$RECOVERY_ACTION" in
+              inspect|recover)
+                [ -z "$RECOVERY_REQUEST_ID" ] || fail
+                target_count=0
+                if [ -n "$RECOVERY_WORK_ID" ]; then
+                  set -- "$@" --work-id "$RECOVERY_WORK_ID"
+                  target_count=$((target_count + 1))
+                fi
+                if [ -n "$RECOVERY_INSURER_RUN_ID" ]; then
+                  set -- "$@" --insurer-run-id "$RECOVERY_INSURER_RUN_ID"
+                  target_count=$((target_count + 1))
+                fi
+                if [ -n "$RECOVERY_PARENT_RUN_ID" ]; then
+                  set -- "$@" --parent-run-id "$RECOVERY_PARENT_RUN_ID"
+                  target_count=$((target_count + 1))
+                fi
+                [ "$target_count" -le 1 ] || fail
+                if [ "$RECOVERY_ACTION" = recover ]; then
+                  [ "$target_count" -eq 1 ] && [ "$RECOVERY_CONFIRMATION" = RECOVER_STALE_RUNS ] || fail
+                  set -- "$@" --apply --confirmation "$RECOVERY_CONFIRMATION"
+                  if [ -n "$RECOVERY_WORK_ID" ]; then
+                    [ -n "$RECOVERY_CLAIM_TOKEN" ] || fail
+                    set -- "$@" --claim-token "$RECOVERY_CLAIM_TOKEN"
+                  else
+                    [ -z "$RECOVERY_CLAIM_TOKEN" ] || fail
+                  fi
+                else
+                  [ -z "$RECOVERY_CONFIRMATION" ] && [ -z "$RECOVERY_CLAIM_TOKEN" ] || fail
+                fi
+                operation_script=scripts/recover-piles-stale-runs.mjs
+                ;;
+              legacy-audit|legacy-apply)
+                [ -z "$RECOVERY_WORK_ID" ] && [ -z "$RECOVERY_CLAIM_TOKEN" ] && [ -z "$RECOVERY_INSURER_RUN_ID" ] && [ -z "$RECOVERY_PARENT_RUN_ID" ] || fail
+                if [ -n "$RECOVERY_REQUEST_ID" ]; then set -- --request-id "$RECOVERY_REQUEST_ID"; fi
+                if [ "$RECOVERY_ACTION" = legacy-apply ]; then
+                  [ -n "$RECOVERY_REQUEST_ID" ] && [ "$RECOVERY_CONFIRMATION" = CANCEL_OBSOLETE_LEGACY_REQUESTS ] || fail
+                  set -- "$@" --apply --confirmation "$RECOVERY_CONFIRMATION"
+                else
+                  [ -z "$RECOVERY_CONFIRMATION" ] || fail
+                fi
+                operation_script=scripts/audit-piles-legacy-requests.mjs
+                ;;
+              *) fail ;;
+            esac
+            cd ~/claims-dashboard
+            set -a
+            . ./.env
+            set +a
+            node "$operation_script" "$@"

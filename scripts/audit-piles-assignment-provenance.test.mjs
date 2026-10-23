@@ -138,8 +138,8 @@ test('ambiguous repair is blocked and rolled back without writes', async () => {
 });
 
 test('incident workflow exposes read-only provenance inspection and no repair command', () => {
-  const workflow = readFileSync(new URL('../.github/workflows/piles-incident-inspection.yml', import.meta.url), 'utf8');
+  const workflow = readFileSync(new URL('../.github/workflows/piles-maintenance.yml', import.meta.url), 'utf8');
   assert.match(workflow, /operation:/);
   assert.match(workflow, /audit-piles-assignment-provenance\.mjs/);
-  assert.doesNotMatch(workflow, /REPAIR_PILES_PROVENANCE|--apply/);
+  assert.doesNotMatch(workflow.split('  inspection:')[1].split('  readiness:')[0], /REPAIR_PILES_PROVENANCE|--apply/);
 });
