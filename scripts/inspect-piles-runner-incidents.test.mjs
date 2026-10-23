@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
 test('historical diagnostic fingerprints include the deployed scan safety dependency', () => {
-  const workflow = readFileSync(new URL('../.github/workflows/piles-incident-inspection.yml', import.meta.url), 'utf8');
+  const workflow = readFileSync(new URL('../.github/workflows/piles-maintenance.yml', import.meta.url), 'utf8');
   const command = workflow.match(/-c '(import hashlib[^\n]+)'/);
   assert.ok(command, 'fingerprint command must be available for execution');
   const result = spawnSync('python3', ['-c', command[1]], {
